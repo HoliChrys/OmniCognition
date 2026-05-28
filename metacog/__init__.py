@@ -24,6 +24,18 @@ from metacog.geometry import (
     k_nearest,
     vec_norm,
 )
+from metacog.collision import (
+    CollisionEvent,
+    CollisionResult,
+    Encoder,
+    LLMExtractor,
+    MAX_CASCADE_ITERATIONS,
+    SleepCycleReport,
+    collision_threshold,
+    detect_collisions,
+    resolve_collision,
+    sleep_cycle_collisions,
+)
 
 __all__ = [
     # epistemic
@@ -49,4 +61,15 @@ __all__ = [
     "effective_embedding",
     "k_nearest",
     "vec_norm",
+    # collision
+    "CollisionEvent",
+    "CollisionResult",
+    "Encoder",
+    "LLMExtractor",
+    "MAX_CASCADE_ITERATIONS",
+    "SleepCycleReport",
+    "collision_threshold",
+    "detect_collisions",
+    "resolve_collision",
+    "sleep_cycle_collisions",
 ]

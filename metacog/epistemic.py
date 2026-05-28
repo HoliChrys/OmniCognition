@@ -90,11 +90,15 @@ class Point:
         `content`, optionally `keywords` (if extracted by LLM).
 
     Fields ∈ ℝ^d (vectors — COMPUTATION):
-        `embedding_orig` (frozen at ingest),
+        `embedding_orig` (frozen at ingest, mutated only on collision
+        revision under Option Z),
         `delta_active`, `delta_latent` (metacognitive offsets).
 
     Fields ∈ ℕ (pure counters — read by A(·)):
-        `n_corrob`, `n_contra`, `n_uses`.
+        `n_corrob`, `n_contra`, `n_uses`, `n_revision`.
+
+    Lineage (collision metadata) :
+        `parents`, `children`, `lineage_depth`.
     """
 
     id: str
@@ -106,9 +110,13 @@ class Point:
     n_corrob: int = 0
     n_contra: int = 0
     n_uses: int = 0
+    n_revision: int = 0  # Option Z : incremented on collision revision
     state: EpistemicState = EpistemicState.CONJECTURE
     keywords: List[str] = field(default_factory=list)
     keywords_source: Optional[SourceClass] = None
+    parents: List[str] = field(default_factory=list)
+    children: List[str] = field(default_factory=list)
+    lineage_depth: int = 0
     update_log: List[AuditEntry] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -126,16 +134,23 @@ class Point:
 
     @property
     def confidence(self) -> float:
-        """Beta-mean. Pure COMPUTATION on ℕ counters."""
-        alpha = 1 + self.n_corrob
-        beta = 1 + self.n_contra
+        """Beta-mean with revision dilution (Option Z).
+
+        Effective alpha/beta are divided by (1 + n_revision) so that
+        each revision INCREASES the uncertainty without losing the
+        ratio between corroborations and contradictions.
+        """
+        scale = 1.0 / (1.0 + self.n_revision)
+        alpha = 1.0 + self.n_corrob * scale
+        beta = 1.0 + self.n_contra * scale
         return alpha / (alpha + beta)
 
     @property
     def uncertainty(self) -> float:
-        """Beta-variance."""
-        alpha = 1 + self.n_corrob
-        beta = 1 + self.n_contra
+        """Beta-variance with revision dilution (Option Z)."""
+        scale = 1.0 / (1.0 + self.n_revision)
+        alpha = 1.0 + self.n_corrob * scale
+        beta = 1.0 + self.n_contra * scale
         s = alpha + beta
         return (alpha * beta) / (s * s * (s + 1))
 

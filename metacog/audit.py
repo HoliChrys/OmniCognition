@@ -67,5 +67,6 @@ def inputs_of_A(point: Point) -> dict[str, object]:
         "n_corrob": point.n_corrob,
         "n_contra": point.n_contra,
         "n_uses": point.n_uses,
+        "n_revision": point.n_revision,
         # confidence and uncertainty are pure functions of the counters above.
     }
