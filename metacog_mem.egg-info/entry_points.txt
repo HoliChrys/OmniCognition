@@ -1,2 +1,0 @@
-[console_scripts]
-metacog-mcp = metacog.mcp_server:main
