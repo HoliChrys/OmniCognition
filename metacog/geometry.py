@@ -163,6 +163,33 @@ def k_nearest(
     return scored[:k]
 
 
+def retrieve_for_observator(
+    query_embedding: Vector,
+    points: Sequence["Point"],  # noqa: F821
+    k: int,
+    t_now: float,
+    observator_id: str,
+    exclude_states: Optional[set] = None,
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
+    """Retrieve top-k using a specific observator's view of each
+    point's state.
+
+    For points without a view for this observator, falls back to the
+    point's default state (the named observator inherits the
+    aggregated consensus until it forms its own opinion).
+    """
+    if exclude_states is None:
+        exclude_states = set()
+    eligible: List["Point"] = []  # noqa: F821
+    for p in points:
+        view = p.observator_views.get(observator_id)
+        state = view.state if view else p.state
+        if state in exclude_states:
+            continue
+        eligible.append(p)
+    return k_nearest(query_embedding, eligible, k, t_now)
+
+
 def retrieve(
     query_embedding: Vector,
     points: Sequence["Point"],  # noqa: F821
