@@ -80,8 +80,8 @@ save                persist to disk
 ### Run the server
 
 ```bash
-pip install -e .
-metacog-mcp --storage ~/.metacog/state.pkl
+uv sync                                  # or pip install -e .
+uv run metacog-mcp --storage ~/.metacog/state.pkl
 ```
 
 The server listens on stdio (the standard transport for Claude Code).
@@ -106,7 +106,9 @@ in any session.
 
 ## Tests
 
-```
+```bash
+uv run pytest tests/ -v
+# or
 PYTHONPATH=. pytest tests/ -v
 ```
 

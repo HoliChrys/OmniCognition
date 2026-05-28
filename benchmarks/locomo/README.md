@@ -5,40 +5,55 @@ conversations (~300 turns / ~9k tokens each), 1986 QA pairs spanning
 single-hop, multi-hop, temporal, open-domain, and adversarial
 categories.
 
-## One-time setup
+## One-time setup (uv)
 
 ```bash
+# install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # from the repo root
-pip install -e ".[bench]"
+uv sync --extra bench           # creates .venv and pulls all deps
 bash benchmarks/locomo/download.sh
+export ANTHROPIC_API_KEY=sk-ant-...    # only needed for --answerer claude
 ```
 
-`[bench]` pulls in :
+`[bench]` extras pull in :
 - `sentence-transformers` — semantic encoder
 - `transformers` + `torch` — extractive roberta QA model
 - `anthropic` — Claude API client (for `--answerer claude`)
 
-First run downloads the HF models. The Claude path needs
-`ANTHROPIC_API_KEY` in the environment.
+First run of the semantic encoder / roberta downloads models from
+HuggingFace.
 
-## Run
+## Run (uv)
 
 ```bash
 # Plain cosine retrieval — chunk-dump answer (fast smoke)
-python -m benchmarks.locomo.eval --samples 10 --encoder semantic
+uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic
 
 # With lineage-traversal retrieval (cosine + parents/children/sequence + RRF)
-python -m benchmarks.locomo.eval --samples 10 --encoder semantic --lineage
+uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --lineage
 
-# Extractive ReAct (roberta-base-squad2, runs locally on CPU)
-python -m benchmarks.locomo.eval --samples 10 --encoder semantic --answerer extractive
+# Extractive ReAct (roberta-base-squad2, local CPU)
+uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --answerer extractive
 
 # Claude-API ReAct (needs ANTHROPIC_API_KEY)
-export ANTHROPIC_API_KEY=sk-ant-...
-python -m benchmarks.locomo.eval --samples 10 --encoder semantic --lineage --answerer claude
+uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --lineage --answerer claude
 
 # Claude smoke (cheap : 1 conv / 20 QAs)
-python -m benchmarks.locomo.eval --samples 1 --max-qa 20 --encoder semantic --lineage --answerer claude
+uv run python -m benchmarks.locomo.eval --samples 1 --max-qa 20 --encoder semantic --lineage --answerer claude
+```
+
+Or via the Makefile :
+
+```bash
+make install               # uv sync
+make bench-deps            # uv sync --extra bench
+make bench-data            # download LoCoMo
+make bench-claude-smoke    # smoke run on Claude (cheap)
+make bench-claude          # full 1986-QA run on Claude
+make bench-lineage         # retrieval-only comparison
+make test                  # pytest suite
 ```
 
 ### Claude model selection
@@ -47,9 +62,9 @@ Default model is `claude-haiku-4-5-20251001` (cheap + fast for
 benchmarking). Override via :
 
 ```bash
-CLAUDE_MODEL=claude-sonnet-4-6 python -m benchmarks.locomo.eval --answerer claude ...
+CLAUDE_MODEL=claude-sonnet-4-6 uv run python -m benchmarks.locomo.eval --answerer claude ...
 # or
-python -m benchmarks.locomo.eval --answerer claude --claude-model claude-opus-4-7 ...
+uv run python -m benchmarks.locomo.eval --answerer claude --claude-model claude-opus-4-7 ...
 ```
 
 ## CLI flags
