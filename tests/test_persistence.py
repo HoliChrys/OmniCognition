@@ -14,6 +14,9 @@ Properties :
 
 from __future__ import annotations
 
+import hashlib
+import math
+
 from metacog import (
     EpistemicState,
     Observation,
@@ -44,7 +47,7 @@ class _BagOfWordsEncoder:
 
     def _word_vec(self, w: str):
         if w not in self._cache:
-            h = abs(hash(("bow", w)))
+            h = int(hashlib.md5(f"bow:{w}".encode()).hexdigest(), 16)
             self._cache[w] = tuple(((h >> (i * 8)) & 0xFF) / 255.0 for i in range(self.dim))
         return self._cache[w]
 

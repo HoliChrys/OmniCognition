@@ -23,6 +23,7 @@ Properties tested :
 
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Tuple
 
@@ -58,7 +59,7 @@ class _BagOfWordsEncoder:
 
     def _word_vec(self, word: str) -> Tuple[float, ...]:
         if word not in self._cache:
-            h = abs(hash(("bow", word)))
+            h = int(hashlib.md5(f"bow:{word}".encode()).hexdigest(), 16)
             self._cache[word] = tuple(
                 ((h >> (i * 8)) & 0xFF) / 255.0 for i in range(self.dim)
             )

@@ -19,6 +19,7 @@ Properties :
 
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Tuple
 
@@ -58,7 +59,7 @@ class _BagOfWordsEncoder:
         acc = [0.0] * self.dim
         for w in words:
             if w not in self._cache:
-                h = abs(hash(("bow", w)))
+                h = int(hashlib.md5(f"bow:{w}".encode()).hexdigest(), 16)
                 self._cache[w] = tuple(
                     1.0 if (h >> i) & 1 else -1.0
                     for i in range(self.dim)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import hashlib
 import pytest
 
 from metacog import (
@@ -45,7 +46,7 @@ class _Encoder:
         acc = [0.0] * self.dim
         for w in words:
             if w not in self._cache:
-                h = abs(hash(("e", w)))
+                h = int(hashlib.md5(f"e:{w}".encode()).hexdigest(), 16)
                 self._cache[w] = tuple(
                     ((h >> (i * 8)) & 0xFF) / 255.0 for i in range(self.dim)
                 )
