@@ -24,6 +24,8 @@ from metacog.observator import (
     spawn_observators_from_polarization,
 )
 from metacog.geometry import retrieve_for_observator
+from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
+from metacog.memory import Memory
 from metacog.compression import (
     CompressionEvent,
     CompressionOpportunity,
@@ -116,6 +118,11 @@ __all__ = [
     "spawn_observators_from_polarization",
     "spawn_observators_by_clustering",
     "retrieve_for_observator",
+    # defaults + top-level wrapper
+    "NoOpExecutor",
+    "SimpleEncoder",
+    "SimpleLLM",
+    "Memory",
     # compression (Chasles)
     "CompressionEvent",
     "CompressionOpportunity",
