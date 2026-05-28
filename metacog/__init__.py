@@ -23,7 +23,7 @@ from metacog.observator import (
     spawn_observators_by_clustering,
     spawn_observators_from_polarization,
 )
-from metacog.geometry import retrieve_for_observator
+from metacog.geometry import retrieve_for_observator, retrieve_with_lineage
 from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
 from metacog.memory import Memory
 from metacog.compression import (
@@ -118,6 +118,7 @@ __all__ = [
     "spawn_observators_from_polarization",
     "spawn_observators_by_clustering",
     "retrieve_for_observator",
+    "retrieve_with_lineage",
     # defaults + top-level wrapper
     "NoOpExecutor",
     "SimpleEncoder",

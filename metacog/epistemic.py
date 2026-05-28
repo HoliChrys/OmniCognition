@@ -152,6 +152,11 @@ class Point:
     parents: List[str] = field(default_factory=list)
     children: List[str] = field(default_factory=list)
     lineage_depth: int = 0
+    # Sequence neighbors for ordered ingestion (conversation turns,
+    # document paragraphs, code lines, …). Optional ; set by the
+    # ingester when the source data has intrinsic sequential order.
+    sequence_prev: Optional[str] = None
+    sequence_next: Optional[str] = None
     update_log: List[AuditEntry] = field(default_factory=list)
     execution_log: list = field(default_factory=list)  # for kind=ACTION
     # Per-observator views (default view = the point's own counters).

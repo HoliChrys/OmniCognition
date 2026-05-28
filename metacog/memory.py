@@ -40,7 +40,7 @@ from metacog.epistemic import (
     process_observation,
 )
 from metacog.execution import execute_action
-from metacog.geometry import effective_embedding, retrieve, retrieve_for_observator
+from metacog.geometry import effective_embedding, retrieve, retrieve_for_observator, retrieve_with_lineage
 from metacog.observator import (
     Observator,
     delegate_query,
@@ -95,8 +95,15 @@ class Memory:
         kind: str = "FACT",
         id: Optional[str] = None,
         parents: Optional[List[str]] = None,
+        sequence_prev: Optional[str] = None,
+        sequence_next: Optional[str] = None,
     ) -> Point:
-        """Create and store a new Point. Returns the Point."""
+        """Create and store a new Point. Returns the Point.
+
+        `sequence_prev` / `sequence_next` link the new point to its
+        ordered neighbors (e.g. previous and next conversation turn,
+        adjacent paragraphs). They power retrieve_with_lineage.
+        """
         if id is None:
             id = f"{kind.lower()}_{uuid.uuid4().hex[:8]}"
         point = Point(
@@ -106,8 +113,22 @@ class Memory:
             kind=PointKind[kind.upper()],
             parents=list(parents) if parents else [],
             lineage_depth=0 if not parents else 1,
+            sequence_prev=sequence_prev,
+            sequence_next=sequence_next,
         )
         self.points.append(point)
+        # Backfill the previous point's sequence_next if we know it
+        if sequence_prev:
+            for p in self.points:
+                if p.id == sequence_prev and p.sequence_next is None:
+                    p.sequence_next = id
+                    break
+        # Backfill children references on the new point's parents
+        if parents:
+            parent_set = set(parents)
+            for p in self.points:
+                if p.id in parent_set and id not in p.children:
+                    p.children = list(p.children) + [id]
         return point
 
     def ingest_action(
@@ -194,15 +215,29 @@ class Memory:
         *,
         k: int = 5,
         observator_id: Optional[str] = None,
+        use_lineage: bool = False,
+        lineage_depth: int = 1,
         t: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve top-k points. If observator_id given, uses that
-        observator's view of state."""
+        """Retrieve top-k points.
+
+        If `use_lineage` is True, runs retrieve_with_lineage : cosine
+        kNN + lineage expansion (parents / children / sequence_prev /
+        sequence_next) + Reciprocal Rank Fusion.
+
+        If `observator_id` is given (and not "default"), routes
+        through that observator's view of state.
+        """
         t_now = self._now(t)
         q_emb = tuple(self.encoder.encode(query))
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             results = retrieve_for_observator(
                 q_emb, self.points, k, t_now, observator_id,
+            )
+        elif use_lineage:
+            results = retrieve_with_lineage(
+                q_emb, self.points, k, t_now,
+                lineage_depth=lineage_depth,
             )
         else:
             results = retrieve(q_emb, self.points, k, t_now)

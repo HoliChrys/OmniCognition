@@ -190,6 +190,81 @@ def retrieve_for_observator(
     return k_nearest(query_embedding, eligible, k, t_now)
 
 
+def retrieve_with_lineage(
+    query_embedding: Vector,
+    points: Sequence["Point"],  # noqa: F821
+    k: int,
+    t_now: float,
+    *,
+    lineage_depth: int = 1,
+    cosine_pool_size: int = 30,
+    rrf_k: int = 60,
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
+    """Hybrid retrieval : cosine kNN + lineage expansion + RRF fusion.
+
+    Phase 1 — cosine kNN over effective embeddings (pool of
+              `cosine_pool_size` candidates).
+    Phase 2 — for each cosine hit, expand via lineage :
+                parents, children, sequence_prev, sequence_next.
+              The expansion is breadth-first up to `lineage_depth`.
+              A lineage-discovered point inherits the rank of the
+              seed that brought it.
+    Phase 3 — Reciprocal Rank Fusion :
+                score(p) = (1 / (rrf_k + rank_cosine(p)))
+                         + (1 / (rrf_k + rank_lineage(p)))
+
+    Rationale : pure cosine retrieval has a ceiling — when the right
+    evidence is semantically orthogonal to the question text but
+    structurally adjacent to a retrieved chunk, cosine fails to
+    surface it. Lineage traversal catches these cases.
+
+    `rrf_k = 60` is the standard Reciprocal Rank Fusion constant
+    (Cormack, Clarke & Buettcher 2009) — not a tuning knob.
+    """
+    points_by_id = {p.id: p for p in points}
+
+    pool = k_nearest(query_embedding, points, cosine_pool_size, t_now)
+    cosine_rank_by_id: dict[str, int] = {
+        p.id: i for i, (_, p) in enumerate(pool)
+    }
+
+    lineage_rank_by_id: dict[str, int] = {}
+    for rank, (_, seed) in enumerate(pool):
+        # BFS frontier expansion
+        frontier = {seed.id}
+        for _depth in range(lineage_depth):
+            next_frontier: set[str] = set()
+            for pid in frontier:
+                p = points_by_id.get(pid)
+                if p is None:
+                    continue
+                neighbors: list[str] = []
+                neighbors.extend(p.parents)
+                neighbors.extend(p.children)
+                if p.sequence_prev:
+                    neighbors.append(p.sequence_prev)
+                if p.sequence_next:
+                    neighbors.append(p.sequence_next)
+                for nid in neighbors:
+                    if nid in points_by_id and nid not in lineage_rank_by_id:
+                        lineage_rank_by_id[nid] = rank
+                        next_frontier.add(nid)
+            frontier = next_frontier
+
+    candidates = set(cosine_rank_by_id) | set(lineage_rank_by_id)
+    rrf_scores: dict[str, float] = {}
+    for pid in candidates:
+        score = 0.0
+        if pid in cosine_rank_by_id:
+            score += 1.0 / (rrf_k + cosine_rank_by_id[pid])
+        if pid in lineage_rank_by_id:
+            score += 1.0 / (rrf_k + lineage_rank_by_id[pid])
+        rrf_scores[pid] = score
+
+    ranked = sorted(rrf_scores.items(), key=lambda x: -x[1])[:k]
+    return [(score, points_by_id[pid]) for pid, score in ranked]
+
+
 def retrieve(
     query_embedding: Vector,
     points: Sequence["Point"],  # noqa: F821
