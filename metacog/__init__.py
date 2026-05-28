@@ -39,6 +39,18 @@ from metacog.collision import (
     resolve_collision,
     sleep_cycle_collisions,
 )
+from metacog.detectors import (
+    COS_HIGHLY_SIMILAR,
+    COS_MODERATELY_SIMILAR,
+    ConversationLog,
+    TurnRecord,
+    analyze_user_turn,
+    detect_contradiction,
+    detect_continuation,
+    detect_corroboration,
+    detect_reformulation,
+    detect_repetition_of_need,
+)
 
 __all__ = [
     # epistemic
@@ -78,4 +90,15 @@ __all__ = [
     "detect_collisions",
     "resolve_collision",
     "sleep_cycle_collisions",
+    # detectors
+    "COS_HIGHLY_SIMILAR",
+    "COS_MODERATELY_SIMILAR",
+    "ConversationLog",
+    "TurnRecord",
+    "analyze_user_turn",
+    "detect_contradiction",
+    "detect_continuation",
+    "detect_corroboration",
+    "detect_reformulation",
+    "detect_repetition_of_need",
 ]
