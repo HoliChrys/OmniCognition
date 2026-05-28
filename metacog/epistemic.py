@@ -146,6 +146,7 @@ class Point:
     children: List[str] = field(default_factory=list)
     lineage_depth: int = 0
     update_log: List[AuditEntry] = field(default_factory=list)
+    execution_log: list = field(default_factory=list)  # for kind=ACTION
 
     def __post_init__(self) -> None:
         # Zero-initialize deltas to match embedding dimension if not given.

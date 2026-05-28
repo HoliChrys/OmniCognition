@@ -20,6 +20,20 @@ from metacog.compression import (
     detect_chasles_opportunities,
     straight_ratio,
 )
+from metacog.execution import (
+    ExecutionOutcome,
+    ExecutionRecord,
+    ExecutionResult,
+    ExecutorProtocol,
+    execute_action,
+)
+from metacog.reasoning import (
+    COS_STABLE,
+    ReasoningLLM,
+    ReasoningStep,
+    ReasoningTrajectory,
+    reason,
+)
 from metacog.audit import (
     NoLaunderingInvariant,
     assert_no_laundering,
@@ -84,6 +98,18 @@ __all__ = [
     "compress_trajectory",
     "detect_chasles_opportunities",
     "straight_ratio",
+    # execution
+    "ExecutionOutcome",
+    "ExecutionRecord",
+    "ExecutionResult",
+    "ExecutorProtocol",
+    "execute_action",
+    # reasoning
+    "COS_STABLE",
+    "ReasoningLLM",
+    "ReasoningStep",
+    "ReasoningTrajectory",
+    "reason",
     # audit
     "NoLaunderingInvariant",
     "assert_no_laundering",
