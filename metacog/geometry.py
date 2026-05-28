@@ -16,7 +16,7 @@ time.
 from __future__ import annotations
 
 import math
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 Vector = Tuple[float, ...]
 
@@ -147,8 +147,10 @@ def k_nearest(
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Top-k points by cosine similarity on effective embeddings.
 
-    This is the on-demand graph view: no edges are stored, neighbors
-    are computed each time from the current geometry.
+    Pure geometric primitive : considers EVERY point in `points`,
+    regardless of epistemic state. State-based filtering is the job
+    of `retrieve` — this function stays unbiased so introspection
+    over latent points remains possible.
     """
     scored: List[Tuple[float, "Point"]] = []  # noqa: F821
     for p in points:
@@ -156,3 +158,101 @@ def k_nearest(
         scored.append((cosine(query_embedding, eff), p))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:k]
+
+
+def retrieve(
+    query_embedding: Vector,
+    points: Sequence["Point"],  # noqa: F821
+    k: int,
+    t_now: float,
+    exclude_states: Optional[set] = None,
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
+    """Top-k retrieval.
+
+    By default applies NO state filter. The system's ZERO-DELETION
+    policy is implemented geometrically by `apply_exile` rather than
+    by suppression at the retrieval layer : latent points get pushed
+    away from the active centroid, so they naturally score below
+    active points for typical queries.
+
+    `exclude_states` remains available as an OPT-IN hard filter for
+    callers that want explicit suppression for a specific use case.
+    """
+    if exclude_states is None:
+        return k_nearest(query_embedding, points, k, t_now)
+    eligible = [p for p in points if p.state not in exclude_states]
+    return k_nearest(query_embedding, eligible, k, t_now)
+
+
+def compute_centroid(
+    points: Sequence["Point"],  # noqa: F821
+    t_now: float,
+    active_only: bool = True,
+) -> Optional[Vector]:
+    """Centroid of effective embeddings.
+
+    By default restricted to active epistemic states
+    (CONJECTURE, CORROBORATED, WARRANTED) so the centroid reflects the
+    consensus the system is currently building. Pass active_only=False
+    to include latent points in the centroid.
+    """
+    from metacog.epistemic import EpistemicState
+    if active_only:
+        active = {
+            EpistemicState.CONJECTURE,
+            EpistemicState.CORROBORATED,
+            EpistemicState.WARRANTED,
+        }
+        eligible = [p for p in points if p.state in active]
+    else:
+        eligible = list(points)
+    if not eligible:
+        return None
+    embeddings = [effective_embedding(p, t_now) for p in eligible]
+    d = len(embeddings[0])
+    return tuple(sum(e[i] for e in embeddings) / len(embeddings) for i in range(d))
+
+
+def apply_exile(
+    point: "Point",  # noqa: F821
+    population: Sequence["Point"],  # noqa: F821
+    t_now: float,
+) -> bool:
+    """Push a latent point AWAY from the active centroid.
+
+    This is the GEOMETRIC substitute for suppression. Rather than
+    removing or hiding a point that fell into a latent state, we move
+    it to the periphery of the manifold. Typical queries (which live
+    in the active region) naturally score it lower; queries in the
+    latent direction can still surface it — by design.
+
+    Step size : 1 / (1 + n_obs)         — same parameter-free formula
+    Direction : (eff_point - centroid)  — orthogonal-ish to consensus
+
+    Returns True if a push was applied, False if no centroid existed
+    or the point is already at the centroid (degenerate direction).
+    """
+    centroid = compute_centroid(population, t_now, active_only=True)
+    if centroid is None:
+        return False
+
+    decay = decay_factor(t_now, point.t_last_obs)
+    point.delta_active = vec_scale(point.delta_active, decay)
+
+    eff_p = effective_embedding(point, t_now)
+    raw_dir = vec_sub(eff_p, centroid)
+    if vec_norm(raw_dir) < _EPS:
+        return False
+    direction = vec_normalize(raw_dir)
+
+    n_obs = point.n_corrob + point.n_contra
+    pas = 1.0 / (1.0 + n_obs)
+
+    point.delta_active = vec_add(point.delta_active, vec_scale(direction, pas))
+
+    new_n = n_obs + 1
+    point.delta_latent = vec_scale(
+        vec_add(vec_scale(point.delta_latent, n_obs), point.delta_active),
+        1.0 / new_n,
+    )
+    return True

@@ -10,6 +10,14 @@ population's confidence distribution. A(·) ⊥ P holds.
 
 GENERATOR sources cannot construct an Observation — enforced at type
 level. Corollary 5 of Romanchuk & Bondar 2026.
+
+POLICY : ZERO DELETION.
+    No code path in MetaCog-Mem removes a point from the cloud. Points
+    that fall into latent states (INVALID, DEPRECATED) are excluded
+    from active recall by `retrieve()`, but remain in the manifold for
+    audit and for RESURRECTION — A(·) is reversible, so a previously
+    INVALID point that accumulates new corroborations can transition
+    back to CORROBORATED automatically.
 """
 
 from __future__ import annotations
@@ -217,6 +225,13 @@ def apply_observation(
 
     point.t_last_obs = observation.timestamp
     point.state = assign_status(point, population)
+
+    # Geometric exile : the éloignement that REPLACES suppression.
+    # Latent points are pushed away from the active centroid, but
+    # never deleted (ZERO-DELETION policy).
+    if point.state in {EpistemicState.INVALID, EpistemicState.DEPRECATED}:
+        from metacog.geometry import apply_exile
+        apply_exile(point, population, observation.timestamp)
 
     entry = AuditEntry(
         node_id=point.id,

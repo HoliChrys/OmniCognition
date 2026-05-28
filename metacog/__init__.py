@@ -16,12 +16,15 @@ from metacog.audit import (
     inputs_of_A,
 )
 from metacog.geometry import (
+    apply_exile,
     apply_pull,
+    compute_centroid,
     cosine,
     decay_factor,
     distance,
     effective_embedding,
     k_nearest,
+    retrieve,
     vec_norm,
 )
 from metacog.collision import (
@@ -59,7 +62,10 @@ __all__ = [
     "decay_factor",
     "distance",
     "effective_embedding",
+    "apply_exile",
+    "compute_centroid",
     "k_nearest",
+    "retrieve",
     "vec_norm",
     # collision
     "CollisionEvent",
