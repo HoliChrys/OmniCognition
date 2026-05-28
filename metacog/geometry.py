@@ -213,11 +213,6 @@ def retrieve_with_lineage(
                 score(p) = (1 / (rrf_k + rank_cosine(p)))
                          + (1 / (rrf_k + rank_lineage(p)))
 
-    Rationale : pure cosine retrieval has a ceiling — when the right
-    evidence is semantically orthogonal to the question text but
-    structurally adjacent to a retrieved chunk, cosine fails to
-    surface it. Lineage traversal catches these cases.
-
     `rrf_k = 60` is the standard Reciprocal Rank Fusion constant
     (Cormack, Clarke & Buettcher 2009) — not a tuning knob.
     """
@@ -263,6 +258,106 @@ def retrieve_with_lineage(
 
     ranked = sorted(rrf_scores.items(), key=lambda x: -x[1])[:k]
     return [(score, points_by_id[pid]) for pid, score in ranked]
+
+
+def retrieve_hybrid(
+    query_text: str,
+    points: Sequence["Point"],  # noqa: F821
+    k: int,
+    t_now: float,
+    *,
+    encoder,
+    extractor,
+    use_lineage: bool = False,
+    lineage_depth: int = 1,
+    pool_per_signal: int = 14,
+    rrf_k: int = 60,
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
+    """Hybrid retrieval :
+      - cosine on KEYWORD embeddings       (entity-level match)
+      - BM25 on full content text          (verbatim / rare-token match)
+      - Reciprocal Rank Fusion → top-k
+      - optional lineage expansion on the fused top-k
+
+    Each signal contributes a pool of `pool_per_signal` candidates,
+    then RRF fuses with the canonical constant `rrf_k = 60`. The two
+    pools are complementary : keyword cosine catches paraphrased
+    references to the same entity ; BM25 catches verbatim dates,
+    names, and rare tokens.
+
+    Points without a `keywords_embedding` are skipped from the cosine
+    signal but remain candidates via BM25.
+    """
+    from metacog.bm25 import bm25_score
+
+    points_by_id = {p.id: p for p in points}
+
+    # Phase 1 — cosine on keyword embeddings
+    query_kw = extractor.extract(query_text, n=8) if extractor else []
+    if query_kw:
+        query_kw_text = " ".join(query_kw)
+        query_kw_emb = tuple(encoder.encode(query_kw_text))
+    else:
+        query_kw_emb = tuple(encoder.encode(query_text))
+
+    cosine_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
+    for p in points:
+        if not p.keywords_embedding:
+            continue
+        s = cosine(query_kw_emb, tuple(p.keywords_embedding))
+        cosine_pool.append((s, p))
+    cosine_pool.sort(key=lambda x: x[0], reverse=True)
+    cosine_pool = cosine_pool[:pool_per_signal]
+
+    # Phase 2 — BM25 on full content
+    bm25_pool = bm25_score(query_text, points, k_pool=pool_per_signal)
+
+    # Phase 3 — Reciprocal Rank Fusion
+    rrf_scores: dict[str, float] = {}
+    for rank, (_, p) in enumerate(cosine_pool):
+        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+    for rank, (_, p) in enumerate(bm25_pool):
+        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+
+    if not rrf_scores:
+        return []
+
+    fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    top_ids = [pid for pid, _ in fused[:k]]
+
+    # Phase 4 — optional lineage expansion
+    if use_lineage:
+        lineage_rank_by_id: dict[str, int] = {}
+        for rank, pid in enumerate(top_ids):
+            frontier = {pid}
+            for _depth in range(lineage_depth):
+                next_frontier: set[str] = set()
+                for fid in frontier:
+                    p = points_by_id.get(fid)
+                    if p is None:
+                        continue
+                    neighbors: list[str] = []
+                    neighbors.extend(p.parents)
+                    neighbors.extend(p.children)
+                    if p.sequence_prev:
+                        neighbors.append(p.sequence_prev)
+                    if p.sequence_next:
+                        neighbors.append(p.sequence_next)
+                    for nid in neighbors:
+                        if nid in points_by_id and nid not in lineage_rank_by_id:
+                            lineage_rank_by_id[nid] = rank
+                            next_frontier.add(nid)
+                frontier = next_frontier
+        for pid, lrank in lineage_rank_by_id.items():
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + lrank)
+        fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+    results = [
+        (score, points_by_id[pid])
+        for pid, score in fused[:k]
+        if pid in points_by_id
+    ]
+    return results
 
 
 def retrieve(

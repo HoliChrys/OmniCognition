@@ -40,7 +40,14 @@ from metacog.epistemic import (
     process_observation,
 )
 from metacog.execution import execute_action
-from metacog.geometry import effective_embedding, retrieve, retrieve_for_observator, retrieve_with_lineage
+from metacog.geometry import (
+    effective_embedding,
+    retrieve,
+    retrieve_for_observator,
+    retrieve_hybrid,
+    retrieve_with_lineage,
+)
+from metacog.keywords import KeywordExtractor, SimpleKeywordExtractor
 from metacog.observator import (
     Observator,
     delegate_query,
@@ -59,6 +66,7 @@ class Memory:
     encoder: Any = field(default_factory=SimpleEncoder)
     llm: Any = field(default_factory=SimpleLLM)
     executor: Any = field(default_factory=NoOpExecutor)
+    extractor: Any = field(default_factory=SimpleKeywordExtractor)
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
@@ -106,6 +114,13 @@ class Memory:
         """
         if id is None:
             id = f"{kind.lower()}_{uuid.uuid4().hex[:8]}"
+        # Extract keywords + their embedding for hybrid retrieval.
+        kws: List[str] = []
+        kw_emb = None
+        if self.extractor is not None:
+            kws = self.extractor.extract(content, n=5)
+            if kws:
+                kw_emb = tuple(self.encoder.encode(" ".join(kws)))
         point = Point(
             id=id,
             content=content,
@@ -115,6 +130,8 @@ class Memory:
             lineage_depth=0 if not parents else 1,
             sequence_prev=sequence_prev,
             sequence_next=sequence_next,
+            keywords=kws,
+            keywords_embedding=kw_emb,
         )
         self.points.append(point)
         # Backfill the previous point's sequence_next if we know it
@@ -213,33 +230,46 @@ class Memory:
         self,
         query: str,
         *,
-        k: int = 5,
+        k: int = 7,
         observator_id: Optional[str] = None,
         use_lineage: bool = False,
+        use_hybrid: bool = False,
         lineage_depth: int = 1,
         t: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
-        If `use_lineage` is True, runs retrieve_with_lineage : cosine
-        kNN + lineage expansion (parents / children / sequence_prev /
-        sequence_next) + Reciprocal Rank Fusion.
+        Modes :
+          - default              cosine kNN over effective embedding
+          - use_lineage=True     cosine + lineage RRF
+          - use_hybrid=True      cosine on keywords + BM25 on content
+                                 + RRF (+ optional lineage)
+          - observator_id=…      route through that observator's view
 
-        If `observator_id` is given (and not "default"), routes
-        through that observator's view of state.
+        Default k=7 (≈ matches LoCoMo / typical agentic context budget).
         """
         t_now = self._now(t)
-        q_emb = tuple(self.encoder.encode(query))
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
+            q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
                 q_emb, self.points, k, t_now, observator_id,
             )
+        elif use_hybrid:
+            results = retrieve_hybrid(
+                query, self.points, k, t_now,
+                encoder=self.encoder,
+                extractor=self.extractor,
+                use_lineage=use_lineage,
+                lineage_depth=lineage_depth,
+            )
         elif use_lineage:
+            q_emb = tuple(self.encoder.encode(query))
             results = retrieve_with_lineage(
                 q_emb, self.points, k, t_now,
                 lineage_depth=lineage_depth,
             )
         else:
+            q_emb = tuple(self.encoder.encode(query))
             results = retrieve(q_emb, self.points, k, t_now)
         return [
             {

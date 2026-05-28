@@ -23,7 +23,9 @@ from metacog.observator import (
     spawn_observators_by_clustering,
     spawn_observators_from_polarization,
 )
-from metacog.geometry import retrieve_for_observator, retrieve_with_lineage
+from metacog.geometry import retrieve_for_observator, retrieve_hybrid, retrieve_with_lineage
+from metacog.keywords import KeywordExtractor, SimpleKeywordExtractor
+from metacog.bm25 import bm25_score
 from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
 from metacog.memory import Memory
 from metacog.compression import (
@@ -119,6 +121,10 @@ __all__ = [
     "spawn_observators_by_clustering",
     "retrieve_for_observator",
     "retrieve_with_lineage",
+    "retrieve_hybrid",
+    "KeywordExtractor",
+    "SimpleKeywordExtractor",
+    "bm25_score",
     # defaults + top-level wrapper
     "NoOpExecutor",
     "SimpleEncoder",
