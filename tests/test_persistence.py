@@ -61,13 +61,20 @@ class _BagOfWordsEncoder:
 
 
 class _SetOpsLLM:
-    def extract_common(self, a: str, b: str) -> str:
-        wa = a.lower().split()
-        wb = set(b.lower().split())
+    def extract_common(self, texts) -> str:
+        texts = list(texts)
+        if len(texts) < 2:
+            return ""
+        word_sets = [set(t.lower().split()) for t in texts]
+        common = word_sets[0].copy()
+        for ws in word_sets[1:]:
+            common &= ws
+        if not common:
+            return ""
         seen = set()
         out = []
-        for w in wa:
-            if w in wb and w not in seen:
+        for w in texts[0].lower().split():
+            if w in common and w not in seen:
                 out.append(w)
                 seen.add(w)
         return " ".join(out)

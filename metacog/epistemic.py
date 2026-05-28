@@ -38,6 +38,25 @@ class SourceClass(Enum):
     GENERATOR = "GENERATOR"      # LLM-produced (forbidden as evidence)
 
 
+class PointKind(Enum):
+    """Ontological kind of a Point — three coexisting types in the same DB.
+
+    All three share the same schema, A(·), and lifecycle. They differ
+    only in what they REPRESENT and in how they typically get
+    corroborated :
+
+      FACT     external observation, world-anchored
+      THOUGHT  internal derivation / reasoning step
+      ACTION   contextualized intervention (replaces the old `skill`
+               concept — actions live in the manifold, not in a
+               separate registry)
+    """
+
+    FACT = "FACT"
+    THOUGHT = "THOUGHT"
+    ACTION = "ACTION"
+
+
 class EpistemicState(Enum):
     CONJECTURE = "CONJECTURE"
     CORROBORATED = "CORROBORATED"
@@ -112,6 +131,7 @@ class Point:
     id: str
     content: str
     embedding_orig: Vector
+    kind: PointKind = PointKind.FACT  # FACT / THOUGHT / ACTION
     delta_active: Vector = field(default_factory=tuple)
     delta_latent: Vector = field(default_factory=tuple)
     t_last_obs: float = 0.0

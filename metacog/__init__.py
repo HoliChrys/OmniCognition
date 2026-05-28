@@ -4,10 +4,21 @@ from metacog.epistemic import (
     LaunderingError,
     Observation,
     Point,
+    PointKind,
     SourceClass,
     apply_observation,
     assign_status,
     process_observation,
+)
+from metacog.compression import (
+    CompressionEvent,
+    CompressionOpportunity,
+    CompressionResult,
+    EagerCompressionReport,
+    compress_chain,
+    compress_trajectory,
+    detect_chasles_opportunities,
+    straight_ratio,
 )
 from metacog.audit import (
     NoLaunderingInvariant,
@@ -59,10 +70,20 @@ __all__ = [
     "LaunderingError",
     "Observation",
     "Point",
+    "PointKind",
     "SourceClass",
     "apply_observation",
     "assign_status",
     "process_observation",
+    # compression (Chasles)
+    "CompressionEvent",
+    "CompressionOpportunity",
+    "CompressionResult",
+    "EagerCompressionReport",
+    "compress_chain",
+    "compress_trajectory",
+    "detect_chasles_opportunities",
+    "straight_ratio",
     # audit
     "NoLaunderingInvariant",
     "assert_no_laundering",

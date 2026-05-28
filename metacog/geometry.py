@@ -81,56 +81,59 @@ def apply_pull(
     point_j: "Point",  # noqa: F821
     polarity: float,
     t_now: float,
+    *,
+    bidirectional: bool = True,
 ) -> None:
     """Geometric distillation between two points.
 
     Positive polarity → pull together. Negative → push apart.
-    Mutates `delta_active` and `delta_latent` of both points.
+
+    By default both points move (bidirectional). For Chasles compression
+    we pass `bidirectional=False` so that only `point_i` is repositioned
+    and `point_j` (the anchor) remains fixed.
 
     Step size is `1 / (1 + n_obs)` per point — parameter-free, decreases
-    with epistemic experience (Bayesian-flavored, no learning rate).
+    with epistemic experience.
 
     Order with respect to `apply_observation`:
       apply_pull MUST run before apply_observation, because apply_pull
       reads `t_last_obs` to compute lazy decay, and apply_observation
       overwrites it.
     """
-    # 1. Lazy-refresh active offsets (apply accumulated time decay)
+    # Lazy-refresh i's stored active (we're going to mutate it)
     decay_i = decay_factor(t_now, point_i.t_last_obs)
-    decay_j = decay_factor(t_now, point_j.t_last_obs)
     point_i.delta_active = vec_scale(point_i.delta_active, decay_i)
-    point_j.delta_active = vec_scale(point_j.delta_active, decay_j)
 
-    # 2. Compute direction from CURRENT effective embeddings
+    # Compute direction from CURRENT effective embeddings
     eff_i = effective_embedding(point_i, t_now)
     eff_j = effective_embedding(point_j, t_now)
     raw_dir = vec_sub(eff_j, eff_i)
     if vec_norm(raw_dir) < _EPS:
-        # Collision: no defined direction; skip the geometric update,
-        # but counters can still be updated by apply_observation.
         return
     direction = vec_normalize(raw_dir)
 
-    # 3. Step size — pure COMPUTATION on counters
-    n_obs_i = point_i.n_corrob + point_i.n_contra
-    n_obs_j = point_j.n_corrob + point_j.n_contra
-    pas_i = 1.0 / (1.0 + n_obs_i)
-    pas_j = 1.0 / (1.0 + n_obs_j)
-
-    # 4. Apply pull (or push if polarity < 0)
     sign = 1.0 if polarity > 0 else -1.0
+    n_obs_i = point_i.n_corrob + point_i.n_contra
+    pas_i = 1.0 / (1.0 + n_obs_i)
     point_i.delta_active = vec_add(
         point_i.delta_active, vec_scale(direction, sign * pas_i)
     )
-    point_j.delta_active = vec_add(
-        point_j.delta_active, vec_scale(direction, -sign * pas_j)
-    )
-
-    # 5. Update latent as the incremental mean of active over time
     new_n_i = n_obs_i + 1
     point_i.delta_latent = vec_scale(
         vec_add(vec_scale(point_i.delta_latent, n_obs_i), point_i.delta_active),
         1.0 / new_n_i,
+    )
+
+    if not bidirectional:
+        return
+
+    # Symmetric pull on point_j
+    decay_j = decay_factor(t_now, point_j.t_last_obs)
+    point_j.delta_active = vec_scale(point_j.delta_active, decay_j)
+    n_obs_j = point_j.n_corrob + point_j.n_contra
+    pas_j = 1.0 / (1.0 + n_obs_j)
+    point_j.delta_active = vec_add(
+        point_j.delta_active, vec_scale(direction, -sign * pas_j)
     )
     new_n_j = n_obs_j + 1
     point_j.delta_latent = vec_scale(

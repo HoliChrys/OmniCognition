@@ -77,15 +77,22 @@ class _BagOfWordsEncoder:
 
 
 class _SetOpsLLM:
-    """Deterministic test LLM : word-set common / difference."""
+    """Deterministic test LLM : word-set common / difference, N-way."""
 
-    def extract_common(self, a: str, b: str) -> str:
-        wa = a.lower().split()
-        wb = set(b.lower().split())
+    def extract_common(self, texts) -> str:
+        texts = list(texts)
+        if len(texts) < 2:
+            return ""
+        word_sets = [set(t.lower().split()) for t in texts]
+        common = word_sets[0].copy()
+        for ws in word_sets[1:]:
+            common &= ws
+        if not common:
+            return ""
         seen: set[str] = set()
         out: list[str] = []
-        for w in wa:
-            if w in wb and w not in seen:
+        for w in texts[0].lower().split():
+            if w in common and w not in seen:
                 out.append(w)
                 seen.add(w)
         return " ".join(out)
@@ -168,7 +175,7 @@ def test_resolve_creates_child_with_parents_and_correct_lineage():
     b = Point(id="B", content="dr sarah berkeley psychology",
               embedding_orig=enc.encode("dr sarah berkeley psychology"))
 
-    result = resolve_collision(a, b, llm, enc, t_now=1.0,
+    result = resolve_collision([a, b], llm, enc, t_now=1.0,
                                trigger_distance=0.1, threshold=0.2)
     assert result is not None
     child = result.child
@@ -186,6 +193,8 @@ def test_resolve_creates_child_with_parents_and_correct_lineage():
     # Parents have the child registered
     assert child.id in a.children
     assert child.id in b.children
+    # Result.parents reflects the list of all parents
+    assert {p.id for p in result.parents} == {"A", "B"}
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +215,7 @@ def test_parents_retain_counters_n_revision_incremented():
     n_corrob_a_before, n_contra_a_before = a.n_corrob, a.n_contra
     n_corrob_b_before, n_contra_b_before = b.n_corrob, b.n_contra
 
-    resolve_collision(a, b, llm, enc, t_now=1.0,
+    resolve_collision([a, b], llm, enc, t_now=1.0,
                       trigger_distance=0.05, threshold=0.2)
 
     # Counters unchanged
@@ -230,7 +239,7 @@ def test_uncertainty_rises_after_revision():
               n_corrob=6, n_contra=2)
 
     u_before_a = a.uncertainty
-    resolve_collision(a, b, llm, enc, t_now=1.0,
+    resolve_collision([a, b], llm, enc, t_now=1.0,
                       trigger_distance=0.05, threshold=0.2)
     u_after_a = a.uncertainty
     assert u_after_a > u_before_a
@@ -289,7 +298,7 @@ def test_a_perp_p_holds_after_collision_revision():
               embedding_orig=enc.encode("gamma delta common"),
               n_corrob=4, n_contra=1)
     pop = [a, b] + _build_pop(enc, [(f"F{i}", f"filler{i}") for i in range(5)])
-    resolve_collision(a, b, llm, enc, t_now=1.0,
+    resolve_collision([a, b], llm, enc, t_now=1.0,
                       trigger_distance=0.05, threshold=0.2)
     # Build a ghost point with identical counters but a totally different
     # content / embedding — A(·) must return the same state.
@@ -345,7 +354,7 @@ def test_resolve_returns_none_when_no_real_overlap():
               embedding_orig=enc.encode("alpha beta"))
     b = Point(id="B", content="gamma delta",
               embedding_orig=enc.encode("gamma delta"))
-    result = resolve_collision(a, b, llm, enc, t_now=1.0,
+    result = resolve_collision([a, b], llm, enc, t_now=1.0,
                                trigger_distance=0.05, threshold=0.2)
     assert result is None
     # And the parents are untouched
@@ -367,7 +376,7 @@ def test_collision_event_records_both_source_classes():
               embedding_orig=enc.encode("dr sarah counseling"))
     b = Point(id="B", content="dr sarah psychology",
               embedding_orig=enc.encode("dr sarah psychology"))
-    result = resolve_collision(a, b, llm, enc, t_now=1.0,
+    result = resolve_collision([a, b], llm, enc, t_now=1.0,
                                trigger_distance=0.1, threshold=0.2)
     assert result is not None
     event = result.event
@@ -375,4 +384,7 @@ def test_collision_event_records_both_source_classes():
     assert event.detection_class == SourceClass.COMPUTATION
     # Content generation (LLM extract_common + remove_overlap) is GENERATOR
     assert event.content_generation_class == SourceClass.GENERATOR
-    # But neither feeds the observation set O → no laundering
+    # Parent ids are recorded (≥ 2)
+    assert set(event.parent_ids) == {"A", "B"}
+    # No anchors used for this proximity collision
+    assert event.anchor_ids == ()
