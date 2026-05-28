@@ -22,6 +22,8 @@ Cor. 5 still forbids GENERATOR-sourced observations.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Sequence, Tuple
 
@@ -209,6 +211,171 @@ class DelegationEvent:
     chain: Tuple[str, ...]
     aborted: bool = False
     abort_reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# PHASE O2-bis — semantic clustering of conflicting observations
+# ---------------------------------------------------------------------------
+
+
+_WORD_RE = re.compile(r"[A-Za-zÀ-ÿ']+")
+
+_BASIC_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "to", "of", "in", "for", "with", "on", "at", "by", "from",
+    "i", "you", "he", "she", "it", "we", "they", "this", "that",
+    "and", "or", "but", "not", "no",
+    "le", "la", "les", "un", "une", "des", "du", "de", "à", "en",
+    "et", "ou", "ni", "pas", "non",
+})
+
+
+def _extract_top_words(text: str, n: int = 5) -> List[str]:
+    """Most frequent content words (basic stopwords removed). Pure
+    COMPUTATION : deterministic frequency count."""
+    tokens = [t.lower() for t in _WORD_RE.findall(text)]
+    tokens = [t for t in tokens if t not in _BASIC_STOPWORDS]
+    freq: dict = {}
+    for t in tokens:
+        freq[t] = freq.get(t, 0) + 1
+    ordered = sorted(freq.items(), key=lambda x: (-x[1], x[0]))
+    return [w for w, _ in ordered[:n]]
+
+
+def cluster_observations_by_content(
+    point: Point,
+    encoder: Encoder,
+    *,
+    threshold: Optional[float] = None,
+) -> List[list]:
+    """Cluster the default-attributed observations on a point by
+    cosine-similarity of their raw_content embeddings.
+
+    Algorithm : build a graph where two observations are connected if
+    cosine(emb_i, emb_j) > threshold, then return connected components.
+
+    Threshold is EMERGENT (median + σ over pairwise cosines) if not
+    provided — no tuning knob.
+
+    Returns a list of lists ; each inner list is one cluster of
+    Observation instances.
+    """
+    from metacog.geometry import cosine
+
+    default_obs = [
+        e.observation for e in point.update_log
+        if e.observation.observator_id == DEFAULT_OBSERVATOR_ID
+        and e.observation.raw_content
+    ]
+    n = len(default_obs)
+    if n == 0:
+        return []
+    if n == 1:
+        return [list(default_obs)]
+
+    embeddings = [tuple(encoder.encode(o.raw_content)) for o in default_obs]
+
+    if threshold is None:
+        pair_cosines: List[float] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                pair_cosines.append(cosine(embeddings[i], embeddings[j]))
+        if not pair_cosines:
+            return [list(default_obs)]
+        sorted_c = sorted(pair_cosines)
+        median = sorted_c[len(sorted_c) // 2]
+        mean = sum(pair_cosines) / len(pair_cosines)
+        var = sum((c - mean) ** 2 for c in pair_cosines) / len(pair_cosines)
+        sigma = math.sqrt(var)
+        threshold = median + sigma
+
+    # Connected components via simple BFS
+    adj = {i: set() for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if cosine(embeddings[i], embeddings[j]) > threshold:
+                adj[i].add(j)
+                adj[j].add(i)
+
+    visited: set[int] = set()
+    components: List[list] = []
+    for start in range(n):
+        if start in visited:
+            continue
+        comp_obs: list = []
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            comp_obs.append(default_obs[node])
+            for nb in adj[node]:
+                if nb not in visited:
+                    stack.append(nb)
+        components.append(comp_obs)
+    return components
+
+
+def spawn_observators_by_clustering(
+    point: Point,
+    encoder: Encoder,
+    t_now: float,
+    *,
+    min_cluster_size: int = 2,
+) -> List[Observator]:
+    """Cluster the point's default-attributed observations by content
+    similarity and spawn one observator per cluster of size ≥
+    `min_cluster_size`.
+
+    Each spawned observator carries :
+      - id        : f"auto-cluster{i}@<point>@<t>"
+      - keywords  : top-frequency content words from the cluster
+      - view      : n_corrob / n_contra reflecting the cluster's polarities
+
+    No-op if the point already has ≥ 2 named observator views (the
+    conflict is already attributed).
+    No-op if fewer than 2 clusters of sufficient size emerge (only one
+    perspective is present).
+    """
+    named = {oid for oid in point.observator_views.keys()
+             if oid != DEFAULT_OBSERVATOR_ID}
+    if len(named) >= 2:
+        return []
+
+    clusters = cluster_observations_by_content(point, encoder)
+    big_enough = [c for c in clusters if len(c) >= min_cluster_size]
+    if len(big_enough) < 2:
+        return []
+
+    spawned: List[Observator] = []
+    for i, cluster in enumerate(big_enough):
+        text = " ".join(
+            (o.raw_content or "") for o in cluster
+        )
+        keywords = _extract_top_words(text, n=5)
+        n_corrob = sum(1 for o in cluster if o.polarity > 0)
+        n_contra = sum(1 for o in cluster if o.polarity < 0)
+
+        cluster_id = f"auto-cluster{i}@{point.id}@{t_now:.6f}"
+        observator = Observator(
+            id=cluster_id,
+            name=f"auto-cluster {i} on {point.id}",
+            keywords=keywords,
+            parent_observator_id=DEFAULT_OBSERVATOR_ID,
+            created_at=t_now,
+        )
+        observator.ensure_keywords_embedding(encoder)
+        point.observator_views[cluster_id] = ObservatorView(
+            n_corrob=n_corrob, n_contra=n_contra,
+        )
+        spawned.append(observator)
+    return spawned
+
+
+# ---------------------------------------------------------------------------
+# PHASE O5 — inter-observator delegation
+# ---------------------------------------------------------------------------
 
 
 def delegate_query(

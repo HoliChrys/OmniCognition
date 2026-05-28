@@ -15,10 +15,12 @@ from metacog.observator import (
     DelegationEvent,
     Observator,
     ObservatorView,
+    cluster_observations_by_content,
     delegate_query,
     detect_polarization,
     polarization_score,
     select_observators,
+    spawn_observators_by_clustering,
     spawn_observators_from_polarization,
 )
 from metacog.geometry import retrieve_for_observator
@@ -107,10 +109,12 @@ __all__ = [
     "ObservatorView",
     "select_observators",
     "DelegationEvent",
+    "cluster_observations_by_content",
     "delegate_query",
     "detect_polarization",
     "polarization_score",
     "spawn_observators_from_polarization",
+    "spawn_observators_by_clustering",
     "retrieve_for_observator",
     # compression (Chasles)
     "CompressionEvent",

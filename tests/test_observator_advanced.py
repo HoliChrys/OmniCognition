@@ -30,10 +30,12 @@ from metacog import (
     Point,
     SourceClass,
     apply_observation,
+    cluster_observations_by_content,
     delegate_query,
     detect_polarization,
     polarization_score,
     retrieve_for_observator,
+    spawn_observators_by_clustering,
     spawn_observators_from_polarization,
 )
 
@@ -234,6 +236,136 @@ def test_delegate_query_increments_target_emitted_counter():
     n_before = alice.n_observations_emitted
     delegate_query(bob, alice, query, points, k=5, t_now=1.0)
     assert alice.n_observations_emitted == n_before + 1
+
+
+def _obs_with_content(target, polarity, t, content, *, observator_id="default"):
+    return Observation(
+        source=SourceClass.OBSERVER,
+        signal_type="corroboration" if polarity > 0 else "contradiction",
+        polarity=polarity,
+        target_node_ids=[target],
+        timestamp=t,
+        raw_content=content,
+        observator_id=observator_id,
+    )
+
+
+# ==========================================================================
+# PHASE O2-bis — semantic clustering
+# ==========================================================================
+
+
+def test_cluster_observations_by_content_separates_two_topics():
+    enc = _Encoder()
+    p = Point(id="P1", content="x", embedding_orig=enc.encode("x"))
+
+    # Two distinct semantic clusters
+    medical_phrases = [
+        "patient consent clinical protocol",
+        "patient consent treatment protocol",
+        "clinical patient assessment protocol",
+    ]
+    legal_phrases = [
+        "contract liability statute compliance",
+        "compliance contract statute jurisdiction",
+        "liability contract clause jurisdiction",
+    ]
+    for i, txt in enumerate(medical_phrases):
+        apply_observation(
+            p, _obs_with_content("P1", +1.0, float(i), txt), [p],
+        )
+    for i, txt in enumerate(legal_phrases):
+        apply_observation(
+            p, _obs_with_content("P1", -1.0, float(i + 10), txt), [p],
+        )
+
+    clusters = cluster_observations_by_content(p, enc)
+    assert len(clusters) == 2
+    # The two clusters should split medical vs legal phrases
+    cluster_contents = [
+        {obs.raw_content for obs in cluster} for cluster in clusters
+    ]
+    medical_set = set(medical_phrases)
+    legal_set = set(legal_phrases)
+    # One cluster should match medical, the other legal (order arbitrary)
+    assert (cluster_contents[0] == medical_set and cluster_contents[1] == legal_set) \
+        or (cluster_contents[0] == legal_set and cluster_contents[1] == medical_set)
+
+
+def test_cluster_returns_empty_when_no_observations():
+    enc = _Encoder()
+    p = Point(id="P1", content="x", embedding_orig=enc.encode("x"))
+    assert cluster_observations_by_content(p, enc) == []
+
+
+def test_spawn_by_clustering_creates_observators_with_keywords():
+    enc = _Encoder()
+    p = Point(id="P1", content="x", embedding_orig=enc.encode("x"))
+
+    for i, txt in enumerate([
+        "patient consent clinical protocol",
+        "patient consent treatment protocol",
+        "clinical patient assessment protocol",
+    ]):
+        apply_observation(p, _obs_with_content("P1", +1.0, float(i), txt), [p])
+    for i, txt in enumerate([
+        "contract liability statute compliance",
+        "compliance contract statute jurisdiction",
+        "liability contract clause jurisdiction",
+    ]):
+        apply_observation(p, _obs_with_content("P1", -1.0, float(i + 10), txt), [p])
+
+    spawned = spawn_observators_by_clustering(p, enc, t_now=100.0)
+    assert len(spawned) == 2
+    # Each observator has keywords extracted from its cluster
+    for obs in spawned:
+        assert len(obs.keywords) >= 1
+        assert obs.keywords_embedding is not None
+    # Views were populated
+    for obs in spawned:
+        view = p.observator_views[obs.id]
+        assert (view.n_corrob > 0) ^ (view.n_contra > 0)  # one-sided per cluster
+
+    # Keywords should reflect each cluster's vocabulary
+    all_keywords = set()
+    for o in spawned:
+        all_keywords.update(o.keywords)
+    # At least one medical and one legal keyword found
+    medical_words = {"patient", "consent", "clinical", "protocol", "treatment", "assessment"}
+    legal_words = {"contract", "liability", "statute", "compliance", "jurisdiction", "clause"}
+    assert all_keywords & medical_words
+    assert all_keywords & legal_words
+
+
+def test_spawn_by_clustering_noop_when_only_one_topic():
+    enc = _Encoder()
+    p = Point(id="P1", content="x", embedding_orig=enc.encode("x"))
+    for i, txt in enumerate([
+        "patient consent clinical protocol",
+        "patient consent treatment protocol",
+        "clinical patient assessment protocol",
+        "patient clinical treatment protocol",
+    ]):
+        apply_observation(p, _obs_with_content("P1", +1.0, float(i), txt), [p])
+    spawned = spawn_observators_by_clustering(p, enc, t_now=10.0)
+    # Only one semantic cluster → no split worth spawning
+    assert spawned == []
+
+
+def test_spawn_by_clustering_noop_when_already_named():
+    enc = _Encoder()
+    p = Point(id="P1", content="x", embedding_orig=enc.encode("x"))
+    # Two observators already exist
+    apply_observation(p, _obs_with_content("P1", +1.0, 1.0, "alpha", observator_id="alice"), [p])
+    apply_observation(p, _obs_with_content("P1", -1.0, 2.0, "beta", observator_id="bob"), [p])
+    # And lots of default observations
+    for i in range(5):
+        apply_observation(p, _obs_with_content("P1", +1.0, float(i + 5), f"topic {i}"), [p])
+    spawned = spawn_observators_by_clustering(p, enc, t_now=20.0)
+    assert spawned == []
+
+
+# (kept the original retrieve_for_observator test at the end for clarity)
 
 
 def test_retrieve_for_observator_falls_back_to_default_state():
