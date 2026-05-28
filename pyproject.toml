@@ -13,8 +13,16 @@ dependencies = [
     "mcp>=1.0.0",
 ]
 
+[project.optional-dependencies]
+bench = [
+    "sentence-transformers>=2.0.0",
+    "transformers>=4.30.0",
+    "torch>=2.0.0",
+    "anthropic>=0.30.0",
+]
+
 [project.scripts]
 metacog-mcp = "metacog.mcp_server:main"
 
 [tool.setuptools]
-packages = ["metacog"]
+packages = ["metacog", "benchmarks", "benchmarks.locomo"]

@@ -4,3 +4,5 @@ __pycache__/
 *.egg
 .pytest_cache/
 *.pkl
+benchmarks/locomo/data/*.json
+!benchmarks/locomo/data/.gitkeep
