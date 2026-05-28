@@ -23,9 +23,9 @@ from metacog import (
     AuditEntry,
     EpistemicState,
     LaunderingError,
-    Node,
     NoLaunderingInvariant,
     Observation,
+    Point,
     SourceClass,
     apply_observation,
     assert_no_laundering,
@@ -34,10 +34,15 @@ from metacog import (
 )
 
 
+def _point(id: str, content: str = "...", **kwargs) -> Point:
+    """Helper: counter-only tests don't care about the embedding dim."""
+    return Point(id=id, content=content, embedding_orig=(0.0,), **kwargs)
+
+
 # ---------- T1, T2 ---------------------------------------------------------
 
 def test_observer_signal_accepted():
-    node = Node(id="n1", content="Dr. Sarah at Berkeley")
+    p = _point("n1", "Dr. Sarah at Berkeley")
     obs = Observation(
         source=SourceClass.OBSERVER,
         signal_type="corroboration",
@@ -46,13 +51,13 @@ def test_observer_signal_accepted():
         timestamp=1.0,
         raw_content="user: yes, Berkeley exactly",
     )
-    entry = apply_observation(node, obs, population=[node])
-    assert node.n_corrob == 1
+    entry = apply_observation(p, obs, population=[p])
+    assert p.n_corrob == 1
     assert entry.confidence_after > entry.confidence_before
 
 
 def test_computation_signal_accepted():
-    node = Node(id="n1", content="meeting tomorrow")
+    p = _point("n1", "meeting tomorrow")
     obs = Observation(
         source=SourceClass.COMPUTATION,
         signal_type="reformulation",
@@ -61,8 +66,8 @@ def test_computation_signal_accepted():
         timestamp=1.0,
         raw_content="cosine(q_t, q_t+1)=0.82",
     )
-    apply_observation(node, obs, population=[node])
-    assert node.n_contra == 1
+    apply_observation(p, obs, population=[p])
+    assert p.n_contra == 1
 
 
 # ---------- T3 -------------------------------------------------------------
@@ -84,7 +89,7 @@ def test_generator_signal_rejected_at_construction():
 # ---------- T4 -------------------------------------------------------------
 
 def test_audit_trail_is_complete():
-    node = Node(id="n1", content="...")
+    p = _point("n1")
     for i in range(5):
         obs = Observation(
             source=SourceClass.OBSERVER,
@@ -93,9 +98,9 @@ def test_audit_trail_is_complete():
             target_node_ids=["n1"],
             timestamp=float(i),
         )
-        apply_observation(node, obs, population=[node])
-    assert len(node.update_log) == 5
-    for entry in node.update_log:
+        apply_observation(p, obs, population=[p])
+    assert len(p.update_log) == 5
+    for entry in p.update_log:
         assert isinstance(entry, AuditEntry)
         assert entry.observation.source in {SourceClass.OBSERVER, SourceClass.COMPUTATION}
 
@@ -103,10 +108,10 @@ def test_audit_trail_is_complete():
 # ---------- T5 -------------------------------------------------------------
 
 def test_global_no_laundering_invariant():
-    nodes = [Node(id=f"n{i}", content=f"...{i}") for i in range(10)]
+    points = [_point(f"n{i}", f"...{i}") for i in range(10)]
     rng = random.Random(42)
     for _ in range(50):
-        n = rng.choice(nodes)
+        n = rng.choice(points)
         obs = Observation(
             source=rng.choice([SourceClass.OBSERVER, SourceClass.COMPUTATION]),
             signal_type=rng.choice(["reformulation", "corroboration", "contradiction"]),
@@ -114,9 +119,9 @@ def test_global_no_laundering_invariant():
             target_node_ids=[n.id],
             timestamp=rng.random(),
         )
-        apply_observation(n, obs, population=nodes)
+        apply_observation(n, obs, population=points)
 
-    report = assert_no_laundering(nodes)
+    report = assert_no_laundering(points)
     assert report.ok
     assert report.by_source.get(SourceClass.GENERATOR, 0) == 0
     assert report.total_updates == 50
@@ -125,7 +130,7 @@ def test_global_no_laundering_invariant():
 def test_invariant_detects_injection():
     """If someone bypasses Observation() and forges a GENERATOR audit entry
     directly, the audit must still catch it."""
-    node = Node(id="n1", content="...")
+    p = _point("n1")
     obs = Observation(
         source=SourceClass.OBSERVER,
         signal_type="corroboration",
@@ -133,22 +138,22 @@ def test_invariant_detects_injection():
         target_node_ids=["n1"],
         timestamp=0.0,
     )
-    apply_observation(node, obs, population=[node])
+    apply_observation(p, obs, population=[p])
 
     # Forge a GENERATOR-sourced entry by mutating the audit log directly.
-    object.__setattr__(node.update_log[0].observation, "source", SourceClass.GENERATOR)
+    object.__setattr__(p.update_log[0].observation, "source", SourceClass.GENERATOR)
 
     with pytest.raises(NoLaunderingInvariant) as exc_info:
-        assert_no_laundering([node])
+        assert_no_laundering([p])
     assert "LAUNDERING" in str(exc_info.value)
 
 
 # ---------- T6 — A(·) ⊥ P  -------------------------------------------------
 
-def test_A_independent_of_P_two_nodes():
+def test_A_independent_of_P_two_points():
     """Same counters, completely different `content` (∈ P) → same state."""
-    a = Node(id="a", content="Dr. Sarah was at Berkeley", n_corrob=3, n_contra=1)
-    b = Node(id="b", content="The capital of Mongolia is Ulaanbaatar", n_corrob=3, n_contra=1)
+    a = _point("a", "Dr. Sarah was at Berkeley", n_corrob=3, n_contra=1)
+    b = _point("b", "The capital of Mongolia is Ulaanbaatar", n_corrob=3, n_contra=1)
     pop = [a, b]
     assert assign_status(a, pop) == assign_status(b, pop)
 
@@ -159,22 +164,35 @@ def test_A_independent_of_P_random():
     rng = random.Random(7)
     for _ in range(100):
         nc, nx = rng.randint(0, 12), rng.randint(0, 12)
-        a = Node(id="a", content="X" * rng.randint(1, 50), n_corrob=nc, n_contra=nx)
-        b = Node(id="b", content="Y" * rng.randint(1, 50), n_corrob=nc, n_contra=nx)
+        a = _point("a", "X" * rng.randint(1, 50), n_corrob=nc, n_contra=nx)
+        b = _point("b", "Y" * rng.randint(1, 50), n_corrob=nc, n_contra=nx)
         pop = [a, b] + [
-            Node(id=f"p{i}", content="filler",
-                 n_corrob=rng.randint(0, 5),
-                 n_contra=rng.randint(0, 5))
+            _point(f"p{i}", "filler",
+                   n_corrob=rng.randint(0, 5),
+                   n_contra=rng.randint(0, 5))
             for i in range(8)
         ]
         assert assign_status(a, pop) == assign_status(b, pop)
 
 
+def test_A_independent_of_deltas():
+    """A(·) must NOT change when deltas (∈ ℝ^d, geometric state) differ,
+    as long as counters are equal."""
+    a = Point(id="a", content="X", embedding_orig=(0.0, 0.0),
+              delta_active=(5.0, 5.0), delta_latent=(3.0, 3.0),
+              n_corrob=3, n_contra=1)
+    b = Point(id="b", content="Y", embedding_orig=(100.0, 100.0),
+              delta_active=(0.0, 0.0), delta_latent=(0.0, 0.0),
+              n_corrob=3, n_contra=1)
+    pop = [a, b]
+    assert assign_status(a, pop) == assign_status(b, pop)
+
+
 # ---------- T7 -------------------------------------------------------------
 
 def test_contradiction_path_to_invalid():
-    node = Node(id="n1", content="...")
-    pop = [node]
+    p = _point("n1")
+    pop = [p]
     for i in range(3):
         obs = Observation(
             source=SourceClass.OBSERVER,
@@ -183,13 +201,13 @@ def test_contradiction_path_to_invalid():
             target_node_ids=["n1"],
             timestamp=float(i),
         )
-        apply_observation(node, obs, population=pop)
-    assert node.state == EpistemicState.INVALID
+        apply_observation(p, obs, population=pop)
+    assert p.state == EpistemicState.INVALID
 
 
 def test_corroboration_path_to_warranted_or_corroborated():
-    nodes = [Node(id=f"n{i}", content=f"...{i}") for i in range(6)]
-    target = nodes[0]
+    points = [_point(f"n{i}") for i in range(6)]
+    target = points[0]
     for i in range(8):
         obs = Observation(
             source=SourceClass.OBSERVER,
@@ -198,7 +216,7 @@ def test_corroboration_path_to_warranted_or_corroborated():
             target_node_ids=[target.id],
             timestamp=float(i),
         )
-        apply_observation(target, obs, population=nodes)
+        apply_observation(target, obs, population=points)
     assert target.state in {EpistemicState.WARRANTED, EpistemicState.CORROBORATED}
     assert target.n_corrob == 8
     assert target.n_contra == 0
@@ -207,10 +225,12 @@ def test_corroboration_path_to_warranted_or_corroborated():
 # ---------- T8 — inputs_of_A inspection -----------------------------------
 
 def test_inputs_of_A_contains_no_P_fields():
-    node = Node(id="n1", content="this string is in P", n_corrob=4, n_contra=1)
-    inputs = inputs_of_A(node)
+    p = _point("n1", "this string is in P", n_corrob=4, n_contra=1)
+    inputs = inputs_of_A(p)
     assert "content" not in inputs
-    assert "embedding" not in inputs
+    assert "embedding_orig" not in inputs
+    assert "delta_active" not in inputs
+    assert "delta_latent" not in inputs
     assert "raw_content" not in inputs
     for v in inputs.values():
         assert isinstance(v, int), f"non-integer input found: {v!r}"
