@@ -1,5 +1,6 @@
 from metacog.epistemic import (
     AuditEntry,
+    DEFAULT_OBSERVATOR_ID,
     EpistemicState,
     LaunderingError,
     Observation,
@@ -9,6 +10,11 @@ from metacog.epistemic import (
     apply_observation,
     assign_status,
     process_observation,
+)
+from metacog.observator import (
+    Observator,
+    ObservatorView,
+    select_observators,
 )
 from metacog.compression import (
     CompressionEvent,
@@ -86,9 +92,14 @@ __all__ = [
     "Point",
     "PointKind",
     "SourceClass",
+    "DEFAULT_OBSERVATOR_ID",
     "apply_observation",
     "assign_status",
     "process_observation",
+    # observators
+    "Observator",
+    "ObservatorView",
+    "select_observators",
     # compression (Chasles)
     "CompressionEvent",
     "CompressionOpportunity",

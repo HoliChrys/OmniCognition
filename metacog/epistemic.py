@@ -25,9 +25,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 Vector = Tuple[float, ...]
+
+DEFAULT_OBSERVATOR_ID = "default"
 
 
 class SourceClass(Enum):
@@ -74,6 +76,10 @@ class LaunderingError(Exception):
 class Observation:
     """A signal that may update a point's counters AND drive geometric
     pulls. Construction rejects GENERATOR sources — Corollary 5.
+
+    `observator_id` carries the AUTHORIAL attribution. The default
+    observator aggregates every observation regardless of attribution;
+    a named observator only sees observations it emitted.
     """
 
     source: SourceClass
@@ -82,6 +88,7 @@ class Observation:
     target_node_ids: Sequence[str]
     timestamp: float
     raw_content: Optional[str] = None
+    observator_id: str = DEFAULT_OBSERVATOR_ID
 
     def __post_init__(self) -> None:
         if self.source == SourceClass.GENERATOR:
@@ -147,6 +154,9 @@ class Point:
     lineage_depth: int = 0
     update_log: List[AuditEntry] = field(default_factory=list)
     execution_log: list = field(default_factory=list)  # for kind=ACTION
+    # Per-observator views (default view = the point's own counters).
+    # Created on demand the first time a named observator touches the point.
+    observator_views: Dict[str, "object"] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Zero-initialize deltas to match embedding dimension if not given.
@@ -184,15 +194,37 @@ class Point:
         return (alpha * beta) / (s * s * (s + 1))
 
 
-def assign_status(point: Point, population: Sequence[Point]) -> EpistemicState:
+def assign_status(
+    point: Point,
+    population: Sequence[Point],
+    *,
+    observator_id: str = DEFAULT_OBSERVATOR_ID,
+) -> EpistemicState:
     """A(·) — reads ONLY integer counters and the population's confidence
     distribution. Never reads `content`, `embedding_orig`, or any delta.
     Therefore A(·) ⊥ P.
+
+    When `observator_id` is "default", reads the point's main counters.
+    For a named observator, reads the corresponding ObservatorView (or
+    empty counters if the view doesn't exist yet).
     """
-    n_corrob = point.n_corrob
-    n_contra = point.n_contra
+    if observator_id == DEFAULT_OBSERVATOR_ID:
+        n_corrob = point.n_corrob
+        n_contra = point.n_contra
+        c = point.confidence
+    else:
+        view = point.observator_views.get(observator_id)
+        if view is None:
+            n_corrob = 0
+            n_contra = 0
+        else:
+            n_corrob = view.n_corrob
+            n_contra = view.n_contra
+        scale = 1.0 / (1.0 + (view.n_revision if view else 0))
+        alpha = 1.0 + n_corrob * scale
+        beta = 1.0 + n_contra * scale
+        c = alpha / (alpha + beta)
     n_obs = n_corrob + n_contra
-    c = point.confidence
 
     if len(population) < 5:
         if n_contra >= 2 and n_corrob < n_contra:
@@ -238,6 +270,7 @@ def apply_observation(
     c_before = point.confidence
     s_before = point.state
 
+    # --- default view (aggregates every observation) ---
     if observation.polarity > 0:
         point.n_corrob += 1
     elif observation.polarity < 0:
@@ -246,6 +279,22 @@ def apply_observation(
 
     point.t_last_obs = observation.timestamp
     point.state = assign_status(point, population)
+
+    # --- named observator view (only its own observations) ---
+    if observation.observator_id != DEFAULT_OBSERVATOR_ID:
+        from metacog.observator import ObservatorView
+        view = point.observator_views.get(observation.observator_id)
+        if view is None:
+            view = ObservatorView()
+            point.observator_views[observation.observator_id] = view
+        if observation.polarity > 0:
+            view.n_corrob += 1
+        elif observation.polarity < 0:
+            view.n_contra += 1
+        view.state = assign_status(
+            point, population,
+            observator_id=observation.observator_id,
+        )
 
     # Geometric exile : the éloignement that REPLACES suppression.
     # Latent points are pushed away from the active centroid, but
