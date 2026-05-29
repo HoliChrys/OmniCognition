@@ -345,14 +345,20 @@ def terse(text: str, question: Optional[str] = None) -> str:
     if not text:
         return text
     t = text.strip()
-    # Plural / "have in common" questions expect a LIST answer (cat1 multi-
-    # hop) — compound-cutting "Pride parade, school speech, support group"
-    # down to one item destroys multi-item F1. Detect from the question and
-    # SKIP the compound-cut pass below.
-    _is_enum_q = bool(question and re.search(
-        r"\b(what|which)\b.{0,30}\b(events?|cities|places|ways|things|"
+    # Skip compound-cutting when the prediction is ALREADY a comma-separated
+    # list of short noun phrases — the agent has chosen to enumerate, and the
+    # trailing-comma cutter would chop "Pride parade, school speech, support
+    # group" down to "Pride parade" (destroying cat1 multi-hop F1).
+    _segs = [s.strip() for s in t.split(",") if s.strip()]
+    _is_list_pred = len(_segs) >= 2 and all(len(s.split()) <= 4 for s in _segs)
+    # Plural question hint as a fallback (covers an empty-list pred where the
+    # gold IS a list, e.g. cat1 enumeration questions).
+    _is_enum_q = _is_list_pred or bool(question and re.search(
+        r"\b(what|which)\b.{0,40}\b(events?|cities|places|ways|things|"
         r"hobbies|activities|projects?|crafts?|sports?|languages?|skills?|"
-        r"groups?|causes?|items?|gifts?)\b"
+        r"groups?|causes?|items?|gifts?|fields?|attributes?|traits?|books?|"
+        r"movies?|games?|pets?|countries|emotions|recipes?|symbols?|"
+        r"organizations?|recommendations?|suggestions?|jobs?)\b"
         r"|\bin what ways\b|\bhave in common\b|\bboth\b",
         question, re.IGNORECASE))
     # "When …" questions : if the agent dumped a citation instead of a bare
