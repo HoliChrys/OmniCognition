@@ -169,8 +169,9 @@ def build_app(
     def walk_start(
         query: str,
         n_stages: int = 3,
-        facts_per_stage: int = 5,
+        facts_per_stage: int = 7,
         actions_per_stage: int = 3,
+        commit: bool = False,
     ) -> dict:
         """Open a meta-cognitive walk and return its STAGE 0.
 
@@ -205,6 +206,7 @@ def build_app(
             n_stages=max(1, n_stages),
             facts_per_stage=max(1, facts_per_stage),
             actions_per_stage=max(1, actions_per_stage),
+            commit=commit,
         )
         walk_id = walkers.open(walker)
         stage = walker.step()

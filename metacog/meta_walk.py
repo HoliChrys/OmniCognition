@@ -69,7 +69,10 @@ from metacog.uncertainty import beta_sigma, node_sigma
 # keeps the worst-case generation cost at 3·2·50 = 300 output tokens.
 _GENERATION_TOKEN_BUDGET = 50
 _DEFAULT_STAGES = 3
-_FACTS_PER_STAGE = 5
+# Match the system retrieval budget (k=7) so a walk's stage-0 facts are
+# the same top-k a single-shot retrieve would return — the walk can then
+# only ADD evidence across later stages, never lose what single-shot found.
+_FACTS_PER_STAGE = 7
 _ACTIONS_PER_STAGE = 3
 
 
@@ -811,13 +814,28 @@ class MetaWalker:
         actions_per_stage: int = _ACTIONS_PER_STAGE,
         pull_strength: float = 1.0,
         t_now: Optional[float] = None,
+        commit: bool = True,
     ) -> None:
+        """`commit` controls whether the walk MUTATES the shared memory.
+
+        commit=True  (live use) : generated ACTION/THOUGHT points are
+            appended to `memory.points`, apply_pull fires, n_uses is
+            bumped — the walk feeds collision/observator dynamics.
+        commit=False (benchmark / concurrent eval) : generated points
+            live in a per-walk local list (visible only to this walk's
+            retrieval), no pull, no counter bump. This makes concurrent
+            walks over a shared memory fully ISOLATED and reproducible —
+            essential when many QAs run in parallel against one memory.
+        """
         self.query = query
         self.memory = memory
         self.n_stages = n_stages
         self.facts_per_stage = facts_per_stage
         self.actions_per_stage = actions_per_stage
         self.pull_strength = pull_strength
+        self.commit = commit
+        # Per-walk scratch for generated points when commit=False.
+        self._local_points: List[Point] = []
         self.t_now = (
             t_now if t_now is not None
             else (memory._now() if hasattr(memory, "_now") else 0.0)
@@ -844,6 +862,25 @@ class MetaWalker:
         self._generated_ids: List[str] = []
 
     # ----------------------------------------------------------------
+
+    def _all_points(self) -> List[Point]:
+        """The point set this walk retrieves over : the shared memory
+        plus this walk's locally-generated points (when commit=False).
+        When commit=True the generated points are already in
+        memory.points, so the local list is empty and this is just the
+        shared list."""
+        if self._local_points:
+            return list(self.memory.points) + self._local_points
+        return self.memory.points
+
+    def _add_generated(self, point: Point) -> None:
+        """Store a generated ACTION/THOUGHT : into shared memory when
+        committing, otherwise into the per-walk scratch."""
+        if self.commit:
+            self.memory.points.append(point)
+        else:
+            self._local_points.append(point)
+        self._generated_ids.append(point.id)
 
     def walk(self):
         """Generator : yield one StageOutput per stage until exhausted.
@@ -898,8 +935,9 @@ class MetaWalker:
             pwe = position_weighted_keyword_embedding(anchored_kws, self._enc)
             seed_emb = pwe if pwe is not None else self._cur_emb
 
+        pts = self._all_points()
         facts = nearest_facts_with_fallback(
-            seed_emb, seed_query, self.memory.points,
+            seed_emb, seed_query, pts,
             self.facts_per_stage, self.t_now,
             exclude_ids=self._visited_fact_ids,
             encoder=self._enc, extractor=self._extr,
@@ -910,14 +948,14 @@ class MetaWalker:
         if self._stage_idx == 0 or self._prev_action is None:
             actions = [
                 p for _s, p in nearest_by_kind(
-                    self._cur_emb, self.memory.points, PointKind.ACTION,
+                    self._cur_emb, pts, PointKind.ACTION,
                     self.actions_per_stage, self.t_now,
                     exclude_ids=self._visited_action_ids,
                 )
             ]
         else:
             a = nearest_action_to(
-                self._prev_action, self.memory.points, self.t_now,
+                self._prev_action, pts, self.t_now,
                 exclude_ids=self._visited_action_ids,
             )
             actions = [a] if a else []
@@ -928,10 +966,9 @@ class MetaWalker:
                 facts, self._llm, self._enc, self._extr, self.t_now,
             )
             if generated is not None:
-                self.memory.points.append(generated)
+                self._add_generated(generated)
                 actions = [generated]
                 gen_action = True
-                self._generated_ids.append(generated.id)
 
         fact_star = least_uncertain(facts)
         action_star = actions[0] if actions else None
@@ -948,20 +985,21 @@ class MetaWalker:
         gen_thought = False
         thought: Optional[Point] = None
         if fact_star is not None and action_star is not None:
-            # Hebbian co-activation + use bump.
-            apply_pull(fact_star, action_star,
-                       polarity=+self.pull_strength, t_now=self.t_now)
-            fact_star.n_uses += 1
-            action_star.n_uses += 1
+            # Hebbian co-activation + use bump — only when committing to
+            # the live memory (skipped during isolated benchmark walks).
+            if self.commit:
+                apply_pull(fact_star, action_star,
+                           polarity=+self.pull_strength, t_now=self.t_now)
+                fact_star.n_uses += 1
+                action_star.n_uses += 1
 
             thought = meta_thought(
-                fact_star, action_star, self.memory.points,
+                fact_star, action_star, pts,
                 self._llm, self._enc, self._extr, self.t_now,
             )
             if thought is not None:
-                self.memory.points.append(thought)
+                self._add_generated(thought)
                 gen_thought = True
-                self._generated_ids.append(thought.id)
                 self._cur_thought = thought
                 # Refresh the query embedding for the NEXT stage from
                 # the thought's enriched keywords.
