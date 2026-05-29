@@ -88,6 +88,28 @@ Example of BAD answer : "Based on the search results, she went on 7 May
 2023." — too verbose, would score poorly. Output just "7 May 2023"."""
 
 
+EXTRACT_SYSTEM = """Extract the single answer value from the text, in the
+briefest gold form : a date ("7 May 2023" / "June 2023" / "2022"), a place
+("Sweden"), a duration ("4 years"), or a short noun phrase ("adoption
+agencies"). If the text says nothing was found, output "Not mentioned".
+Output ONLY the value — no sentence, no preamble, no punctuation around it."""
+
+
+def _looks_verbose(text: str) -> bool:
+    """Heuristic : does this answer still carry sentence-like wrapping
+    that would dilute token-F1 ? Triggers the extraction call."""
+    if not text:
+        return False
+    if len(text) > 60:
+        return True
+    low = text.lower()
+    return any(p in low for p in (
+        "i found", "mentioned", "according to", "the conversation",
+        "based on", "in the ", "she said", "he said", "states that",
+        "it appears", "the answer",
+    ))
+
+
 def _resolve_client(api_key: Optional[str], model: str):
     import anthropic
 
@@ -326,8 +348,21 @@ class McpReactAgent:
                 total_out += r[1]
                 answer_text = r[2]
 
+        # Finalize : the agent's free-form answer is often verbose
+        # ("I found the answer. John mentioned on Nov 6 2023 that…"),
+        # which tanks token-overlap F1. One cheap extraction call distills
+        # it to the bare gold-style value. Deterministic terse() then
+        # mops up any remaining wrapper.
+        final = terse(answer_text)
+        if _looks_verbose(final):
+            extracted, ei, eo = self._extract_value(question, answer_text)
+            total_in += ei
+            total_out += eo
+            if extracted:
+                final = terse(extracted)
+
         return {
-            "answer": terse(answer_text),
+            "answer": final,
             "answer_raw": answer_text,
             "steps": len([t for t in trace if t["action"] == "tool"]),
             "tokens_in": total_in,
@@ -335,6 +370,24 @@ class McpReactAgent:
             "retrieved_ids": sorted(seen_ids),  # cumulative across queries
             "trace": trace,
         }
+
+    def _extract_value(self, question: str, verbose_answer: str):
+        """One small call : distill a verbose answer to the bare value."""
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=40,
+                system=EXTRACT_SYSTEM,
+                messages=[{"role": "user", "content":
+                           f"Q: {question}\nText: {verbose_answer}\nValue:"}],
+            )
+            ti = getattr(getattr(resp, "usage", None), "input_tokens", 0) or 0
+            to = getattr(getattr(resp, "usage", None), "output_tokens", 0) or 0
+            text = " ".join(b.text for b in resp.content
+                            if b.type == "text").strip()
+            return text, ti, to
+        except Exception:
+            return "", 0, 0
 
     async def _force_final(self, messages, trace, round_idx) -> Any:
         """Issue ONE final call with tools disabled, demanding the answer.
