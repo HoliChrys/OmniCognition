@@ -88,6 +88,30 @@ def ingest_conversation(
     "yesterday").
     """
     count = 0
+    # Pre-warm the entity extractor cache IN PARALLEL : entity extraction
+    # is one LLM call per turn ; done synchronously inside memory.ingest it
+    # serializes ~400 calls (minutes). Here we fan them out concurrently so
+    # the per-turn ingest below hits a warm cache. No-op when no extractor.
+    ex = getattr(memory, "entity_extractor", None)
+    if ex is not None and hasattr(ex, "extract_entities"):
+        from concurrent.futures import ThreadPoolExecutor
+        texts = []
+        for key in conv:
+            if not key.startswith("session_") or key.endswith("_date_time"):
+                continue
+            session_date = _clean_session_date(conv.get(f"{key}_date_time", ""))
+            prefix = f"[{session_date}] " if (with_dates and session_date) else ""
+            for turn in (conv[key] if isinstance(conv[key], list) else []):
+                if turn.get("text") and turn.get("dia_id"):
+                    texts.append(f"{prefix}{turn.get('speaker','')}: {turn['text']}")
+        # Force lazy client init BEFORE fanning out — the anthropic client's
+        # lazy build races (deadlocks) under concurrent first-touch.
+        try:
+            _ = ex.llm.client
+        except Exception:
+            pass
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(ex.extract_entities, texts))
     for key in conv:
         if not key.startswith("session_") or key.endswith("_date_time"):
             continue
