@@ -141,6 +141,7 @@ def evaluate_sample(
     use_lineage: bool = False,
     use_hybrid: bool = False,
     with_dates: bool = True,
+    agent_concurrency: int = 10,
     claude_answerer=None,
     debug_writer=None,
 ) -> Dict[str, Any]:
@@ -159,7 +160,29 @@ def evaluate_sample(
         "tokens_in": 0, "tokens_out": 0, "steps": 0,
     })
 
-    for qa in qas:
+    # For the MCP agent, precompute all answers concurrently. Each QA
+    # runs the agent in its own thread (own asyncio loop + own in-process
+    # MCP session) ; the conversation memory is read-only during QA, so
+    # concurrent access is safe. This turns an otherwise multi-hour
+    # sequential run into a parallel one.
+    precomputed: Dict[int, Dict[str, Any]] = {}
+    if answerer == "mcp":
+        from concurrent.futures import ThreadPoolExecutor
+
+        valid = [(i, qa) for i, qa in enumerate(qas) if qa.get("question")]
+
+        def _run(idx_qa):
+            idx, qa = idx_qa
+            return idx, claude_answerer.answer(
+                memory, qa["question"],
+                k=k_retrieve, max_steps=3, use_lineage=use_lineage,
+            )
+
+        with ThreadPoolExecutor(max_workers=agent_concurrency) as ex:
+            for idx, ca in ex.map(_run, valid):
+                precomputed[idx] = ca
+
+    for qa_index, qa in enumerate(qas):
         question = qa.get("question", "")
         gold_answer = str(qa.get("answer", ""))
         evidence = qa.get("evidence", []) or []
@@ -189,10 +212,13 @@ def evaluate_sample(
                               k_retrieve=k_retrieve)
             pred = ra["answer"]
         elif answerer in ("claude", "mcp"):
-            ca = claude_answerer.answer(
-                memory, question,
-                k=k_retrieve, max_steps=3, use_lineage=use_lineage,
-            )
+            if answerer == "mcp":
+                ca = precomputed.get(qa_index, {"answer": ""})
+            else:
+                ca = claude_answerer.answer(
+                    memory, question,
+                    k=k_retrieve, max_steps=3, use_lineage=use_lineage,
+                )
             pred = ca["answer"]
             tokens_in = ca.get("tokens_in", 0) or 0
             tokens_out = ca.get("tokens_out", 0) or 0
@@ -333,6 +359,9 @@ def main():
                              "Matches what the claude answerer retrieves "
                              "internally. Works with the lightweight simhash "
                              "encoder (no torch).")
+    parser.add_argument("--agent-concurrency", type=int, default=10,
+                        help="number of MCP-agent QAs to run in parallel "
+                             "(threads). Cuts wall-time for --answerer mcp.")
     parser.add_argument("--no-dates", action="store_true",
                         help="disable session-date prefix on ingested turns "
                              "(baseline for measuring the temporal-anchor "
@@ -388,6 +417,7 @@ def main():
             use_lineage=args.lineage,
             use_hybrid=args.use_hybrid,
             with_dates=not args.no_dates,
+            agent_concurrency=args.agent_concurrency,
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
         )
