@@ -117,23 +117,60 @@ class SimpleKeywordExtractor:
         self.stopwords = stopwords
         self.min_length = min_length
 
+    # Calendar tokens carry no discriminative power (every dated turn has
+    # them) and would crowd out real proper nouns.
+    _CALENDAR = frozenset({
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+        "monday", "tuesday", "wednesday", "thursday", "friday",
+        "saturday", "sunday",
+    })
+
     def extract(self, text: str, n: int = 5) -> List[str]:
-        tokens = [t.lower() for t in _TOKEN_RE.findall(text or "")]
+        raw = text or ""
+        # Drop a leading "[date] Speaker:" prefix so the date and the
+        # (non-discriminative, every-turn) speaker name don't dominate.
+        body = raw
+        if "]" in body:
+            body = body.split("]", 1)[1]
+        if ":" in body[:40]:
+            body = body.split(":", 1)[1]
+
+        all_tokens = _TOKEN_RE.findall(body)
+        # Proper nouns : capitalized, NOT sentence-initial, not a calendar
+        # word — the discriminative entities a query usually targets
+        # ("Sweden", "Vivaldi", "DoorDash"). These get priority.
+        proper: List[str] = []
+        for i, tok in enumerate(all_tokens):
+            low = tok.lower()
+            if (tok[:1].isupper() and i > 0
+                    and low not in self.stopwords
+                    and low not in self._CALENDAR
+                    and len(low) >= self.min_length
+                    and not all_tokens[i - 1].endswith((".", "!", "?"))):
+                if low not in proper:
+                    proper.append(low)
+
         tokens = [
-            t for t in tokens
-            if t not in self.stopwords and len(t) >= self.min_length
+            t.lower() for t in all_tokens
+            if t.lower() not in self.stopwords
+            and t.lower() not in self._CALENDAR
+            and len(t) >= self.min_length
         ]
-        if not tokens:
-            return []
         freq: dict[str, int] = {}
         for t in tokens:
             freq[t] = freq.get(t, 0) + 1
-        # Sort by (-frequency, -length, alphabetical) for determinism
-        ordered = sorted(
-            freq.items(),
-            key=lambda x: (-x[1], -len(x[0]), x[0]),
-        )
-        return [w for w, _ in ordered[:n]]
+        ordered = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+        freq_ranked = [w for w, _ in ordered]
+
+        # Proper nouns first (capped to leave room), then fill by frequency.
+        out: List[str] = []
+        for w in proper[:max(1, n // 2 + 1)] + freq_ranked:
+            if w not in out:
+                out.append(w)
+            if len(out) >= n:
+                break
+        return out
 
 
 class LLMKeywordExtractor:
