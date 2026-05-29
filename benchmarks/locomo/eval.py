@@ -135,6 +135,7 @@ def evaluate_sample(
     entities: bool = False,
     merge: bool = False,
     per_category: int = None,
+    auto_cluster: bool = False,
 ) -> Dict[str, Any]:
     qas = list(sample["qa"])
     if sample_seed is not None:
@@ -172,6 +173,12 @@ def evaluate_sample(
         mrep = memory.consolidate_duplicates()
         print(f"  merged {mrep['merged_count']} same-info turns "
               f"-> {mrep['n_points']} points")
+    if auto_cluster:
+        # Detect Level-1 communities and instantiate one observator each
+        # (the agent can focus a walk on a community via observator_id).
+        crep = memory.auto_cluster_observators()
+        print(f"  auto-clustered {len(crep)} communities: "
+              f"{[c['id'] for c in crep]}")
 
     per_cat = defaultdict(lambda: {
         "n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
@@ -465,6 +472,12 @@ def main():
                              "turns (content-cosine >= 0.95) into single nodes, "
                              "absorbing corroboration. Recall resolves absorbed "
                              "ids to survivors. No LLM (pure geometric).")
+    parser.add_argument("--auto-cluster", action="store_true",
+                        help="opt-in : after ingest, detect Level-1 topical "
+                             "communities (Louvain, edge-free) and create one "
+                             "observator per community. The agent can focus a "
+                             "walk on a community via list_communities + "
+                             "walk_start(observator_id=…). No LLM.")
     args = parser.parse_args()
     if args.react and args.answerer == "chunk":
         args.answerer = "extractive"
@@ -528,6 +541,7 @@ def main():
             entities=args.entities,
             merge=args.merge,
             per_category=args.per_category,
+            auto_cluster=args.auto_cluster,
         )
         results.append(summary)
         print(json.dumps(summary, indent=2))
