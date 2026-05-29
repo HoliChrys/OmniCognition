@@ -424,11 +424,24 @@ class McpMetaAgent:
                 # to try a breadth pivot (second walk_start). A single
                 # done=true should be a signal to pivot, not to stop.
                 if done_seen and walk_start_count >= 2:
-                    # Two breadth threads exhausted — enough evidence.
+                    # Two breadth threads exhausted — synthesize from
+                    # accumulated evidence, never from a blank slate.
+                    ev_ctx = ""
+                    if last_relevant_collected:
+                        ev_lines = "\n".join(
+                            f"  [{e.get('id', '')}] ({e.get('relevance', '')}) "
+                            f"{e.get('content', '')}"
+                            for e in last_relevant_collected[:10]
+                        )
+                        ev_ctx = (
+                            f"\n\nYour accumulated evidence:\n{ev_lines}\n\n"
+                        )
                     messages.append({
                         "role": "user",
-                        "content": "Walk finished. Give the final answer "
-                                   "now, value only.",
+                        "content": (
+                            f"Walk finished.{ev_ctx}"
+                            "Give the final answer now, value only."
+                        ),
                     })
             else:
                 # max_rounds exhausted without a natural answer.
