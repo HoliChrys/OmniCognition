@@ -45,6 +45,7 @@ from metacog.geometry import (
     apply_pull,
     distance,
     effective_embedding,
+    effective_keyword_embedding,
 )
 
 
@@ -117,9 +118,9 @@ def collision_threshold(points: Sequence[Point], t_now: float) -> Optional[float
         return None
     distances: List[float] = []
     for i in range(len(points)):
-        eff_i = effective_embedding(points[i], t_now)
+        eff_i = effective_keyword_embedding(points[i], t_now)
         for j in range(i + 1, len(points)):
-            eff_j = effective_embedding(points[j], t_now)
+            eff_j = effective_keyword_embedding(points[j], t_now)
             distances.append(distance(eff_i, eff_j))
     if not distances:
         return None
@@ -154,12 +155,12 @@ def detect_collisions(
     ]
     pairs: List[Tuple[Point, Point, float]] = []
     for i in range(len(eligible)):
-        eff_i = effective_embedding(eligible[i], t_now)
+        eff_i = effective_keyword_embedding(eligible[i], t_now)
         for j in range(i + 1, len(eligible)):
             # Intra-kind only
             if eligible[i].kind != eligible[j].kind:
                 continue
-            eff_j = effective_embedding(eligible[j], t_now)
+            eff_j = effective_keyword_embedding(eligible[j], t_now)
             d = distance(eff_i, eff_j)
             if d < threshold:
                 pairs.append((eligible[i], eligible[j], d))

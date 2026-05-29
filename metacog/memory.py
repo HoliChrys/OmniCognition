@@ -165,6 +165,36 @@ class Memory:
     # Observation
     # ------------------------------------------------------------------
 
+    def _refresh_keywords(self, point: Point, additional_context: str = "") -> None:
+        """Re-extract keywords for a revisited point.
+
+        Called from observe / process_turn / process_observation
+        whenever a point is touched by an observation. Lets the
+        keywords drift as the system learns new context around the
+        point (Hebbian-style entity refresh).
+
+        If `additional_context` is provided, keywords are extracted
+        from `content + " " + additional_context` so the local context
+        (e.g. the user turn that triggered the observation) can
+        influence the entity tags.
+        """
+        if self.extractor is None:
+            return
+        source_text = point.content
+        if additional_context:
+            source_text = f"{point.content} {additional_context}"
+        new_kws = self.extractor.extract(source_text, n=5)
+        if not new_kws:
+            return
+        if new_kws == list(point.keywords):
+            return  # no change, skip embedding recompute
+        point.keywords = new_kws
+        point.keywords_embedding = tuple(self.encoder.encode(" ".join(new_kws)))
+        # source class follows the extractor
+        point.keywords_source = getattr(
+            self.extractor, "source", SourceClass.COMPUTATION,
+        )
+
     def observe(
         self,
         target_ids: List[str],
@@ -192,6 +222,11 @@ class Memory:
             observator_id=observator_id,
         )
         process_observation(self.points, obs, population=self.points)
+        # Refresh keywords for every touched point (entity drift via context)
+        for tid in target_ids:
+            p = next((q for q in self.points if q.id == tid), None)
+            if p is not None:
+                self._refresh_keywords(p, additional_context=raw_content or "")
         return obs
 
     # ------------------------------------------------------------------
@@ -223,6 +258,11 @@ class Memory:
         observations = analyze_user_turn(turn, self.conversation_log, self.points, encoder=self.encoder)
         for obs in observations:
             process_observation(self.points, obs, population=self.points)
+            # Refresh keywords for points touched by detected observations
+            for tid in obs.target_node_ids:
+                p = next((q for q in self.points if q.id == tid), None)
+                if p is not None:
+                    self._refresh_keywords(p, additional_context=text)
         return observations
 
     # ------------------------------------------------------------------

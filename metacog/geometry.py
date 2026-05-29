@@ -76,6 +76,36 @@ def effective_embedding(point: "Point", t_now: float) -> Vector:  # noqa: F821
     return vec_add(vec_add(point.embedding_orig, active_now), point.delta_latent)
 
 
+def effective_keyword_embedding(point: "Point", t_now: float) -> Vector:  # noqa: F821
+    """Effective KEYWORD embedding for geometric operations.
+
+    Returns keywords_embedding + decayed(delta_active) + delta_latent
+    when the point has a keyword embedding ; falls back to the
+    content-level effective_embedding otherwise.
+
+    Used by apply_pull, apply_exile, and collision detection — the
+    geometric "pull / push / merge" mechanism operates at the entity
+    level (keywords) rather than at the surface-form level (content).
+    Two points with the same entities but different phrasing are
+    treated as attracted ; two points with different entities are
+    treated as orthogonal, regardless of how similar their content
+    reads on the surface.
+
+    The same delta_active / delta_latent vectors apply to BOTH the
+    content embedding and the keyword embedding (they share the
+    encoder dimension), so a single Hebbian drift carries through
+    both representations consistently.
+    """
+    if not point.keywords_embedding:
+        return effective_embedding(point, t_now)
+    decay = decay_factor(t_now, point.t_last_obs)
+    active_now = vec_scale(point.delta_active, decay)
+    return vec_add(
+        vec_add(tuple(point.keywords_embedding), active_now),
+        point.delta_latent,
+    )
+
+
 def apply_pull(
     point_i: "Point",  # noqa: F821
     point_j: "Point",  # noqa: F821
@@ -84,29 +114,29 @@ def apply_pull(
     *,
     bidirectional: bool = True,
 ) -> None:
-    """Geometric distillation between two points.
+    """Geometric distillation between two points OPERATING ON THE
+    KEYWORD EMBEDDING.
 
     Positive polarity → pull together. Negative → push apart.
 
-    By default both points move (bidirectional). For Chasles compression
-    we pass `bidirectional=False` so that only `point_i` is repositioned
-    and `point_j` (the anchor) remains fixed.
+    By default both points move (bidirectional). For Chasles
+    compression we pass `bidirectional=False` so that only `point_i`
+    is repositioned and `point_j` (the anchor) remains fixed.
 
-    Step size is `1 / (1 + n_obs)` per point — parameter-free, decreases
-    with epistemic experience.
+    Step size is `1 / (1 + n_obs)` per point — parameter-free.
 
-    Order with respect to `apply_observation`:
-      apply_pull MUST run before apply_observation, because apply_pull
-      reads `t_last_obs` to compute lazy decay, and apply_observation
-      overwrites it.
+    Direction is computed from effective_keyword_embedding so the
+    pull acts at the entity level : two points with the same
+    keywords are pulled together even if their surface-form content
+    differs, and pushed apart pulls them along the keyword axis
+    rather than the noisy content axis.
     """
     # Lazy-refresh i's stored active (we're going to mutate it)
     decay_i = decay_factor(t_now, point_i.t_last_obs)
     point_i.delta_active = vec_scale(point_i.delta_active, decay_i)
 
-    # Compute direction from CURRENT effective embeddings
-    eff_i = effective_embedding(point_i, t_now)
-    eff_j = effective_embedding(point_j, t_now)
+    eff_i = effective_keyword_embedding(point_i, t_now)
+    eff_j = effective_keyword_embedding(point_j, t_now)
     raw_dir = vec_sub(eff_j, eff_i)
     if vec_norm(raw_dir) < _EPS:
         return
@@ -127,7 +157,6 @@ def apply_pull(
     if not bidirectional:
         return
 
-    # Symmetric pull on point_j
     decay_j = decay_factor(t_now, point_j.t_last_obs)
     point_j.delta_active = vec_scale(point_j.delta_active, decay_j)
     n_obs_j = point_j.n_corrob + point_j.n_contra
@@ -482,7 +511,7 @@ def apply_exile(
     decay = decay_factor(t_now, point.t_last_obs)
     point.delta_active = vec_scale(point.delta_active, decay)
 
-    eff_p = effective_embedding(point, t_now)
+    eff_p = effective_keyword_embedding(point, t_now)
     raw_dir = vec_sub(eff_p, centroid)
     if vec_norm(raw_dir) < _EPS:
         return False
