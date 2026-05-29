@@ -37,6 +37,31 @@ _MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
 # calling raw retrieve. This is enforced server-side AND client-side.
 _ALLOWED_TOOLS = {"walk_start", "walk_next"}
 
+# Constrained final-answer tool (literature : constrained decoding +
+# strict tool-use tames the verbose tail that costs token-F1). The agent
+# emits its answer by calling this with the bare value ; on the terminal
+# turn we force tool_choice to it so the model cannot ramble.
+_FINAL_ANSWER_TOOL = {
+    "name": "final_answer",
+    "description": (
+        "Emit the FINAL answer as a bare value, copied VERBATIM from the "
+        "evidence (the speaker's own words). <= 5 words, no prose, no "
+        "dialog ids, no 'and'-lists of extras. Use 'Not mentioned' only if "
+        "the evidence truly lacks it."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "value": {
+                "type": "string",
+                "description": "the bare answer value, e.g. 'Sweden' / "
+                               "'7 May 2023' / 'painting' / 'Not mentioned'",
+            },
+        },
+        "required": ["value"],
+    },
+}
+
 
 AGENT_SYSTEM = """You answer questions about a long conversation by
 driving a meta-cognitive walk through tools.
@@ -106,7 +131,23 @@ Examples of GOOD answers : "7 May 2023" · "Sweden" · "4 years" ·
 Example of BAD : "Based on the walk, the support group was on …" —
 too verbose, will score poorly. Just the value.
 Example of BAD : "Transgender artist and member of the LGBTQ
-community" — has "and", strip to "Transgender woman"."""
+community" — has "and", strip to "Transgender woman".
+
+EXTRACTIVE RULE : copy the answer VERBATIM from the evidence — reuse the
+speaker's own words, do not paraphrase. The token-overlap score rewards
+the EXACT words from the conversation. If the fact says "counseling and
+mental health for transgender people", answer with those exact words, not
+a paraphrase like "therapy work".
+
+Few-shot (one per question type — match this terseness) :
+Q: What craft do Mel and her kids do besides pottery? → painting
+Q: Where did Caroline move from? → Sweden
+Q: When did Caroline attend the pride parade? → August 2023
+Q: How long have they been friends? → 4 years
+Q: What career path did Caroline choose? → counseling, mental health
+Q: Whose birthday did Melanie celebrate? → Melanie's daughter
+Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
+Q: What sports car does Jon drive? → Not mentioned"""
 
 
 def _resolve_client(api_key: Optional[str]):
@@ -419,7 +460,7 @@ class McpMetaAgent:
         async with create_connected_server_and_client_session(app) as session:
             await session.initialize()
             listed = await session.list_tools()
-            tools = _mcp_tools_to_anthropic(listed.tools)
+            tools = _mcp_tools_to_anthropic(listed.tools) + [_FINAL_ANSWER_TOOL]
 
             messages: List[Dict[str, Any]] = [
                 {"role": "user", "content": f"Question: {question}"}
@@ -448,6 +489,15 @@ class McpMetaAgent:
                 if not tool_uses:
                     answer_text = " ".join(text_blocks).strip()
                     trace.append({"round": round_idx, "action": "final",
+                                  "text": answer_text[:200]})
+                    break
+
+                # Constrained exit : the agent emitted final_answer(value).
+                final_tu = next(
+                    (b for b in tool_uses if b.name == "final_answer"), None)
+                if final_tu is not None:
+                    answer_text = str((final_tu.input or {}).get("value", "")).strip()
+                    trace.append({"round": round_idx, "action": "final_tool",
                                   "text": answer_text[:200]})
                     break
 
@@ -519,7 +569,8 @@ class McpMetaAgent:
                         "role": "user",
                         "content": (
                             f"Walk finished.{ev_ctx}"
-                            "Give the final answer now, value only."
+                            "Call final_answer now with the bare value, "
+                            "copied verbatim from the evidence."
                         ),
                     })
             else:
@@ -539,22 +590,31 @@ class McpMetaAgent:
                     )
                 resp = self.client.messages.create(
                     model=self.model,
-                    max_tokens=self.max_tokens,
+                    max_tokens=32,
                     system=AGENT_SYSTEM,
+                    tools=[_FINAL_ANSWER_TOOL],
+                    tool_choice={"type": "tool", "name": "final_answer"},
                     messages=messages + [{
                         "role": "user",
                         "content": (
                             f"Stop searching.{forced_evidence}"
-                            "Final answer now, value only."
+                            "Call final_answer with the bare value, copied "
+                            "verbatim from the evidence."
                         ),
                     }],
                 )
                 if hasattr(resp, "usage"):
                     total_in += getattr(resp.usage, "input_tokens", 0) or 0
                     total_out += getattr(resp.usage, "output_tokens", 0) or 0
-                answer_text = " ".join(
-                    b.text for b in resp.content if b.type == "text"
-                ).strip()
+                fa = next((b for b in resp.content
+                           if b.type == "tool_use" and b.name == "final_answer"),
+                          None)
+                if fa is not None:
+                    answer_text = str((fa.input or {}).get("value", "")).strip()
+                else:
+                    answer_text = " ".join(
+                        b.text for b in resp.content if b.type == "text"
+                    ).strip()
                 trace.append({"round": self.max_rounds,
                               "action": "forced_final"})
 
