@@ -789,6 +789,17 @@ class MetaWalker:
 
     # ----------------------------------------------------------------
 
+    def walk(self):
+        """Generator : yield one StageOutput per stage until exhausted.
+
+        Lets a caller validate / inspect each step as it happens :
+
+            for stage in walker.walk():
+                ...inspect stage...   # decide to break early if wanted
+        """
+        while not self._done:
+            yield self.step()
+
     @property
     def done(self) -> bool:
         return self._done
