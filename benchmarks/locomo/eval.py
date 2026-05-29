@@ -134,6 +134,7 @@ def evaluate_sample(
     debug_writer=None,
     entities: bool = False,
     merge: bool = False,
+    per_category: int = None,
 ) -> Dict[str, Any]:
     qas = list(sample["qa"])
     if sample_seed is not None:
@@ -142,7 +143,18 @@ def evaluate_sample(
         # first-N QAs happen to be.
         import random
         random.Random(sample_seed).shuffle(qas)
-    if max_qa is not None:
+    if per_category is not None:
+        # Stratified : up to `per_category` QAs from EACH category, so the
+        # five categories are balanced (equal n) instead of following the
+        # natural distribution. Shuffle above randomises which ones.
+        from collections import defaultdict as _dd
+        picked = _dd(list)
+        for qa in qas:
+            c = qa.get("category", 0)
+            if len(picked[c]) < per_category:
+                picked[c].append(qa)
+        qas = [qa for c in sorted(picked) for qa in picked[c]]
+    elif max_qa is not None:
         qas = qas[:max_qa]
 
     enc = make_encoder(encoder_name)
@@ -395,6 +407,10 @@ def main():
                         help="how many of the 10 conversations to evaluate")
     parser.add_argument("--max-qa", type=int, default=None,
                         help="cap QA pairs per sample")
+    parser.add_argument("--per-category", type=int, default=None,
+                        help="stratified : up to N QAs from EACH category "
+                             "per sample (balanced n per category instead of "
+                             "the natural distribution). Overrides --max-qa.")
     parser.add_argument("--k", type=int, default=7,
                         help="retrieval top-k (recall measured @5 and @7)")
     parser.add_argument("--top-chunks", type=int, default=3)
@@ -511,6 +527,7 @@ def main():
             debug_writer=debug_writer,
             entities=args.entities,
             merge=args.merge,
+            per_category=args.per_category,
         )
         results.append(summary)
         print(json.dumps(summary, indent=2))
