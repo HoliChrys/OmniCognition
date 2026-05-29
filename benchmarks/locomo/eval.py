@@ -224,6 +224,19 @@ def evaluate_sample(
             ra = react_answer(memory, question, max_steps=2,
                               k_retrieve=k_retrieve)
             pred = ra["answer"]
+        elif answerer == "meta":
+            from metacog.meta_walk import (
+                meta_walk,
+                synthesize_answer_from_walk,
+            )
+            traj = meta_walk(question, memory)
+            pred = synthesize_answer_from_walk(question, traj, memory)
+            steps = len(traj.stages)
+            agent_retrieved_ids = list(dict.fromkeys(traj.fact_ids_cumulative))
+            if ev_set:
+                agent_recall = (
+                    len(set(agent_retrieved_ids) & ev_set) / len(ev_set)
+                )
         elif answerer in ("claude", "mcp"):
             if answerer == "mcp":
                 ca = precomputed.get(qa_index, {"answer": ""})
@@ -384,12 +397,15 @@ def main():
     parser.add_argument("--encoder", choices=["simple", "semantic"],
                         default="semantic")
     parser.add_argument("--answerer",
-                        choices=["chunk", "extractive", "claude", "mcp"],
+                        choices=["chunk", "extractive", "claude", "mcp", "meta"],
                         default="chunk",
                         help="how to produce the answer. 'claude' = single-shot "
                              "ReAct with pre-dumped chunks ; 'mcp' = real "
                              "tool-using ReAct agent connected to the metacog "
-                             "MCP server (multi-round retrieval).")
+                             "MCP server (multi-round retrieval) ; 'meta' = "
+                             "in-memory meta-cognitive walk (autonomous "
+                             "FACT/ACTION/THOUGHT cycle, ReAct kicks in only "
+                             "for tool use which LoCoMo doesn't need).")
     parser.add_argument("--claude-model", default=None,
                         help="Anthropic model id (default : env CLAUDE_MODEL or claude-haiku-4-5-20251001)")
     parser.add_argument("--react", action="store_true",

@@ -66,6 +66,23 @@ class SimpleLLM:
     def __init__(self) -> None:
         self._answer_history: List[str] = []
 
+    def generate(self, prompt: str, max_tokens: int = 50) -> str:
+        """Deterministic free-text generator used by meta_walk.
+
+        Stub : extracts the tail of the prompt (the last data-bearing
+        line) and returns its first `max_tokens // 2` words. Produces
+        non-empty deterministic text so tests can exercise the walk
+        without an LLM. Override with a Claude-backed generator in
+        production.
+        """
+        # Take the last non-empty line of the prompt as context.
+        lines = [ln.strip() for ln in (prompt or "").splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        words = lines[-1].split()
+        # ≈ 2 words per token for a deterministic stub.
+        return " ".join(words[: max(1, max_tokens // 2)])
+
     def synthesize_step(
         self,
         query: str,
