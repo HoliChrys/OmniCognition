@@ -28,7 +28,10 @@ from typing import Any, Dict, List, Optional
 
 _DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "256"))
-_MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "5"))
+# 8 rounds: 3 walk_start + 2 walk_next each = 5 tool rounds, leaving 3 for
+# synthesis. Previously 5 rounds let 3 breadth pivots exhaust the budget with
+# no synthesis round, causing "Not mentioned" despite recall=1.
+_MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
 
 # Only the walk tools — the agent should NOT bypass the walk by
 # calling raw retrieve. This is enforced server-side AND client-side.
@@ -187,7 +190,9 @@ _PREAMBLE_RE = re.compile(
     r"^(based on[^,.:]*[,.:]\s*|according to[^,.:]*[,.:]\s*|"
     r"following the walk[^,.:]*[,.:]\s*|"
     r"the answer is[:\s]+|answer[:\s]+|i found that\s+|"
-    r"it (?:appears|seems) that\s+)",
+    r"it (?:appears|seems) that\s+|"
+    r"key (?:facts?|information|details?)[\w\s']+:\s*|"
+    r"(?:here are|here is) (?:the )?(?:key )?(?:facts?|details?)[\w\s']*:\s*)",
     re.IGNORECASE,
 )
 _INTERJECTION_RE = re.compile(
@@ -250,6 +255,9 @@ def terse(text: str) -> str:
         t = stripped
     if re.search(r"\bnot mentioned\b", t, re.IGNORECASE):
         return "Not mentioned"
+    # Bare list header with no value ("Key facts about X:" → stripped to "").
+    if t.endswith(":") and len(t.split()) <= 8:
+        return ""
     # Drop any leaked dialog-id citation, then tidy leftover punctuation.
     t = _DIALOG_ID_RE.sub("", t).strip(" .,()")
     # Compound cutting : apply iteratively while the answer is short
@@ -310,6 +318,7 @@ class McpMetaAgent:
             answer_text = ""
             walk_start_count = 0   # total breadth pivots taken
             done_seen = False
+            last_relevant_collected: List[dict] = []  # for forced-final evidence
 
             for round_idx in range(self.max_rounds):
                 resp = self.client.messages.create(
@@ -346,6 +355,14 @@ class McpMetaAgent:
                         call_result = await session.call_tool(tu.name, tu.input)
                         result_text = _tool_result_text(call_result)
                         seen_ids.update(_extract_fact_ids(call_result))
+                        # Track the latest relevant_collected for forced-final.
+                        try:
+                            obj = json.loads(result_text)
+                            rc = obj.get("relevant_collected")
+                            if isinstance(rc, list) and rc:
+                                last_relevant_collected = rc
+                        except Exception:
+                            pass
                         if tu.name == "walk_start":
                             walk_start_count += 1
                             done_seen = False  # reset — new walk, new chance
@@ -377,14 +394,30 @@ class McpMetaAgent:
                                    "now, value only.",
                     })
             else:
-                # max_rounds exhausted without a natural answer
+                # max_rounds exhausted without a natural answer.
+                # Inject the accumulated evidence so the agent can answer
+                # from facts it DID retrieve rather than saying "Not mentioned".
+                forced_evidence = ""
+                if last_relevant_collected:
+                    ev_lines = "\n".join(
+                        f"  [{e.get('id', '')}] ({e.get('relevance', '')}) "
+                        f"{e.get('content', '')}"
+                        for e in last_relevant_collected[:10]
+                    )
+                    forced_evidence = (
+                        f"\n\nYour accumulated evidence (all on-target facts "
+                        f"gathered so far):\n{ev_lines}\n\nUse this to answer. "
+                    )
                 resp = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
                     system=AGENT_SYSTEM,
                     messages=messages + [{
                         "role": "user",
-                        "content": "Stop searching. Final answer now.",
+                        "content": (
+                            f"Stop searching.{forced_evidence}"
+                            "Final answer now, value only."
+                        ),
                     }],
                 )
                 if hasattr(resp, "usage"):
