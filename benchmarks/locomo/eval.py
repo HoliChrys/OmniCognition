@@ -157,6 +157,7 @@ def evaluate_sample(
 
     per_cat = defaultdict(lambda: {
         "n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
+        "agent_recall": 0.0, "agent_recall_n": 0,
         "tokens_in": 0, "tokens_out": 0, "steps": 0,
     })
 
@@ -206,6 +207,8 @@ def evaluate_sample(
 
         tokens_in = tokens_out = steps = 0
         react_trace: List[Dict[str, Any]] = []
+        agent_recall = None        # cumulative recall across agent queries
+        agent_retrieved_ids: List[str] = []
         if answerer == "extractive":
             from benchmarks.locomo.react_qa import react_answer
             ra = react_answer(memory, question, max_steps=2,
@@ -224,6 +227,9 @@ def evaluate_sample(
             tokens_out = ca.get("tokens_out", 0) or 0
             steps = ca.get("steps", 0) or 0
             react_trace = ca.get("trace", []) or []
+            agent_retrieved_ids = ca.get("retrieved_ids", []) or []
+            if ev_set:
+                agent_recall = len(set(agent_retrieved_ids) & ev_set) / len(ev_set)
         else:  # "chunk"
             pred = " ".join(r["content"] for r in results[:top_chunks_for_answer])
         f1 = f1_score(pred, gold_answer)
@@ -232,6 +238,9 @@ def evaluate_sample(
         per_cat[category]["recall_at_5"] += r5
         per_cat[category]["recall_at_7"] += r7
         per_cat[category]["f1"] += f1
+        if agent_recall is not None:
+            per_cat[category]["agent_recall"] += agent_recall
+            per_cat[category]["agent_recall_n"] += 1
         per_cat[category]["tokens_in"] += tokens_in
         per_cat[category]["tokens_out"] += tokens_out
         per_cat[category]["steps"] += steps
@@ -266,6 +275,9 @@ def evaluate_sample(
                 "f1": round(f1, 4),
                 "r5": round(r5, 4),
                 "r7": round(r7, 4),
+                "agent_recall": (round(agent_recall, 4)
+                                 if agent_recall is not None else None),
+                "agent_retrieved_ids": agent_retrieved_ids,
                 "retrieved_top7": top7_dump,
                 "gold_evidence": evidence,
                 "evidence_hits_in_top5": ev_hits_5,
@@ -287,6 +299,7 @@ def evaluate_sample(
         "by_category": {},
     }
     total = {"n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
+             "agent_recall": 0.0, "agent_recall_n": 0,
              "tokens_in": 0, "tokens_out": 0, "steps": 0}
     for cat, stats in per_cat.items():
         n = stats["n"]
@@ -298,6 +311,10 @@ def evaluate_sample(
             "recall_at_7": round(stats["recall_at_7"] / n, 4),
             "f1": round(stats["f1"] / n, 4),
         }
+        if stats["agent_recall_n"]:
+            cat_entry["agent_recall"] = round(
+                stats["agent_recall"] / stats["agent_recall_n"], 4
+            )
         if stats["tokens_in"] or stats["tokens_out"]:
             cat_entry["tokens_in_per_qa"] = round(stats["tokens_in"] / n, 1)
             cat_entry["tokens_out_per_qa"] = round(stats["tokens_out"] / n, 1)
@@ -307,6 +324,8 @@ def evaluate_sample(
         total["recall_at_5"] += stats["recall_at_5"]
         total["recall_at_7"] += stats["recall_at_7"]
         total["f1"] += stats["f1"]
+        total["agent_recall"] += stats["agent_recall"]
+        total["agent_recall_n"] += stats["agent_recall_n"]
         total["tokens_in"] += stats["tokens_in"]
         total["tokens_out"] += stats["tokens_out"]
         total["steps"] += stats["steps"]
@@ -317,6 +336,10 @@ def evaluate_sample(
             "recall_at_7": round(total["recall_at_7"] / total["n"], 4),
             "f1": round(total["f1"] / total["n"], 4),
         }
+        if total["agent_recall_n"]:
+            overall["agent_recall"] = round(
+                total["agent_recall"] / total["agent_recall_n"], 4
+            )
         if total["tokens_in"] or total["tokens_out"]:
             overall["tokens_in_per_qa"] = round(total["tokens_in"] / total["n"], 1)
             overall["tokens_out_per_qa"] = round(total["tokens_out"] / total["n"], 1)

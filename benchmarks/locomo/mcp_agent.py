@@ -163,6 +163,38 @@ def terse(text: str) -> str:
     return t.strip().rstrip(".")
 
 
+def _ids_from_call_result(call_result) -> List[str]:
+    """Extract point ids from a `retrieve` MCP result.
+
+    FastMCP returns the list as `structuredContent={'result': [...]}`
+    AND as one TextContent block per item. Prefer structuredContent ;
+    fall back to parsing each text block as a standalone JSON object.
+    Defensive : returns [] on any failure.
+    """
+    ids: List[str] = []
+    structured = getattr(call_result, "structuredContent", None)
+    if isinstance(structured, dict):
+        items = structured.get("result")
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and "id" in it:
+                    ids.append(it["id"])
+            if ids:
+                return ids
+    # Fallback : one JSON object per content block
+    for block in getattr(call_result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "id" in obj:
+                ids.append(obj["id"])
+        except Exception:
+            continue
+    return ids
+
+
 def _tool_result_text(call_result) -> str:
     """Flatten an MCP CallToolResult's content blocks into text."""
     parts: List[str] = []
@@ -212,6 +244,7 @@ class McpReactAgent:
                 {"role": "user", "content": f"Question: {question}"}
             ]
             seen_calls: set[str] = set()
+            seen_ids: set[str] = set()  # all point ids the agent retrieved
             answer_text = ""
 
             for round_idx in range(self.max_rounds):
@@ -252,6 +285,9 @@ class McpReactAgent:
                     else:
                         call_result = await session.call_tool(tu.name, tu.input)
                         result_text = _tool_result_text(call_result)
+                        # Accumulate retrieved ids for effective-recall.
+                        if tu.name == "retrieve":
+                            seen_ids.update(_ids_from_call_result(call_result))
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tu.id,
@@ -287,6 +323,7 @@ class McpReactAgent:
             "steps": len([t for t in trace if t["action"] == "tool"]),
             "tokens_in": total_in,
             "tokens_out": total_out,
+            "retrieved_ids": sorted(seen_ids),  # cumulative across queries
             "trace": trace,
         }
 
