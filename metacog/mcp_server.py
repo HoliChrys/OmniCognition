@@ -36,9 +36,19 @@ from mcp.server.fastmcp import FastMCP
 from metacog.memory import Memory
 
 
-def build_app(storage_path: Optional[str] = None) -> FastMCP:
+def build_app(
+    storage_path: Optional[str] = None,
+    memory: Optional[Memory] = None,
+) -> FastMCP:
+    """Build the metacog MCP app.
+
+    `memory` lets a caller inject an already-populated Memory (e.g. a
+    benchmark conversation pre-ingested in-process) instead of creating
+    an empty one. When omitted, a fresh Memory(storage_path=…) is used.
+    """
     app = FastMCP("metacog")
-    memory = Memory(storage_path=storage_path)
+    if memory is None:
+        memory = Memory(storage_path=storage_path)
 
     @app.tool()
     def ingest(content: str, kind: str = "FACT", id: Optional[str] = None) -> dict:
@@ -113,9 +123,36 @@ def build_app(storage_path: Optional[str] = None) -> FastMCP:
         }
 
     @app.tool()
-    def retrieve(query: str, k: int = 5, observator_id: Optional[str] = None) -> List[dict]:
-        """Retrieve top-k points. Optionally route through a named observator."""
-        return memory.retrieve(query, k=k, observator_id=observator_id)
+    def retrieve(
+        query: str,
+        k: int = 5,
+        observator_id: Optional[str] = None,
+        use_hybrid: bool = True,
+        use_lineage: bool = True,
+        use_spreading: bool = True,
+        prefer_kind: Optional[str] = None,
+    ) -> List[dict]:
+        """Retrieve top-k points for a query.
+
+        Args:
+          query:        natural-language search text.
+          k:            number of points to return.
+          observator_id: route through a named observator's view (optional).
+          use_hybrid:   keyword-embedding cosine + BM25 fallback + RRF
+                        (default True ; the primary retrieval path).
+          use_lineage:  expand the fused top-k along parent/child/sequence
+                        links with uncertainty-pruned RRF (default True).
+          use_spreading: geometric spreading activation — expand the base
+                        top-k to their manifold neighbours (edge-free
+                        analog of associative spreading; default True).
+          prefer_kind:  boost a PointKind in ranking — FACT | THOUGHT |
+                        ACTION. Use ACTION for "how do I X" queries.
+        """
+        return memory.retrieve(
+            query, k=k, observator_id=observator_id,
+            use_hybrid=use_hybrid, use_lineage=use_lineage,
+            use_spreading=use_spreading, prefer_kind=prefer_kind,
+        )
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:

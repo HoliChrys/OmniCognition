@@ -188,7 +188,7 @@ def evaluate_sample(
             ra = react_answer(memory, question, max_steps=2,
                               k_retrieve=k_retrieve)
             pred = ra["answer"]
-        elif answerer == "claude":
+        elif answerer in ("claude", "mcp"):
             ca = claude_answerer.answer(
                 memory, question,
                 k=k_retrieve, max_steps=3, use_lineage=use_lineage,
@@ -313,9 +313,13 @@ def main():
     parser.add_argument("--top-chunks", type=int, default=3)
     parser.add_argument("--encoder", choices=["simple", "semantic"],
                         default="semantic")
-    parser.add_argument("--answerer", choices=["chunk", "extractive", "claude"],
+    parser.add_argument("--answerer",
+                        choices=["chunk", "extractive", "claude", "mcp"],
                         default="chunk",
-                        help="how to produce the answer from retrieved chunks")
+                        help="how to produce the answer. 'claude' = single-shot "
+                             "ReAct with pre-dumped chunks ; 'mcp' = real "
+                             "tool-using ReAct agent connected to the metacog "
+                             "MCP server (multi-round retrieval).")
     parser.add_argument("--claude-model", default=None,
                         help="Anthropic model id (default : env CLAUDE_MODEL or claude-haiku-4-5-20251001)")
     parser.add_argument("--react", action="store_true",
@@ -351,6 +355,14 @@ def main():
             kwargs["model"] = args.claude_model
         claude_answerer = ClaudeReactAnswerer(**kwargs)
         print(f"Claude answerer ready : model={claude_answerer.model}")
+    elif args.answerer == "mcp":
+        from benchmarks.locomo.mcp_agent import McpReactAgent
+        kwargs = {}
+        if args.claude_model:
+            kwargs["model"] = args.claude_model
+        claude_answerer = McpReactAgent(**kwargs)
+        print(f"MCP ReAct agent ready : model={claude_answerer.model} "
+              f"(in-process metacog MCP, max_rounds={claude_answerer.max_rounds})")
 
     debug_writer = None
     if args.debug_jsonl:

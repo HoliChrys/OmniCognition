@@ -277,6 +277,7 @@ class Memory:
         observator_id: Optional[str] = None,
         use_lineage: bool = False,
         use_hybrid: bool = False,
+        use_spreading: bool = False,
         lineage_depth: int = 7,
         prefer_kind: Optional[str] = None,
         t: Optional[float] = None,
@@ -313,6 +314,7 @@ class Memory:
                 encoder=self.encoder,
                 extractor=self.extractor,
                 use_lineage=use_lineage,
+                use_spreading=use_spreading,
                 lineage_depth=lineage_depth,
                 prefer_kind=kind_filter,
             )

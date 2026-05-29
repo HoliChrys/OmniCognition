@@ -149,6 +149,16 @@ def test_debug_writer_emits_one_object_per_qa():
         assert rec["tokens_out"] == 0
 
 
+def test_terse_strips_verbose_agent_wrapping():
+    from benchmarks.locomo.mcp_agent import terse
+    assert terse("Based on the search results, she went on **7 May 2023**.") \
+        == "7 May 2023"
+    assert terse("According to the evidence, the answer is Sweden.") == "Sweden"
+    assert terse("... which means 2022. Not mentioned.") == "Not mentioned"
+    assert terse("Counseling and mental health.") == "Counseling and mental health"
+    assert terse("7 May 2023") == "7 May 2023"
+
+
 def test_clean_session_date_strips_clock_and_comma():
     assert _clean_session_date("1:56 pm on 8 May, 2023") == "8 May 2023"
     assert _clean_session_date("8:56 pm on 20 July, 2023") == "20 July 2023"

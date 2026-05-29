@@ -312,6 +312,66 @@ def retrieve_with_lineage(
     return [(score, points_by_id[pid]) for pid, score in ranked]
 
 
+def geometric_spread(
+    seed_points: Sequence["Point"],  # noqa: F821
+    all_points: Sequence["Point"],  # noqa: F821
+    t_now: float,
+) -> List[Tuple[float, "Point"]]:
+    """Edge-free analog of HeLa-Mem's spreading activation.
+
+    HeLa propagates base scores through LEARNED Hebbian edges
+    (S(v_j) += β·Σ S(v_i)·w_ij, with hyperparameters β and a threshold
+    θ). We have no edges — but `apply_pull` already drags co-corroborated
+    points together IN THE MANIFOLD, so co-activation is encoded as
+    geometric proximity rather than as an edge weight. Spreading is then
+    just : for each base seed, gather its manifold neighbours.
+
+    Neighbour membership uses the SAME emergent threshold the collision
+    machinery uses — (median − σ) of all pairwise keyword-embedding
+    distances — so there is NO new hyperparameter (no β, no θ). A point
+    is a spread-neighbour of a seed iff its distance is below that
+    population-derived cutoff.
+
+    Returns (distance, point) for every neighbour found, closest first,
+    de-duplicated. The seeds themselves are excluded.
+    """
+    if len(all_points) < 4 or not seed_points:
+        return []
+
+    # Emergent threshold over keyword-embedding distances (same statistic
+    # as collision_threshold : median − σ).
+    embs = {p.id: effective_keyword_embedding(p, t_now) for p in all_points}
+    dists: List[float] = []
+    pts = list(all_points)
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            dists.append(distance(embs[pts[i].id], embs[pts[j].id]))
+    if not dists:
+        return []
+    dists.sort()
+    median = dists[len(dists) // 2]
+    mean = sum(dists) / len(dists)
+    sigma = math.sqrt(sum((d - mean) ** 2 for d in dists) / len(dists))
+    threshold = max(0.0, median - sigma)
+
+    seed_ids = {p.id for p in seed_points}
+    found: dict[str, float] = {}
+    for seed in seed_points:
+        es = embs.get(seed.id)
+        if es is None:
+            continue
+        for p in all_points:
+            if p.id in seed_ids:
+                continue
+            d = distance(es, embs[p.id])
+            if d < threshold:
+                if p.id not in found or d < found[p.id]:
+                    found[p.id] = d
+    by_id = {p.id: p for p in all_points}
+    ranked = sorted(found.items(), key=lambda x: x[1])
+    return [(d, by_id[pid]) for pid, d in ranked]
+
+
 def retrieve_hybrid(
     query_text: str,
     points: Sequence["Point"],  # noqa: F821
@@ -321,6 +381,7 @@ def retrieve_hybrid(
     encoder,
     extractor,
     use_lineage: bool = False,
+    use_spreading: bool = False,
     lineage_depth: int = 7,
     pool_per_signal: int = 14,
     rrf_k: int = 60,
@@ -402,6 +463,19 @@ def retrieve_hybrid(
 
     fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
     top_ids = [pid for pid, _ in fused[:k]]
+
+    # Phase 3.5 — geometric spreading activation (edge-free analog of
+    # HeLa's Hebbian spreading). Spread from the fused base top-k to
+    # their manifold neighbours and add a RRF signal. Parameter-free :
+    # neighbour membership uses the emergent (median − σ) threshold.
+    if use_spreading:
+        seeds = [points_by_id[pid] for pid in top_ids if pid in points_by_id]
+        spread = geometric_spread(seeds, points, t_now)
+        for srank, (_dist, p) in enumerate(spread):
+            rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + srank)
+        if spread:
+            fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+            top_ids = [pid for pid, _ in fused[:k]]
 
     # Phase 4 — optional lineage expansion with uncertainty propagation
     if use_lineage:
