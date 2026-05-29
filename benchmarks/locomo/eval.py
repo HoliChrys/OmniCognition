@@ -70,9 +70,36 @@ def load_locomo(path: str) -> List[Dict[str, Any]]:
         return json.load(f)
 
 
-def ingest_conversation(memory: Memory, conv: Dict[str, Any]) -> int:
+_DATE_AFTER_ON_RE = re.compile(r"\bon\s+(.+)$")
+
+
+def _clean_session_date(raw: str) -> str:
+    """'1:56 pm on 8 May, 2023' → '8 May 2023'.
+
+    LoCoMo session timestamps carry a clock time prefix we don't need ;
+    keep only the calendar date so it can anchor relative references
+    ("yesterday", "last week") to an absolute date the gold expects.
+    """
+    if not raw:
+        return ""
+    m = _DATE_AFTER_ON_RE.search(raw)
+    date = m.group(1) if m else raw
+    return date.replace(",", "").strip()
+
+
+def ingest_conversation(
+    memory: Memory, conv: Dict[str, Any], *, with_dates: bool = True
+) -> int:
     """Ingest each dialog turn with sequence_prev so lineage traversal
-    can walk adjacent turns within a session."""
+    can walk adjacent turns within a session.
+
+    When `with_dates`, each turn's content is prefixed with its session
+    date — `[8 May 2023] Caroline: ... yesterday` — so the answerer can
+    resolve relative time references to the absolute dates the LoCoMo
+    gold answers use. Without this anchor, temporal questions are
+    unanswerable even with perfect retrieval (the turn only says
+    "yesterday").
+    """
     count = 0
     for key in conv:
         if not key.startswith("session_") or key.endswith("_date_time"):
@@ -80,6 +107,8 @@ def ingest_conversation(memory: Memory, conv: Dict[str, Any]) -> int:
         turns = conv[key]
         if not isinstance(turns, list):
             continue
+        session_date = _clean_session_date(conv.get(f"{key}_date_time", ""))
+        prefix = f"[{session_date}] " if (with_dates and session_date) else ""
         prev_id = None
         for turn in turns:
             text = turn.get("text", "")
@@ -89,7 +118,7 @@ def ingest_conversation(memory: Memory, conv: Dict[str, Any]) -> int:
                 continue
             try:
                 memory.ingest(
-                    content=f"{speaker}: {text}",
+                    content=f"{prefix}{speaker}: {text}",
                     kind="FACT",
                     id=dia_id,
                     sequence_prev=prev_id,
@@ -111,6 +140,7 @@ def evaluate_sample(
     answerer: str = "chunk",
     use_lineage: bool = False,
     use_hybrid: bool = False,
+    with_dates: bool = True,
     claude_answerer=None,
     debug_writer=None,
 ) -> Dict[str, Any]:
@@ -120,7 +150,9 @@ def evaluate_sample(
 
     enc = make_encoder(encoder_name)
     memory = Memory(encoder=enc)
-    ingested = ingest_conversation(memory, sample["conversation"])
+    ingested = ingest_conversation(
+        memory, sample["conversation"], with_dates=with_dates,
+    )
 
     per_cat = defaultdict(lambda: {
         "n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
@@ -296,6 +328,10 @@ def main():
                              "Matches what the claude answerer retrieves "
                              "internally. Works with the lightweight simhash "
                              "encoder (no torch).")
+    parser.add_argument("--no-dates", action="store_true",
+                        help="disable session-date prefix on ingested turns "
+                             "(baseline for measuring the temporal-anchor "
+                             "contribution). Default : dates ON.")
     parser.add_argument("--debug-jsonl", default=None,
                         help="per-QA full trace (question, gold, pred, retrieved "
                              "ids, hits, misses, ReAct steps, tokens) written one "
@@ -338,6 +374,7 @@ def main():
             answerer=args.answerer,
             use_lineage=args.lineage,
             use_hybrid=args.use_hybrid,
+            with_dates=not args.no_dates,
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
         )

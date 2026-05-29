@@ -20,7 +20,14 @@ import json
 
 import pytest
 
-from benchmarks.locomo.eval import evaluate_sample, f1_score
+from benchmarks.locomo.eval import (
+    _clean_session_date,
+    evaluate_sample,
+    f1_score,
+    ingest_conversation,
+)
+from metacog import Memory
+from metacog.defaults import SimpleEncoder
 
 
 # ---------- E1, E2, E3 ----------------------------------------------------
@@ -140,6 +147,46 @@ def test_debug_writer_emits_one_object_per_qa():
         assert rec["react_trace"] == []
         assert rec["tokens_in"] == 0
         assert rec["tokens_out"] == 0
+
+
+def test_clean_session_date_strips_clock_and_comma():
+    assert _clean_session_date("1:56 pm on 8 May, 2023") == "8 May 2023"
+    assert _clean_session_date("8:56 pm on 20 July, 2023") == "20 July 2023"
+    # already-clean date passes through
+    assert _clean_session_date("1 May 2023") == "1 May 2023"
+    # empty / missing
+    assert _clean_session_date("") == ""
+
+
+def test_ingest_with_dates_prefixes_session_date():
+    """with_dates=True attaches the [session date] anchor so relative
+    references in the turn can be resolved by the answerer."""
+    conv = {
+        "session_1_date_time": "1:56 pm on 8 May, 2023",
+        "session_1": [
+            {"speaker": "Caroline", "text": "I went yesterday.", "dia_id": "D1:3"},
+        ],
+    }
+    m = Memory(encoder=SimpleEncoder())
+    n = ingest_conversation(m, conv, with_dates=True)
+    assert n == 1
+    p = next(q for q in m.points if q.id == "D1:3")
+    assert p.content.startswith("[8 May 2023] ")
+    assert "yesterday" in p.content.lower()
+
+
+def test_ingest_without_dates_has_no_prefix():
+    conv = {
+        "session_1_date_time": "1:56 pm on 8 May, 2023",
+        "session_1": [
+            {"speaker": "Caroline", "text": "I went yesterday.", "dia_id": "D1:3"},
+        ],
+    }
+    m = Memory(encoder=SimpleEncoder())
+    ingest_conversation(m, conv, with_dates=False)
+    p = next(q for q in m.points if q.id == "D1:3")
+    assert not p.content.startswith("[")
+    assert p.content == "Caroline: I went yesterday."
 
 
 def test_debug_evidence_hits_and_misses_partition():

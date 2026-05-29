@@ -39,15 +39,15 @@ _KEYWORDS_HINT_MAX = 3
 
 
 REACT_SYSTEM = """Answer concisely matching the gold style :
-- "When ..." → date only ("7 May 2023" or "June 2023")
+- "When ..." → ABSOLUTE date only ("7 May 2023" or "June 2023"), never
+  relative. Each chunk is prefixed with its [session date]; resolve any
+  "yesterday/last week/last month/X days ago" against that date into a
+  calendar date.
 - "Where ..." → place only ("Sweden")
 - "What did X do/research/like" → noun phrase ("adoption agencies")
 - "How long" → "<n> <unit>" ("4 years")
 - YES/NO/inference → "Likely yes/no, <one clause>"
-- adversarial → "Not mentioned"
-
-Use D<session>:<turn> ids and "yesterday/last week/this month" relative
-to the session date to anchor temporal answers.
+- adversarial / not in evidence → "Not mentioned"
 
 Output ONE JSON object, no prose, no code fences :
   {"action": "answer", "answer": "..."}
