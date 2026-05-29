@@ -536,7 +536,21 @@ class McpMetaAgent:
                     # convert it via a forced final_answer turn — otherwise
                     # the reasoning prose leaks as the answer (F1≈0 despite
                     # recall=1). Short answers are taken as-is.
-                    if len(raw.split()) > 6:
+                    # Abstention guard : if the narration says the info is
+                    # absent, keep "Not mentioned" — forcing a value here
+                    # turns a correct adversarial abstention into a wrong
+                    # answer (or a leaked citation).
+                    _low = raw.lower()
+                    _abstains = any(s in _low for s in (
+                        "not mentioned", "no information", "isn't mentioned",
+                        "not mention", "no mention", "doesn't mention",
+                        "don't have", "do not have", "not available",
+                        "not stated", "not specified", "can't find",
+                        "cannot find", "no record", "not provided",
+                    ))
+                    if _abstains:
+                        answer_text = "Not mentioned"
+                    elif len(raw.split()) > 6:
                         messages.append({"role": "assistant",
                                          "content": resp.content})
                         fr = self.client.messages.create(
