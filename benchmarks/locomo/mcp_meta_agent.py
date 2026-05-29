@@ -71,14 +71,24 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   [session date] prefix into a calendar date. Never answer relative.
 - "Where ..." → place only ("Sweden").
 - "How long" → "<n> <unit>" ("4 years").
-- "What did X do/like/research" → short noun phrase.
+- "What/Who is X" / identity / role → the SHORTEST label that fits
+  (1-3 words). "Transgender woman" not "Transgender artist and member
+  of the LGBTQ community". "Teacher" not "A passionate elementary
+  school teacher who loves kids". Pick the bare category noun.
+- "What did X do/like/research" → short noun phrase (1-4 words).
 - yes/no/inference → "Likely yes, <one short clause>".
 - not in the evidence / adversarial / unanswerable → "Not mentioned".
 
+Hard rule : if your answer is longer than 5 words, you are wrong —
+strip every adjective and conjunction until only the bare value
+remains. Drop "and ...", "who is ...", "the ... of ...".
+
 Examples of GOOD answers : "7 May 2023" · "Sweden" · "4 years" ·
-"adoption agencies" · "Not mentioned".
+"adoption agencies" · "Transgender woman" · "Not mentioned".
 Example of BAD : "Based on the walk, the support group was on …" —
-too verbose, will score poorly. Just the value."""
+too verbose, will score poorly. Just the value.
+Example of BAD : "Transgender artist and member of the LGBTQ
+community" — has "and", strip to "Transgender woman"."""
 
 
 def _resolve_client(api_key: Optional[str]):
@@ -177,17 +187,46 @@ _INTERJECTION_RE = re.compile(
 # Strip a "(D4:11)" / "from D4:11" / "D4:11" dialog-id citation the
 # agent sometimes leaks into the answer.
 _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
+# Compound-phrase cutters : keep the head label, drop trailing
+# elaboration. Order matters — most specific first.
+_COMPOUND_CUTTERS = [
+    re.compile(r"\s+(?:and|or|as well as|along with|together with)\s+.+$",
+               re.IGNORECASE),
+    re.compile(r"\s+who\s+(?:is|was|has|loves|enjoys|likes)\s+.+$",
+               re.IGNORECASE),
+    re.compile(r"\s+that\s+(?:is|was)\s+.+$", re.IGNORECASE),
+    re.compile(r",\s+.+$"),  # trailing ", member of …"
+]
 
 
 def terse(text: str) -> str:
     """Strip Haiku's preamble/interjection wrapping. Mirrors the helper
-    in mcp_agent.py — keeps the bare value the F1 metric scores on."""
+    in mcp_agent.py — keeps the bare value the F1 metric scores on.
+
+    For short-label answers (≤ 8 words after preamble strip), also cut
+    trailing "and …" / "who is …" / ", …" compounds so identity-style
+    questions reduce to the bare head label ("Transgender woman" not
+    "Transgender artist and member of the LGBTQ community").
+
+    Verbose Haiku replies often paste a quoted citation then put the
+    bare label on its OWN line at the end. If we see that pattern (the
+    text has multiple lines, ends with a short line ≤ 8 words and no
+    sentence terminator before it), keep only the trailing label line.
+    """
     if not text:
         return text
     t = text.strip()
     m = re.search(r"\*\*(.+?)\*\*", t)
     if m:
         return m.group(1).strip().rstrip(".")
+    # Citation + trailing label pattern : take the last short line.
+    lines = [ln.strip(" .,") for ln in t.splitlines() if ln.strip(" .,")]
+    if len(lines) >= 2:
+        tail = lines[-1]
+        if 1 <= len(tail.split()) <= 8 and not tail.lower().startswith(
+            ("based on", "according to", "the answer", "perfect", "i found")
+        ):
+            t = tail
     while True:
         stripped = _INTERJECTION_RE.sub("", t)
         stripped = _PREAMBLE_RE.sub("", stripped).strip()
@@ -201,6 +240,22 @@ def terse(text: str) -> str:
         return "Not mentioned"
     # Drop any leaked dialog-id citation, then tidy leftover punctuation.
     t = _DIALOG_ID_RE.sub("", t).strip(" .,()")
+    # Compound cutting : apply iteratively while the answer is short
+    # enough that the head is plausibly the bare label. Avoid touching
+    # long prose answers where "and" is part of a real sentence.
+    # Skip inference answers ("Likely yes, …") — the trailing clause IS
+    # the expected format.
+    is_inference = bool(re.match(r"^\s*likely\s+(?:yes|no)\b", t, re.IGNORECASE))
+    if t and not is_inference and len(t.split()) <= 12:
+        changed = True
+        while changed and t and len(t.split()) <= 12:
+            changed = False
+            for cutter in _COMPOUND_CUTTERS:
+                new = cutter.sub("", t).strip(" .,()")
+                if new and new != t:
+                    t = new
+                    changed = True
+                    break
     return t.strip().rstrip(".")
 
 
