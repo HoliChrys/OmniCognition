@@ -27,7 +27,8 @@ from typing import Any, Dict, List, Optional, Sequence
 from metacog.audit import audit, assert_no_laundering, inputs_of_A
 from metacog.collision import sleep_cycle_collisions
 from metacog.compression import compress_trajectory
-from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
+from metacog.defaults import NoOpExecutor, SimpleEncoder
+from metacog.llm import ClaudeLLM
 from metacog.detectors import ConversationLog, TurnRecord, analyze_user_turn
 from metacog.epistemic import (
     DEFAULT_OBSERVATOR_ID,
@@ -64,7 +65,7 @@ class Memory:
     """High-level service object that orchestrates the whole pipeline."""
 
     encoder: Any = field(default_factory=SimpleEncoder)
-    llm: Any = field(default_factory=SimpleLLM)
+    llm: Any = field(default_factory=ClaudeLLM)
     executor: Any = field(default_factory=NoOpExecutor)
     extractor: Any = field(default_factory=SimpleKeywordExtractor)
     storage_path: Optional[str] = None

@@ -72,8 +72,36 @@ def test_retrieve_returns_top_k():
         assert "id" in r and "content" in r and "score" in r
 
 
+class _FakeLLM:
+    """Lightweight LLM mock for unit tests : implements the methods
+    reason() and sleep() invoke, returns deterministic strings. The
+    production code uses ClaudeLLM ; here we just need the protocol
+    to be satisfied without an API call."""
+
+    def generate(self, prompt: str, max_tokens: int = 50) -> str:
+        return ""
+
+    def synthesize_step(self, query, previous_answer, new_point_content):
+        return f"{previous_answer or ''} {new_point_content}".strip()[:80]
+
+    def propose_action(self, query, current_answer):
+        return None
+
+    def extract_common(self, texts):
+        # token-set intersection — enough to drive collision tests.
+        sets = [set(t.split()) for t in texts]
+        common = sets[0]
+        for s in sets[1:]:
+            common &= s
+        return " ".join(sorted(common))
+
+    def remove_overlap(self, full: str, common: str) -> str:
+        cset = set(common.split())
+        return " ".join(w for w in full.split() if w not in cset)
+
+
 def test_reason_returns_summary():
-    m = Memory()
+    m = Memory(llm=_FakeLLM())
     for content in ["dr sarah berkeley conference",
                     "dr sarah counseling career",
                     "dr sarah adoption support"]:
@@ -86,7 +114,7 @@ def test_reason_returns_summary():
 
 
 def test_sleep_returns_report():
-    m = Memory()
+    m = Memory(llm=_FakeLLM())
     # ingest several points that share content to provoke collisions
     for content in [
         "common token alpha extra1",

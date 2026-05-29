@@ -131,7 +131,8 @@ Memory wrapper, and one end-to-end integration scenario.
 | `metacog/observator.py` | Observators, polarization, delegation |
 | `metacog/audit.py` | non-laundering verification |
 | `metacog/memory.py` | top-level `Memory` wrapper |
-| `metacog/defaults.py` | `SimpleEncoder`, `SimpleLLM`, `NoOpExecutor` |
+| `metacog/defaults.py` | `SimpleEncoder`, `NoOpExecutor` |
+| `metacog/llm.py`      | `ClaudeLLM` (Haiku, lazy) — the only LLM, no stub fallback |
 | `metacog/mcp_server.py` | MCP service |
 
 ## References

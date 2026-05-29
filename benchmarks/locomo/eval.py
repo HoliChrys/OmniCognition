@@ -157,7 +157,7 @@ def evaluate_sample(
         qas = qas[:max_qa]
 
     enc = make_encoder(encoder_name)
-    memory = Memory(encoder=enc)
+    memory = Memory(encoder=enc)  # llm defaults to ClaudeLLM (Haiku)
     ingested = ingest_conversation(
         memory, sample["conversation"], with_dates=with_dates,
     )
@@ -229,8 +229,14 @@ def evaluate_sample(
                 meta_walk,
                 synthesize_answer_from_walk,
             )
+            # Snapshot the LLM's token counters so we attribute tokens
+            # per-QA (the ClaudeLLM accumulates across calls).
+            tin0 = getattr(memory.llm, "tokens_in", 0)
+            tout0 = getattr(memory.llm, "tokens_out", 0)
             traj = meta_walk(question, memory)
             pred = synthesize_answer_from_walk(question, traj, memory)
+            tokens_in = getattr(memory.llm, "tokens_in", 0) - tin0
+            tokens_out = getattr(memory.llm, "tokens_out", 0) - tout0
             steps = len(traj.stages)
             agent_retrieved_ids = list(dict.fromkeys(traj.fact_ids_cumulative))
             if ev_set:
