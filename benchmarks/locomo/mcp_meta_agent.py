@@ -512,6 +512,7 @@ class McpMetaAgent:
                 resp = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
+                    temperature=0,
                     system=AGENT_SYSTEM,
                     tools=tools,
                     messages=messages,
@@ -636,6 +637,7 @@ class McpMetaAgent:
                 resp = self.client.messages.create(
                     model=self.model,
                     max_tokens=48,
+                    temperature=0,
                     system=AGENT_SYSTEM,
                     tools=[_FINAL_ANSWER_TOOL],
                     tool_choice={"type": "tool", "name": "final_answer"},

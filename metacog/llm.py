@@ -128,6 +128,7 @@ class ClaudeLLM:
             resp = self.client.messages.create(
                 model=self.model,
                 max_tokens=budget,
+                temperature=0,
                 system=self.system,
                 messages=[{"role": "user", "content": prompt}],
             )
