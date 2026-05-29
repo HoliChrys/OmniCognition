@@ -202,9 +202,11 @@ _PREAMBLE_RE = re.compile(
     r"^(based on[^,.:]*[,.:]\s*|according to[^,.:]*[,.:]\s*|"
     r"following the walk[^,.:]*[,.:]\s*|"
     r"the answer is[:\s]+|answer[:\s]+|i found that\s+|"
+    r"i found (?:exactly |the answer|it|what)[^.!?]*[.!?]\s*|"
     r"it (?:appears|seems) that\s+|"
     r"key (?:facts?|information|details?)[\w\s']+:\s*|"
-    r"(?:here are|here is) (?:the )?(?:key )?(?:facts?|details?)[\w\s']*:\s*)",
+    r"(?:here are|here is) (?:the )?(?:key )?(?:facts?|details?)[\w\s']*:\s*|"
+    r"the key fact is that\s+|since\s+\w+\s+is\s+)",
     re.IGNORECASE,
 )
 _INTERJECTION_RE = re.compile(
@@ -252,10 +254,24 @@ def terse(text: str) -> str:
     lines = [ln.strip(" .,") for ln in t.splitlines() if ln.strip(" .,")]
     if len(lines) >= 2:
         tail = lines[-1]
-        if 1 <= len(tail.split()) <= 8 and not tail.lower().startswith(
+        tail_words = tail.split()
+        # Don't take the tail if it's a bare gerund/past-participle (a verb
+        # from mid-sentence that happened to land on its own line, e.g. "hosting").
+        _single_verb = (
+            len(tail_words) == 1
+            and (tail.lower().endswith("ing") or tail.lower().endswith("ed"))
+            and not any(c.isdigit() for c in tail)
+        )
+        if 1 <= len(tail_words) <= 8 and not _single_verb and not tail.lower().startswith(
             ("based on", "according to", "the answer", "perfect", "i found")
         ):
             t = tail
+        elif _single_verb:
+            # Strip the stray verb line so it doesn't pollute the answer.
+            raw_lines = t.splitlines()
+            while raw_lines and raw_lines[-1].strip(" .,") == tail:
+                raw_lines.pop()
+            t = "\n".join(raw_lines).strip(" .,")
     while True:
         stripped = _INTERJECTION_RE.sub("", t)
         stripped = _PREAMBLE_RE.sub("", stripped).strip()
@@ -270,6 +286,15 @@ def terse(text: str) -> str:
     # Bare list header with no value ("Key facts about X:" → stripped to "").
     if t.endswith(":") and len(t.split()) <= 8:
         return ""
+    # Long inference answers : extract the "Likely yes/no, …" clause buried in prose.
+    # The agent often reasons for 50+ words then ends with the actual answer.
+    if len(t.split()) > 15:
+        m_inf = re.search(
+            r"\blikely\s+(?:yes|no)\b[^.!?]{0,60}",
+            t, re.IGNORECASE,
+        )
+        if m_inf:
+            t = m_inf.group(0).strip().rstrip(".,;")
     # Drop any leaked dialog-id citation, then tidy leftover punctuation.
     t = _DIALOG_ID_RE.sub("", t).strip(" .,()")
     # Compound cutting : apply iteratively while the answer is short
