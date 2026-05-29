@@ -26,7 +26,7 @@ else through api_key= (x-api-key).
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
@@ -43,18 +43,39 @@ class MissingCredential(RuntimeError):
     """
 
 
-def _resolve_credential(api_key: Optional[str]) -> str:
-    token = (
-        api_key
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+def _read_ingress_token() -> Optional[str]:
+    """OAuth bearer token file used by managed remote-exec environments
+    (Claude Code on the web / mobile). Same fallback the LoCoMo agent uses."""
+    path = os.environ.get("CLAUDE_SESSION_INGRESS_TOKEN_FILE")
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _resolve_credential(api_key: Optional[str]) -> Tuple[str, bool]:
+    """Return (token, is_auth_token). `is_auth_token` is True for OAuth
+    bearer tokens (ANTHROPIC_AUTH_TOKEN / sk-ant-oat / ingress token file)
+    which must go through anthropic's auth_token= rather than api_key=."""
+    if api_key:
+        return api_key, api_key.startswith("sk-ant-oat")
+    env_key = os.environ.get("ANTHROPIC_API_KEY")
+    if env_key:
+        return env_key, env_key.startswith("sk-ant-oat")
+    auth_env = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if auth_env:
+        return auth_env, True
+    ingress = _read_ingress_token()
+    if ingress:
+        return ingress, True
+    raise MissingCredential(
+        "Set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN / "
+        "CLAUDE_SESSION_INGRESS_TOKEN_FILE for OAuth sessions) — "
+        "metacog generates with Claude, no stub fallback."
     )
-    if not token:
-        raise MissingCredential(
-            "Set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN for OAuth "
-            "sessions) — metacog generates with Claude, no stub fallback."
-        )
-    return token
 
 
 class ClaudeLLM:
@@ -82,12 +103,10 @@ class ClaudeLLM:
             import anthropic
 
             base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
-            token = _resolve_credential(self._api_key_override)
-            # Use auth_token= when the token came from ANTHROPIC_AUTH_TOKEN
-            # (OAuth bearer) OR when it has the sk-ant-oat prefix. Otherwise
-            # use api_key= (standard API key path).
-            auth_env = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-            if token.startswith("sk-ant-oat") or (auth_env and token == auth_env):
+            token, is_auth = _resolve_credential(self._api_key_override)
+            # OAuth bearer tokens go through auth_token= ; standard API
+            # keys through api_key=.
+            if is_auth:
                 self._client = anthropic.Anthropic(
                     auth_token=token, base_url=base_url
                 )
