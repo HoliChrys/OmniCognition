@@ -497,6 +497,13 @@ class McpMetaAgent:
                     (b for b in tool_uses if b.name == "final_answer"), None)
                 if final_tu is not None:
                     answer_text = str((final_tu.input or {}).get("value", "")).strip()
+                    # Never accept an empty answer : fall back to any prose
+                    # in the turn, then to the strongest accumulated fact.
+                    if not answer_text:
+                        answer_text = " ".join(text_blocks).strip()
+                    if not answer_text and last_relevant_collected:
+                        answer_text = str(
+                            last_relevant_collected[0].get("content", "")).strip()
                     trace.append({"round": round_idx, "action": "final_tool",
                                   "text": answer_text[:200]})
                     break
@@ -590,7 +597,7 @@ class McpMetaAgent:
                     )
                 resp = self.client.messages.create(
                     model=self.model,
-                    max_tokens=32,
+                    max_tokens=48,
                     system=AGENT_SYSTEM,
                     tools=[_FINAL_ANSWER_TOOL],
                     tool_choice={"type": "tool", "name": "final_answer"},
@@ -609,12 +616,17 @@ class McpMetaAgent:
                 fa = next((b for b in resp.content
                            if b.type == "tool_use" and b.name == "final_answer"),
                           None)
+                answer_text = ""
                 if fa is not None:
                     answer_text = str((fa.input or {}).get("value", "")).strip()
-                else:
+                if not answer_text:
                     answer_text = " ".join(
                         b.text for b in resp.content if b.type == "text"
                     ).strip()
+                # Last resort : the strongest fact we gathered, never empty.
+                if not answer_text and last_relevant_collected:
+                    answer_text = str(
+                        last_relevant_collected[0].get("content", "")).strip()
                 trace.append({"round": self.max_rounds,
                               "action": "forced_final"})
 
