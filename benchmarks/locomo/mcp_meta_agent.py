@@ -247,9 +247,19 @@ def terse(text: str) -> str:
     if not text:
         return text
     t = text.strip()
+    # Bold-marked answer — skip if the bold is in a negation/correction context
+    # like "it's actually **Caroline's** necklace, not Melanie's". Trust the
+    # bold only when preceded by a confirming phrase ("is", "the answer", "found").
     m = re.search(r"\*\*(.+?)\*\*", t)
     if m:
-        return m.group(1).strip().rstrip(".")
+        prefix_start = max(0, m.start() - 30)
+        prefix = t[prefix_start:m.start()].lower()
+        _negation = any(x in prefix for x in (
+            "actually", "it's actually", "it is actually",
+            "not melanie", "not mel", "rather than",
+        ))
+        if not _negation:
+            return m.group(1).strip().rstrip(".")
     # Citation + trailing label pattern : take the last short line.
     lines = [ln.strip(" .,") for ln in t.splitlines() if ln.strip(" .,")]
     if len(lines) >= 2:
@@ -426,7 +436,6 @@ class McpMetaAgent:
                 if done_seen and walk_start_count >= 2:
                     # Two breadth threads exhausted — synthesize from
                     # accumulated evidence, never from a blank slate.
-                    ev_ctx = ""
                     if last_relevant_collected:
                         ev_lines = "\n".join(
                             f"  [{e.get('id', '')}] ({e.get('relevance', '')}) "
@@ -435,6 +444,14 @@ class McpMetaAgent:
                         )
                         ev_ctx = (
                             f"\n\nYour accumulated evidence:\n{ev_lines}\n\n"
+                        )
+                    else:
+                        # relevant_collected is empty (CoN may have labelled all
+                        # facts irrelevant) but the answer IS in your tool results.
+                        ev_ctx = (
+                            " The answer IS in your earlier tool results — "
+                            "re-read the 'facts' arrays from each walk_start/"
+                            "walk_next result above to find it. "
                         )
                     messages.append({
                         "role": "user",
