@@ -221,12 +221,19 @@ _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
 # Compound-phrase cutters : keep the head label, drop trailing
 # elaboration. Order matters — most specific first.
 _COMPOUND_CUTTERS = [
-    re.compile(r"\s+(?:and|or|as well as|along with|together with)\s+.+$",
+    # Cut trailing "and/or X Y Z …" but ONLY when there are ≥ 3 words after
+    # the conjunction — this preserves short coordinated lists like
+    # "Love, faith and strength" or "running and hiking" while still removing
+    # elaboration tails like "and member of the LGBTQ community".
+    re.compile(r"\s+(?:and|or|as well as|along with|together with)\s+\S+(?:\s+\S+){2,}$",
                re.IGNORECASE),
     re.compile(r"\s+who\s+(?:is|was|has|loves|enjoys|likes)\s+.+$",
                re.IGNORECASE),
     re.compile(r"\s+that\s+(?:is|was)\s+.+$", re.IGNORECASE),
-    re.compile(r",\s+.+$"),  # trailing ", member of …"
+    # Cut trailing ", X Y Z …" but only when ≥ 4 words follow the comma —
+    # avoids slicing "Love, faith and strength" → "Love" (3 words after comma
+    # is a short list, not elaboration; 4+ words is safe to trim).
+    re.compile(r",\s+\S+(?:\s+\S+){3,}$"),
 ]
 
 
