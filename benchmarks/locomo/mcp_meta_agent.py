@@ -45,9 +45,13 @@ _FINAL_ANSWER_TOOL = {
     "name": "final_answer",
     "description": (
         "Emit the FINAL answer as a bare value, copied VERBATIM from the "
-        "evidence (the speaker's own words). <= 5 words, no prose, no "
-        "dialog ids, no 'and'-lists of extras. Use 'Not mentioned' only if "
-        "the evidence truly lacks it."
+        "evidence (the speaker's own words). No prose, no dialog ids. "
+        "For a SINGLE-fact question keep it <= 5 words. For a PLURAL / "
+        "enumeration question ('what events/cities/ways/things has X…', "
+        "'have in common') list EVERY item found, comma-separated "
+        "('pride parade, school speech, support group') — do NOT collapse "
+        "a list to one item. Use 'Not mentioned' only if the evidence "
+        "truly lacks it."
     ),
     "input_schema": {
         "type": "object",
