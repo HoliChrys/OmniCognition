@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import string
 import time
 from collections import defaultdict
 from typing import Any, Dict, List
@@ -30,38 +31,48 @@ from typing import Any, Dict, List
 from metacog import Memory
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
-# SQuAD / LoCoMo normalize_answer drops these articles before token
-# overlap. Matching the official metric so our internal F1 is
-# comparable to the published leaderboard and so a leading "a/an/the"
-# in a generated answer doesn't bleed precision.
-_ARTICLES = {"a", "an", "the"}
+# Official LoCoMo metric — VERBATIM from snap-research/locomo
+# task_eval/evaluation.py (normalize_answer + f1_score). We use the
+# official function directly so our F1 is the published token-F1, not a
+# reimplementation. normalize_answer: drop commas, strip a/an/the/and,
+# remove punctuation, lowercase, whitespace-fix. f1_score: Porter-stem
+# every token, then token-overlap precision/recall harmonic mean.
+import regex as _regex          # official uses `regex`, not `re`
+from collections import Counter as _Counter
+from nltk.stem import PorterStemmer as _PorterStemmer
+
+_ps = _PorterStemmer()
 
 
-def _tokens(text: str) -> List[str]:
-    return [
-        t.lower()
-        for t in _TOKEN_RE.findall(text or "")
-        if t.lower() not in _ARTICLES
-    ]
+def normalize_answer(s: str) -> str:
+    s = (s or "").replace(",", "")
+
+    def remove_articles(text):
+        return _regex.sub(r"\b(a|an|the|and)\b", " ", text)
+
+    def white_space_fix(text):
+        return " ".join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
-def f1_score(pred: str, gold: str) -> float:
-    p, g = _tokens(pred), _tokens(gold)
-    if not p or not g:
+def f1_score(prediction: str, ground_truth: str) -> float:
+    prediction_tokens = [_ps.stem(w) for w in normalize_answer(prediction).split()]
+    ground_truth_tokens = [_ps.stem(w) for w in normalize_answer(ground_truth).split()]
+    common = _Counter(prediction_tokens) & _Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
         return 0.0
-    p_set: Dict[str, int] = {}
-    g_set: Dict[str, int] = {}
-    for t in p:
-        p_set[t] = p_set.get(t, 0) + 1
-    for t in g:
-        g_set[t] = g_set.get(t, 0) + 1
-    overlap = sum(min(p_set.get(t, 0), g_set.get(t, 0)) for t in p_set)
-    if overlap == 0:
-        return 0.0
-    precision = overlap / sum(p_set.values())
-    recall = overlap / sum(g_set.values())
-    return 2 * precision * recall / (precision + recall)
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(ground_truth_tokens)
+    return (2 * precision * recall) / (precision + recall)
 
 
 def make_encoder(name: str):
