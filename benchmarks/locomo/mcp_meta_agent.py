@@ -116,12 +116,24 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   of the LGBTQ community". "Teacher" not "A passionate elementary
   school teacher who loves kids". Pick the bare category noun.
 - "What did X do/like/research" → short noun phrase (1-4 words).
-- yes/no/inference → "Likely yes, <one short clause>".
-- not in the evidence / adversarial / unanswerable → "Not mentioned".
+- ENUMERATION (plural question : "What events/cities/ways/things/hobbies",
+  "Which X has Y done", "what do they have in common") → LIST EVERY item
+  you gathered, comma-separated ("Paris, Rome" ; "Pride parade, school
+  speech, support group"). Do NOT reduce a list to one item — each correct
+  item earns score. This is the ONE case where a longer answer is right.
+- INFERENCE ("Would / Could / Is X likely … ?", "Does X seem …?",
+  "Would X enjoy/have …?") → you MUST reason from the evidence and answer
+  "Likely yes, <short reason>" or "Likely no, <short reason>". For these
+  questions NEVER say "Not mentioned" — the answer is an inference you draw
+  from the retrieved facts, not a literal quote.
+- not in the evidence / adversarial / unanswerable → "Not mentioned"
+  (ONLY for factual look-ups, never for an inference question above).
 
-Hard rule : if your answer is longer than 5 words, you are wrong —
-strip every adjective and conjunction until only the bare value
-remains. Drop "and ...", "who is ...", "the ... of ...".
+Hard rule : for a SINGLE-VALUE answer (date, place, one entity/label), if
+it is longer than 5 words you are wrong — strip adjectives/conjunctions to
+the bare value, drop "and ...", "who is ...", "the ... of ...". This rule
+does NOT apply to ENUMERATION or INFERENCE answers above (keep their lists
+/ clauses intact).
 
 NEVER output a dialog turn ID (D4:11, D10:12, etc.) as your answer.
 Output the CONTENT of the fact, not its reference ID.
@@ -147,6 +159,9 @@ Q: How long have they been friends? → 4 years
 Q: What career path did Caroline choose? → counseling, mental health
 Q: Whose birthday did Melanie celebrate? → Melanie's daughter
 Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
+Q: Would Caroline likely have Dr. Seuss books? → Likely yes, she collects classic children's books
+Q: Which cities has Jon visited? → Paris, Rome
+Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
 Q: What sports car does Jon drive? → Not mentioned"""
 
 
@@ -331,6 +346,14 @@ def terse(text: str, question: Optional[str] = None) -> str:
     if not text:
         return text
     t = text.strip()
+    # Enumeration questions expect a LIST answer ("Paris, Rome") — never
+    # compound-cut them down to one item (that destroys multi-hop F1).
+    _is_enum_q = bool(question and re.search(
+        r"\b(what|which)\b.*\b(events?|cities|places|ways|things|hobbies|"
+        r"activities|projects|crafts?|sports?|languages?|skills?|"
+        r"groups?|causes?)\b"
+        r"|\bin what ways\b|\bhave in common\b|\bboth\b",
+        question, re.IGNORECASE))
     # "When …" questions : if the agent dumped a citation instead of a bare
     # date, pull the date out. Only when the text is verbose (>5 words) —
     # a clean "19 January 2023" already passes through untouched.
@@ -416,7 +439,7 @@ def terse(text: str, question: Optional[str] = None) -> str:
     # Skip inference answers ("Likely yes, …") — the trailing clause IS
     # the expected format.
     is_inference = bool(re.match(r"^\s*likely\s+(?:yes|no)\b", t, re.IGNORECASE))
-    if t and not is_inference and len(t.split()) <= 12:
+    if t and not is_inference and not _is_enum_q and len(t.split()) <= 12:
         changed = True
         while changed and t and len(t.split()) <= 12:
             changed = False
