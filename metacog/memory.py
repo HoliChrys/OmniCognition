@@ -117,10 +117,12 @@ class Memory:
         # Extract keywords + their embedding for hybrid retrieval.
         kws: List[str] = []
         kw_emb = None
+        kw_src = None
         if self.extractor is not None:
             kws = self.extractor.extract(content, n=5)
             if kws:
                 kw_emb = tuple(self.encoder.encode(" ".join(kws)))
+                kw_src = getattr(self.extractor, "source", SourceClass.COMPUTATION)
         point = Point(
             id=id,
             content=content,
@@ -132,6 +134,7 @@ class Memory:
             sequence_next=sequence_next,
             keywords=kws,
             keywords_embedding=kw_emb,
+            keywords_source=kw_src,
         )
         self.points.append(point)
         # Backfill the previous point's sequence_next if we know it
