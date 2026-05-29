@@ -431,18 +431,29 @@ def retrieve_hybrid(
     cosine_pool.sort(key=lambda x: x[0], reverse=True)
     cosine_pool = cosine_pool[:pool_per_signal]
 
+    # Phase 1b — dense cosine on the FULL-CONTENT effective embedding.
+    # Keyword cosine matches at the entity level but discards most of the
+    # turn's meaning ; full-content dense cosine is the strong semantic
+    # signal (especially with a real sentence encoder). The two are
+    # complementary and fused below. COMPUTATION on vectors — A(·) ⊥ P.
+    query_content_emb = tuple(encoder.encode(query_text))
+    content_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
+    for p in points:
+        eff = effective_embedding(p, t_now)
+        content_pool.append((cosine(query_content_emb, eff), p))
+    content_pool.sort(key=lambda x: x[0], reverse=True)
+    content_pool = content_pool[:pool_per_signal]
+
     # Phase 2 — BM25 on full content
     bm25_pool = bm25_score(query_text, points, k_pool=pool_per_signal)
 
-    # Phase 3 — Reciprocal Rank Fusion
+    # Phase 3 — Reciprocal Rank Fusion (keyword cosine + content cosine + BM25)
     rrf_scores: dict[str, float] = {}
     best_rank_by_id: dict[str, int] = {}
-    for rank, (_, p) in enumerate(cosine_pool):
-        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
-        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
-    for rank, (_, p) in enumerate(bm25_pool):
-        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
-        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
+    for pool in (cosine_pool, content_pool, bm25_pool):
+        for rank, (_, p) in enumerate(pool):
+            rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+            best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
 
     # Étape 5 — preference routing : 3rd RRF signal for matching kind.
     # Points of the preferred kind that are already candidates get an
