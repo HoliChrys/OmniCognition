@@ -969,6 +969,7 @@ class MetaWalker:
         t_now: Optional[float] = None,
         commit: bool = True,
         use_chain_of_note: bool = True,
+        observator_id: Optional[str] = None,
     ) -> None:
         """`commit` controls whether the walk MUTATES the shared memory.
 
@@ -996,6 +997,9 @@ class MetaWalker:
         self.pull_strength = pull_strength
         self.commit = commit
         self.use_chain_of_note = use_chain_of_note
+        # Optional Level-1 community activation : restricts FACT retrieval
+        # to this observator's members (see _all_points).
+        self.observator_id = observator_id
         # Per-walk scratch for generated points when commit=False.
         self._local_points: List[Point] = []
         self.t_now = (
@@ -1047,10 +1051,30 @@ class MetaWalker:
         plus this walk's locally-generated points (when commit=False).
         When commit=True the generated points are already in
         memory.points, so the local list is empty and this is just the
-        shared list."""
-        if self._local_points:
-            return list(self.memory.points) + self._local_points
-        return self.memory.points
+        shared list.
+
+        When `observator_id` is set (the agent activated a Level-1
+        community), the candidate FACTs are restricted to that community's
+        members. Entity beacons (id "entity_*") and walk scaffolding
+        (THOUGHT / ACTION) are ALWAYS kept — beacons are shared anchors and
+        scaffolding is community-agnostic."""
+        base = (list(self.memory.points) + self._local_points
+                if self._local_points else list(self.memory.points))
+        oid = getattr(self, "observator_id", None)
+        if not oid:
+            return base
+        out: List[Point] = []
+        for p in base:
+            if p.kind != PointKind.FACT or p.id.startswith("entity_"):
+                out.append(p)              # scaffolding + shared beacons
+            elif oid in p.observator_views:
+                out.append(p)              # community member FACT
+        # If activation matched nothing (bad id), fall back to the full set
+        # rather than starve the walk.
+        return out if any(
+            p.kind == PointKind.FACT and not p.id.startswith("entity_")
+            for p in out
+        ) else base
 
     def _add_generated(self, point: Point) -> None:
         """Store a generated ACTION/THOUGHT : into shared memory when

@@ -172,6 +172,7 @@ def build_app(
         facts_per_stage: int = 7,
         actions_per_stage: int = 3,
         commit: bool = False,
+        observator_id: str = "",
     ) -> dict:
         """Open a meta-cognitive walk and return its STAGE 0.
 
@@ -207,6 +208,7 @@ def build_app(
             facts_per_stage=max(1, facts_per_stage),
             actions_per_stage=max(1, actions_per_stage),
             commit=commit,
+            observator_id=observator_id or None,
         )
         walk_id = walkers.open(walker)
         stage = walker.step()
@@ -296,6 +298,29 @@ def build_app(
     def route(query: str, k: int = 1) -> List[dict]:
         """Pick the top-k observators most aligned with the query."""
         return memory.route(query, k=k)
+
+    @app.tool()
+    def list_communities() -> List[dict]:
+        """List the Level-1 topical communities (auto-detected observators).
+
+        Each is {id, name, keywords, n_points}. Pass an `id` to
+        `walk_start(observator_id=…)` to FOCUS the walk's FACT retrieval on
+        that community's turns (entity beacons + scaffolding stay visible).
+        Returns [] when no communities were detected — then just walk over
+        the whole memory as usual.
+        """
+        out: List[dict] = []
+        for oid, obs in memory.observators.items():
+            if not oid.startswith("auto-comm-"):
+                continue
+            n = sum(1 for p in memory.points if oid in p.observator_views)
+            out.append({
+                "id": oid,
+                "name": obs.name,
+                "keywords": obs.keywords[:8],
+                "n_points": n,
+            })
+        return out
 
     @app.tool()
     def save() -> str:
