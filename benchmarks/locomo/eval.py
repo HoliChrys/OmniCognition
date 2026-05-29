@@ -174,7 +174,7 @@ def evaluate_sample(
     # concurrent access is safe. This turns an otherwise multi-hour
     # sequential run into a parallel one.
     precomputed: Dict[int, Dict[str, Any]] = {}
-    if answerer == "mcp":
+    if answerer in ("mcp", "meta"):
         from concurrent.futures import ThreadPoolExecutor
 
         valid = [(i, qa) for i, qa in enumerate(qas) if qa.get("question")]
@@ -224,27 +224,8 @@ def evaluate_sample(
             ra = react_answer(memory, question, max_steps=2,
                               k_retrieve=k_retrieve)
             pred = ra["answer"]
-        elif answerer == "meta":
-            from metacog.meta_walk import (
-                meta_walk,
-                synthesize_answer_from_walk,
-            )
-            # Snapshot the LLM's token counters so we attribute tokens
-            # per-QA (the ClaudeLLM accumulates across calls).
-            tin0 = getattr(memory.llm, "tokens_in", 0)
-            tout0 = getattr(memory.llm, "tokens_out", 0)
-            traj = meta_walk(question, memory)
-            pred = synthesize_answer_from_walk(question, traj, memory)
-            tokens_in = getattr(memory.llm, "tokens_in", 0) - tin0
-            tokens_out = getattr(memory.llm, "tokens_out", 0) - tout0
-            steps = len(traj.stages)
-            agent_retrieved_ids = list(dict.fromkeys(traj.fact_ids_cumulative))
-            if ev_set:
-                agent_recall = (
-                    len(set(agent_retrieved_ids) & ev_set) / len(ev_set)
-                )
-        elif answerer in ("claude", "mcp"):
-            if answerer == "mcp":
+        elif answerer in ("claude", "mcp", "meta"):
+            if answerer in ("mcp", "meta"):
                 ca = precomputed.get(qa_index, {"answer": ""})
             else:
                 ca = claude_answerer.answer(
@@ -463,6 +444,15 @@ def main():
         claude_answerer = McpReactAgent(**kwargs)
         print(f"MCP ReAct agent ready : model={claude_answerer.model} "
               f"(in-process metacog MCP, max_rounds={claude_answerer.max_rounds})")
+    elif args.answerer == "meta":
+        from benchmarks.locomo.mcp_meta_agent import McpMetaAgent
+        kwargs = {}
+        if args.claude_model:
+            kwargs["model"] = args.claude_model
+        claude_answerer = McpMetaAgent(**kwargs)
+        print(f"MCP meta-walk agent ready : model={claude_answerer.model} "
+              f"(walks the metacog memory stage-by-stage, "
+              f"max_rounds={claude_answerer.max_rounds})")
 
     debug_writer = None
     if args.debug_jsonl:

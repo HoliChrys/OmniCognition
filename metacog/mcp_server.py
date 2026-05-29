@@ -46,9 +46,13 @@ def build_app(
     benchmark conversation pre-ingested in-process) instead of creating
     an empty one. When omitted, a fresh Memory(storage_path=…) is used.
     """
+    from metacog.meta_walk import MetaWalker, WalkerRegistry
+
     app = FastMCP("metacog")
     if memory is None:
         memory = Memory(storage_path=storage_path)
+
+    walkers = WalkerRegistry()
 
     @app.tool()
     def ingest(content: str, kind: str = "FACT", id: Optional[str] = None) -> dict:
@@ -156,6 +160,76 @@ def build_app(
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
         )
+
+    # ----------------------------------------------------------------
+    # Meta-cognitive walk — streaming, step-by-step
+    # ----------------------------------------------------------------
+
+    @app.tool()
+    def walk_start(
+        query: str,
+        n_stages: int = 3,
+        facts_per_stage: int = 5,
+        actions_per_stage: int = 3,
+    ) -> dict:
+        """Open a meta-cognitive walk and return its STAGE 0.
+
+        The walk traverses three coordinated kinds (FACT / ACTION /
+        THOUGHT) over the memory. Each call returns ONE stage — the
+        agent then calls `walk_next(walk_id)` for the next stage
+        until `done=True`. This is how multi-hop filiation is
+        preserved : each step is sent back to the agent who composes
+        the answer across stages.
+
+        Stage 0 output schema :
+          walk_id              : str  — pass to walk_next
+          stage                : int  — starts at 0
+          facts                : list of nodes with full INDEXED CONTENT,
+                                  keywords, confidence, uncertainty,
+                                  counters — the agent sees the text,
+                                  not just ids.
+          actions              : same
+          chosen_fact / action : the most-certain fact + first action
+          thought              : the THOUGHT that fuses fact+action
+                                  keywords (generated, kind=THOUGHT,
+                                  source=GENERATOR)
+          generated_action     : True if no ACTION existed and one was
+                                  generated from the facts
+          generated_thought    : True if the THOUGHT was generated
+          fact_ids_cumulative  : every FACT id seen so far (effective
+                                  retrieval set for the answerer)
+          done                 : True if no further stage is available
+        """
+        walker = MetaWalker(
+            query, memory,
+            n_stages=max(1, n_stages),
+            facts_per_stage=max(1, facts_per_stage),
+            actions_per_stage=max(1, actions_per_stage),
+        )
+        walk_id = walkers.open(walker)
+        stage = walker.step()
+        out = stage.to_dict()
+        out["walk_id"] = walk_id
+        if stage.done:
+            walkers.close(walk_id)
+        return out
+
+    @app.tool()
+    def walk_next(walk_id: str) -> dict:
+        """Advance the walk identified by walk_id by ONE stage.
+
+        Returns the same shape as walk_start (without walk_id). The
+        agent should keep calling this until `done=True` is returned
+        OR until it has enough evidence to answer.
+        """
+        walker = walkers.get(walk_id)
+        if walker is None:
+            return {"done": True, "error": f"unknown walk_id {walk_id!r}"}
+        stage = walker.step()
+        out = stage.to_dict()
+        if stage.done:
+            walkers.close(walk_id)
+        return out
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:

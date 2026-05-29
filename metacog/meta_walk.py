@@ -190,37 +190,54 @@ def nearest_facts_with_fallback(
     t_now: float,
     *,
     exclude_ids: Optional[set] = None,
+    encoder: Any = None,
+    extractor: Any = None,
 ) -> List[Point]:
-    """FACT retrieval with BM25 fallback on the node's full content.
+    """FACT retrieval — delegates to the FULL hybrid pipeline.
 
-    Primary signal : keyword-embedding cosine kNN. When that returns
-    fewer than `k` non-zero-cosine FACTs (no meaningful entity overlap),
-    we BACKFILL from BM25 on the full content text. BM25 catches rare
-    verbatim tokens — dates, names, numbers — that the keyword
-    embedding misses when the query doesn't share entity keywords with
-    the relevant turn.
+    Earlier this hand-rolled keyword-cosine + BM25, which proved much
+    weaker than `retrieve_hybrid` (it lacked content-cosine, fuzzy
+    Levenshtein, geometric spreading and lineage). We now route FACT
+    retrieval through `retrieve_hybrid(restrict_kind=FACT, …)` so the
+    walk benefits from every retrieval signal the rest of the system
+    has. The keyword `query_emb` is unused here (the hybrid pipeline
+    re-derives its own signals from `query_text`) but kept in the
+    signature for callers that still pass it.
 
-    The fallback is parameter-free : a cosine of exactly 0 (or below)
-    means the query and the point's keyword vector are orthogonal —
-    no entity signal at all. BM25 fills the slots up to k.
+    When `encoder`/`extractor` are not supplied we fall back to the old
+    keyword-cosine + BM25 path (used by unit tests that call this
+    helper directly without a full Memory).
     """
     exclude_ids = exclude_ids or set()
+
+    if encoder is not None and extractor is not None:
+        from metacog.geometry import retrieve_hybrid
+        results = retrieve_hybrid(
+            query_text, points, k + len(exclude_ids), t_now,
+            encoder=encoder, extractor=extractor,
+            use_lineage=True, use_spreading=True, use_fuzzy=True,
+            restrict_kind=PointKind.FACT,
+        )
+        out: List[Point] = []
+        for _s, p in results:
+            if p.id in exclude_ids:
+                continue
+            out.append(p)
+            if len(out) >= k:
+                break
+        return out
+
+    # --- Fallback path (no encoder/extractor : direct callers/tests) ---
     fact_pts = [p for p in points
                 if p.kind == PointKind.FACT and p.id not in exclude_ids]
-
-    # Primary : keyword-embedding cosine
     knn = nearest_by_kind(
         query_emb, fact_pts, PointKind.FACT, k, t_now,
         exclude_ids=exclude_ids,
     )
     relevant = [p for s, p in knn if s > 0.0]
     seen: set = {p.id for p in relevant}
-
     if len(relevant) >= k:
         return relevant[:k]
-
-    # Fallback : BM25 on full content. Pulls in rare-token matches the
-    # keyword embedding cannot see.
     from metacog.bm25 import bm25_score
     fallback = bm25_score(query_text, fact_pts, k_pool=k * 2)
     for _s, p in fallback:
@@ -586,6 +603,7 @@ def meta_walk(
 
     facts = nearest_facts_with_fallback(
         query_emb, query, memory.points, facts_per_stage, t_now,
+        encoder=enc, extractor=extractor,
     )
     actions = [p for _s, p in nearest_by_kind(
         query_emb, memory.points, PointKind.ACTION, actions_per_stage, t_now,
@@ -650,6 +668,7 @@ def meta_walk(
         facts_next = nearest_facts_with_fallback(
             new_emb, fallback_query, memory.points, facts_per_stage, t_now,
             exclude_ids=visited_fact_ids,
+            encoder=enc, extractor=extractor,
         )
         action_next = nearest_action_to(
             prev_action, memory.points, t_now,
@@ -810,6 +829,7 @@ class MetaWalker:
             self._cur_emb, seed_query, self.memory.points,
             self.facts_per_stage, self.t_now,
             exclude_ids=self._visited_fact_ids,
+            encoder=self._enc, extractor=self._extr,
         )
 
         # ACTIONs : at stage 0 nearest by query embedding ; at later

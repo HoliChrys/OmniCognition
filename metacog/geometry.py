@@ -387,6 +387,7 @@ def retrieve_hybrid(
     pool_per_signal: int = 20,
     rrf_k: int = 60,
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
+    restrict_kind: Optional["PointKind"] = None,  # noqa: F821
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -412,6 +413,13 @@ def retrieve_hybrid(
     so ACTIONs already known to be relevant outrank co-relevant FACTs.
     """
     from metacog.bm25 import bm25_score
+
+    # Restrict the candidate set to a single kind when asked (the
+    # meta-walk retrieves FACT-only / ACTION-only). Applied before any
+    # pool is built so every signal respects it ; lineage stays within
+    # the restricted set too.
+    if restrict_kind is not None:
+        points = [p for p in points if p.kind == restrict_kind]
 
     points_by_id = {p.id: p for p in points}
 
