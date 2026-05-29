@@ -81,11 +81,20 @@ class ClaudeLLM:
         if self._client is None:
             import anthropic
 
+            base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
             token = _resolve_credential(self._api_key_override)
-            if token.startswith("sk-ant-oat"):
-                self._client = anthropic.Anthropic(auth_token=token)
+            # Use auth_token= when the token came from ANTHROPIC_AUTH_TOKEN
+            # (OAuth bearer) OR when it has the sk-ant-oat prefix. Otherwise
+            # use api_key= (standard API key path).
+            auth_env = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            if token.startswith("sk-ant-oat") or (auth_env and token == auth_env):
+                self._client = anthropic.Anthropic(
+                    auth_token=token, base_url=base_url
+                )
             else:
-                self._client = anthropic.Anthropic(api_key=token)
+                self._client = anthropic.Anthropic(
+                    api_key=token, base_url=base_url
+                )
         return self._client
 
     # ------------------------------------------------------------------

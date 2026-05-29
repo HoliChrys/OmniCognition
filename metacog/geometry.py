@@ -456,8 +456,13 @@ def retrieve_hybrid(
     content_pool.sort(key=lambda x: x[0], reverse=True)
     content_pool = content_pool[:pool_per_signal]
 
-    # Phase 2 — BM25 on full content (exact-token)
-    bm25_pool = bm25_score(query_text, points, k_pool=pool_per_signal)
+    # Phase 2 — BM25 on point keywords with stemming. Symmetric with the
+    # points (keyword-indexed) so question words and conversation
+    # structure don't contaminate the scores.
+    bm25_pool = bm25_score(
+        query_text, points, k_pool=pool_per_signal,
+        query_keywords=query_kw or None,
+    )
 
     # Phase 2b — fuzzy lexical (Levenshtein) : recovers morphological /
     # spelling variants of rare entities that exact BM25 misses. Edit

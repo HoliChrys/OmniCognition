@@ -84,14 +84,16 @@ too verbose, will score poorly. Just the value."""
 def _resolve_client(api_key: Optional[str]):
     import anthropic
 
-    token = (
-        api_key
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
+    # ANTHROPIC_AUTH_TOKEN is always an OAuth bearer — use auth_token=.
+    # ANTHROPIC_API_KEY / explicit api_key that starts with sk-ant-oat too.
+    auth_tok = os.environ.get("ANTHROPIC_AUTH_TOKEN") or (
+        api_key if (api_key and api_key.startswith("sk-ant-oat")) else None
     )
-    if token and token.startswith("sk-ant-oat"):
-        return anthropic.Anthropic(auth_token=token)
-    return anthropic.Anthropic(api_key=token)
+    if auth_tok:
+        return anthropic.Anthropic(auth_token=auth_tok, base_url=base_url)
+    api_tok = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    return anthropic.Anthropic(api_key=api_tok, base_url=base_url)
 
 
 def _mcp_tools_to_anthropic(mcp_tools) -> List[Dict[str, Any]]:
