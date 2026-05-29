@@ -455,10 +455,10 @@ def meta_thought(
             + "\n".join(f"  - {c}" for c in cluster_lines)
         )
     prompt = (
-        "Reflect on the relation between the FACT and the ACTION, taking "
-        "the FACT's epistemic state into account. Output ONE short "
-        "reflection (≤ 15 words) naming the entities/properties/relations "
-        "that connect them. No prose, just the reflection.\n\n"
+        "Write ONE short RETROSPECTIVE reflection (≤ 15 words) on the "
+        "situation — what the FACT means given the ACTION, taking the "
+        "fact's epistemic state into account. This is a thought looking "
+        "BACK on the fact and action it is born from.\n\n"
         f"{meta_line}\n"
         f"FACT [{fact_kws}] : {fact.content}\n"
         f"ACTION [{action_kws}] : {action.content}"
@@ -470,16 +470,42 @@ def meta_thought(
         return None
     if not text:
         return None
-    # Enriched keyword set = thought-extracted keywords ∪ parent keywords
-    base_kws = extractor.extract(text, n=8) if extractor else []
-    parent_kws = list(fact.keywords) + list(action.keywords)
-    merged: List[str] = []
+
+    # KEYWORDS — never generated from zero. The thought ENRICHES and
+    # REORDERS the parent (fact + action) keywords ; the reflection only
+    # decides which of them matter most for the next hop. We additionally
+    # allow ENRICHMENT with tokens that appear in the fact/action CONTENT
+    # (concrete entities) — never the abstract relational vocabulary of
+    # the reflection itself.
+    parent_kws: List[str] = []
     seen: set = set()
-    for kw in base_kws + parent_kws:
+    for kw in list(fact.keywords) + list(action.keywords):
         if kw and kw not in seen:
             seen.add(kw)
-            merged.append(kw)
-    kws = merged[:8]
+            parent_kws.append(kw)
+
+    # Tokens the reflection emphasises (lowercased word set).
+    refl_tokens = {w.strip(".,;:!?\"'()").lower() for w in text.split()}
+    # Concrete vocabulary the parents are actually made of.
+    content_vocab = {
+        w.strip(".,;:!?\"'()").lower()
+        for w in (fact.content + " " + action.content).split()
+        if len(w) >= 4
+    }
+
+    # 1. Parent keywords the reflection emphasised come FIRST (reordered
+    #    by metacognitive relevance), then the remaining parent keywords.
+    emphasised = [k for k in parent_kws if k.lower() in refl_tokens]
+    rest = [k for k in parent_kws if k.lower() not in refl_tokens]
+    # 2. ENRICH : concrete content tokens the reflection surfaced that are
+    #    not already keywords (grounded entities, never abstract prose).
+    enrich = [
+        w for w in refl_tokens
+        if w in content_vocab and w not in seen
+    ]
+    kws = (emphasised + rest + enrich)[:8]
+    if not kws:
+        kws = parent_kws[:8]
     kw_emb = position_weighted_keyword_embedding(kws, encoder)
     return Point(
         id=_gen_id("thought_meta", t_now),
