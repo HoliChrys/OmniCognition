@@ -44,6 +44,7 @@ THOUGHT/ACTION Points (which were appended to the memory).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -131,6 +132,11 @@ class StageOutput:
     Carries full content of every retrieved node (not just ids) plus a
     'done' flag that lets the agent decide whether to call walk_next
     or move on to synthesis.
+
+    sigma_path : cumulative σ propagated in quadrature over the walk's
+    embedding hops. High sigma_path signals that depth is exhausted and
+    the agent should pivot to a breadth walk_start with a reformulated
+    query targeting the missing aspect.
     """
 
     stage: int
@@ -143,6 +149,7 @@ class StageOutput:
     generated_thought: bool
     fact_ids_cumulative: List[str]
     done: bool
+    sigma_path: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -156,6 +163,7 @@ class StageOutput:
             "generated_thought": self.generated_thought,
             "fact_ids_cumulative": list(self.fact_ids_cumulative),
             "done": self.done,
+            "sigma_path": round(self.sigma_path, 4),
         }
 
 
@@ -860,6 +868,14 @@ class MetaWalker:
         self._stage_idx = 0
         self._done = False
         self._generated_ids: List[str] = []
+        # σ-propagation depth-stop state.
+        self._sigma_path: float = 0.0
+        self._prev_seed_emb: Optional[tuple] = None
+        # Walk-local emergent threshold : median + std of pairwise cosine
+        # distances between stage-0 retrieved facts. Set once after the
+        # first retrieval. Replaces prune_threshold(points) which returns
+        # None for cold-start memories (uniform beta_sigma).
+        self._walk_sigma_cutoff: Optional[float] = None
 
     # ----------------------------------------------------------------
 
@@ -918,6 +934,7 @@ class MetaWalker:
                 generated_action=False, generated_thought=False,
                 fact_ids_cumulative=list(self._fact_ids_cum),
                 done=True,
+                sigma_path=self._sigma_path,
             )
 
         # Retrieval — stage 0 seeds from the query ; later stages from
@@ -935,6 +952,29 @@ class MetaWalker:
             pwe = position_weighted_keyword_embedding(anchored_kws, self._enc)
             seed_emb = pwe if pwe is not None else self._cur_emb
 
+        # σ-propagation depth-stop — the cumulative embedding drift
+        # between successive walk seeds, propagated in GUM quadrature.
+        # When the total drift exceeds the walk-local emergent threshold
+        # (median + std of stage-0 fact pairwise distances), depth is
+        # exhausted ; the agent should pivot breadth via a new walk_start
+        # with a query targeting the missing aspect.
+        if self._stage_idx > 0 and self._prev_seed_emb is not None:
+            hop = max(0.0, 1.0 - cosine(self._prev_seed_emb, seed_emb))
+            self._sigma_path = math.sqrt(self._sigma_path ** 2 + hop ** 2)
+            cutoff = self._walk_sigma_cutoff
+            if cutoff is not None and self._sigma_path > cutoff:
+                self._done = True
+                return StageOutput(
+                    stage=self._stage_idx,
+                    facts=[], actions=[],
+                    chosen_fact=None, chosen_action=None, thought=None,
+                    generated_action=False, generated_thought=False,
+                    fact_ids_cumulative=list(self._fact_ids_cum),
+                    done=True,
+                    sigma_path=self._sigma_path,
+                )
+        self._prev_seed_emb = seed_emb
+
         pts = self._all_points()
         facts = nearest_facts_with_fallback(
             seed_emb, seed_query, pts,
@@ -942,6 +982,30 @@ class MetaWalker:
             exclude_ids=self._visited_fact_ids,
             encoder=self._enc, extractor=self._extr,
         )
+
+        # Calibrate the walk-local σ threshold once from stage-0 facts.
+        # median + std of pairwise cosine distances between the initial
+        # retrieved facts = "typical manifold resolution" at this query.
+        # Used instead of prune_threshold(points) which fails for
+        # cold-start memories where all beta_sigma are identical.
+        if self._stage_idx == 0 and self._walk_sigma_cutoff is None:
+            fact_embs = [
+                effective_keyword_embedding(f, self.t_now) for f in facts
+            ]
+            fact_embs = [e for e in fact_embs if e is not None]
+            if len(fact_embs) >= 3:
+                dists = [
+                    max(0.0, 1.0 - cosine(fact_embs[i], fact_embs[j]))
+                    for i in range(len(fact_embs))
+                    for j in range(i + 1, len(fact_embs))
+                ]
+                if dists:
+                    mean_d = sum(dists) / len(dists)
+                    std_d = math.sqrt(
+                        sum((d - mean_d) ** 2 for d in dists) / len(dists)
+                    )
+                    median_d = sorted(dists)[len(dists) // 2]
+                    self._walk_sigma_cutoff = median_d + std_d
 
         # ACTIONs : at stage 0 nearest by query embedding ; at later
         # stages nearest to the previous action.
@@ -1020,6 +1084,7 @@ class MetaWalker:
             generated_thought=gen_thought,
             fact_ids_cumulative=list(self._fact_ids_cum),
             done=False,
+            sigma_path=self._sigma_path,
         )
 
         self._prev_action = action_star

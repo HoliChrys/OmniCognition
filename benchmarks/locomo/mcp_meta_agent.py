@@ -45,11 +45,25 @@ Workflow :
    keywords, confidence and uncertainty — read those.
 2. If the chosen fact at this stage already answers the question,
    answer now (no more tool calls).
-3. Otherwise call `walk_next(walk_id=…)` to receive the NEXT stage —
-   it follows the filiation of the previous thought. Multi-hop
-   questions usually need 2-3 stages.
-4. Stop calling `walk_next` once `done=true` is returned, or once you
-   have enough evidence across the stages you have seen.
+3. DEPTH : call `walk_next(walk_id=…)` for the next stage when the
+   current thread is still on-topic and sigma_path is low. Multi-hop
+   questions often need 2-3 depth stages.
+4. BREADTH PIVOT : when `done=true` (depth exhausted or sigma_path
+   high) and you are still MISSING a specific piece :
+   — name what's missing in one phrase
+   — call `walk_start(query=<targeted phrase>)` with a query that
+     focuses on EXACTLY what's missing, NOT the original question.
+   Example : found "Melanie thanked Caroline" but not the book title →
+     walk_start(query="book title Caroline recommended Melanie read")
+   Example : found running but not the second hobby →
+     walk_start(query="Melanie hobby activity craft pottery")
+5. Answer once you have enough evidence or have made 5 walk calls
+   total. Incomplete evidence → answer with what you have or
+   "Not mentioned" if nothing supports it.
+
+sigma_path in the stage output measures cumulative walk drift; when it
+is high the walk has drifted off-topic and breadth is more useful than
+more depth on the same thread.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").
@@ -225,7 +239,7 @@ class McpMetaAgent:
                 {"role": "user", "content": f"Question: {question}"}
             ]
             answer_text = ""
-            walk_started = False
+            walk_start_count = 0   # total breadth pivots taken
             done_seen = False
 
             for round_idx in range(self.max_rounds):
@@ -256,15 +270,16 @@ class McpMetaAgent:
                     if tu.name not in _ALLOWED_TOOLS:
                         result_text = (f"Tool {tu.name} not permitted — only "
                                        "walk_start and walk_next are allowed.")
-                    elif tu.name == "walk_next" and not walk_started:
-                        # Guard : walk_next without walk_start.
+                    elif tu.name == "walk_next" and walk_start_count == 0:
+                        # Guard : walk_next without any walk_start.
                         result_text = ("Call walk_start first.")
                     else:
                         call_result = await session.call_tool(tu.name, tu.input)
                         result_text = _tool_result_text(call_result)
                         seen_ids.update(_extract_fact_ids(call_result))
                         if tu.name == "walk_start":
-                            walk_started = True
+                            walk_start_count += 1
+                            done_seen = False  # reset — new walk, new chance
                         # Detect done flag for trace.
                         try:
                             if json.loads(result_text).get("done"):
@@ -282,8 +297,11 @@ class McpMetaAgent:
 
                 messages.append({"role": "user", "content": tool_results})
 
-                if done_seen:
-                    # Walk exhausted — force a final answer next round.
+                # Force final answer only after the agent has had a chance
+                # to try a breadth pivot (second walk_start). A single
+                # done=true should be a signal to pivot, not to stop.
+                if done_seen and walk_start_count >= 2:
+                    # Two breadth threads exhausted — enough evidence.
                     messages.append({
                         "role": "user",
                         "content": "Walk finished. Give the final answer "
