@@ -218,6 +218,38 @@ _INTERJECTION_RE = re.compile(
 # Strip a "(D4:11)" / "from D4:11" / "D4:11" dialog-id citation the
 # agent sometimes leaks into the answer.
 _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
+
+# Absolute-date patterns for "when" question extraction, most specific first :
+#   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
+_MONTHS = (r"(?:January|February|March|April|May|June|July|August|"
+           r"September|October|November|December)")
+_DATE_RES = [
+    re.compile(rf"\b\d{{1,2}}\s+{_MONTHS}\s+\d{{4}}\b", re.IGNORECASE),
+    re.compile(rf"\b{_MONTHS}\s+\d{{1,2}},?\s+\d{{4}}\b", re.IGNORECASE),
+    re.compile(rf"\b{_MONTHS}\s+\d{{4}}\b", re.IGNORECASE),
+    re.compile(rf"\b{_MONTHS}\s+\d{{1,2}}\b", re.IGNORECASE),
+    re.compile(r"\b\d{4}\b"),
+]
+
+
+def _extract_date(text: str) -> Optional[str]:
+    """Pull the first absolute date out of a verbose 'when' answer.
+
+    Prefers a leading "[session date]" bracket (the memory turn's own
+    timestamp, the most reliable anchor for when an event happened),
+    then falls back to the first date pattern anywhere in the text.
+    """
+    m = re.match(r"\s*\[([^\]]+)\]", text)
+    if m:
+        for rx in _DATE_RES:
+            d = rx.search(m.group(1))
+            if d:
+                return d.group(0).strip()
+    for rx in _DATE_RES:
+        d = rx.search(text)
+        if d:
+            return d.group(0).strip()
+    return None
 # Compound-phrase cutters : keep the head label, drop trailing
 # elaboration. Order matters — most specific first.
 _COMPOUND_CUTTERS = [
@@ -237,7 +269,7 @@ _COMPOUND_CUTTERS = [
 ]
 
 
-def terse(text: str) -> str:
+def terse(text: str, question: Optional[str] = None) -> str:
     """Strip Haiku's preamble/interjection wrapping. Mirrors the helper
     in mcp_agent.py — keeps the bare value the F1 metric scores on.
 
@@ -250,10 +282,22 @@ def terse(text: str) -> str:
     bare label on its OWN line at the end. If we see that pattern (the
     text has multiple lines, ends with a short line ≤ 8 words and no
     sentence terminator before it), keep only the trailing label line.
+
+    When `question` is a "when …" question and the answer is verbose
+    (the agent pasted a whole "[date] Speaker: …" citation), extract the
+    bare absolute date — that is all the F1 metric scores on.
     """
     if not text:
         return text
     t = text.strip()
+    # "When …" questions : if the agent dumped a citation instead of a bare
+    # date, pull the date out. Only when the text is verbose (>5 words) —
+    # a clean "19 January 2023" already passes through untouched.
+    if question and re.match(r"\s*when\b", question, re.IGNORECASE) \
+            and len(t.split()) > 5 and "not mentioned" not in t.lower():
+        d = _extract_date(t)
+        if d:
+            return d
     # Bold-marked answer — take the first bold span that is a real value,
     # skipping two traps:
     #  - a bold dialog-id citation ("From **D2:7** …") : the agent bolds the
@@ -515,7 +559,7 @@ class McpMetaAgent:
                               "action": "forced_final"})
 
         return {
-            "answer": terse(answer_text),
+            "answer": terse(answer_text, question),
             "answer_raw": answer_text,
             "steps": len([t for t in trace if t["action"] == "tool"]),
             "tokens_in": total_in,
