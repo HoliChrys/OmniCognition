@@ -31,48 +31,15 @@ from typing import Any, Dict, List
 from metacog import Memory
 
 
-# Official LoCoMo metric — VERBATIM from snap-research/locomo
-# task_eval/evaluation.py (normalize_answer + f1_score). We use the
-# official function directly so our F1 is the published token-F1, not a
-# reimplementation. normalize_answer: drop commas, strip a/an/the/and,
-# remove punctuation, lowercase, whitespace-fix. f1_score: Porter-stem
-# every token, then token-overlap precision/recall harmonic mean.
-import regex as _regex          # official uses `regex`, not `re`
-from collections import Counter as _Counter
-from nltk.stem import PorterStemmer as _PorterStemmer
-
-_ps = _PorterStemmer()
-
-
-def normalize_answer(s: str) -> str:
-    s = (s or "").replace(",", "")
-
-    def remove_articles(text):
-        return _regex.sub(r"\b(a|an|the|and)\b", " ", text)
-
-    def white_space_fix(text):
-        return " ".join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def f1_score(prediction: str, ground_truth: str) -> float:
-    prediction_tokens = [_ps.stem(w) for w in normalize_answer(prediction).split()]
-    ground_truth_tokens = [_ps.stem(w) for w in normalize_answer(ground_truth).split()]
-    common = _Counter(prediction_tokens) & _Counter(ground_truth_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = 1.0 * num_same / len(prediction_tokens)
-    recall = 1.0 * num_same / len(ground_truth_tokens)
-    return (2 * precision * recall) / (precision + recall)
+# Official LoCoMo metric — imported VERBATIM from the vendored upstream
+# (benchmarks/locomo/official_locomo_eval.py, copied from snap-research/
+# locomo task_eval/evaluation.py). We do NOT reimplement scoring : the
+# math and the per-category dispatch are the upstream code.
+from benchmarks.locomo.official_locomo_eval import (  # noqa: E402
+    f1_score,
+    normalize_answer,
+    score_qa as official_score,
+)
 
 
 def make_encoder(name: str):
@@ -290,7 +257,9 @@ def evaluate_sample(
                 agent_recall = len(agent_seen & ev_set) / len(ev_set)
         else:  # "chunk"
             pred = " ".join(r["content"] for r in results[:top_chunks_for_answer])
-        f1 = f1_score(pred, gold_answer)
+        # Official per-category scoring (cat5 = abstention, cat1 = multi-hop
+        # sub-answer F1, cat3 = first ';'-clause, cat2/4 = token-F1).
+        f1 = official_score(pred, gold_answer, category)
 
         per_cat[category]["n"] += 1
         per_cat[category]["recall_at_5"] += r5
