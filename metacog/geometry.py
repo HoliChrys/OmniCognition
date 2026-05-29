@@ -196,7 +196,7 @@ def retrieve_with_lineage(
     k: int,
     t_now: float,
     *,
-    lineage_depth: int = 1,
+    lineage_depth: int = 7,
     cosine_pool_size: int = 30,
     rrf_k: int = 60,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
@@ -223,11 +223,13 @@ def retrieve_with_lineage(
         p.id: i for i, (_, p) in enumerate(pool)
     }
 
+    # BFS expansion : lineage rank penalizes depth so deeper hops
+    # contribute less to RRF (rank = seed_rank + depth * pool_size).
     lineage_rank_by_id: dict[str, int] = {}
-    for rank, (_, seed) in enumerate(pool):
-        # BFS frontier expansion
+    pool_len = max(1, len(pool))
+    for seed_rank, (_, seed) in enumerate(pool):
         frontier = {seed.id}
-        for _depth in range(lineage_depth):
+        for depth in range(1, lineage_depth + 1):
             next_frontier: set[str] = set()
             for pid in frontier:
                 p = points_by_id.get(pid)
@@ -240,9 +242,10 @@ def retrieve_with_lineage(
                     neighbors.append(p.sequence_prev)
                 if p.sequence_next:
                     neighbors.append(p.sequence_next)
+                effective_rank = seed_rank + depth * pool_len
                 for nid in neighbors:
                     if nid in points_by_id and nid not in lineage_rank_by_id:
-                        lineage_rank_by_id[nid] = rank
+                        lineage_rank_by_id[nid] = effective_rank
                         next_frontier.add(nid)
             frontier = next_frontier
 
@@ -269,7 +272,7 @@ def retrieve_hybrid(
     encoder,
     extractor,
     use_lineage: bool = False,
-    lineage_depth: int = 1,
+    lineage_depth: int = 7,
     pool_per_signal: int = 14,
     rrf_k: int = 60,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
@@ -325,12 +328,13 @@ def retrieve_hybrid(
     fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
     top_ids = [pid for pid, _ in fused[:k]]
 
-    # Phase 4 — optional lineage expansion
+    # Phase 4 — optional lineage expansion with depth-penalized rank
     if use_lineage:
         lineage_rank_by_id: dict[str, int] = {}
-        for rank, pid in enumerate(top_ids):
+        seed_pool_len = max(1, len(top_ids))
+        for seed_rank, pid in enumerate(top_ids):
             frontier = {pid}
-            for _depth in range(lineage_depth):
+            for depth in range(1, lineage_depth + 1):
                 next_frontier: set[str] = set()
                 for fid in frontier:
                     p = points_by_id.get(fid)
@@ -343,9 +347,10 @@ def retrieve_hybrid(
                         neighbors.append(p.sequence_prev)
                     if p.sequence_next:
                         neighbors.append(p.sequence_next)
+                    effective_rank = seed_rank + depth * seed_pool_len
                     for nid in neighbors:
                         if nid in points_by_id and nid not in lineage_rank_by_id:
-                            lineage_rank_by_id[nid] = rank
+                            lineage_rank_by_id[nid] = effective_rank
                             next_frontier.add(nid)
                 frontier = next_frontier
         for pid, lrank in lineage_rank_by_id.items():

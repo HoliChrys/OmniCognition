@@ -234,7 +234,7 @@ class Memory:
         observator_id: Optional[str] = None,
         use_lineage: bool = False,
         use_hybrid: bool = False,
-        lineage_depth: int = 1,
+        lineage_depth: int = 7,
         t: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
