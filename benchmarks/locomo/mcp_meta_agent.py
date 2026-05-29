@@ -547,8 +547,10 @@ class McpMetaAgent:
                             messages=messages + [{
                                 "role": "user",
                                 "content": ("Call final_answer with the bare "
-                                            "value only, copied verbatim from "
-                                            "the evidence — no narration."),
+                                            "value, following the format rules "
+                                            "(absolute calendar date for "
+                                            "'when'; shortest label; full list "
+                                            "for plural). No narration."),
                             }],
                         )
                         if hasattr(fr, "usage"):
