@@ -44,6 +44,41 @@ def beta_sigma(point: "Point") -> float:  # noqa: F821
     return math.sqrt(max(0.0, point.uncertainty))
 
 
+def keyword_sigma(point: "Point") -> float:  # noqa: F821
+    """Position-aware keyword uncertainty.
+
+    Keywords are stored ORDERED by salience. Their ordered list defines
+    a position-weighted "evidential mass" :
+
+        M(p)  =  Σ_i  1 / (i+1)            (canonical 1/(i+1) decay,
+                                            same family as RRF)
+
+    The keyword-level σ is then 1 / sqrt(1 + M). A point with no
+    keywords has σ_kw = 1 ; one with one keyword has σ_kw ≈ 0.71 ;
+    five keywords push it to ≈ 0.55. Position matters because adding a
+    second keyword (weight 0.5) reduces σ less than adding a first one
+    (weight 1.0), exactly as salience-decreasing terms should.
+    """
+    kws = point.keywords or []
+    mass = sum(1.0 / (i + 1) for i in range(len(kws)))
+    return 1.0 / math.sqrt(1.0 + mass)
+
+
+def node_sigma(point: "Point") -> float:  # noqa: F821
+    """Combined σ : β-uncertainty AND keyword-order uncertainty,
+    composed in quadrature (independent contributions, GUM 1995).
+
+    The walker's `least_uncertain` should use THIS, not beta_sigma
+    alone, so a point with strong counters but weak/few keywords is
+    correctly penalized — the keyword list is the projection of the
+    point's content onto the entity manifold, and a weak projection
+    means a weak retrieval handle.
+    """
+    bs = beta_sigma(point)
+    ks = keyword_sigma(point)
+    return math.sqrt(bs * bs + ks * ks)
+
+
 def hop_sigma(parent: "Point", child: "Point", t_now: float) -> float:  # noqa: F821
     """Uncertainty added by a single BFS hop.
 

@@ -418,8 +418,11 @@ def retrieve_hybrid(
     # Phase 1 — cosine on keyword embeddings
     query_kw = extractor.extract(query_text, n=8) if extractor else []
     if query_kw:
-        query_kw_text = " ".join(query_kw)
-        query_kw_emb = tuple(encoder.encode(query_kw_text))
+        # Symmetric with the points' position-weighted keyword
+        # embedding so the cosine respects keyword salience order.
+        from metacog.keywords import position_weighted_keyword_embedding
+        pwe = position_weighted_keyword_embedding(query_kw, encoder)
+        query_kw_emb = pwe if pwe is not None else tuple(encoder.encode(query_text))
     else:
         query_kw_emb = tuple(encoder.encode(query_text))
 

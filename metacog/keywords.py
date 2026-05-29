@@ -55,6 +55,46 @@ _BASIC_STOPWORDS = frozenset({
 })
 
 
+def position_weighted_keyword_embedding(
+    keywords, encoder,
+):
+    """Position-aware keyword embedding.
+
+    Keywords are returned ORDERED by salience (top keyword = most
+    discriminative entity). Encoding the joined string treats them as
+    a bag, so order is washed out. We instead :
+
+      emb = Σ_i  enc(kw_i) / (i+1)        # position weighting
+      emb = emb / ||emb||                  # L2 normalize
+
+    The weight 1/(i+1) is the same canonical decay used by RRF (and the
+    apply_pull step size) — no hyperparameter. The top keyword
+    contributes the full encoder output ; the i-th contributes 1/(i+1).
+    Two nodes that share their TOP keywords land closer in the manifold
+    than two nodes whose keywords overlap only at the tail.
+
+    Returns None if the input is empty.
+    """
+    import math
+
+    kws = [k for k in (keywords or []) if k]
+    if not kws:
+        return None
+    acc = None
+    for i, kw in enumerate(kws):
+        v = encoder.encode(kw)
+        w = 1.0 / (i + 1)
+        if acc is None:
+            acc = [x * w for x in v]
+        else:
+            for j, x in enumerate(v):
+                acc[j] += x * w
+    norm = math.sqrt(sum(x * x for x in acc))
+    if norm < 1e-12:
+        return tuple(acc)
+    return tuple(x / norm for x in acc)
+
+
 class KeywordExtractor(Protocol):
     """Protocol for keyword extractors injected into Memory."""
 

@@ -48,7 +48,11 @@ from metacog.geometry import (
     retrieve_hybrid,
     retrieve_with_lineage,
 )
-from metacog.keywords import KeywordExtractor, SimpleKeywordExtractor
+from metacog.keywords import (
+    KeywordExtractor,
+    SimpleKeywordExtractor,
+    position_weighted_keyword_embedding,
+)
 from metacog.observator import (
     Observator,
     delegate_query,
@@ -122,7 +126,7 @@ class Memory:
         if self.extractor is not None:
             kws = self.extractor.extract(content, n=5)
             if kws:
-                kw_emb = tuple(self.encoder.encode(" ".join(kws)))
+                kw_emb = position_weighted_keyword_embedding(kws, self.encoder)
                 kw_src = getattr(self.extractor, "source", SourceClass.COMPUTATION)
         point = Point(
             id=id,
@@ -190,7 +194,9 @@ class Memory:
         if new_kws == list(point.keywords):
             return  # no change, skip embedding recompute
         point.keywords = new_kws
-        point.keywords_embedding = tuple(self.encoder.encode(" ".join(new_kws)))
+        point.keywords_embedding = position_weighted_keyword_embedding(
+            new_kws, self.encoder,
+        )
         # source class follows the extractor
         point.keywords_source = getattr(
             self.extractor, "source", SourceClass.COMPUTATION,

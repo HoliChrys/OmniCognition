@@ -60,7 +60,8 @@ from metacog.geometry import (
     effective_keyword_embedding,
     geometric_spread,
 )
-from metacog.uncertainty import beta_sigma
+from metacog.keywords import position_weighted_keyword_embedding
+from metacog.uncertainty import beta_sigma, node_sigma
 
 
 # Hard caps per generation step. Not tuning knobs : token budget per
@@ -96,6 +97,63 @@ class MetaWalkTrajectory:
     # the answerer (or the F1 scorer downstream) treats as "evidence".
     fact_ids_cumulative: List[str] = field(default_factory=list)
     generated_point_ids: List[str] = field(default_factory=list)
+
+
+def _node_payload(p: Point) -> dict:
+    """Compact JSON-ready dump of a node for an external (MCP) caller.
+
+    Always carries the INDEXED CONTENT so the agent driving the walk
+    over MCP can reason on the actual text, not just ids — even though
+    retrieval itself runs on keyword kNN.
+    """
+    return {
+        "id": p.id,
+        "kind": p.kind.value,
+        "content": p.content,
+        "keywords": list(p.keywords),
+        "confidence": round(p.confidence, 3),
+        "uncertainty": round(beta_sigma(p), 3),
+        "n_corrob": p.n_corrob,
+        "n_contra": p.n_contra,
+        "n_uses": p.n_uses,
+        "state": p.state.value,
+        "source": p.keywords_source.value if p.keywords_source else None,
+    }
+
+
+@dataclass
+class StageOutput:
+    """One stage's result as returned to an MCP caller.
+
+    Carries full content of every retrieved node (not just ids) plus a
+    'done' flag that lets the agent decide whether to call walk_next
+    or move on to synthesis.
+    """
+
+    stage: int
+    facts: List[dict]
+    actions: List[dict]
+    chosen_fact: Optional[dict]
+    chosen_action: Optional[dict]
+    thought: Optional[dict]
+    generated_action: bool
+    generated_thought: bool
+    fact_ids_cumulative: List[str]
+    done: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "stage": self.stage,
+            "facts": self.facts,
+            "actions": self.actions,
+            "chosen_fact": self.chosen_fact,
+            "chosen_action": self.chosen_action,
+            "thought": self.thought,
+            "generated_action": self.generated_action,
+            "generated_thought": self.generated_thought,
+            "fact_ids_cumulative": list(self.fact_ids_cumulative),
+            "done": self.done,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +234,17 @@ def nearest_facts_with_fallback(
 
 
 def least_uncertain(facts: Sequence[Point]) -> Optional[Point]:
-    """Return the most epistemically certain fact (lowest β-σ)."""
+    """Return the most epistemically certain fact, using the COMBINED
+    σ : β-uncertainty AND keyword-order uncertainty (node_sigma).
+
+    A fact with strong counters but weak/few keywords is correctly
+    penalized — the keyword list is its projection onto the entity
+    manifold ; a weak projection means a weak retrieval handle, so it
+    should not win the "least uncertain" vote at this stage.
+    """
     if not facts:
         return None
-    return min(facts, key=beta_sigma)
+    return min(facts, key=node_sigma)
 
 
 def nearest_action_to(
@@ -312,7 +377,7 @@ def generate_action(
     if not text:
         return None
     kws = extractor.extract(text, n=5) if extractor else []
-    kw_emb = tuple(encoder.encode(" ".join(kws))) if kws else None
+    kw_emb = position_weighted_keyword_embedding(kws, encoder)
     return Point(
         id=_gen_id("act_gen", t_now),
         content=text,
@@ -398,7 +463,7 @@ def meta_thought(
             seen.add(kw)
             merged.append(kw)
     kws = merged[:8]
-    kw_emb = tuple(encoder.encode(" ".join(kws))) if kws else None
+    kw_emb = position_weighted_keyword_embedding(kws, encoder)
     return Point(
         id=_gen_id("thought_meta", t_now),
         content=text,
@@ -513,10 +578,11 @@ def meta_walk(
 
     traj = MetaWalkTrajectory(query=query)
 
-    # Stage 0 : seed from the raw query
+    # Stage 0 : seed from the raw query — position-weighted on its
+    # extracted keywords so the most salient one drives the embedding.
     query_kws = extractor.extract(query, n=8) if extractor else []
-    query_kw_text = " ".join(query_kws) if query_kws else query
-    query_emb = tuple(enc.encode(query_kw_text))
+    pwe = position_weighted_keyword_embedding(query_kws, enc) if query_kws else None
+    query_emb = pwe if pwe is not None else tuple(enc.encode(query))
 
     facts = nearest_facts_with_fallback(
         query_emb, query, memory.points, facts_per_stage, t_now,
@@ -574,7 +640,8 @@ def meta_walk(
 
     for stage in range(1, n_stages):
         kws_new = cur_thought.keywords or query_kws
-        new_emb = tuple(enc.encode(" ".join(kws_new))) if kws_new else query_emb
+        pwe_n = position_weighted_keyword_embedding(kws_new, enc) if kws_new else None
+        new_emb = pwe_n if pwe_n is not None else query_emb
 
         # FACT retrieval with BM25 fallback when keyword kNN runs dry.
         # The fallback query text combines the new keyword set so BM25
@@ -634,3 +701,235 @@ def meta_walk(
         cur_thought = thought_next
 
     return traj
+
+
+# ---------------------------------------------------------------------------
+# Stateful walker for MCP-driven step-by-step traversal
+# ---------------------------------------------------------------------------
+
+
+class MetaWalker:
+    """Stateful one-step-at-a-time meta-cognitive walker.
+
+    Designed for an external agent driving the walk over MCP : the agent
+    calls `step()` after each stage, sees the full content of every
+    retrieved node, decides whether to keep going or to synthesize.
+
+    Construction runs stage 0 immediately (so the first `step()` returns
+    stage 0). Each subsequent `step()` either advances or signals
+    `done=True` if the walk is exhausted (no new facts, no new action,
+    or the configured `n_stages` ceiling reached).
+
+    The walker holds a reference to the live `memory`, so generated
+    THOUGHT/ACTION points are appended to it as they are produced —
+    they participate in collision/observator mechanics like any other
+    Point. Cor. 5 : all generated points carry `source=GENERATOR`.
+    """
+
+    def __init__(
+        self,
+        query: str,
+        memory: Any,
+        *,
+        n_stages: int = _DEFAULT_STAGES,
+        facts_per_stage: int = _FACTS_PER_STAGE,
+        actions_per_stage: int = _ACTIONS_PER_STAGE,
+        pull_strength: float = 1.0,
+        t_now: Optional[float] = None,
+    ) -> None:
+        self.query = query
+        self.memory = memory
+        self.n_stages = n_stages
+        self.facts_per_stage = facts_per_stage
+        self.actions_per_stage = actions_per_stage
+        self.pull_strength = pull_strength
+        self.t_now = (
+            t_now if t_now is not None
+            else (memory._now() if hasattr(memory, "_now") else 0.0)
+        )
+
+        self._enc = memory.encoder
+        self._extr = memory.extractor
+        self._llm = memory.llm
+
+        # Stage-0 seed embedding from the query keywords. Position-
+        # weighted (1/(i+1) decay) so the top keyword drives the vector.
+        q_kws = self._extr.extract(query, n=8) if self._extr else []
+        self._query_keywords = q_kws
+        pwe0 = position_weighted_keyword_embedding(q_kws, self._enc) if q_kws else None
+        self._cur_emb = pwe0 if pwe0 is not None else tuple(self._enc.encode(query))
+
+        self._fact_ids_cum: List[str] = []
+        self._visited_fact_ids: set = set()
+        self._visited_action_ids: set = set()
+        self._prev_action: Optional[Point] = None
+        self._cur_thought: Optional[Point] = None
+        self._stage_idx = 0
+        self._done = False
+        self._generated_ids: List[str] = []
+
+    # ----------------------------------------------------------------
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @property
+    def generated_point_ids(self) -> List[str]:
+        return list(self._generated_ids)
+
+    # ----------------------------------------------------------------
+    # The step
+    # ----------------------------------------------------------------
+
+    def step(self) -> StageOutput:
+        """Advance one stage and return the StageOutput. Sets done=True
+        on the returned output when the walk cannot continue further."""
+        if self._done:
+            # Idempotent : repeated calls after exhaustion return an
+            # empty done-stage instead of raising.
+            return StageOutput(
+                stage=self._stage_idx,
+                facts=[], actions=[],
+                chosen_fact=None, chosen_action=None, thought=None,
+                generated_action=False, generated_thought=False,
+                fact_ids_cumulative=list(self._fact_ids_cum),
+                done=True,
+            )
+
+        # Retrieval — for stage 0 we seed from the query embedding ; for
+        # later stages from the current thought's enriched keywords (set
+        # at the end of the previous step).
+        if self._stage_idx == 0:
+            seed_query = self.query
+        else:
+            seed_kws = self._cur_thought.keywords if self._cur_thought else []
+            seed_query = " ".join(seed_kws) if seed_kws else self.query
+
+        facts = nearest_facts_with_fallback(
+            self._cur_emb, seed_query, self.memory.points,
+            self.facts_per_stage, self.t_now,
+            exclude_ids=self._visited_fact_ids,
+        )
+
+        # ACTIONs : at stage 0 nearest by query embedding ; at later
+        # stages nearest to the previous action.
+        if self._stage_idx == 0 or self._prev_action is None:
+            actions = [
+                p for _s, p in nearest_by_kind(
+                    self._cur_emb, self.memory.points, PointKind.ACTION,
+                    self.actions_per_stage, self.t_now,
+                    exclude_ids=self._visited_action_ids,
+                )
+            ]
+        else:
+            a = nearest_action_to(
+                self._prev_action, self.memory.points, self.t_now,
+                exclude_ids=self._visited_action_ids,
+            )
+            actions = [a] if a else []
+
+        gen_action = False
+        if not actions and facts:
+            generated = generate_action(
+                facts, self._llm, self._enc, self._extr, self.t_now,
+            )
+            if generated is not None:
+                self.memory.points.append(generated)
+                actions = [generated]
+                gen_action = True
+                self._generated_ids.append(generated.id)
+
+        fact_star = least_uncertain(facts)
+        action_star = actions[0] if actions else None
+
+        # Accumulate FACT ids (this is the "effective recall" the
+        # answerer sees across the whole walk).
+        for f in facts:
+            if f.id not in self._visited_fact_ids:
+                self._fact_ids_cum.append(f.id)
+                self._visited_fact_ids.add(f.id)
+        if action_star and action_star.id not in self._visited_action_ids:
+            self._visited_action_ids.add(action_star.id)
+
+        gen_thought = False
+        thought: Optional[Point] = None
+        if fact_star is not None and action_star is not None:
+            # Hebbian co-activation + use bump.
+            apply_pull(fact_star, action_star,
+                       polarity=+self.pull_strength, t_now=self.t_now)
+            fact_star.n_uses += 1
+            action_star.n_uses += 1
+
+            thought = meta_thought(
+                fact_star, action_star, self.memory.points,
+                self._llm, self._enc, self._extr, self.t_now,
+            )
+            if thought is not None:
+                self.memory.points.append(thought)
+                gen_thought = True
+                self._generated_ids.append(thought.id)
+                self._cur_thought = thought
+                # Refresh the query embedding for the NEXT stage from
+                # the thought's enriched keywords.
+                kws = thought.keywords or self._query_keywords
+                if kws:
+                    pwe = position_weighted_keyword_embedding(kws, self._enc)
+                    if pwe is not None:
+                        self._cur_emb = pwe
+
+        out = StageOutput(
+            stage=self._stage_idx,
+            facts=[_node_payload(p) for p in facts],
+            actions=[_node_payload(p) for p in actions if p is not None],
+            chosen_fact=_node_payload(fact_star) if fact_star else None,
+            chosen_action=_node_payload(action_star) if action_star else None,
+            thought=_node_payload(thought) if thought else None,
+            generated_action=gen_action,
+            generated_thought=gen_thought,
+            fact_ids_cumulative=list(self._fact_ids_cum),
+            done=False,
+        )
+
+        self._prev_action = action_star
+
+        # Terminal conditions for the NEXT step.
+        next_idx = self._stage_idx + 1
+        cant_continue = (
+            fact_star is None
+            or action_star is None
+            or thought is None
+        )
+        if cant_continue or next_idx >= self.n_stages:
+            self._done = True
+            out.done = True
+
+        self._stage_idx = next_idx
+        return out
+
+
+# ---------------------------------------------------------------------------
+# In-process walker registry (per-MCP-server) for tool-call continuity
+# ---------------------------------------------------------------------------
+
+
+class WalkerRegistry:
+    """Holds active MetaWalker instances by walk_id so a sequence of
+    MCP tool calls (walk_start → walk_next → walk_next → …) can drive
+    the same walk."""
+
+    def __init__(self) -> None:
+        self._walkers: dict = {}
+        self._counter: int = 0
+
+    def open(self, walker: MetaWalker) -> str:
+        self._counter += 1
+        walk_id = f"walk_{self._counter}"
+        self._walkers[walk_id] = walker
+        return walk_id
+
+    def get(self, walk_id: str) -> Optional[MetaWalker]:
+        return self._walkers.get(walk_id)
+
+    def close(self, walk_id: str) -> None:
+        self._walkers.pop(walk_id, None)
