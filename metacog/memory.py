@@ -561,6 +561,53 @@ class Memory:
         self.observators[id] = obs
         return obs
 
+    def auto_cluster_observators(
+        self,
+        *,
+        min_cluster_size: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Detect Level-1 communities over the FACTs and instantiate one
+        named observator per community (à la GraphRAG / LightRAG).
+
+        Single-pass Louvain on the cleaned-content similarity graph.
+        THOUGHTs, ACTIONs, and entity beacons are excluded ; FACTs not in
+        a large-enough community stay attached only to the default
+        observator.
+
+        Each point in a community gets an ObservatorView marker so
+        retrieve_for_observator / select_observators can route to it.
+        Observators can call each other via observator.delegate_query
+        (cycle- and depth-bounded).
+
+        Returns a list of {id, name, keywords, point_ids} dicts.
+        """
+        from metacog.communities import detect_level1_communities
+        from metacog.observator import ObservatorView
+
+        comms = detect_level1_communities(
+            self.points, self.encoder,
+            min_cluster_size=min_cluster_size,
+        )
+        out: List[Dict[str, Any]] = []
+        for c in comms:
+            obs = self.declare_observator(
+                c.id,
+                name=" / ".join(c.keywords[:3]) if c.keywords else c.id,
+                keywords=c.keywords,
+            )
+            member_set = set(c.point_ids)
+            for p in self.points:
+                if p.id in member_set and obs.id not in p.observator_views:
+                    p.observator_views[obs.id] = ObservatorView()
+            out.append({
+                "id": obs.id,
+                "name": obs.name,
+                "keywords": c.keywords,
+                "point_ids": c.point_ids,
+                "n_points": len(c.point_ids),
+            })
+        return out
+
     def detect_polarized_points(self) -> List[str]:
         return [p.id for p in self.points if detect_polarization(p)]
 
