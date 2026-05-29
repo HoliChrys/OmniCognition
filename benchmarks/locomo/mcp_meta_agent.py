@@ -35,7 +35,7 @@ _MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
 
 # Only the walk tools — the agent should NOT bypass the walk by
 # calling raw retrieve. This is enforced server-side AND client-side.
-_ALLOWED_TOOLS = {"walk_start", "walk_next"}
+_ALLOWED_TOOLS = {"walk_start", "walk_next", "list_communities"}
 
 # Constrained final-answer tool (literature : constrained decoding +
 # strict tool-use tames the verbose tail that costs token-F1). The agent
@@ -104,6 +104,14 @@ Workflow :
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
+
+OPTIONAL focus : `list_communities()` returns topical groups of the
+conversation ({id, keywords}). If ONE group's keywords clearly match the
+question's topic, you MAY pass its id as walk_start(observator_id=…) to
+focus retrieval on that group's turns (entity/date anchors stay visible).
+Use this only when a group is an obvious topical match ; otherwise walk
+the whole memory normally. Never let it make you answer "Not mentioned" —
+if a focused walk drifts, pivot to a normal walk_start without the id.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").
