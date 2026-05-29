@@ -76,6 +76,36 @@ def effective_embedding(point: "Point", t_now: float) -> Vector:  # noqa: F821
     return vec_add(vec_add(point.embedding_orig, active_now), point.delta_latent)
 
 
+def effective_keyword_embedding(point: "Point", t_now: float) -> Vector:  # noqa: F821
+    """Effective KEYWORD embedding for geometric operations.
+
+    Returns keywords_embedding + decayed(delta_active) + delta_latent
+    when the point has a keyword embedding ; falls back to the
+    content-level effective_embedding otherwise.
+
+    Used by apply_pull, apply_exile, and collision detection — the
+    geometric "pull / push / merge" mechanism operates at the entity
+    level (keywords) rather than at the surface-form level (content).
+    Two points with the same entities but different phrasing are
+    treated as attracted ; two points with different entities are
+    treated as orthogonal, regardless of how similar their content
+    reads on the surface.
+
+    The same delta_active / delta_latent vectors apply to BOTH the
+    content embedding and the keyword embedding (they share the
+    encoder dimension), so a single Hebbian drift carries through
+    both representations consistently.
+    """
+    if not point.keywords_embedding:
+        return effective_embedding(point, t_now)
+    decay = decay_factor(t_now, point.t_last_obs)
+    active_now = vec_scale(point.delta_active, decay)
+    return vec_add(
+        vec_add(tuple(point.keywords_embedding), active_now),
+        point.delta_latent,
+    )
+
+
 def apply_pull(
     point_i: "Point",  # noqa: F821
     point_j: "Point",  # noqa: F821
@@ -84,29 +114,29 @@ def apply_pull(
     *,
     bidirectional: bool = True,
 ) -> None:
-    """Geometric distillation between two points.
+    """Geometric distillation between two points OPERATING ON THE
+    KEYWORD EMBEDDING.
 
     Positive polarity → pull together. Negative → push apart.
 
-    By default both points move (bidirectional). For Chasles compression
-    we pass `bidirectional=False` so that only `point_i` is repositioned
-    and `point_j` (the anchor) remains fixed.
+    By default both points move (bidirectional). For Chasles
+    compression we pass `bidirectional=False` so that only `point_i`
+    is repositioned and `point_j` (the anchor) remains fixed.
 
-    Step size is `1 / (1 + n_obs)` per point — parameter-free, decreases
-    with epistemic experience.
+    Step size is `1 / (1 + n_obs)` per point — parameter-free.
 
-    Order with respect to `apply_observation`:
-      apply_pull MUST run before apply_observation, because apply_pull
-      reads `t_last_obs` to compute lazy decay, and apply_observation
-      overwrites it.
+    Direction is computed from effective_keyword_embedding so the
+    pull acts at the entity level : two points with the same
+    keywords are pulled together even if their surface-form content
+    differs, and pushed apart pulls them along the keyword axis
+    rather than the noisy content axis.
     """
     # Lazy-refresh i's stored active (we're going to mutate it)
     decay_i = decay_factor(t_now, point_i.t_last_obs)
     point_i.delta_active = vec_scale(point_i.delta_active, decay_i)
 
-    # Compute direction from CURRENT effective embeddings
-    eff_i = effective_embedding(point_i, t_now)
-    eff_j = effective_embedding(point_j, t_now)
+    eff_i = effective_keyword_embedding(point_i, t_now)
+    eff_j = effective_keyword_embedding(point_j, t_now)
     raw_dir = vec_sub(eff_j, eff_i)
     if vec_norm(raw_dir) < _EPS:
         return
@@ -127,7 +157,6 @@ def apply_pull(
     if not bidirectional:
         return
 
-    # Symmetric pull on point_j
     decay_j = decay_factor(t_now, point_j.t_last_obs)
     point_j.delta_active = vec_scale(point_j.delta_active, decay_j)
     n_obs_j = point_j.n_corrob + point_j.n_contra
@@ -196,7 +225,7 @@ def retrieve_with_lineage(
     k: int,
     t_now: float,
     *,
-    lineage_depth: int = 1,
+    lineage_depth: int = 7,
     cosine_pool_size: int = 30,
     rrf_k: int = 60,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
@@ -213,11 +242,6 @@ def retrieve_with_lineage(
                 score(p) = (1 / (rrf_k + rank_cosine(p)))
                          + (1 / (rrf_k + rank_lineage(p)))
 
-    Rationale : pure cosine retrieval has a ceiling — when the right
-    evidence is semantically orthogonal to the question text but
-    structurally adjacent to a retrieved chunk, cosine fails to
-    surface it. Lineage traversal catches these cases.
-
     `rrf_k = 60` is the standard Reciprocal Rank Fusion constant
     (Cormack, Clarke & Buettcher 2009) — not a tuning knob.
     """
@@ -228,16 +252,28 @@ def retrieve_with_lineage(
         p.id: i for i, (_, p) in enumerate(pool)
     }
 
+    # BFS expansion with UNCERTAINTY PROPAGATION pruning.
+    # Branch stops when the accumulated σ_path exceeds the emergent
+    # threshold derived from the population's own σ distribution.
+    # Lineage rank is also inflated by σ_path so high-uncertainty
+    # nodes drop in the final RRF ranking.
+    from metacog.uncertainty import beta_sigma, hop_sigma, prune_threshold
+
     lineage_rank_by_id: dict[str, int] = {}
-    for rank, (_, seed) in enumerate(pool):
-        # BFS frontier expansion
+    sigma_by_id: dict[str, float] = {}
+    pool_len = max(1, len(pool))
+    sigma_cutoff = prune_threshold(points)
+
+    for seed_rank, (_, seed) in enumerate(pool):
+        sigma_by_id.setdefault(seed.id, beta_sigma(seed))
         frontier = {seed.id}
-        for _depth in range(lineage_depth):
+        for _depth in range(1, lineage_depth + 1):
             next_frontier: set[str] = set()
             for pid in frontier:
                 p = points_by_id.get(pid)
                 if p is None:
                     continue
+                current_sigma = sigma_by_id.get(pid, beta_sigma(p))
                 neighbors: list[str] = []
                 neighbors.extend(p.parents)
                 neighbors.extend(p.children)
@@ -246,9 +282,20 @@ def retrieve_with_lineage(
                 if p.sequence_next:
                     neighbors.append(p.sequence_next)
                 for nid in neighbors:
-                    if nid in points_by_id and nid not in lineage_rank_by_id:
-                        lineage_rank_by_id[nid] = rank
-                        next_frontier.add(nid)
+                    if nid not in points_by_id or nid in lineage_rank_by_id:
+                        continue
+                    child = points_by_id[nid]
+                    hop = hop_sigma(p, child, t_now)
+                    propagated = math.sqrt(current_sigma * current_sigma
+                                           + hop * hop)
+                    # Prune over-uncertain branches
+                    if sigma_cutoff is not None and propagated > sigma_cutoff:
+                        continue
+                    sigma_by_id[nid] = propagated
+                    # Rank inflation : seed_rank + σ_propagated × pool_len
+                    effective_rank = seed_rank + int(propagated * pool_len)
+                    lineage_rank_by_id[nid] = effective_rank
+                    next_frontier.add(nid)
             frontier = next_frontier
 
     candidates = set(cosine_rank_by_id) | set(lineage_rank_by_id)
@@ -263,6 +310,152 @@ def retrieve_with_lineage(
 
     ranked = sorted(rrf_scores.items(), key=lambda x: -x[1])[:k]
     return [(score, points_by_id[pid]) for pid, score in ranked]
+
+
+def retrieve_hybrid(
+    query_text: str,
+    points: Sequence["Point"],  # noqa: F821
+    k: int,
+    t_now: float,
+    *,
+    encoder,
+    extractor,
+    use_lineage: bool = False,
+    lineage_depth: int = 7,
+    pool_per_signal: int = 14,
+    rrf_k: int = 60,
+    prefer_kind: Optional["PointKind"] = None,  # noqa: F821
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
+    """Hybrid retrieval :
+      - cosine on KEYWORD embeddings       (entity-level match)
+      - BM25 on full content text          (verbatim / rare-token match)
+      - Reciprocal Rank Fusion → top-k
+      - optional lineage expansion on the fused top-k
+
+    Each signal contributes a pool of `pool_per_signal` candidates,
+    then RRF fuses with the canonical constant `rrf_k = 60`. The two
+    pools are complementary : keyword cosine catches paraphrased
+    references to the same entity ; BM25 catches verbatim dates,
+    names, and rare tokens.
+
+    Points without a `keywords_embedding` are skipped from the cosine
+    signal but remain candidates via BM25.
+
+    `prefer_kind` (étape 5 — preference routing) : when set to a
+    PointKind, points of that kind that already appear in the
+    cosine ∪ BM25 candidate set receive an extra RRF contribution
+    ranked by their best existing rank. This is purely additive — no
+    hyperparameter, no boost factor, no down-weighting of other kinds.
+    Use case : "how do I X" queries pass prefer_kind=PointKind.ACTION
+    so ACTIONs already known to be relevant outrank co-relevant FACTs.
+    """
+    from metacog.bm25 import bm25_score
+
+    points_by_id = {p.id: p for p in points}
+
+    # Phase 1 — cosine on keyword embeddings
+    query_kw = extractor.extract(query_text, n=8) if extractor else []
+    if query_kw:
+        query_kw_text = " ".join(query_kw)
+        query_kw_emb = tuple(encoder.encode(query_kw_text))
+    else:
+        query_kw_emb = tuple(encoder.encode(query_text))
+
+    cosine_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
+    for p in points:
+        if not p.keywords_embedding:
+            continue
+        s = cosine(query_kw_emb, tuple(p.keywords_embedding))
+        cosine_pool.append((s, p))
+    cosine_pool.sort(key=lambda x: x[0], reverse=True)
+    cosine_pool = cosine_pool[:pool_per_signal]
+
+    # Phase 2 — BM25 on full content
+    bm25_pool = bm25_score(query_text, points, k_pool=pool_per_signal)
+
+    # Phase 3 — Reciprocal Rank Fusion
+    rrf_scores: dict[str, float] = {}
+    best_rank_by_id: dict[str, int] = {}
+    for rank, (_, p) in enumerate(cosine_pool):
+        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
+    for rank, (_, p) in enumerate(bm25_pool):
+        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
+
+    # Étape 5 — preference routing : 3rd RRF signal for matching kind.
+    # Points of the preferred kind that are already candidates get an
+    # additional 1/(rrf_k + r) contribution, where r is their best rank
+    # among the preferred-kind subset. Parameter-free (canonical rrf_k).
+    if prefer_kind is not None:
+        kind_candidates = [
+            (best_rank_by_id[pid], pid)
+            for pid in best_rank_by_id
+            if points_by_id[pid].kind == prefer_kind
+        ]
+        kind_candidates.sort(key=lambda x: x[0])
+        for kind_rank, (_, pid) in enumerate(kind_candidates):
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + kind_rank)
+
+    if not rrf_scores:
+        return []
+
+    fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    top_ids = [pid for pid, _ in fused[:k]]
+
+    # Phase 4 — optional lineage expansion with uncertainty propagation
+    if use_lineage:
+        from metacog.uncertainty import beta_sigma, hop_sigma, prune_threshold
+
+        lineage_rank_by_id: dict[str, int] = {}
+        sigma_by_id: dict[str, float] = {}
+        seed_pool_len = max(1, len(top_ids))
+        sigma_cutoff = prune_threshold(points)
+
+        for seed_rank, pid in enumerate(top_ids):
+            seed_p = points_by_id.get(pid)
+            if seed_p is None:
+                continue
+            sigma_by_id.setdefault(pid, beta_sigma(seed_p))
+            frontier = {pid}
+            for _depth in range(1, lineage_depth + 1):
+                next_frontier: set[str] = set()
+                for fid in frontier:
+                    p = points_by_id.get(fid)
+                    if p is None:
+                        continue
+                    current_sigma = sigma_by_id.get(fid, beta_sigma(p))
+                    neighbors: list[str] = []
+                    neighbors.extend(p.parents)
+                    neighbors.extend(p.children)
+                    if p.sequence_prev:
+                        neighbors.append(p.sequence_prev)
+                    if p.sequence_next:
+                        neighbors.append(p.sequence_next)
+                    for nid in neighbors:
+                        if nid not in points_by_id or nid in lineage_rank_by_id:
+                            continue
+                        child = points_by_id[nid]
+                        hop = hop_sigma(p, child, t_now)
+                        propagated = math.sqrt(current_sigma * current_sigma
+                                               + hop * hop)
+                        if sigma_cutoff is not None and propagated > sigma_cutoff:
+                            continue
+                        sigma_by_id[nid] = propagated
+                        effective_rank = seed_rank + int(propagated * seed_pool_len)
+                        lineage_rank_by_id[nid] = effective_rank
+                        next_frontier.add(nid)
+                frontier = next_frontier
+        for pid, lrank in lineage_rank_by_id.items():
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + lrank)
+        fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+    results = [
+        (score, points_by_id[pid])
+        for pid, score in fused[:k]
+        if pid in points_by_id
+    ]
+    return results
 
 
 def retrieve(
@@ -344,7 +537,7 @@ def apply_exile(
     decay = decay_factor(t_now, point.t_last_obs)
     point.delta_active = vec_scale(point.delta_active, decay)
 
-    eff_p = effective_embedding(point, t_now)
+    eff_p = effective_keyword_embedding(point, t_now)
     raw_dir = vec_sub(eff_p, centroid)
     if vec_norm(raw_dir) < _EPS:
         return False

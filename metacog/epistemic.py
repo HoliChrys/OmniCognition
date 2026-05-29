@@ -149,6 +149,7 @@ class Point:
     state: EpistemicState = EpistemicState.CONJECTURE
     keywords: List[str] = field(default_factory=list)
     keywords_source: Optional[SourceClass] = None
+    keywords_embedding: Optional[Vector] = None
     parents: List[str] = field(default_factory=list)
     children: List[str] = field(default_factory=list)
     lineage_depth: int = 0

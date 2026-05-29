@@ -40,7 +40,14 @@ from metacog.epistemic import (
     process_observation,
 )
 from metacog.execution import execute_action
-from metacog.geometry import effective_embedding, retrieve, retrieve_for_observator, retrieve_with_lineage
+from metacog.geometry import (
+    effective_embedding,
+    retrieve,
+    retrieve_for_observator,
+    retrieve_hybrid,
+    retrieve_with_lineage,
+)
+from metacog.keywords import KeywordExtractor, SimpleKeywordExtractor
 from metacog.observator import (
     Observator,
     delegate_query,
@@ -59,6 +66,7 @@ class Memory:
     encoder: Any = field(default_factory=SimpleEncoder)
     llm: Any = field(default_factory=SimpleLLM)
     executor: Any = field(default_factory=NoOpExecutor)
+    extractor: Any = field(default_factory=SimpleKeywordExtractor)
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
@@ -106,6 +114,15 @@ class Memory:
         """
         if id is None:
             id = f"{kind.lower()}_{uuid.uuid4().hex[:8]}"
+        # Extract keywords + their embedding for hybrid retrieval.
+        kws: List[str] = []
+        kw_emb = None
+        kw_src = None
+        if self.extractor is not None:
+            kws = self.extractor.extract(content, n=5)
+            if kws:
+                kw_emb = tuple(self.encoder.encode(" ".join(kws)))
+                kw_src = getattr(self.extractor, "source", SourceClass.COMPUTATION)
         point = Point(
             id=id,
             content=content,
@@ -115,6 +132,9 @@ class Memory:
             lineage_depth=0 if not parents else 1,
             sequence_prev=sequence_prev,
             sequence_next=sequence_next,
+            keywords=kws,
+            keywords_embedding=kw_emb,
+            keywords_source=kw_src,
         )
         self.points.append(point)
         # Backfill the previous point's sequence_next if we know it
@@ -145,6 +165,36 @@ class Memory:
     # Observation
     # ------------------------------------------------------------------
 
+    def _refresh_keywords(self, point: Point, additional_context: str = "") -> None:
+        """Re-extract keywords for a revisited point.
+
+        Called from observe / process_turn / process_observation
+        whenever a point is touched by an observation. Lets the
+        keywords drift as the system learns new context around the
+        point (Hebbian-style entity refresh).
+
+        If `additional_context` is provided, keywords are extracted
+        from `content + " " + additional_context` so the local context
+        (e.g. the user turn that triggered the observation) can
+        influence the entity tags.
+        """
+        if self.extractor is None:
+            return
+        source_text = point.content
+        if additional_context:
+            source_text = f"{point.content} {additional_context}"
+        new_kws = self.extractor.extract(source_text, n=5)
+        if not new_kws:
+            return
+        if new_kws == list(point.keywords):
+            return  # no change, skip embedding recompute
+        point.keywords = new_kws
+        point.keywords_embedding = tuple(self.encoder.encode(" ".join(new_kws)))
+        # source class follows the extractor
+        point.keywords_source = getattr(
+            self.extractor, "source", SourceClass.COMPUTATION,
+        )
+
     def observe(
         self,
         target_ids: List[str],
@@ -172,6 +222,11 @@ class Memory:
             observator_id=observator_id,
         )
         process_observation(self.points, obs, population=self.points)
+        # Refresh keywords for every touched point (entity drift via context)
+        for tid in target_ids:
+            p = next((q for q in self.points if q.id == tid), None)
+            if p is not None:
+                self._refresh_keywords(p, additional_context=raw_content or "")
         return obs
 
     # ------------------------------------------------------------------
@@ -203,6 +258,11 @@ class Memory:
         observations = analyze_user_turn(turn, self.conversation_log, self.points, encoder=self.encoder)
         for obs in observations:
             process_observation(self.points, obs, population=self.points)
+            # Refresh keywords for points touched by detected observations
+            for tid in obs.target_node_ids:
+                p = next((q for q in self.points if q.id == tid), None)
+                if p is not None:
+                    self._refresh_keywords(p, additional_context=text)
         return observations
 
     # ------------------------------------------------------------------
@@ -213,33 +273,57 @@ class Memory:
         self,
         query: str,
         *,
-        k: int = 5,
+        k: int = 7,
         observator_id: Optional[str] = None,
         use_lineage: bool = False,
-        lineage_depth: int = 1,
+        use_hybrid: bool = False,
+        lineage_depth: int = 7,
+        prefer_kind: Optional[str] = None,
         t: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
-        If `use_lineage` is True, runs retrieve_with_lineage : cosine
-        kNN + lineage expansion (parents / children / sequence_prev /
-        sequence_next) + Reciprocal Rank Fusion.
+        Modes :
+          - default              cosine kNN over effective embedding
+          - use_lineage=True     cosine + lineage RRF
+          - use_hybrid=True      cosine on keywords + BM25 on content
+                                 + RRF (+ optional lineage)
+          - observator_id=…      route through that observator's view
+          - prefer_kind=…        boost a PointKind in hybrid RRF (étape 5)
+                                 accepts "FACT" / "THOUGHT" / "ACTION" or
+                                 a PointKind ; ignored unless use_hybrid.
 
-        If `observator_id` is given (and not "default"), routes
-        through that observator's view of state.
+        Default k=7 (≈ matches LoCoMo / typical agentic context budget).
         """
         t_now = self._now(t)
-        q_emb = tuple(self.encoder.encode(query))
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
+            q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
                 q_emb, self.points, k, t_now, observator_id,
             )
+        elif use_hybrid:
+            kind_filter: Optional[PointKind] = None
+            if prefer_kind is not None:
+                kind_filter = (
+                    prefer_kind if isinstance(prefer_kind, PointKind)
+                    else PointKind[prefer_kind.upper()]
+                )
+            results = retrieve_hybrid(
+                query, self.points, k, t_now,
+                encoder=self.encoder,
+                extractor=self.extractor,
+                use_lineage=use_lineage,
+                lineage_depth=lineage_depth,
+                prefer_kind=kind_filter,
+            )
         elif use_lineage:
+            q_emb = tuple(self.encoder.encode(query))
             results = retrieve_with_lineage(
                 q_emb, self.points, k, t_now,
                 lineage_depth=lineage_depth,
             )
         else:
+            q_emb = tuple(self.encoder.encode(query))
             results = retrieve(q_emb, self.points, k, t_now)
         return [
             {

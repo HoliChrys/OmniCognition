@@ -1,17 +1,21 @@
 """
 Claude-API-backed ReAct answerer for the LoCoMo benchmark.
 
-Each step :
-  1. retrieve(query, k) over the Memory (with lineage if enabled)
-  2. accumulate evidence chunks
-  3. ask Claude to decide :
-       {"action": "search", "query": "<refined>"}
-       {"action": "answer", "answer": "<final concise>"}
-  4. loop until "answer" or max_steps
+Designed for a strict token budget : target ≤ 500 tokens / QA with k=7.
 
-Set ANTHROPIC_API_KEY in the environment. Optional knobs :
-  CLAUDE_MODEL          (default : claude-haiku-4-5-20251001 — cheap + fast)
-  CLAUDE_MAX_TOKENS     (default : 512)
+Layout per QA (target) :
+  system        ~ 80 tokens  (format rules only, no examples)
+  user          ~ 250 tokens (question + 7 chunks truncated to ~120 chars)
+  output        ~  25 tokens (single JSON object)
+  ────────────────────────────
+  total         ~ 355 tokens
+
+ReAct loop is OPT-IN (max_steps default = 1). Pass max_steps>1 to
+allow the model to issue refined searches at the cost of more tokens.
+
+Set ANTHROPIC_API_KEY. Optional knobs :
+  CLAUDE_MODEL         (default : claude-haiku-4-5-20251001)
+  CLAUDE_MAX_TOKENS    (default : 128 — bounds output spend)
 """
 
 from __future__ import annotations
@@ -23,35 +27,31 @@ from typing import Any, Dict, List, Optional
 
 
 _DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-_DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "512"))
+_DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "128"))
+
+# Hard cap on each evidence chunk's CONTENT character length when
+# rendered into the user message. 100 chars ≈ 25 tokens. With the
+# enrichment prefix [id|kw1,kw2,kw3], total per chunk ≈ 130 chars
+# ≈ 32 tokens. 7 × 32 = 224 evidence tokens.
+_CHUNK_CHAR_LIMIT = 100
+# Compact keyword hint cap : at most 3 keywords, comma-separated
+_KEYWORDS_HINT_MAX = 3
 
 
-REACT_SYSTEM = """You are answering questions over a memory of conversation turns.
+REACT_SYSTEM = """Answer concisely matching the gold style :
+- "When ..." → date only ("7 May 2023" or "June 2023")
+- "Where ..." → place only ("Sweden")
+- "What did X do/research/like" → noun phrase ("adoption agencies")
+- "How long" → "<n> <unit>" ("4 years")
+- YES/NO/inference → "Likely yes/no, <one clause>"
+- adversarial → "Not mentioned"
 
-You proceed step by step (ReAct). At each step you see the original
-question and all evidence chunks retrieved so far (each labeled with
-its dialog id like D3:13).
+Use D<session>:<turn> ids and "yesterday/last week/this month" relative
+to the session date to anchor temporal answers.
 
-At each step, output EXACTLY ONE JSON object, no prose, of the form :
-
-  {"action": "search", "query": "<refined search terms>"}
-    — when the evidence is insufficient and you want more chunks.
-    The query should be different from previous queries — try
-    entity-level or temporal-anchor reformulations.
-
-  {"action": "answer", "answer": "<concise final answer>"}
-    — when you have enough evidence. The answer must match the
-    style of the gold answer : a date like "7 May 2023" for "when"
-    questions, a noun phrase like "adoption agencies" for "what"
-    questions, a one-word place name like "Sweden" for "where"
-    questions. Do not add explanations.
-
-Rules :
-- Max 3 search rounds. After that, give your best answer.
-- Be concise — the evaluator scores by token-overlap F1.
-- For inference questions ("would she likely..."), start the answer
-  with "Likely yes" or "Likely no" then a brief reason.
-"""
+Output ONE JSON object, no prose, no code fences :
+  {"action": "answer", "answer": "..."}
+or {"action": "search", "query": "..."}"""
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
@@ -59,18 +59,15 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
     text = text.strip()
-    # Strip code fences if present
     fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
-    # Direct parse first
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
             return obj
     except Exception:
         pass
-    # Fallback : find first { ... last matching }
     start = text.find("{")
     if start < 0:
         return None
@@ -92,14 +89,60 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _format_evidence(
+    chunks: List[Dict[str, Any]],
+    char_limit: int,
+    memory=None,
+) -> str:
+    """Render chunks as compact enriched one-liners.
+
+    Format per chunk :
+      [<id>|<kw1>,<kw2>,<kw3>] <truncated_content>
+
+    Enrichments :
+      - id           : dialog id ; for collision children, resolves to
+                       <parent_a>↔<parent_b> when possible.
+      - kw1..kw3     : top keywords already extracted at ingest
+                       (compact entity signal, ~20 chars total).
+      - content      : raw text, truncated to `char_limit` chars
+                       and suffixed with "…" if truncated.
+
+    Falls back to plain `[id] content` when keywords or memory are
+    unavailable.
+    """
+    points_by_id = {p.id: p for p in memory.points} if memory else {}
+    lines = []
+    for r in chunks:
+        rid = r["id"]
+        # Resolve collision child id to its parents when possible
+        display_id = rid
+        if rid.startswith("collision("):
+            p = points_by_id.get(rid)
+            if p is not None and p.parents:
+                display_id = "↔".join(p.parents[:2])
+
+        # Compact keyword hint from the live point
+        kw_hint = ""
+        p = points_by_id.get(rid)
+        if p is not None and p.keywords:
+            kw_hint = "|" + ",".join(p.keywords[:_KEYWORDS_HINT_MAX])
+
+        content = r.get("content", "")
+        if len(content) > char_limit:
+            content = content[:char_limit].rstrip() + "…"
+        lines.append(f"[{display_id}{kw_hint}] {content}")
+    return "\n".join(lines)
+
+
 class ClaudeReactAnswerer:
-    """Persistent ReAct answerer using the Anthropic SDK."""
+    """Token-budgeted ReAct answerer using the Anthropic SDK."""
 
     def __init__(
         self,
         model: str = _DEFAULT_MODEL,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         api_key: Optional[str] = None,
+        chunk_char_limit: int = _CHUNK_CHAR_LIMIT,
     ) -> None:
         import anthropic
 
@@ -108,36 +151,45 @@ class ClaudeReactAnswerer:
         )
         self.model = model
         self.max_tokens = max_tokens
+        self.chunk_char_limit = chunk_char_limit
 
     def answer(
         self,
         memory,
         question: str,
         *,
-        k: int = 10,
-        max_steps: int = 3,
+        k: int = 7,
+        max_steps: int = 1,
         use_lineage: bool = True,
+        use_hybrid: bool = True,
     ) -> Dict[str, Any]:
+        """Run one (or up to max_steps) ReAct rounds.
+
+        Defaults : single shot. The full evidence pool (k=7) is shown to
+        the model on the first message ; further rounds only happen if
+        Claude explicitly emits {"action": "search", ...}.
+        """
         evidence: List[Dict[str, Any]] = []
         evidence_ids: set[str] = set()
         trace: List[Dict[str, Any]] = []
+        total_in = 0
+        total_out = 0
         query = question
 
         for step in range(max_steps):
-            results = memory.retrieve(query, k=k, use_lineage=use_lineage)
+            results = memory.retrieve(
+                query, k=k,
+                use_hybrid=use_hybrid,
+                use_lineage=use_lineage,
+            )
             for r in results:
                 if r["id"] not in evidence_ids:
                     evidence.append(r)
                     evidence_ids.add(r["id"])
 
-            evidence_text = "\n".join(
-                f"[{r['id']}] {r['content']}" for r in evidence
-            )
-            user_msg = (
-                f"Question: {question}\n\n"
-                f"Evidence so far ({len(evidence)} chunks):\n{evidence_text}\n\n"
-                f"Output the JSON object."
-            )
+            evidence_text = _format_evidence(evidence, self.chunk_char_limit, memory=memory)
+            user_msg = f"Q: {question}\n{evidence_text}"
+
             resp = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -145,6 +197,9 @@ class ClaudeReactAnswerer:
                 messages=[{"role": "user", "content": user_msg}],
             )
             text = resp.content[0].text if resp.content else ""
+            if hasattr(resp, "usage"):
+                total_in += getattr(resp.usage, "input_tokens", 0) or 0
+                total_out += getattr(resp.usage, "output_tokens", 0) or 0
             obj = _extract_json(text)
             trace.append({
                 "step": step,
@@ -155,12 +210,13 @@ class ClaudeReactAnswerer:
             })
 
             if obj is None:
-                # Fall back : treat the raw text as the answer
                 return {
                     "answer": text.strip(),
                     "steps": step + 1,
                     "evidence_ids": sorted(evidence_ids),
                     "trace": trace,
+                    "tokens_in": total_in,
+                    "tokens_out": total_out,
                 }
             action = obj.get("action")
             if action == "answer":
@@ -169,24 +225,21 @@ class ClaudeReactAnswerer:
                     "steps": step + 1,
                     "evidence_ids": sorted(evidence_ids),
                     "trace": trace,
+                    "tokens_in": total_in,
+                    "tokens_out": total_out,
                 }
             if action == "search":
                 new_q = str(obj.get("query", "")).strip() or question
-                # Avoid infinite loop : if same query twice, abort
                 if new_q == query and step > 0:
                     break
                 query = new_q
                 continue
 
-        # Final fallback : ask Claude to answer with the evidence we have
-        evidence_text = "\n".join(
-            f"[{r['id']}] {r['content']}" for r in evidence
-        )
+        # Forced final answer (max_steps exhausted on a search action)
+        evidence_text = _format_evidence(evidence, self.chunk_char_limit)
         user_msg = (
-            f"Question: {question}\n\n"
-            f"Evidence:\n{evidence_text}\n\n"
-            f"You have exhausted search rounds. "
-            f"Output {{\"action\": \"answer\", \"answer\": \"<your best answer>\"}}."
+            f"Q: {question}\n{evidence_text}\n"
+            f'Budget exhausted. Output {{"action": "answer", "answer": "..."}}.'
         )
         resp = self.client.messages.create(
             model=self.model,
@@ -195,10 +248,15 @@ class ClaudeReactAnswerer:
             messages=[{"role": "user", "content": user_msg}],
         )
         text = resp.content[0].text if resp.content else ""
+        if hasattr(resp, "usage"):
+            total_in += getattr(resp.usage, "input_tokens", 0) or 0
+            total_out += getattr(resp.usage, "output_tokens", 0) or 0
         obj = _extract_json(text) or {}
         return {
             "answer": str(obj.get("answer", text)).strip(),
             "steps": max_steps,
             "evidence_ids": sorted(evidence_ids),
             "trace": trace,
+            "tokens_in": total_in,
+            "tokens_out": total_out,
         }

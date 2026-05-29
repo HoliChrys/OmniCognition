@@ -122,6 +122,7 @@ def evaluate_sample(
 
     per_cat = defaultdict(lambda: {
         "n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
+        "tokens_in": 0, "tokens_out": 0, "steps": 0,
     })
 
     for qa in qas:
@@ -143,6 +144,7 @@ def evaluate_sample(
         else:
             r5 = r10 = 0.0
 
+        tokens_in = tokens_out = steps = 0
         if answerer == "extractive":
             from benchmarks.locomo.react_qa import react_answer
             ra = react_answer(memory, question, max_steps=2,
@@ -154,6 +156,9 @@ def evaluate_sample(
                 k=k_retrieve, max_steps=3, use_lineage=use_lineage,
             )
             pred = ca["answer"]
+            tokens_in = ca.get("tokens_in", 0) or 0
+            tokens_out = ca.get("tokens_out", 0) or 0
+            steps = ca.get("steps", 0) or 0
         else:  # "chunk"
             pred = " ".join(r["content"] for r in results[:top_chunks_for_answer])
         f1 = f1_score(pred, gold_answer)
@@ -162,6 +167,9 @@ def evaluate_sample(
         per_cat[category]["recall_at_5"] += r5
         per_cat[category]["recall_at_10"] += r10
         per_cat[category]["f1"] += f1
+        per_cat[category]["tokens_in"] += tokens_in
+        per_cat[category]["tokens_out"] += tokens_out
+        per_cat[category]["steps"] += steps
 
     summary: Dict[str, Any] = {
         "sample_id": sample.get("sample_id"),
@@ -172,28 +180,45 @@ def evaluate_sample(
         "n_qa": len(qas),
         "by_category": {},
     }
-    total = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0}
+    total = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
+             "tokens_in": 0, "tokens_out": 0, "steps": 0}
     for cat, stats in per_cat.items():
         n = stats["n"]
         if n == 0:
             continue
-        summary["by_category"][cat] = {
+        cat_entry = {
             "n": n,
             "recall_at_5": round(stats["recall_at_5"] / n, 4),
             "recall_at_10": round(stats["recall_at_10"] / n, 4),
             "f1": round(stats["f1"] / n, 4),
         }
+        if stats["tokens_in"] or stats["tokens_out"]:
+            cat_entry["tokens_in_per_qa"] = round(stats["tokens_in"] / n, 1)
+            cat_entry["tokens_out_per_qa"] = round(stats["tokens_out"] / n, 1)
+            cat_entry["steps_per_qa"] = round(stats["steps"] / n, 2)
+        summary["by_category"][cat] = cat_entry
         total["n"] += n
         total["recall_at_5"] += stats["recall_at_5"]
         total["recall_at_10"] += stats["recall_at_10"]
         total["f1"] += stats["f1"]
+        total["tokens_in"] += stats["tokens_in"]
+        total["tokens_out"] += stats["tokens_out"]
+        total["steps"] += stats["steps"]
     if total["n"]:
-        summary["overall"] = {
+        overall = {
             "n": total["n"],
             "recall_at_5": round(total["recall_at_5"] / total["n"], 4),
             "recall_at_10": round(total["recall_at_10"] / total["n"], 4),
             "f1": round(total["f1"] / total["n"], 4),
         }
+        if total["tokens_in"] or total["tokens_out"]:
+            overall["tokens_in_per_qa"] = round(total["tokens_in"] / total["n"], 1)
+            overall["tokens_out_per_qa"] = round(total["tokens_out"] / total["n"], 1)
+            overall["tokens_total_per_qa"] = round(
+                (total["tokens_in"] + total["tokens_out"]) / total["n"], 1
+            )
+            overall["steps_per_qa"] = round(total["steps"] / total["n"], 2)
+        summary["overall"] = overall
     return summary
 
 
@@ -234,7 +259,8 @@ def main():
         print(f"Claude answerer ready : model={claude_answerer.model}")
 
     results = []
-    overall = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0}
+    overall = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
+               "tokens_in": 0.0, "tokens_out": 0.0, "steps": 0.0}
     t0 = time.time()
     for i, sample in enumerate(data[: args.samples]):
         print(
@@ -258,10 +284,14 @@ def main():
             overall["recall_at_5"] += o["recall_at_5"] * o["n"]
             overall["recall_at_10"] += o["recall_at_10"] * o["n"]
             overall["f1"] += o["f1"] * o["n"]
+            if "tokens_in_per_qa" in o:
+                overall["tokens_in"] += o["tokens_in_per_qa"] * o["n"]
+                overall["tokens_out"] += o["tokens_out_per_qa"] * o["n"]
+                overall["steps"] += o["steps_per_qa"] * o["n"]
 
     if overall["n"]:
         print("\n=== AGGREGATE ===")
-        print(json.dumps({
+        agg = {
             "n_samples": len(results),
             "n_qa_total": overall["n"],
             "encoder": args.encoder,
@@ -271,7 +301,16 @@ def main():
             "recall_at_10": round(overall["recall_at_10"] / overall["n"], 4),
             "f1": round(overall["f1"] / overall["n"], 4),
             "elapsed_seconds": round(time.time() - t0, 2),
-        }, indent=2))
+        }
+        if overall["tokens_in"] or overall["tokens_out"]:
+            n = overall["n"]
+            agg["tokens_in_per_qa"] = round(overall["tokens_in"] / n, 1)
+            agg["tokens_out_per_qa"] = round(overall["tokens_out"] / n, 1)
+            agg["tokens_total_per_qa"] = round(
+                (overall["tokens_in"] + overall["tokens_out"]) / n, 1
+            )
+            agg["steps_per_qa"] = round(overall["steps"] / n, 2)
+        print(json.dumps(agg, indent=2))
 
 
 if __name__ == "__main__":
