@@ -42,6 +42,7 @@ from metacog.epistemic import (
 )
 from metacog.execution import execute_action
 from metacog.geometry import (
+    apply_pull,
     effective_embedding,
     retrieve,
     retrieve_for_observator,
@@ -72,6 +73,10 @@ class Memory:
     llm: Any = field(default_factory=ClaudeLLM)
     executor: Any = field(default_factory=NoOpExecutor)
     extractor: Any = field(default_factory=SimpleKeywordExtractor)
+    # Opt-in LLM entity extractor. None = current behavior unchanged.
+    # When set, each ingested FACT spawns tagged entity beacon nodes that
+    # are geometrically pulled onto it (the edge-free "edges-equivalent").
+    entity_extractor: Any = None
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
@@ -154,7 +159,108 @@ class Memory:
             for p in self.points:
                 if p.id in parent_set and id not in p.children:
                     p.children = list(p.children) + [id]
+        # Spawn entity beacon nodes (opt-in). Only from genuine FACTs —
+        # never recurse on entity-derived facts (their ids start "entity_").
+        if (
+            self.entity_extractor is not None
+            and kind.upper() == "FACT"
+            and not id.startswith("entity_")
+        ):
+            try:
+                self._spawn_entities(point)
+            except Exception:
+                # A flaky extractor must never break ingestion.
+                pass
         return point
+
+    # ------------------------------------------------------------------
+    # Entity beacons (edge-free "edges" via geometric pull)
+    # ------------------------------------------------------------------
+
+    def ingest_entity(
+        self,
+        value: str,
+        *,
+        source_fact: Point,
+        tags: Optional[List[str]] = None,
+        parent_entity: Optional[Point] = None,
+        t_now: Optional[float] = None,
+    ) -> Point:
+        """Create a tagged entity beacon node and relate it to its source
+        fact GEOMETRICALLY — there are no stored edges.
+
+        The beacon is a PointKind.FACT carrying a clean entity value +
+        type tags so a query matches it easily ; `apply_pull` then drags
+        BOTH the beacon and `source_fact` together in the manifold. The
+        fact's effective (content) embedding shifts toward the entity
+        value, so a query for that value retrieves the real fact directly
+        — this is the edges-equivalent. Date components are also pulled
+        onto their `parent_entity` (the shared `date` beacon).
+
+        Per-fact (NOT deduplicated across facts) : the same entity in two
+        facts spawns two beacons, each co-located with its own fact, so a
+        query surfaces ALL facts that mention it (parallel paths).
+
+        Cor. 5 : the beacon is GENERATOR-sourced and never produces an
+        Observation — apply_pull is called directly.
+        """
+        tags = tags or []
+        if t_now is None:
+            t_now = self._now()
+        kws = [value] + [t for t in tags if t and t != value]
+        kw_emb = position_weighted_keyword_embedding(kws, self.encoder)
+        beacon = Point(
+            id=f"entity_{uuid.uuid4().hex[:8]}",
+            content=(":".join(tags) + " " + value).strip() if tags else value,
+            embedding_orig=tuple(self.encoder.encode(value)),
+            kind=PointKind.FACT,
+            keywords=kws,
+            keywords_embedding=kw_emb,
+            keywords_source=SourceClass.GENERATOR,
+            tags=list(tags),
+        )
+        self.points.append(beacon)
+        # Geometric "edges" : pull the beacon onto its source fact, and
+        # date components onto their parent date. Shared t_now so intra-fact
+        # decay never wipes the accumulating pulls.
+        apply_pull(beacon, source_fact, +1.0, t_now)
+        if parent_entity is not None:
+            apply_pull(beacon, parent_entity, +1.0, t_now)
+        return beacon
+
+    def _spawn_entities(self, source_fact: Point) -> None:
+        """Extract entities from a freshly ingested FACT and spawn their
+        beacon nodes. A date yields a full-date beacon plus day/month/year
+        component beacons — all tagged "date" and all pulled onto the SAME
+        source fact, so they cluster together near it (their geometric
+        "part_of" link is this shared co-location, not a separate pull,
+        which would only fight the source pull). One frozen t_now per fact
+        so pulls accumulate without inter-pull decay."""
+        ents = self.entity_extractor.extract_entities(source_fact.content)
+        if not ents:
+            return
+        t_now = self._now()
+        for e in ents:
+            if e.etype == "date":
+                self.ingest_entity(
+                    e.value, source_fact=source_fact,
+                    tags=["date"], t_now=t_now,
+                )
+                for part in ("day", "month", "year"):
+                    val = (e.date_parts or {}).get(part)
+                    if not val:
+                        continue
+                    # Bare value ("20"/"january"/"2023") is the matchable
+                    # keyword ; the part lives in tags.
+                    self.ingest_entity(
+                        val, source_fact=source_fact,
+                        tags=["date", part], t_now=t_now,
+                    )
+            else:
+                self.ingest_entity(
+                    e.value, source_fact=source_fact,
+                    tags=[e.etype], t_now=t_now,
+                )
 
     def ingest_action(
         self,
@@ -304,10 +410,17 @@ class Memory:
         Default k=7 (≈ matches LoCoMo / typical agentic context budget).
         """
         t_now = self._now(t)
+        # When entity beacons exist they act as ingest-time pull agents :
+        # their geometric pull already shifted the real facts, so we drop
+        # them from the RETURNED ids (over-fetching to backfill to k) — the
+        # recall metric then measures real facts only, and beacons never
+        # displace evidence. No-op / unchanged when no extractor is set.
+        beacons = self.entity_extractor is not None
+        k_fetch = (k * 2 + 10) if beacons else k
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
-                q_emb, self.points, k, t_now, observator_id,
+                q_emb, self.points, k_fetch, t_now, observator_id,
             )
         elif use_hybrid:
             kind_filter: Optional[PointKind] = None
@@ -317,7 +430,7 @@ class Memory:
                     else PointKind[prefer_kind.upper()]
                 )
             results = retrieve_hybrid(
-                query, self.points, k, t_now,
+                query, self.points, k_fetch, t_now,
                 encoder=self.encoder,
                 extractor=self.extractor,
                 use_lineage=use_lineage,
@@ -328,12 +441,15 @@ class Memory:
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_with_lineage(
-                q_emb, self.points, k, t_now,
+                q_emb, self.points, k_fetch, t_now,
                 lineage_depth=lineage_depth,
             )
         else:
             q_emb = tuple(self.encoder.encode(query))
-            results = retrieve(q_emb, self.points, k, t_now)
+            results = retrieve(q_emb, self.points, k_fetch, t_now)
+        if beacons:
+            results = [(s, p) for s, p in results
+                       if not p.id.startswith("entity_")][:k]
         return [
             {
                 "id": p.id,

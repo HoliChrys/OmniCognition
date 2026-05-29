@@ -150,6 +150,11 @@ class Point:
     keywords: List[str] = field(default_factory=list)
     keywords_source: Optional[SourceClass] = None
     keywords_embedding: Optional[Vector] = None
+    # Entity-type tags that NAME a derived entity node ("date", "year",
+    # "person", …). Edge-free : the relation to the source fact is NOT
+    # stored here — it is simulated geometrically by apply_pull, which
+    # co-locates the entity node with its source in the keyword manifold.
+    tags: List[str] = field(default_factory=list)
     parents: List[str] = field(default_factory=list)
     children: List[str] = field(default_factory=list)
     lineage_depth: int = 0

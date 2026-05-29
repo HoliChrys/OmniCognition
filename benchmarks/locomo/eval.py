@@ -154,6 +154,7 @@ def evaluate_sample(
     sample_seed: int = None,
     claude_answerer=None,
     debug_writer=None,
+    entities: bool = False,
 ) -> Dict[str, Any]:
     qas = list(sample["qa"])
     if sample_seed is not None:
@@ -166,7 +167,11 @@ def evaluate_sample(
         qas = qas[:max_qa]
 
     enc = make_encoder(encoder_name)
-    memory = Memory(encoder=enc)  # llm defaults to ClaudeLLM (Haiku)
+    entity_extractor = None
+    if entities:
+        from metacog.entities import LLMEntityExtractor
+        entity_extractor = LLMEntityExtractor()
+    memory = Memory(encoder=enc, entity_extractor=entity_extractor)
     ingested = ingest_conversation(
         memory, sample["conversation"], with_dates=with_dates,
     )
@@ -430,6 +435,12 @@ def main():
                         help="per-QA full trace (question, gold, pred, retrieved "
                              "ids, hits, misses, ReAct steps, tokens) written one "
                              "JSON object per line. Use to root-cause low F1.")
+    parser.add_argument("--entities", action="store_true",
+                        help="opt-in : LLM entity extraction at ingest. Each FACT "
+                             "spawns tagged entity beacon nodes (dates decomposed "
+                             "into day/month/year) pulled onto it geometrically — "
+                             "the edge-free 'edges-equivalent' that lifts the real "
+                             "fact into recall. One LLM call per turn (cached).")
     args = parser.parse_args()
     if args.react and args.answerer == "chunk":
         args.answerer = "extractive"
@@ -490,6 +501,7 @@ def main():
             sample_seed=args.shuffle_seed,
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
+            entities=args.entities,
         )
         results.append(summary)
         print(json.dumps(summary, indent=2))

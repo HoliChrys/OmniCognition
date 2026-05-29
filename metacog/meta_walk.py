@@ -249,15 +249,19 @@ def nearest_facts_with_fallback(
 
     if encoder is not None and extractor is not None:
         from metacog.geometry import retrieve_hybrid
+        # Over-fetch : entity beacons (id "entity_*") are FACT-kind so they
+        # score here, but they are ingest-time pull agents — their pull
+        # already lifted the real facts. Drop them from the returned set so
+        # the walk reasons over (and agent_recall counts) real facts only.
         results = retrieve_hybrid(
-            query_text, points, k + len(exclude_ids), t_now,
+            query_text, points, (k + len(exclude_ids)) * 2 + 10, t_now,
             encoder=encoder, extractor=extractor,
             use_lineage=True, use_spreading=True, use_fuzzy=True,
             restrict_kind=PointKind.FACT,
         )
         out: List[Point] = []
         for _s, p in results:
-            if p.id in exclude_ids:
+            if p.id in exclude_ids or p.id.startswith("entity_"):
                 continue
             out.append(p)
             if len(out) >= k:
