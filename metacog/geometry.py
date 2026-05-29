@@ -223,18 +223,28 @@ def retrieve_with_lineage(
         p.id: i for i, (_, p) in enumerate(pool)
     }
 
-    # BFS expansion : lineage rank penalizes depth so deeper hops
-    # contribute less to RRF (rank = seed_rank + depth * pool_size).
+    # BFS expansion with UNCERTAINTY PROPAGATION pruning.
+    # Branch stops when the accumulated σ_path exceeds the emergent
+    # threshold derived from the population's own σ distribution.
+    # Lineage rank is also inflated by σ_path so high-uncertainty
+    # nodes drop in the final RRF ranking.
+    from metacog.uncertainty import beta_sigma, hop_sigma, prune_threshold
+
     lineage_rank_by_id: dict[str, int] = {}
+    sigma_by_id: dict[str, float] = {}
     pool_len = max(1, len(pool))
+    sigma_cutoff = prune_threshold(points)
+
     for seed_rank, (_, seed) in enumerate(pool):
+        sigma_by_id.setdefault(seed.id, beta_sigma(seed))
         frontier = {seed.id}
-        for depth in range(1, lineage_depth + 1):
+        for _depth in range(1, lineage_depth + 1):
             next_frontier: set[str] = set()
             for pid in frontier:
                 p = points_by_id.get(pid)
                 if p is None:
                     continue
+                current_sigma = sigma_by_id.get(pid, beta_sigma(p))
                 neighbors: list[str] = []
                 neighbors.extend(p.parents)
                 neighbors.extend(p.children)
@@ -242,11 +252,21 @@ def retrieve_with_lineage(
                     neighbors.append(p.sequence_prev)
                 if p.sequence_next:
                     neighbors.append(p.sequence_next)
-                effective_rank = seed_rank + depth * pool_len
                 for nid in neighbors:
-                    if nid in points_by_id and nid not in lineage_rank_by_id:
-                        lineage_rank_by_id[nid] = effective_rank
-                        next_frontier.add(nid)
+                    if nid not in points_by_id or nid in lineage_rank_by_id:
+                        continue
+                    child = points_by_id[nid]
+                    hop = hop_sigma(p, child, t_now)
+                    propagated = math.sqrt(current_sigma * current_sigma
+                                           + hop * hop)
+                    # Prune over-uncertain branches
+                    if sigma_cutoff is not None and propagated > sigma_cutoff:
+                        continue
+                    sigma_by_id[nid] = propagated
+                    # Rank inflation : seed_rank + σ_propagated × pool_len
+                    effective_rank = seed_rank + int(propagated * pool_len)
+                    lineage_rank_by_id[nid] = effective_rank
+                    next_frontier.add(nid)
             frontier = next_frontier
 
     candidates = set(cosine_rank_by_id) | set(lineage_rank_by_id)
@@ -328,18 +348,28 @@ def retrieve_hybrid(
     fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
     top_ids = [pid for pid, _ in fused[:k]]
 
-    # Phase 4 — optional lineage expansion with depth-penalized rank
+    # Phase 4 — optional lineage expansion with uncertainty propagation
     if use_lineage:
+        from metacog.uncertainty import beta_sigma, hop_sigma, prune_threshold
+
         lineage_rank_by_id: dict[str, int] = {}
+        sigma_by_id: dict[str, float] = {}
         seed_pool_len = max(1, len(top_ids))
+        sigma_cutoff = prune_threshold(points)
+
         for seed_rank, pid in enumerate(top_ids):
+            seed_p = points_by_id.get(pid)
+            if seed_p is None:
+                continue
+            sigma_by_id.setdefault(pid, beta_sigma(seed_p))
             frontier = {pid}
-            for depth in range(1, lineage_depth + 1):
+            for _depth in range(1, lineage_depth + 1):
                 next_frontier: set[str] = set()
                 for fid in frontier:
                     p = points_by_id.get(fid)
                     if p is None:
                         continue
+                    current_sigma = sigma_by_id.get(fid, beta_sigma(p))
                     neighbors: list[str] = []
                     neighbors.extend(p.parents)
                     neighbors.extend(p.children)
@@ -347,11 +377,19 @@ def retrieve_hybrid(
                         neighbors.append(p.sequence_prev)
                     if p.sequence_next:
                         neighbors.append(p.sequence_next)
-                    effective_rank = seed_rank + depth * seed_pool_len
                     for nid in neighbors:
-                        if nid in points_by_id and nid not in lineage_rank_by_id:
-                            lineage_rank_by_id[nid] = effective_rank
-                            next_frontier.add(nid)
+                        if nid not in points_by_id or nid in lineage_rank_by_id:
+                            continue
+                        child = points_by_id[nid]
+                        hop = hop_sigma(p, child, t_now)
+                        propagated = math.sqrt(current_sigma * current_sigma
+                                               + hop * hop)
+                        if sigma_cutoff is not None and propagated > sigma_cutoff:
+                            continue
+                        sigma_by_id[nid] = propagated
+                        effective_rank = seed_rank + int(propagated * seed_pool_len)
+                        lineage_rank_by_id[nid] = effective_rank
+                        next_frontier.add(nid)
                 frontier = next_frontier
         for pid, lrank in lineage_rank_by_id.items():
             rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + lrank)

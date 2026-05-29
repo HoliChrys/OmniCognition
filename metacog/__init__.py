@@ -26,6 +26,7 @@ from metacog.observator import (
 from metacog.geometry import retrieve_for_observator, retrieve_hybrid, retrieve_with_lineage
 from metacog.keywords import KeywordExtractor, SimpleKeywordExtractor
 from metacog.bm25 import bm25_score
+from metacog.uncertainty import beta_sigma, hop_sigma, propagate, prune_threshold
 from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
 from metacog.memory import Memory
 from metacog.compression import (
@@ -125,6 +126,10 @@ __all__ = [
     "KeywordExtractor",
     "SimpleKeywordExtractor",
     "bm25_score",
+    "beta_sigma",
+    "hop_sigma",
+    "propagate",
+    "prune_threshold",
     # defaults + top-level wrapper
     "NoOpExecutor",
     "SimpleEncoder",
