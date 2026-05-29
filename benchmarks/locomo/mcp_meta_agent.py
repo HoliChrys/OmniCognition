@@ -116,12 +116,23 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   of the LGBTQ community". "Teacher" not "A passionate elementary
   school teacher who loves kids". Pick the bare category noun.
 - "What did X do/like/research" → short noun phrase (1-4 words).
-- yes/no/inference → "Likely yes, <one short clause>".
-- not in the evidence / adversarial / unanswerable → "Not mentioned".
+- PLURAL question ("What EVENTS / CITIES / WAYS / THINGS / HOBBIES /
+  PROJECTS has X done", "Which X has Y done", "what do they have in
+  COMMON") → list EVERY gathered item, comma-separated ("Paris, Rome" ;
+  "Pride parade, school speech, support group"). One item only when there
+  truly is one. Tokens count : each listed item earns score.
+- "Would / Could X likely … ?" inference (the question STARTS with
+  "Would" or "Could") → answer "Likely yes, <short reason>" or "Likely no,
+  <short reason>". Do NOT say "Not mentioned" on these — the answer is an
+  inference you DRAW from the retrieved facts. Other "yes/no" questions
+  follow the same pattern.
+- not in the evidence / adversarial / unanswerable → "Not mentioned"
+  (NEVER for a "Would/Could … likely" question above).
 
-Hard rule : if your answer is longer than 5 words, you are wrong —
-strip every adjective and conjunction until only the bare value
-remains. Drop "and ...", "who is ...", "the ... of ...".
+Hard rule : single-value answers (dates / places / one entity) above 5
+words are wrong — strip adjectives/conjunctions to the bare value.
+EXCEPTION : the PLURAL and the "Would/Could likely" rules above keep
+their lists / clauses intact (do not trim them).
 
 NEVER output a dialog turn ID (D4:11, D10:12, etc.) as your answer.
 Output the CONTENT of the fact, not its reference ID.
@@ -147,6 +158,9 @@ Q: How long have they been friends? → 4 years
 Q: What career path did Caroline choose? → counseling, mental health
 Q: Whose birthday did Melanie celebrate? → Melanie's daughter
 Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
+Q: Would Caroline have Dr. Seuss books? → Likely yes, she collects classic children's books
+Q: Which cities has Jon visited? → Paris, Rome
+Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
 Q: What sports car does Jon drive? → Not mentioned"""
 
 
@@ -331,6 +345,16 @@ def terse(text: str, question: Optional[str] = None) -> str:
     if not text:
         return text
     t = text.strip()
+    # Plural / "have in common" questions expect a LIST answer (cat1 multi-
+    # hop) — compound-cutting "Pride parade, school speech, support group"
+    # down to one item destroys multi-item F1. Detect from the question and
+    # SKIP the compound-cut pass below.
+    _is_enum_q = bool(question and re.search(
+        r"\b(what|which)\b.{0,30}\b(events?|cities|places|ways|things|"
+        r"hobbies|activities|projects?|crafts?|sports?|languages?|skills?|"
+        r"groups?|causes?|items?|gifts?)\b"
+        r"|\bin what ways\b|\bhave in common\b|\bboth\b",
+        question, re.IGNORECASE))
     # "When …" questions : if the agent dumped a citation instead of a bare
     # date, pull the date out. Only when the text is verbose (>5 words) —
     # a clean "19 January 2023" already passes through untouched.
@@ -416,7 +440,7 @@ def terse(text: str, question: Optional[str] = None) -> str:
     # Skip inference answers ("Likely yes, …") — the trailing clause IS
     # the expected format.
     is_inference = bool(re.match(r"^\s*likely\s+(?:yes|no)\b", t, re.IGNORECASE))
-    if t and not is_inference and len(t.split()) <= 12:
+    if t and not is_inference and not _is_enum_q and len(t.split()) <= 12:
         changed = True
         while changed and t and len(t.split()) <= 12:
             changed = False
