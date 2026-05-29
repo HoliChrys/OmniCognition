@@ -134,7 +134,7 @@ def evaluate_sample(
     sample: Dict[str, Any],
     encoder_name: str,
     *,
-    k_retrieve: int = 10,
+    k_retrieve: int = 7,
     top_chunks_for_answer: int = 3,
     max_qa: int = None,
     answerer: str = "chunk",
@@ -155,7 +155,7 @@ def evaluate_sample(
     )
 
     per_cat = defaultdict(lambda: {
-        "n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
+        "n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
         "tokens_in": 0, "tokens_out": 0, "steps": 0,
     })
 
@@ -173,13 +173,13 @@ def evaluate_sample(
         )
         retrieved_ids = [r["id"] for r in results]
         top5 = set(retrieved_ids[:5])
-        top10 = set(retrieved_ids[:10])
+        top7 = set(retrieved_ids[:7])
         ev_set = set(evidence)
         if ev_set:
             r5 = len(top5 & ev_set) / len(ev_set)
-            r10 = len(top10 & ev_set) / len(ev_set)
+            r7 = len(top7 & ev_set) / len(ev_set)
         else:
-            r5 = r10 = 0.0
+            r5 = r7 = 0.0
 
         tokens_in = tokens_out = steps = 0
         react_trace: List[Dict[str, Any]] = []
@@ -204,7 +204,7 @@ def evaluate_sample(
 
         per_cat[category]["n"] += 1
         per_cat[category]["recall_at_5"] += r5
-        per_cat[category]["recall_at_10"] += r10
+        per_cat[category]["recall_at_7"] += r7
         per_cat[category]["f1"] += f1
         per_cat[category]["tokens_in"] += tokens_in
         per_cat[category]["tokens_out"] += tokens_out
@@ -212,14 +212,14 @@ def evaluate_sample(
 
         if debug_writer is not None:
             ev_hits_5 = sorted(top5 & ev_set)
-            ev_misses = sorted(ev_set - top10)
+            ev_misses = sorted(ev_set - top7)
             # Compact dump of retrieved chunk content so we can read what
             # the answerer actually saw, not just the ids.
-            top10_dump = [
+            top7_dump = [
                 {"id": r["id"],
                  "kind": r.get("kind"),
                  "content": (r.get("content") or "")[:200]}
-                for r in results[:10]
+                for r in results[:7]
             ]
             # Keep ReAct trace compact : drop raw_reply > 300 chars
             trace_dump = []
@@ -239,11 +239,11 @@ def evaluate_sample(
                 "pred": pred,
                 "f1": round(f1, 4),
                 "r5": round(r5, 4),
-                "r10": round(r10, 4),
-                "retrieved_top10": top10_dump,
+                "r7": round(r7, 4),
+                "retrieved_top7": top7_dump,
                 "gold_evidence": evidence,
                 "evidence_hits_in_top5": ev_hits_5,
-                "evidence_missed_top10": ev_misses,
+                "evidence_missed_top7": ev_misses,
                 "react_trace": trace_dump,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
@@ -260,7 +260,7 @@ def evaluate_sample(
         "n_qa": len(qas),
         "by_category": {},
     }
-    total = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
+    total = {"n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
              "tokens_in": 0, "tokens_out": 0, "steps": 0}
     for cat, stats in per_cat.items():
         n = stats["n"]
@@ -269,7 +269,7 @@ def evaluate_sample(
         cat_entry = {
             "n": n,
             "recall_at_5": round(stats["recall_at_5"] / n, 4),
-            "recall_at_10": round(stats["recall_at_10"] / n, 4),
+            "recall_at_7": round(stats["recall_at_7"] / n, 4),
             "f1": round(stats["f1"] / n, 4),
         }
         if stats["tokens_in"] or stats["tokens_out"]:
@@ -279,7 +279,7 @@ def evaluate_sample(
         summary["by_category"][cat] = cat_entry
         total["n"] += n
         total["recall_at_5"] += stats["recall_at_5"]
-        total["recall_at_10"] += stats["recall_at_10"]
+        total["recall_at_7"] += stats["recall_at_7"]
         total["f1"] += stats["f1"]
         total["tokens_in"] += stats["tokens_in"]
         total["tokens_out"] += stats["tokens_out"]
@@ -288,7 +288,7 @@ def evaluate_sample(
         overall = {
             "n": total["n"],
             "recall_at_5": round(total["recall_at_5"] / total["n"], 4),
-            "recall_at_10": round(total["recall_at_10"] / total["n"], 4),
+            "recall_at_7": round(total["recall_at_7"] / total["n"], 4),
             "f1": round(total["f1"] / total["n"], 4),
         }
         if total["tokens_in"] or total["tokens_out"]:
@@ -309,7 +309,8 @@ def main():
                         help="how many of the 10 conversations to evaluate")
     parser.add_argument("--max-qa", type=int, default=None,
                         help="cap QA pairs per sample")
-    parser.add_argument("--k", type=int, default=10, help="retrieval top-k")
+    parser.add_argument("--k", type=int, default=7,
+                        help="retrieval top-k (recall measured @5 and @7)")
     parser.add_argument("--top-chunks", type=int, default=3)
     parser.add_argument("--encoder", choices=["simple", "semantic"],
                         default="semantic")
@@ -370,7 +371,7 @@ def main():
         print(f"Per-QA debug trace → {args.debug_jsonl}")
 
     results = []
-    overall = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
+    overall = {"n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
                "tokens_in": 0.0, "tokens_out": 0.0, "steps": 0.0}
     t0 = time.time()
     for i, sample in enumerate(data[: args.samples]):
@@ -396,7 +397,7 @@ def main():
             o = summary["overall"]
             overall["n"] += o["n"]
             overall["recall_at_5"] += o["recall_at_5"] * o["n"]
-            overall["recall_at_10"] += o["recall_at_10"] * o["n"]
+            overall["recall_at_7"] += o["recall_at_7"] * o["n"]
             overall["f1"] += o["f1"] * o["n"]
             if "tokens_in_per_qa" in o:
                 overall["tokens_in"] += o["tokens_in_per_qa"] * o["n"]
@@ -412,7 +413,7 @@ def main():
             "use_lineage": args.lineage,
             "answerer": args.answerer,
             "recall_at_5": round(overall["recall_at_5"] / overall["n"], 4),
-            "recall_at_10": round(overall["recall_at_10"] / overall["n"], 4),
+            "recall_at_7": round(overall["recall_at_7"] / overall["n"], 4),
             "f1": round(overall["f1"] / overall["n"], 4),
             "elapsed_seconds": round(time.time() - t0, 2),
         }

@@ -147,7 +147,10 @@ def build_app(
                         analog of associative spreading; default True).
           prefer_kind:  boost a PointKind in ranking — FACT | THOUGHT |
                         ACTION. Use ACTION for "how do I X" queries.
+
+        k is capped at 7 (the system's retrieval budget).
         """
+        k = min(max(1, k), 7)
         return memory.retrieve(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,

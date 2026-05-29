@@ -6,10 +6,10 @@ Properties :
   E2   f1_score is 1.0 on identical strings, 0.0 on disjoint
   E3   f1_score is case- and punctuation-insensitive (tokenizer)
   E4   evaluate_sample(answerer="chunk") runs with no API and reports
-       recall_at_5 / recall_at_10 / f1 per category
+       recall_at_5 / recall_at_7 / f1 per category
   E5   --debug-jsonl writer emits one well-formed JSON object per QA
        carrying the documented schema (question, gold, pred, f1, r5,
-       r10, retrieved_top10, evidence hits/misses)
+       r7, retrieved_top7, evidence hits/misses)
   E6   evidence hits/misses are computed against gold dia_ids
 """
 
@@ -109,7 +109,7 @@ def test_evaluate_sample_chunk_no_api():
     o = summary["overall"]
     assert o["n"] == 2
     assert 0.0 <= o["recall_at_5"] <= 1.0
-    assert 0.0 <= o["recall_at_10"] <= 1.0
+    assert 0.0 <= o["recall_at_7"] <= 1.0
     assert 0.0 <= o["f1"] <= 1.0
     # category 2 is present in by_category
     assert 2 in summary["by_category"]
@@ -134,14 +134,14 @@ def test_debug_writer_emits_one_object_per_qa():
         # Documented schema
         for key in (
             "sample_id", "category", "question", "gold_answer", "pred",
-            "f1", "r5", "r10", "retrieved_top10", "gold_evidence",
-            "evidence_hits_in_top5", "evidence_missed_top10",
+            "f1", "r5", "r7", "retrieved_top7", "gold_evidence",
+            "evidence_hits_in_top5", "evidence_missed_top7",
             "react_trace", "tokens_in", "tokens_out", "steps",
         ):
             assert key in rec, f"missing {key}"
-        assert isinstance(rec["retrieved_top10"], list)
+        assert isinstance(rec["retrieved_top7"], list)
         # each retrieved chunk dump carries id + kind + content
-        for chunk in rec["retrieved_top10"]:
+        for chunk in rec["retrieved_top7"]:
             assert set(chunk.keys()) == {"id", "kind", "content"}
         # chunk answerer makes no API calls → no react steps / tokens
         assert rec["react_trace"] == []
@@ -211,7 +211,7 @@ def test_debug_evidence_hits_and_misses_partition():
         rec = json.loads(ln)
         gold = set(rec["gold_evidence"])
         hits = set(rec["evidence_hits_in_top5"])
-        misses = set(rec["evidence_missed_top10"])
+        misses = set(rec["evidence_missed_top7"])
         # hits ⊆ gold, misses ⊆ gold, hits ∩ misses = ∅
         assert hits <= gold
         assert misses <= gold
