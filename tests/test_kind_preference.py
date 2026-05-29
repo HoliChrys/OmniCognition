@@ -80,6 +80,8 @@ def test_prefer_kind_none_is_baseline():
 
 
 def test_prefer_kind_action_boosts_actions():
+    """When baseline ranks a non-ACTION first AND ACTIONs are present in
+    the candidate set, prefer_kind=ACTION must put an ACTION at rank 0."""
     m = _seed_memory()
     base = retrieve_hybrid(
         "how do i cook pasta", m.points, k=5, t_now=1.0,
@@ -90,19 +92,41 @@ def test_prefer_kind_action_boosts_actions():
         encoder=m.encoder, extractor=m.extractor,
         prefer_kind=PointKind.ACTION,
     )
-    base_ids = [p.id for _, p in base]
-    boosted_ids = [p.id for _, p in boosted]
+    base_kinds = [p.kind for _, p in base]
+    boosted_kinds = [p.kind for _, p in boosted]
 
-    base_first_action = next(
-        (i for i, pid in enumerate(base_ids) if pid.startswith("ACT")), None
+    # Premise: baseline puts a non-ACTION first while ACTIONs exist in pool
+    assert base_kinds[0] != PointKind.ACTION
+    assert PointKind.ACTION in base_kinds
+    # Effect: boosted promotes an ACTION to rank 0
+    assert boosted_kinds[0] == PointKind.ACTION
+    # And the top-2 of boosted are both ACTIONs (since we have 2 of them
+    # in the pool and they both beat the non-ACTION it displaced)
+    assert boosted_kinds[1] == PointKind.ACTION
+
+
+def test_prefer_kind_does_not_lose_top_relevance():
+    """A FACT that dominates BOTH cosine AND BM25 by a wide margin must
+    not be displaced — boosting is additive over the SAME 1/(60+r) scale,
+    so a strong baseline lead cannot be erased by a single extra signal."""
+    m = Memory(encoder=_Enc(), extractor=SimpleKeywordExtractor())
+    # FACT_HIT is the only point matching the rare query token "carbonara"
+    m.ingest("carbonara carbonara carbonara guanciale pecorino", id="FACT_HIT",
+            kind="FACT")
+    m.ingest("generic pasta dish", id="ACT_FAR", kind="ACTION")
+    m.ingest("another pasta dish here", id="ACT_FAR2", kind="ACTION")
+    m.ingest("more pasta unrelated", id="FACT_FAR", kind="FACT")
+    base = retrieve_hybrid(
+        "carbonara recipe", m.points, k=4, t_now=1.0,
+        encoder=m.encoder, extractor=m.extractor,
     )
-    boosted_first_action = next(
-        (i for i, pid in enumerate(boosted_ids) if pid.startswith("ACT")), None
+    boosted = retrieve_hybrid(
+        "carbonara recipe", m.points, k=4, t_now=1.0,
+        encoder=m.encoder, extractor=m.extractor,
+        prefer_kind=PointKind.ACTION,
     )
-    assert base_first_action is not None
-    assert boosted_first_action is not None
-    # Action ranking is no worse — and at least one ACTION moves up
-    assert boosted_first_action <= base_first_action
+    assert base[0][1].id == "FACT_HIT"
+    assert boosted[0][1].id == "FACT_HIT"
 
 
 # ---------- KP3 ----------------------------------------------------------
