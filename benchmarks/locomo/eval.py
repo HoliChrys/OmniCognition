@@ -110,6 +110,7 @@ def evaluate_sample(
     max_qa: int = None,
     answerer: str = "chunk",
     use_lineage: bool = False,
+    use_hybrid: bool = False,
     claude_answerer=None,
     debug_writer=None,
 ) -> Dict[str, Any]:
@@ -134,7 +135,10 @@ def evaluate_sample(
         if not question:
             continue
 
-        results = memory.retrieve(question, k=k_retrieve, use_lineage=use_lineage)
+        results = memory.retrieve(
+            question, k=k_retrieve,
+            use_hybrid=use_hybrid, use_lineage=use_lineage,
+        )
         retrieved_ids = [r["id"] for r in results]
         top5 = set(retrieved_ids[:5])
         top10 = set(retrieved_ids[:10])
@@ -286,6 +290,12 @@ def main():
                         help="(deprecated alias for --answerer=extractive)")
     parser.add_argument("--lineage", action="store_true",
                         help="retrieve_with_lineage (cosine + adjacent + RRF)")
+    parser.add_argument("--use-hybrid", action="store_true",
+                        help="metric retrieval = hybrid (keyword-embedding "
+                             "cosine + BM25 + RRF) instead of plain cosine kNN. "
+                             "Matches what the claude answerer retrieves "
+                             "internally. Works with the lightweight simhash "
+                             "encoder (no torch).")
     parser.add_argument("--debug-jsonl", default=None,
                         help="per-QA full trace (question, gold, pred, retrieved "
                              "ids, hits, misses, ReAct steps, tokens) written one "
@@ -327,6 +337,7 @@ def main():
             max_qa=args.max_qa,
             answerer=args.answerer,
             use_lineage=args.lineage,
+            use_hybrid=args.use_hybrid,
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
         )
