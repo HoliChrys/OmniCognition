@@ -116,24 +116,35 @@ def _mcp_tools_to_anthropic(mcp_tools) -> List[Dict[str, Any]]:
     return out
 
 
+# Leading conversational interjections the model prepends to its answer.
+_INTERJECTION_RE = re.compile(
+    r"^(perfect|got it|sure|okay|ok|great|yes|absolutely|certainly|"
+    r"alright|right|excellent|understood|done|here you go|here's the answer)"
+    r"[!.,:\s]+",
+    re.IGNORECASE,
+)
 _PREAMBLE_RE = re.compile(
     r"^(based on[^,.:]*[,.:]\s*|according to[^,.:]*[,.:]\s*|"
-    r"the answer is[:\s]+|answer[:\s]+)",
+    r"the answer is[:\s]+|answer[:\s]+|i found that\s+|"
+    r"it (?:appears|seems) that\s+)",
     re.IGNORECASE,
 )
 
 
 def terse(text: str) -> str:
-    """Strip the verbose wrapping Haiku tends to add, leaving the bare
-    value the token-overlap F1 wants.
+    """Strip the verbose wrapping Haiku tends to add, leaving the value
+    the token-overlap F1 wants.
 
-    Order of attempts :
-      1. A bolded **value** → take it (the model often bolds the answer).
-      2. Otherwise drop a leading "Based on …, / According to …, / The
-         answer is …" preamble.
-      3. If the text is multi-sentence and ends with a short final
-         sentence, keep that.
-    Conservative : if nothing matches, return the stripped original.
+    Steps :
+      1. A bolded **value** → take it.
+      2. Strip leading interjections ("Perfect!", "Sure,", …) and
+         preambles ("Based on …, / The answer is …"), repeatedly.
+      3. "Not mentioned" detection.
+
+    Deliberately does NOT pick "the shortest sentence" — that rule used
+    to reduce "Perfect! Mel collects leaves on hikes." to "Perfect!",
+    destroying correct answers. A moderately verbose answer that still
+    contains the gold tokens scores far better than an interjection.
     """
     if not text:
         return text
@@ -143,23 +154,21 @@ def terse(text: str) -> str:
     if m:
         return m.group(1).strip().rstrip(".")
 
-    # Strip stacked preambles ("According to …, the answer is …").
+    # Strip stacked interjections + preambles ("Perfect! Based on …, …").
     while True:
-        stripped = _PREAMBLE_RE.sub("", t).strip()
+        stripped = _INTERJECTION_RE.sub("", t)
+        stripped = _PREAMBLE_RE.sub("", stripped).strip()
         if stripped == t:
+            break
+        if not stripped:
+            # The entire text was interjection/preamble — no real answer.
+            t = ""
             break
         t = stripped
 
-    # If there's an explicit "Not mentioned", prefer it.
     if re.search(r"\bnot mentioned\b", t, re.IGNORECASE):
         return "Not mentioned"
 
-    # Collapse a remaining multi-sentence blob to its last short sentence
-    # only when the whole thing is long (avoids touching clean answers).
-    if len(t) > 80:
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
-        if sentences:
-            t = min(sentences, key=len)
     return t.strip().rstrip(".")
 
 

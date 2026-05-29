@@ -192,7 +192,10 @@ def evaluate_sample(
 
     for qa_index, qa in enumerate(qas):
         question = qa.get("question", "")
-        gold_answer = str(qa.get("answer", ""))
+        # Category 5 (adversarial) stores its gold in `adversarial_answer`,
+        # not `answer` (which is empty). Scoring those against "" forced
+        # an F1 of 0 on every adversarial QA.
+        gold_answer = str(qa.get("answer", "") or qa.get("adversarial_answer", ""))
         evidence = qa.get("evidence", []) or []
         category = qa.get("category", 0)
         if not question:
@@ -263,16 +266,26 @@ def evaluate_sample(
                  "content": (r.get("content") or "")[:200]}
                 for r in results[:7]
             ]
-            # Keep ReAct trace compact : drop raw_reply > 300 chars
+            # Keep ReAct trace compact. Two trace shapes are supported :
+            # the claude_react shape (step/query/parsed/raw_reply) and the
+            # mcp_agent shape (round/action/name/input/text).
             trace_dump = []
             for t in react_trace:
-                trace_dump.append({
-                    "step": t.get("step"),
-                    "query": t.get("query"),
-                    "n_evidence": t.get("n_evidence"),
-                    "parsed": t.get("parsed"),
-                    "raw_reply": (t.get("raw_reply") or "")[:300],
-                })
+                if "action" in t:  # mcp_agent shape
+                    trace_dump.append({
+                        "round": t.get("round"),
+                        "action": t.get("action"),
+                        "name": t.get("name"),
+                        "input": t.get("input"),
+                        "text": (t.get("text") or "")[:200],
+                    })
+                else:  # claude_react shape
+                    trace_dump.append({
+                        "step": t.get("step"),
+                        "query": t.get("query"),
+                        "parsed": t.get("parsed"),
+                        "raw_reply": (t.get("raw_reply") or "")[:300],
+                    })
             debug_writer.write(json.dumps({
                 "sample_id": sample.get("sample_id"),
                 "category": category,

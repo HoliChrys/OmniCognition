@@ -159,6 +159,19 @@ def test_terse_strips_verbose_agent_wrapping():
     assert terse("7 May 2023") == "7 May 2023"
 
 
+def test_terse_strips_interjection_not_the_answer():
+    """Regression: the old 'shortest sentence' rule turned
+    'Perfect! Mel collects leaves on hikes.' into 'Perfect!' (F1=0).
+    terse must keep the answer and drop only the interjection."""
+    from benchmarks.locomo.mcp_agent import terse
+    assert terse("Perfect! Mel collects leaves on hikes.") \
+        == "Mel collects leaves on hikes"
+    assert terse("Got it. painting") == "painting"
+    assert terse("Sure, the answer is excitement") == "excitement"
+    # a bare interjection must not survive as the whole answer
+    assert terse("Perfect!") == ""
+
+
 def test_clean_session_date_strips_clock_and_comma():
     assert _clean_session_date("1:56 pm on 8 May, 2023") == "8 May 2023"
     assert _clean_session_date("8:56 pm on 20 July, 2023") == "20 July 2023"
