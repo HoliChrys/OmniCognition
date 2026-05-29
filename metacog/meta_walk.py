@@ -382,9 +382,21 @@ def generate_action(
     if not hasattr(llm, "generate"):
         return None
     context = "\n".join(f"- {p.content}" for p in facts[:5])
+    # Anchor the action on the facts' OWN entities so it doesn't drift
+    # into unrelated concepts (e.g. inventing "camping" / "beach").
+    fact_entities = []
+    seen_e: set = set()
+    for p in facts[:5]:
+        for kw in p.keywords:
+            if kw and kw not in seen_e:
+                seen_e.add(kw)
+                fact_entities.append(kw)
+    anchor = ", ".join(fact_entities[:8]) or "(the facts above)"
     prompt = (
         "Given these facts, propose ONE concrete action (an imperative "
-        "phrase, ≤ 12 words). No explanation, just the action.\n\n"
+        "phrase, ≤ 12 words) that stays ABOUT these entities — do not "
+        f"introduce new topics. Entities: {anchor}.\n"
+        "No explanation, just the action.\n\n"
         f"{context}"
     )
     try:
@@ -393,7 +405,22 @@ def generate_action(
         return None
     if not text:
         return None
-    kws = extractor.extract(text, n=5) if extractor else []
+    # KEYWORDS — anchored, like the THOUGHT : start from the facts'
+    # entities the action text actually mentions, reorder by that, then
+    # enrich only with concrete tokens shared between the action text and
+    # the fact content. Never an unrelated free-extraction.
+    act_tokens = {w.strip(".,;:!?\"'()").lower() for w in text.split()}
+    content_vocab = {
+        w.strip(".,;:!?\"'()").lower()
+        for p in facts[:5] for w in p.content.split() if len(w) >= 4
+    }
+    emphasised = [k for k in fact_entities if k.lower() in act_tokens]
+    rest = [k for k in fact_entities if k.lower() not in act_tokens]
+    enrich = [w for w in act_tokens
+              if w in content_vocab and w not in seen_e]
+    kws = (emphasised + rest + enrich)[:5]
+    if not kws:
+        kws = (extractor.extract(text, n=5) if extractor else [])
     kw_emb = position_weighted_keyword_embedding(kws, encoder)
     return Point(
         id=_gen_id("act_gen", t_now),
@@ -683,7 +710,10 @@ def meta_walk(
     cur_thought = thought
 
     for stage in range(1, n_stages):
-        kws_new = cur_thought.keywords or query_kws
+        # Re-anchor : original query keywords FIRST (so position weighting
+        # keeps them dominant), then the thought's enrichment.
+        thought_kws = cur_thought.keywords if cur_thought else []
+        kws_new = list(query_kws) + list(thought_kws)
         pwe_n = position_weighted_keyword_embedding(kws_new, enc) if kws_new else None
         new_emb = pwe_n if pwe_n is not None else query_emb
 
@@ -853,17 +883,23 @@ class MetaWalker:
                 done=True,
             )
 
-        # Retrieval — for stage 0 we seed from the query embedding ; for
-        # later stages from the current thought's enriched keywords (set
-        # at the end of the previous step).
+        # Retrieval — stage 0 seeds from the query ; later stages from
+        # the thought's enriched keywords ALWAYS combined with the
+        # original query keywords (re-anchoring). The thought enriches /
+        # advances the search, but the question stays in the signal so a
+        # drifting generated action cannot pull the walk off-topic.
         if self._stage_idx == 0:
             seed_query = self.query
+            seed_emb = self._cur_emb
         else:
-            seed_kws = self._cur_thought.keywords if self._cur_thought else []
-            seed_query = " ".join(seed_kws) if seed_kws else self.query
+            thought_kws = self._cur_thought.keywords if self._cur_thought else []
+            anchored_kws = list(self._query_keywords) + list(thought_kws)
+            seed_query = " ".join(anchored_kws) if anchored_kws else self.query
+            pwe = position_weighted_keyword_embedding(anchored_kws, self._enc)
+            seed_emb = pwe if pwe is not None else self._cur_emb
 
         facts = nearest_facts_with_fallback(
-            self._cur_emb, seed_query, self.memory.points,
+            seed_emb, seed_query, self.memory.points,
             self.facts_per_stage, self.t_now,
             exclude_ids=self._visited_fact_ids,
             encoder=self._enc, extractor=self._extr,
