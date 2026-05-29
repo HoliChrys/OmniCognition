@@ -146,9 +146,20 @@ class ClaudeReactAnswerer:
     ) -> None:
         import anthropic
 
-        self.client = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"),
+        # Resolve credential. Two accepted shapes :
+        #   - standard API key  (sk-ant-api…)  → x-api-key header
+        #   - OAuth access token (sk-ant-oat…)  → Authorization: Bearer
+        # The latter is what Claude-Code-style sessions hand out ; the
+        # SDK routes it through `auth_token=` rather than `api_key=`.
+        token = (
+            api_key
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
         )
+        if token and token.startswith("sk-ant-oat"):
+            self.client = anthropic.Anthropic(auth_token=token)
+        else:
+            self.client = anthropic.Anthropic(api_key=token)
         self.model = model
         self.max_tokens = max_tokens
         self.chunk_char_limit = chunk_char_limit
