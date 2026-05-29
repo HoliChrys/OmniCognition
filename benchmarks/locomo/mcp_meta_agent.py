@@ -45,25 +45,37 @@ Workflow :
    keywords, confidence and uncertainty — read those.
 2. If the chosen fact at this stage already answers the question,
    answer now (no more tool calls).
-3. DEPTH : call `walk_next(walk_id=…)` for the next stage when the
-   current thread is still on-topic and sigma_path is low. Multi-hop
-   questions often need 2-3 depth stages.
-4. BREADTH PIVOT : when `done=true` (depth exhausted or sigma_path
-   high) and you are still MISSING a specific piece :
-   — name what's missing in one phrase
-   — call `walk_start(query=<targeted phrase>)` with a query that
-     focuses on EXACTLY what's missing, NOT the original question.
-   Example : found "Melanie thanked Caroline" but not the book title →
-     walk_start(query="book title Caroline recommended Melanie read")
+3. READ THE RELEVANCE NOTES. Each fact has a `relevance` tag :
+   relevant / partial / contradicts / irrelevant. Trust only
+   relevant + partial + contradicts ; ignore irrelevant facts (they are
+   adjacent-but-off-target conversation turns). The stage also returns
+   `relevant_collected` — the running MAP-REDUCE set of every on-target
+   fact gathered SO FAR across all stages (bridging facts from earlier
+   stages are kept here, never lost). COMPOSE YOUR ANSWER over
+   `relevant_collected`, not just the latest stage : a multi-hop answer
+   chains facts collected across several stages.
+4. DEPTH : call `walk_next(walk_id=…)` for the next stage when the
+   current thread is still on-topic. Multi-hop questions often need 2-3
+   depth stages.
+5. BREADTH PIVOT — this is REQUIRED, not optional. When a stage returns
+   `drifted=true` or `n_relevant=0` (every fact reads irrelevant), the
+   query phrasing is wrong, NOT the memory. Do NOT answer "Not
+   mentioned" yet. Instead:
+   — name what you are looking for in concrete entity words
+   — call `walk_start(query=<targeted phrase>)` with the FULL specific
+     phrasing, not a 2-word stub. Use the entities from the question.
+   Example : question "What did Caroline research?" drifted →
+     walk_start(query="Caroline researching adoption agencies family")
    Example : found running but not the second hobby →
      walk_start(query="Melanie hobby activity craft pottery")
-5. Answer once you have enough evidence or have made 5 walk calls
-   total. Incomplete evidence → answer with what you have or
-   "Not mentioned" if nothing supports it.
+   Start each walk with a RICH query (4+ content words from the
+   question), never a 2-word stub like "Caroline research".
+6. Only answer "Not mentioned" after you have tried at least TWO
+   differently-phrased walks and both drifted. Otherwise answer with
+   the best relevant/partial evidence you found.
 
-sigma_path in the stage output measures cumulative walk drift; when it
-is high the walk has drifted off-topic and breadth is more useful than
-more depth on the same thread.
+sigma_path measures geometric drift ; drifted / n_relevant measure
+CONTENT relevance and are the stronger pivot signal — act on them.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").

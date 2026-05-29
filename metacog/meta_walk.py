@@ -103,14 +103,20 @@ class MetaWalkTrajectory:
     generated_point_ids: List[str] = field(default_factory=list)
 
 
-def _node_payload(p: Point) -> dict:
+def _node_payload(p: Point, relevance: Optional[str] = None) -> dict:
     """Compact JSON-ready dump of a node for an external (MCP) caller.
 
     Always carries the INDEXED CONTENT so the agent driving the walk
     over MCP can reason on the actual text, not just ids — even though
     retrieval itself runs on keyword kNN.
+
+    `relevance` (Chain-of-Note) annotates how the retrieved fact relates
+    to the query : relevant | partial | irrelevant | contradicts. It is
+    a READING NOTE for the agent and the THOUGHT prompt — it never drops
+    the node from the cumulative recall set, so recall is preserved while
+    the reasoning gains precision.
     """
-    return {
+    out = {
         "id": p.id,
         "kind": p.kind.value,
         "content": p.content,
@@ -123,6 +129,9 @@ def _node_payload(p: Point) -> dict:
         "state": p.state.value,
         "source": p.keywords_source.value if p.keywords_source else None,
     }
+    if relevance is not None:
+        out["relevance"] = relevance
+    return out
 
 
 @dataclass
@@ -137,6 +146,13 @@ class StageOutput:
     embedding hops. High sigma_path signals that depth is exhausted and
     the agent should pivot to a breadth walk_start with a reformulated
     query targeting the missing aspect.
+
+    n_relevant : Chain-of-Note count of facts that read
+    relevant/partial/contradicts (i.e. on-target) at this stage.
+    drifted : True when n_relevant == 0 — every retrieved fact reads
+    irrelevant, so the walk has wandered off the query. This is a SOFT
+    hint : it does NOT terminate the walk (that would risk recall), it
+    tells the agent to pivot breadth with a reformulated query.
     """
 
     stage: int
@@ -150,6 +166,13 @@ class StageOutput:
     fact_ids_cumulative: List[str]
     done: bool
     sigma_path: float = 0.0
+    n_relevant: int = 0
+    drifted: bool = False
+    # MAP-REDUCE deliverable : the successively-collected ON-TARGET facts
+    # across all stages (relevant/partial/contradicts), each {id,
+    # content, relevance}. This is the reduced evidence the answerer
+    # should compose over — it never loses a prior stage's bridging fact.
+    relevant_collected: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -164,6 +187,9 @@ class StageOutput:
             "fact_ids_cumulative": list(self.fact_ids_cumulative),
             "done": self.done,
             "sigma_path": round(self.sigma_path, 4),
+            "n_relevant": self.n_relevant,
+            "drifted": self.drifted,
+            "relevant_collected": self.relevant_collected,
         }
 
 
@@ -273,6 +299,121 @@ def least_uncertain(facts: Sequence[Point]) -> Optional[Point]:
     if not facts:
         return None
     return min(facts, key=node_sigma)
+
+
+# Chain-of-Note relevance labels. Categorical (not a threshold) — no
+# hyperparameter. "contradicts" is surfaced rather than dropped so the
+# THOUGHT can reason about the conflict (it also feeds the existing
+# polarization / collision machinery downstream when committed).
+_CON_LABELS = ("relevant", "partial", "contradicts", "irrelevant")
+
+
+def chain_of_note(
+    query: str,
+    facts: Sequence[Point],
+    llm: Any,
+    *,
+    collected: Optional[Sequence[Point]] = None,
+    current_thought: Optional[str] = None,
+) -> List[str]:
+    """Annotate each retrieved FACT with its relevance to the query —
+    judged AS A MULTI-HOP CHAIN, not as a static keyword match.
+
+    Returns a list of labels (one per fact, same order) drawn from
+    {relevant, partial, contradicts, irrelevant}. This is the
+    Chain-of-Note reading pass (Yu et al., EMNLP 2024) adapted for an
+    iterative walk : before the THOUGHT is composed, the walk reads
+    every retrieved fact and notes its role IN THE CHAIN toward the
+    answer. Crucially a fact that does NOT directly answer but BRIDGES
+    to the next hop (a stepping-stone) is `relevant`, not `irrelevant` —
+    going deeper does not make a bridging fact off-target. Only genuine
+    different-topic chitchat is `irrelevant` (the #1 LoCoMo failure
+    mode : adjacent-but-wrong turns).
+
+    `collected` — the facts already gathered as on-target in PRIOR
+    stages (the map-reduce accumulator). Passed as context so a new
+    fact is judged for what it ADDS to the chain, and so the model
+    understands the bridge it must continue.
+    `current_thought` — the latest reflection, the "where we are" of the
+    walk.
+
+    A(·) ⊥ P is preserved at the EPISTEMIC level : this note does NOT
+    update any point's epistemic state from foreign content ; it is a
+    transient reasoning annotation used to focus the THOUGHT and the
+    fact* choice. The cumulative recall set keeps every fact regardless
+    of its label, so recall is never traded away for this precision.
+
+    On any LLM failure we fail OPEN — every fact is labelled "relevant"
+    so the walk degrades to its pre-Chain-of-Note behaviour rather than
+    silently dropping evidence.
+    """
+    n = len(facts)
+    if n == 0:
+        return []
+    if not hasattr(llm, "generate"):
+        return ["relevant"] * n
+
+    lines = []
+    for i, p in enumerate(facts):
+        lines.append(f"[{i}] {p.content}")
+    listing = "\n".join(lines)
+
+    # Context block : what the chain has already established, so the
+    # model judges each new fact's role relative to where the walk is.
+    ctx_parts: List[str] = []
+    if collected:
+        gathered = "\n".join(f"  - {p.content}" for p in list(collected)[-6:])
+        ctx_parts.append("ALREADY GATHERED (on-target so far) :\n" + gathered)
+    if current_thought:
+        ctx_parts.append(f"CURRENT REFLECTION : {current_thought}")
+    ctx_block = ("\n" + "\n".join(ctx_parts) + "\n") if ctx_parts else ""
+
+    prompt = (
+        "You are reading retrieved memory turns during a MULTI-HOP walk "
+        "toward answering the QUERY. The answer may require chaining "
+        "several facts. For EACH numbered fact output one label :\n"
+        "  relevant    — helps answer the query, OR is a stepping-stone "
+        "that bridges toward the answer (links people/events/topics the "
+        "next hop needs). A fact need NOT answer directly to be relevant.\n"
+        "  partial     — gives useful context but is neither answer nor "
+        "a clear bridge\n"
+        "  contradicts — conflicts with the gathered facts about the query\n"
+        "  irrelevant  — a genuinely DIFFERENT topic / off-target chitchat "
+        "that neither answers nor bridges\n\n"
+        "Be generous with `relevant` for bridging facts : going deeper "
+        "does not make an earlier on-topic fact irrelevant.\n"
+        "Output ONLY lines of the form `i: label`, one per fact, nothing "
+        "else.\n\n"
+        f"QUERY : {query}\n"
+        f"{ctx_block}"
+        f"FACTS :\n{listing}"
+    )
+    try:
+        # ~6 tokens per fact line is plenty for "i: label".
+        raw = llm.generate(prompt, max_tokens=max(16, 8 * n)).strip()
+    except Exception:
+        return ["relevant"] * n
+    if not raw:
+        return ["relevant"] * n
+
+    labels: List[Optional[str]] = [None] * n
+    for ln in raw.splitlines():
+        ln = ln.strip().lstrip("-•* ").strip()
+        if ":" not in ln:
+            continue
+        idx_part, _, label_part = ln.partition(":")
+        idx_part = idx_part.strip().strip("[]")
+        if not idx_part.isdigit():
+            continue
+        idx = int(idx_part)
+        if not (0 <= idx < n):
+            continue
+        label_norm = label_part.strip().lower()
+        match = next((L for L in _CON_LABELS if label_norm.startswith(L)), None)
+        if match is not None:
+            labels[idx] = match
+    # Any fact the model didn't label → fail open to "relevant".
+    return [lab if lab is not None else "relevant" for lab in labels]
 
 
 def nearest_action_to(
@@ -823,6 +964,7 @@ class MetaWalker:
         pull_strength: float = 1.0,
         t_now: Optional[float] = None,
         commit: bool = True,
+        use_chain_of_note: bool = True,
     ) -> None:
         """`commit` controls whether the walk MUTATES the shared memory.
 
@@ -834,6 +976,13 @@ class MetaWalker:
             retrieval), no pull, no counter bump. This makes concurrent
             walks over a shared memory fully ISOLATED and reproducible —
             essential when many QAs run in parallel against one memory.
+
+        `use_chain_of_note` (default True) : run a relevance reading pass
+            over each stage's retrieved facts. Irrelevant facts are kept
+            in the cumulative recall set (recall preserved) but excluded
+            from the THOUGHT seed and the fact* choice (precision gained).
+            When EVERY fact at a stage reads irrelevant, the walk is
+            drifting → it stops so the agent can pivot breadth.
         """
         self.query = query
         self.memory = memory
@@ -842,6 +991,7 @@ class MetaWalker:
         self.actions_per_stage = actions_per_stage
         self.pull_strength = pull_strength
         self.commit = commit
+        self.use_chain_of_note = use_chain_of_note
         # Per-walk scratch for generated points when commit=False.
         self._local_points: List[Point] = []
         self.t_now = (
@@ -868,6 +1018,15 @@ class MetaWalker:
         self._stage_idx = 0
         self._done = False
         self._generated_ids: List[str] = []
+        # MAP-REDUCE accumulator : the successively-collected set of
+        # ON-TARGET facts (relevant/partial/contradicts per Chain-of-Note)
+        # across ALL stages. A bridging fact found at état -1 PERSISTS
+        # here into état k — going deeper never discards prior relevant
+        # evidence. This reduced collection is what seeds each THOUGHT
+        # and what the answerer composes over.
+        self._relevant_cum: List[Point] = []
+        self._relevant_ids: set = set()
+        self._relevant_label: dict = {}
         # σ-propagation depth-stop state.
         self._sigma_path: float = 0.0
         self._prev_seed_emb: Optional[tuple] = None
@@ -1007,6 +1166,41 @@ class MetaWalker:
                     median_d = sorted(dists)[len(dists) // 2]
                     self._walk_sigma_cutoff = median_d + std_d
 
+        # Chain-of-Note reading pass (MAP) — annotate each retrieved fact
+        # with its relevance to the ORIGINAL query, judged as part of the
+        # multi-hop CHAIN : a bridging fact is relevant even if it does
+        # not answer directly. Context = the map-reduce accumulator so
+        # far + the current reflection, so the model judges what each new
+        # fact ADDS to the chain. Labels focus the THOUGHT/fact* WITHOUT
+        # dropping any fact from the recall set : precision up, recall held.
+        relevance: List[str] = ["relevant"] * len(facts)
+        if self.use_chain_of_note and facts:
+            relevance = chain_of_note(
+                self.query, facts, self._llm,
+                collected=self._relevant_cum,
+                current_thought=(
+                    self._cur_thought.content if self._cur_thought else None
+                ),
+            )
+        rel_by_id = {f.id: relevance[i] for i, f in enumerate(facts)}
+
+        # REDUCE — fold this stage's on-target facts into the persistent
+        # accumulator (dedup, order-preserving). Bridging evidence from
+        # état -1 survives into état k ; going deeper never loses it.
+        for i, f in enumerate(facts):
+            if relevance[i] != "irrelevant" and f.id not in self._relevant_ids:
+                self._relevant_cum.append(f)
+                self._relevant_ids.add(f.id)
+                self._relevant_label[f.id] = relevance[i]
+
+        # The subset the reasoning trusts : everything except clearly
+        # off-target turns. "contradicts" is kept (the THOUGHT must see
+        # the conflict). Fall back to ALL facts if the note left nothing.
+        focus_facts = [
+            f for i, f in enumerate(facts)
+            if relevance[i] != "irrelevant"
+        ] or list(facts)
+
         # ACTIONs : at stage 0 nearest by query embedding ; at later
         # stages nearest to the previous action.
         if self._stage_idx == 0 or self._prev_action is None:
@@ -1025,16 +1219,21 @@ class MetaWalker:
             actions = [a] if a else []
 
         gen_action = False
-        if not actions and facts:
+        if not actions and focus_facts:
+            # Generate the action from the FOCUSED facts so it doesn't
+            # anchor on an adjacent-but-wrong turn.
             generated = generate_action(
-                facts, self._llm, self._enc, self._extr, self.t_now,
+                focus_facts, self._llm, self._enc, self._extr, self.t_now,
             )
             if generated is not None:
                 self._add_generated(generated)
                 actions = [generated]
                 gen_action = True
 
-        fact_star = least_uncertain(facts)
+        # fact* is chosen among the FOCUSED facts (Chain-of-Note has
+        # filtered the off-target turns) so the THOUGHT is seeded by a
+        # fact that actually bears on the query.
+        fact_star = least_uncertain(focus_facts)
         action_star = actions[0] if actions else None
 
         # Accumulate FACT ids (this is the "effective recall" the
@@ -1075,9 +1274,12 @@ class MetaWalker:
 
         out = StageOutput(
             stage=self._stage_idx,
-            facts=[_node_payload(p) for p in facts],
+            facts=[_node_payload(p, rel_by_id.get(p.id)) for p in facts],
             actions=[_node_payload(p) for p in actions if p is not None],
-            chosen_fact=_node_payload(fact_star) if fact_star else None,
+            chosen_fact=(
+                _node_payload(fact_star, rel_by_id.get(fact_star.id))
+                if fact_star else None
+            ),
             chosen_action=_node_payload(action_star) if action_star else None,
             thought=_node_payload(thought) if thought else None,
             generated_action=gen_action,
@@ -1085,11 +1287,33 @@ class MetaWalker:
             fact_ids_cumulative=list(self._fact_ids_cum),
             done=False,
             sigma_path=self._sigma_path,
+            relevant_collected=[
+                {"id": p.id, "content": p.content,
+                 "relevance": self._relevant_label.get(p.id, "relevant")}
+                for p in self._relevant_cum
+            ],
         )
 
         self._prev_action = action_star
 
-        # Terminal conditions for the NEXT step.
+        # Chain-of-Note drift signal — SOFT. If not a single retrieved
+        # fact at this stage reads relevant/partial/contradicts (all
+        # off-target), the walk has drifted. We EXPOSE this as a hint
+        # (out.drifted) so the agent can pivot breadth with a
+        # reformulated query, but we deliberately do NOT force done from
+        # it : forcing termination here would cut the walk short and risk
+        # dropping gold the next stage might still surface. CoN therefore
+        # only ADDS precision (focused THOUGHT/fact*) and a pivot hint —
+        # it never reduces the number of stages, so recall can only stay
+        # equal or improve versus the pre-CoN walk.
+        on_target = sum(
+            1 for r in relevance
+            if r in ("relevant", "partial", "contradicts")
+        )
+        out.n_relevant = on_target
+        out.drifted = self.use_chain_of_note and bool(facts) and on_target == 0
+
+        # Terminal conditions for the NEXT step (drift NOT among them).
         next_idx = self._stage_idx + 1
         cant_continue = (
             fact_star is None
