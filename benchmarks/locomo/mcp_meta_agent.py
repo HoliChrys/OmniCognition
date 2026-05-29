@@ -98,6 +98,9 @@ Hard rule : if your answer is longer than 5 words, you are wrong —
 strip every adjective and conjunction until only the bare value
 remains. Drop "and ...", "who is ...", "the ... of ...".
 
+NEVER output a dialog turn ID (D4:11, D10:12, etc.) as your answer.
+Output the CONTENT of the fact, not its reference ID.
+
 Examples of GOOD answers : "7 May 2023" · "Sweden" · "4 years" ·
 "adoption agencies" · "Transgender woman" · "Not mentioned".
 Example of BAD : "Based on the walk, the support group was on …" —
@@ -110,11 +113,20 @@ def _resolve_client(api_key: Optional[str]):
     import anthropic
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
-    # ANTHROPIC_AUTH_TOKEN is always an OAuth bearer — use auth_token=.
-    # ANTHROPIC_API_KEY / explicit api_key that starts with sk-ant-oat too.
+    # Priority 1 : ANTHROPIC_AUTH_TOKEN env var (OAuth bearer token in most
+    #              managed environments) or explicit sk-ant-oat* api_key arg.
     auth_tok = os.environ.get("ANTHROPIC_AUTH_TOKEN") or (
         api_key if (api_key and api_key.startswith("sk-ant-oat")) else None
     )
+    # Priority 2 : CLAUDE_SESSION_INGRESS_TOKEN_FILE (remote exec environments
+    #              where the token lives in a file, not an env var).
+    if not auth_tok:
+        tok_file = os.environ.get("CLAUDE_SESSION_INGRESS_TOKEN_FILE")
+        if tok_file:
+            try:
+                auth_tok = open(tok_file).read().strip() or None
+            except OSError:
+                pass
     if auth_tok:
         return anthropic.Anthropic(auth_token=auth_tok, base_url=base_url)
     api_tok = api_key or os.environ.get("ANTHROPIC_API_KEY")
