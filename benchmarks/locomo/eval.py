@@ -213,10 +213,22 @@ def evaluate_sample(
 
         def _run(idx_qa):
             idx, qa = idx_qa
-            return idx, claude_answerer.answer(
-                memory, qa["question"],
-                k=k_retrieve, max_steps=3, use_lineage=use_lineage,
-            )
+            # Resilient : a transient per-QA API error (e.g. a DNS blip)
+            # must not crash the whole run. Retry once, then degrade to an
+            # empty answer for just this QA.
+            for attempt in range(2):
+                try:
+                    return idx, claude_answerer.answer(
+                        memory, qa["question"],
+                        k=k_retrieve, max_steps=3, use_lineage=use_lineage,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == 0:
+                        time.sleep(3)
+                        continue
+                    print(f"  [warn] QA {idx} failed twice ({exc}); "
+                          "recording empty answer")
+                    return idx, {"answer": "", "trace": [], "retrieved_ids": []}
 
         with ThreadPoolExecutor(max_workers=agent_concurrency) as ex:
             for idx, ca in ex.map(_run, valid):
