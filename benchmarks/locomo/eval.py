@@ -142,10 +142,17 @@ def evaluate_sample(
     use_hybrid: bool = False,
     with_dates: bool = True,
     agent_concurrency: int = 10,
+    sample_seed: int = None,
     claude_answerer=None,
     debug_writer=None,
 ) -> Dict[str, Any]:
-    qas = sample["qa"]
+    qas = list(sample["qa"])
+    if sample_seed is not None:
+        # Deterministic random sample per conversation, so the category
+        # mix reflects the true distribution instead of whatever the
+        # first-N QAs happen to be.
+        import random
+        random.Random(sample_seed).shuffle(qas)
     if max_qa is not None:
         qas = qas[:max_qa]
 
@@ -385,6 +392,11 @@ def main():
     parser.add_argument("--agent-concurrency", type=int, default=10,
                         help="number of MCP-agent QAs to run in parallel "
                              "(threads). Cuts wall-time for --answerer mcp.")
+    parser.add_argument("--shuffle-seed", type=int, default=None,
+                        help="deterministically shuffle each conversation's "
+                             "QAs before --max-qa, so a capped run is a "
+                             "representative random sample (category mix "
+                             "matches the dataset) instead of the first-N.")
     parser.add_argument("--no-dates", action="store_true",
                         help="disable session-date prefix on ingested turns "
                              "(baseline for measuring the temporal-anchor "
@@ -441,6 +453,7 @@ def main():
             use_hybrid=args.use_hybrid,
             with_dates=not args.no_dates,
             agent_concurrency=args.agent_concurrency,
+            sample_seed=args.shuffle_seed,
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
         )
