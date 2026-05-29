@@ -101,11 +101,6 @@ Workflow :
 6. Only answer "Not mentioned" after you have tried at least TWO
    differently-phrased walks and both drifted. Otherwise answer with
    the best relevant/partial evidence you found.
-   HARD RULE : if `relevant_collected` contains ANY fact (relevant or
-   partial), you are FORBIDDEN to answer "Not mentioned". Compose the
-   bare value from those facts — extract the date, place, label, or list
-   that the question asks for from their content. Saying "Not mentioned"
-   while you have relevant_collected facts is the #1 failure mode.
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
