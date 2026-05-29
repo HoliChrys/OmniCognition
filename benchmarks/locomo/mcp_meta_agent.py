@@ -158,6 +158,9 @@ _INTERJECTION_RE = re.compile(
     r"[!.,:\s]+",
     re.IGNORECASE,
 )
+# Strip a "(D4:11)" / "from D4:11" / "D4:11" dialog-id citation the
+# agent sometimes leaks into the answer.
+_DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
 
 
 def terse(text: str) -> str:
@@ -180,6 +183,8 @@ def terse(text: str) -> str:
         t = stripped
     if re.search(r"\bnot mentioned\b", t, re.IGNORECASE):
         return "Not mentioned"
+    # Drop any leaked dialog-id citation, then tidy leftover punctuation.
+    t = _DIALOG_ID_RE.sub("", t).strip(" .,()")
     return t.strip().rstrip(".")
 
 
