@@ -530,7 +530,37 @@ class McpMetaAgent:
 
                 # Natural exit : no tool calls → answer
                 if not tool_uses:
-                    answer_text = " ".join(text_blocks).strip()
+                    raw = " ".join(text_blocks).strip()
+                    # If the agent NARRATED instead of giving a bare value
+                    # ("I now have clear evidence…", "Looking at the facts…"),
+                    # convert it via a forced final_answer turn — otherwise
+                    # the reasoning prose leaks as the answer (F1≈0 despite
+                    # recall=1). Short answers are taken as-is.
+                    if len(raw.split()) > 6:
+                        messages.append({"role": "assistant",
+                                         "content": resp.content})
+                        fr = self.client.messages.create(
+                            model=self.model, max_tokens=48, temperature=0,
+                            system=AGENT_SYSTEM, tools=[_FINAL_ANSWER_TOOL],
+                            tool_choice={"type": "tool",
+                                         "name": "final_answer"},
+                            messages=messages + [{
+                                "role": "user",
+                                "content": ("Call final_answer with the bare "
+                                            "value only, copied verbatim from "
+                                            "the evidence — no narration."),
+                            }],
+                        )
+                        if hasattr(fr, "usage"):
+                            total_in += getattr(fr.usage, "input_tokens", 0) or 0
+                            total_out += getattr(fr.usage, "output_tokens", 0) or 0
+                        fa = next((b for b in fr.content
+                                   if b.type == "tool_use"
+                                   and b.name == "final_answer"), None)
+                        val = str((fa.input or {}).get("value", "")).strip() if fa else ""
+                        answer_text = val or raw
+                    else:
+                        answer_text = raw
                     trace.append({"round": round_idx, "action": "final",
                                   "text": answer_text[:200]})
                     break
