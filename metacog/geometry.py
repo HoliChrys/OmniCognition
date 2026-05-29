@@ -382,8 +382,9 @@ def retrieve_hybrid(
     extractor,
     use_lineage: bool = False,
     use_spreading: bool = False,
+    use_fuzzy: bool = True,
     lineage_depth: int = 7,
-    pool_per_signal: int = 14,
+    pool_per_signal: int = 20,
     rrf_k: int = 60,
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
@@ -444,13 +445,21 @@ def retrieve_hybrid(
     content_pool.sort(key=lambda x: x[0], reverse=True)
     content_pool = content_pool[:pool_per_signal]
 
-    # Phase 2 — BM25 on full content
+    # Phase 2 — BM25 on full content (exact-token)
     bm25_pool = bm25_score(query_text, points, k_pool=pool_per_signal)
 
-    # Phase 3 — Reciprocal Rank Fusion (keyword cosine + content cosine + BM25)
+    # Phase 2b — fuzzy lexical (Levenshtein) : recovers morphological /
+    # spelling variants of rare entities that exact BM25 misses. Edit
+    # budget is length-relative (parameter-free).
+    fuzzy_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
+    if use_fuzzy:
+        from metacog.fuzzy import fuzzy_score
+        fuzzy_pool = fuzzy_score(query_text, points, k_pool=pool_per_signal)
+
+    # Phase 3 — Reciprocal Rank Fusion across all base signals
     rrf_scores: dict[str, float] = {}
     best_rank_by_id: dict[str, int] = {}
-    for pool in (cosine_pool, content_pool, bm25_pool):
+    for pool in (cosine_pool, content_pool, bm25_pool, fuzzy_pool):
         for rank, (_, p) in enumerate(pool):
             rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
             best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
