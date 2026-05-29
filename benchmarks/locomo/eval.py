@@ -13,9 +13,9 @@ Per conversation :
      - synthesize an answer (chunk dump, extractive ReAct, …)
      - measure token-overlap F1 vs gold
 
-Categories (per LoCoMo paper) :
-  1 = single-hop   2 = multi-hop   3 = temporal
-  4 = open-domain  5 = adversarial
+Categories (official LoCoMo convention, Maharana et al. 2024) :
+  1 = multi-hop    2 = temporal    3 = open-domain
+  4 = single-hop   5 = adversarial
 """
 
 from __future__ import annotations

@@ -20,20 +20,23 @@ import json
 import sys
 from typing import Dict, List
 
+# Official LoCoMo category convention (Maharana et al. 2024) — verified
+# against the data (cat 2 questions are all "When did…" = temporal).
 CAT_NAMES = {
-    1: "single-hop",
-    2: "multi-hop",
-    3: "temporal",
-    4: "open-domain",
+    1: "multi-hop",
+    2: "temporal",
+    3: "open-domain",
+    4: "single-hop",
     5: "adversarial",
 }
 
-# HeLa-Mem reported F1 (GPT-4o-mini backbone, LoCoMo) — the bar to beat.
+# HeLa-Mem reported F1 (GPT-4o-mini backbone, LoCoMo) — the bar to beat,
+# keyed by the CORRECT category number.
 HELA_F1 = {
-    1: 0.519,   # single-hop
-    2: 0.401,   # multi-hop
-    3: 0.473,   # temporal
-    4: 0.297,   # open-domain
+    1: 0.401,   # multi-hop
+    2: 0.473,   # temporal
+    3: 0.297,   # open-domain
+    4: 0.519,   # single-hop
 }
 
 
