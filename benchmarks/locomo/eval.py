@@ -155,6 +155,7 @@ def evaluate_sample(
     claude_answerer=None,
     debug_writer=None,
     entities: bool = False,
+    merge: bool = False,
 ) -> Dict[str, Any]:
     qas = list(sample["qa"])
     if sample_seed is not None:
@@ -175,6 +176,12 @@ def evaluate_sample(
     ingested = ingest_conversation(
         memory, sample["conversation"], with_dates=with_dates,
     )
+    if merge:
+        # Collapse genuine same-info turns into single nodes (corroboration
+        # absorbed). Recall scoring below resolves absorbed ids to survivors.
+        mrep = memory.consolidate_duplicates()
+        print(f"  merged {mrep['merged_count']} same-info turns "
+              f"-> {mrep['n_points']} points")
 
     per_cat = defaultdict(lambda: {
         "n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
@@ -220,9 +227,12 @@ def evaluate_sample(
             use_hybrid=use_hybrid, use_lineage=use_lineage,
         )
         retrieved_ids = [r["id"] for r in results]
-        top5 = set(retrieved_ids[:5])
-        top7 = set(retrieved_ids[:7])
-        ev_set = set(evidence)
+        # Resolve absorbed (merged) ids to their surviving node so a survivor
+        # still credits recall for an evidence turn that was folded into it.
+        _rid = memory.resolve_alias
+        top5 = {_rid(i) for i in retrieved_ids[:5]}
+        top7 = {_rid(i) for i in retrieved_ids[:7]}
+        ev_set = {_rid(e) for e in evidence}
         if ev_set:
             r5 = len(top5 & ev_set) / len(ev_set)
             r7 = len(top7 & ev_set) / len(ev_set)
@@ -253,7 +263,8 @@ def evaluate_sample(
             react_trace = ca.get("trace", []) or []
             agent_retrieved_ids = ca.get("retrieved_ids", []) or []
             if ev_set:
-                agent_recall = len(set(agent_retrieved_ids) & ev_set) / len(ev_set)
+                agent_seen = {_rid(i) for i in agent_retrieved_ids}
+                agent_recall = len(agent_seen & ev_set) / len(ev_set)
         else:  # "chunk"
             pred = " ".join(r["content"] for r in results[:top_chunks_for_answer])
         f1 = f1_score(pred, gold_answer)
@@ -441,6 +452,11 @@ def main():
                              "into day/month/year) pulled onto it geometrically — "
                              "the edge-free 'edges-equivalent' that lifts the real "
                              "fact into recall. One LLM call per turn (cached).")
+    parser.add_argument("--merge", action="store_true",
+                        help="opt-in : after ingest, collapse genuine same-info "
+                             "turns (content-cosine >= 0.95) into single nodes, "
+                             "absorbing corroboration. Recall resolves absorbed "
+                             "ids to survivors. No LLM (pure geometric).")
     args = parser.parse_args()
     if args.react and args.answerer == "chunk":
         args.answerer = "extractive"
@@ -502,6 +518,7 @@ def main():
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
             entities=args.entities,
+            merge=args.merge,
         )
         results.append(summary)
         print(json.dumps(summary, indent=2))

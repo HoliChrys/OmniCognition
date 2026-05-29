@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from metacog.audit import audit, assert_no_laundering, inputs_of_A
-from metacog.collision import sleep_cycle_collisions
+from metacog.collision import merge_duplicates, sleep_cycle_collisions
 from metacog.compression import compress_trajectory
 from metacog.defaults import NoOpExecutor, SimpleEncoder
 from metacog.llm import ClaudeLLM
@@ -82,6 +82,8 @@ class Memory:
     points: List[Point] = field(default_factory=list)
     observators: Dict[str, Observator] = field(default_factory=dict)
     conversation_log: ConversationLog = field(default_factory=ConversationLog)
+    # absorbed point id -> surviving node id, from consolidate_duplicates().
+    _merge_aliases: Dict[str, str] = field(default_factory=dict)
     _t_clock: float = 0.0
 
     def __post_init__(self) -> None:
@@ -511,6 +513,31 @@ class Memory:
             "new_children_ids": [p.id for p in report.new_children],
             "aborted_for_cascade_limit": report.aborted_for_cascade_limit,
         }
+
+    def consolidate_duplicates(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """True-merge deduplication : same-kind points carrying the SAME
+        information collapse into a single node (the duplicate is dropped,
+        its corroboration absorbed). Records id aliases so a dropped id can
+        still be resolved to its survivor (e.g. evidence-id scoring)."""
+        t_now = self._now(t)
+        report = merge_duplicates(self.points, t_now)
+        # Chain aliases through the existing map so older absorbed ids still
+        # resolve to the final survivor.
+        for absorbed, keeper in report.aliases.items():
+            self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
+        return {
+            "merged_count": len(report.merged),
+            "aliases": dict(report.aliases),
+            "n_points": len(self.points),
+        }
+
+    def resolve_alias(self, point_id: str) -> str:
+        """Resolve a (possibly absorbed) id to its surviving node id."""
+        seen = set()
+        while point_id in self._merge_aliases and point_id not in seen:
+            seen.add(point_id)
+            point_id = self._merge_aliases[point_id]
+        return point_id
 
     # ------------------------------------------------------------------
     # Observators
