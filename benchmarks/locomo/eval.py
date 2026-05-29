@@ -31,10 +31,19 @@ from metacog import Memory
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+# SQuAD / LoCoMo normalize_answer drops these articles before token
+# overlap. Matching the official metric so our internal F1 is
+# comparable to the published leaderboard and so a leading "a/an/the"
+# in a generated answer doesn't bleed precision.
+_ARTICLES = {"a", "an", "the"}
 
 
 def _tokens(text: str) -> List[str]:
-    return [t.lower() for t in _TOKEN_RE.findall(text or "")]
+    return [
+        t.lower()
+        for t in _TOKEN_RE.findall(text or "")
+        if t.lower() not in _ARTICLES
+    ]
 
 
 def f1_score(pred: str, gold: str) -> float:
