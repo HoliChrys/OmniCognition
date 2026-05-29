@@ -254,19 +254,30 @@ def terse(text: str) -> str:
     if not text:
         return text
     t = text.strip()
-    # Bold-marked answer — skip if the bold is in a negation/correction context
-    # like "it's actually **Caroline's** necklace, not Melanie's". Trust the
-    # bold only when preceded by a confirming phrase ("is", "the answer", "found").
-    m = re.search(r"\*\*(.+?)\*\*", t)
-    if m:
+    # Bold-marked answer — take the first bold span that is a real value,
+    # skipping two traps:
+    #  - a bold dialog-id citation ("From **D2:7** …") : the agent bolds the
+    #    reference, not the answer — returning it leaks the ID and scores 0.
+    #  - a bold in a negation/correction context ("it's actually **Caroline's**
+    #    necklace, not Melanie's") : the bolded entity is the WRONG one.
+    for m in re.finditer(r"\*\*(.+?)\*\*", t):
+        cand = m.group(1).strip().rstrip(".")
+        # Skip a bold that is only a dialog-turn id (e.g. "D2:7").
+        if _DIALOG_ID_RE.fullmatch(cand):
+            continue
+        # Skip a long bold : that's a quoted sentence, not a terse answer
+        # label. Let it fall through to the normal prose-cleaning path.
+        if len(cand.split()) > 8:
+            continue
         prefix_start = max(0, m.start() - 30)
         prefix = t[prefix_start:m.start()].lower()
         _negation = any(x in prefix for x in (
             "actually", "it's actually", "it is actually",
             "not melanie", "not mel", "rather than",
         ))
-        if not _negation:
-            return m.group(1).strip().rstrip(".")
+        if _negation:
+            continue
+        return cand
     # Citation + trailing label pattern : take the last short line.
     lines = [ln.strip(" .,") for ln in t.splitlines() if ln.strip(" .,")]
     if len(lines) >= 2:
