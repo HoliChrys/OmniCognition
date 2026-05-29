@@ -29,9 +29,13 @@ from typing import Any, Dict, List, Optional
 _DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "128"))
 
-# Hard cap on each evidence chunk's character length when rendered into
-# the user message. 120 chars ≈ 30 tokens. 7 × 30 = 210 evidence tokens.
-_CHUNK_CHAR_LIMIT = 120
+# Hard cap on each evidence chunk's CONTENT character length when
+# rendered into the user message. 100 chars ≈ 25 tokens. With the
+# enrichment prefix [id|kw1,kw2,kw3], total per chunk ≈ 130 chars
+# ≈ 32 tokens. 7 × 32 = 224 evidence tokens.
+_CHUNK_CHAR_LIMIT = 100
+# Compact keyword hint cap : at most 3 keywords, comma-separated
+_KEYWORDS_HINT_MAX = 3
 
 
 REACT_SYSTEM = """Answer concisely matching the gold style :
@@ -85,14 +89,48 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _format_evidence(chunks: List[Dict[str, Any]], char_limit: int) -> str:
-    """Render chunks as compact one-liners : '[id] truncated_content'."""
+def _format_evidence(
+    chunks: List[Dict[str, Any]],
+    char_limit: int,
+    memory=None,
+) -> str:
+    """Render chunks as compact enriched one-liners.
+
+    Format per chunk :
+      [<id>|<kw1>,<kw2>,<kw3>] <truncated_content>
+
+    Enrichments :
+      - id           : dialog id ; for collision children, resolves to
+                       <parent_a>↔<parent_b> when possible.
+      - kw1..kw3     : top keywords already extracted at ingest
+                       (compact entity signal, ~20 chars total).
+      - content      : raw text, truncated to `char_limit` chars
+                       and suffixed with "…" if truncated.
+
+    Falls back to plain `[id] content` when keywords or memory are
+    unavailable.
+    """
+    points_by_id = {p.id: p for p in memory.points} if memory else {}
     lines = []
     for r in chunks:
+        rid = r["id"]
+        # Resolve collision child id to its parents when possible
+        display_id = rid
+        if rid.startswith("collision("):
+            p = points_by_id.get(rid)
+            if p is not None and p.parents:
+                display_id = "↔".join(p.parents[:2])
+
+        # Compact keyword hint from the live point
+        kw_hint = ""
+        p = points_by_id.get(rid)
+        if p is not None and p.keywords:
+            kw_hint = "|" + ",".join(p.keywords[:_KEYWORDS_HINT_MAX])
+
         content = r.get("content", "")
         if len(content) > char_limit:
             content = content[:char_limit].rstrip() + "…"
-        lines.append(f"[{r['id']}] {content}")
+        lines.append(f"[{display_id}{kw_hint}] {content}")
     return "\n".join(lines)
 
 
@@ -149,7 +187,7 @@ class ClaudeReactAnswerer:
                     evidence.append(r)
                     evidence_ids.add(r["id"])
 
-            evidence_text = _format_evidence(evidence, self.chunk_char_limit)
+            evidence_text = _format_evidence(evidence, self.chunk_char_limit, memory=memory)
             user_msg = f"Q: {question}\n{evidence_text}"
 
             resp = self.client.messages.create(
