@@ -278,6 +278,7 @@ class Memory:
         use_lineage: bool = False,
         use_hybrid: bool = False,
         lineage_depth: int = 7,
+        prefer_kind: Optional[str] = None,
         t: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
@@ -288,6 +289,9 @@ class Memory:
           - use_hybrid=True      cosine on keywords + BM25 on content
                                  + RRF (+ optional lineage)
           - observator_id=…      route through that observator's view
+          - prefer_kind=…        boost a PointKind in hybrid RRF (étape 5)
+                                 accepts "FACT" / "THOUGHT" / "ACTION" or
+                                 a PointKind ; ignored unless use_hybrid.
 
         Default k=7 (≈ matches LoCoMo / typical agentic context budget).
         """
@@ -298,12 +302,19 @@ class Memory:
                 q_emb, self.points, k, t_now, observator_id,
             )
         elif use_hybrid:
+            kind_filter: Optional[PointKind] = None
+            if prefer_kind is not None:
+                kind_filter = (
+                    prefer_kind if isinstance(prefer_kind, PointKind)
+                    else PointKind[prefer_kind.upper()]
+                )
             results = retrieve_hybrid(
                 query, self.points, k, t_now,
                 encoder=self.encoder,
                 extractor=self.extractor,
                 use_lineage=use_lineage,
                 lineage_depth=lineage_depth,
+                prefer_kind=kind_filter,
             )
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))

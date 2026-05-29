@@ -324,6 +324,7 @@ def retrieve_hybrid(
     lineage_depth: int = 7,
     pool_per_signal: int = 14,
     rrf_k: int = 60,
+    prefer_kind: Optional["PointKind"] = None,  # noqa: F821
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -339,6 +340,14 @@ def retrieve_hybrid(
 
     Points without a `keywords_embedding` are skipped from the cosine
     signal but remain candidates via BM25.
+
+    `prefer_kind` (étape 5 — preference routing) : when set to a
+    PointKind, points of that kind that already appear in the
+    cosine ∪ BM25 candidate set receive an extra RRF contribution
+    ranked by their best existing rank. This is purely additive — no
+    hyperparameter, no boost factor, no down-weighting of other kinds.
+    Use case : "how do I X" queries pass prefer_kind=PointKind.ACTION
+    so ACTIONs already known to be relevant outrank co-relevant FACTs.
     """
     from metacog.bm25 import bm25_score
 
@@ -366,10 +375,27 @@ def retrieve_hybrid(
 
     # Phase 3 — Reciprocal Rank Fusion
     rrf_scores: dict[str, float] = {}
+    best_rank_by_id: dict[str, int] = {}
     for rank, (_, p) in enumerate(cosine_pool):
         rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
     for rank, (_, p) in enumerate(bm25_pool):
         rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
+
+    # Étape 5 — preference routing : 3rd RRF signal for matching kind.
+    # Points of the preferred kind that are already candidates get an
+    # additional 1/(rrf_k + r) contribution, where r is their best rank
+    # among the preferred-kind subset. Parameter-free (canonical rrf_k).
+    if prefer_kind is not None:
+        kind_candidates = [
+            (best_rank_by_id[pid], pid)
+            for pid in best_rank_by_id
+            if points_by_id[pid].kind == prefer_kind
+        ]
+        kind_candidates.sort(key=lambda x: x[0])
+        for kind_rank, (_, pid) in enumerate(kind_candidates):
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rrf_k + kind_rank)
 
     if not rrf_scores:
         return []
