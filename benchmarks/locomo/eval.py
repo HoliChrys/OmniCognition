@@ -111,6 +111,7 @@ def evaluate_sample(
     answerer: str = "chunk",
     use_lineage: bool = False,
     claude_answerer=None,
+    debug_writer=None,
 ) -> Dict[str, Any]:
     qas = sample["qa"]
     if max_qa is not None:
@@ -145,6 +146,7 @@ def evaluate_sample(
             r5 = r10 = 0.0
 
         tokens_in = tokens_out = steps = 0
+        react_trace: List[Dict[str, Any]] = []
         if answerer == "extractive":
             from benchmarks.locomo.react_qa import react_answer
             ra = react_answer(memory, question, max_steps=2,
@@ -159,6 +161,7 @@ def evaluate_sample(
             tokens_in = ca.get("tokens_in", 0) or 0
             tokens_out = ca.get("tokens_out", 0) or 0
             steps = ca.get("steps", 0) or 0
+            react_trace = ca.get("trace", []) or []
         else:  # "chunk"
             pred = " ".join(r["content"] for r in results[:top_chunks_for_answer])
         f1 = f1_score(pred, gold_answer)
@@ -170,6 +173,47 @@ def evaluate_sample(
         per_cat[category]["tokens_in"] += tokens_in
         per_cat[category]["tokens_out"] += tokens_out
         per_cat[category]["steps"] += steps
+
+        if debug_writer is not None:
+            ev_hits_5 = sorted(top5 & ev_set)
+            ev_misses = sorted(ev_set - top10)
+            # Compact dump of retrieved chunk content so we can read what
+            # the answerer actually saw, not just the ids.
+            top10_dump = [
+                {"id": r["id"],
+                 "kind": r.get("kind"),
+                 "content": (r.get("content") or "")[:200]}
+                for r in results[:10]
+            ]
+            # Keep ReAct trace compact : drop raw_reply > 300 chars
+            trace_dump = []
+            for t in react_trace:
+                trace_dump.append({
+                    "step": t.get("step"),
+                    "query": t.get("query"),
+                    "n_evidence": t.get("n_evidence"),
+                    "parsed": t.get("parsed"),
+                    "raw_reply": (t.get("raw_reply") or "")[:300],
+                })
+            debug_writer.write(json.dumps({
+                "sample_id": sample.get("sample_id"),
+                "category": category,
+                "question": question,
+                "gold_answer": gold_answer,
+                "pred": pred,
+                "f1": round(f1, 4),
+                "r5": round(r5, 4),
+                "r10": round(r10, 4),
+                "retrieved_top10": top10_dump,
+                "gold_evidence": evidence,
+                "evidence_hits_in_top5": ev_hits_5,
+                "evidence_missed_top10": ev_misses,
+                "react_trace": trace_dump,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "steps": steps,
+            }, ensure_ascii=False) + "\n")
+            debug_writer.flush()
 
     summary: Dict[str, Any] = {
         "sample_id": sample.get("sample_id"),
@@ -242,6 +286,10 @@ def main():
                         help="(deprecated alias for --answerer=extractive)")
     parser.add_argument("--lineage", action="store_true",
                         help="retrieve_with_lineage (cosine + adjacent + RRF)")
+    parser.add_argument("--debug-jsonl", default=None,
+                        help="per-QA full trace (question, gold, pred, retrieved "
+                             "ids, hits, misses, ReAct steps, tokens) written one "
+                             "JSON object per line. Use to root-cause low F1.")
     args = parser.parse_args()
     if args.react and args.answerer == "chunk":
         args.answerer = "extractive"
@@ -257,6 +305,11 @@ def main():
             kwargs["model"] = args.claude_model
         claude_answerer = ClaudeReactAnswerer(**kwargs)
         print(f"Claude answerer ready : model={claude_answerer.model}")
+
+    debug_writer = None
+    if args.debug_jsonl:
+        debug_writer = open(args.debug_jsonl, "w", encoding="utf-8")
+        print(f"Per-QA debug trace → {args.debug_jsonl}")
 
     results = []
     overall = {"n": 0, "recall_at_5": 0.0, "recall_at_10": 0.0, "f1": 0.0,
@@ -275,6 +328,7 @@ def main():
             answerer=args.answerer,
             use_lineage=args.lineage,
             claude_answerer=claude_answerer,
+            debug_writer=debug_writer,
         )
         results.append(summary)
         print(json.dumps(summary, indent=2))
@@ -311,6 +365,9 @@ def main():
             )
             agg["steps_per_qa"] = round(overall["steps"] / n, 2)
         print(json.dumps(agg, indent=2))
+
+    if debug_writer is not None:
+        debug_writer.close()
 
 
 if __name__ == "__main__":
