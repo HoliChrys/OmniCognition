@@ -505,22 +505,41 @@ class Memory:
             results = retrieve(q_emb, self.points, k_fetch, t_now)
         if beacons or atomics:
             by_id = {p.id: p for p in self.points}
-            deduped = []
-            seen: set = set()
+            # Two streams, both resolved to source turns : raw-turn hits and
+            # atom-derived hits. Atoms make many turns competitive, so pure
+            # score order lets atoms displace strong raw evidence (multi-hop
+            # recall drops). INTERLEAVING the streams keeps recall >= the
+            # better of {raw-only, atom-only} per query : the raw stream
+            # preserves the baseline (e.g. enumeration turns), the atom
+            # stream adds the entity-lookup turns the raw extractor missed.
+            raw_stream, atom_stream = [], []
             for s, p in results:
                 if p.id.startswith("entity_"):
                     continue                       # beacon : drop
-                # Resolve an atomic-fact hit back to its SOURCE turn (the
-                # raw turn keeps the [date] prefix needed to answer) and
-                # dedup so 3 atoms of one turn don't fill 3 slots.
-                rid = self._atom_parent.get(p.id, p.id)
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                deduped.append((s, by_id.get(rid, p)))
-                if len(deduped) >= k:
-                    break
-            results = deduped
+                if p.id.startswith("atom_"):
+                    rid = self._atom_parent.get(p.id, p.id)
+                    atom_stream.append((s, rid))
+                else:
+                    raw_stream.append((s, p.id))
+            deduped, seen = [], set()
+            ri = ai = 0
+            while len(deduped) < k and (ri < len(raw_stream) or ai < len(atom_stream)):
+                for stream, idx_name in ((raw_stream, "r"), (atom_stream, "a")):
+                    i = ri if idx_name == "r" else ai
+                    while i < len(stream) and stream[i][1] in seen:
+                        i += 1
+                    if i < len(stream):
+                        s, rid = stream[i]
+                        seen.add(rid)
+                        deduped.append((s, by_id.get(rid)))
+                        i += 1
+                    if idx_name == "r":
+                        ri = i
+                    else:
+                        ai = i
+                    if len(deduped) >= k:
+                        break
+            results = [(s, p) for s, p in deduped if p is not None]
         return [
             {
                 "id": p.id,
