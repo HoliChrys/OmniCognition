@@ -1032,6 +1032,10 @@ class MetaWalker:
         self._cur_emb = pwe0 if pwe0 is not None else tuple(self._enc.encode(query))
 
         self._fact_ids_cum: List[str] = []
+        # Spike-and-Path Chasles : track the previous stage's fact_star id
+        # so we can call record_hop on each multi-hop transition. Only
+        # used when commit=True (benchmark walks stay reproducible).
+        self._prev_fact_star_id: Optional[str] = None
         self._visited_fact_ids: set = set()
         self._visited_action_ids: set = set()
         self._prev_action: Optional[Point] = None
@@ -1296,6 +1300,18 @@ class MetaWalker:
                            polarity=+self.pull_strength, t_now=self.t_now)
                 fact_star.n_uses += 1
                 action_star.n_uses += 1
+                # Spike-and-Path : record the multi-hop transition. The
+                # very first stage has no predecessor and is skipped.
+                if self._prev_fact_star_id is not None:
+                    prev_fact = next(
+                        (p for p in self.memory.points
+                         if p.id == self._prev_fact_star_id),
+                        None,
+                    )
+                    if prev_fact is not None:
+                        from metacog.spike import record_hop
+                        record_hop(prev_fact, fact_star, self.memory)
+                self._prev_fact_star_id = fact_star.id
 
             thought = meta_thought(
                 fact_star, action_star, pts,

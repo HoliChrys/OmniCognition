@@ -146,6 +146,10 @@ class Point:
     n_contra: int = 0
     n_uses: int = 0
     n_revision: int = 0  # Option Z : incremented on collision revision
+    # Spike counter : incremented by record_hop on every multi-hop
+    # transition. Calibrated by spike_threshold(memory) which scales
+    # with population size — see metacog.spike.
+    n_spike: int = 0
     state: EpistemicState = EpistemicState.CONJECTURE
     keywords: List[str] = field(default_factory=list)
     keywords_source: Optional[SourceClass] = None

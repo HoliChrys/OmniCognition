@@ -91,6 +91,9 @@ class Memory:
     _atom_parent: Dict[str, str] = field(default_factory=dict)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
+    # Total number of multi-hop transitions recorded by record_hop ;
+    # drives the Poisson baseline used by spike_threshold(). Persisted.
+    _spike_total_hops: int = 0
     _t_clock: float = 0.0
 
     def __post_init__(self) -> None:
@@ -621,6 +624,25 @@ class Memory:
             "aborted_for_cascade_limit": report.aborted_for_cascade_limit,
         }
 
+    def compress_chasles(self) -> List[Dict[str, Any]]:
+        """Auto-detect spike-driven Chasles paths and compress them.
+
+        Each path of >= 4 same-kind spiking nodes (start, ≥2 intermediates,
+        end) triggers resolve_collision on the intermediates with start /
+        end as anchors. Reset n_spike to 0 on every node of a fired path
+        (refractory period). Returns the list of CollisionEvent dicts."""
+        from metacog.spike import auto_compress_chasles
+        events = auto_compress_chasles(self, self.llm, self.encoder)
+        return [
+            {
+                "child_id": ev.child_id,
+                "parent_ids": list(ev.parent_ids),
+                "anchor_ids": list(ev.anchor_ids),
+                "timestamp": ev.timestamp,
+            }
+            for ev in events
+        ]
+
     def consolidate_duplicates(self, t: Optional[float] = None) -> Dict[str, Any]:
         """True-merge deduplication : same-kind points carrying the SAME
         information collapse into a single node (the duplicate is dropped,
@@ -825,6 +847,7 @@ class Memory:
             "observators": self.observators,
             "conversation_log": self.conversation_log,
             "_t_clock": self._t_clock,
+            "_spike_total_hops": self._spike_total_hops,
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -840,3 +863,4 @@ class Memory:
         self.observators = snapshot.get("observators", {})
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)
+        self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
