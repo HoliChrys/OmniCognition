@@ -600,6 +600,7 @@ def generate_action(
         keywords=kws,
         keywords_embedding=kw_emb,
         keywords_source=SourceClass.GENERATOR,
+        tags=["generated"],
     )
 
 
@@ -712,6 +713,7 @@ def meta_thought(
         keywords=kws,
         keywords_embedding=kw_emb,
         keywords_source=SourceClass.GENERATOR,
+        tags=["generated"],
     )
 
 

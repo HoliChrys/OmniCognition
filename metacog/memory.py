@@ -217,6 +217,7 @@ class Memory:
                 keywords_embedding=kw_emb,
                 keywords_source=SourceClass.GENERATOR,
                 parents=[source_fact.id],
+                tags=["atomic"],
             )
             self.points.append(atom)
             self._atom_parent[atom.id] = source_fact.id
@@ -266,7 +267,7 @@ class Memory:
             keywords=kws,
             keywords_embedding=kw_emb,
             keywords_source=SourceClass.GENERATOR,
-            tags=list(tags),
+            tags=list(tags) + ["entity"],
         )
         self.points.append(beacon)
         # Geometric "edges" : pull the beacon onto its source fact, and
