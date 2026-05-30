@@ -586,6 +586,14 @@ class McpMetaAgent:
                                    if b.type == "tool_use"
                                    and b.name == "final_answer"), None)
                         val = str((fa.input or {}).get("value", "")).strip() if fa else ""
+                        # Fallback chain when the forced final_answer returns
+                        # empty : (a) terse() on the raw narration may still
+                        # strip the preamble and recover a usable value ;
+                        # (b) otherwise fall back to the raw narration so we
+                        # at least preserve some signal — terse() in the
+                        # final stage will give it a last cleaning pass.
+                        if not val:
+                            val = terse(raw, question)
                         answer_text = val or raw
                     else:
                         answer_text = raw
