@@ -142,8 +142,10 @@ def chasles_path(start: Point, memory: "Memory",
     by_id = {p.id: p for p in memory.points}
     while len(path) < max_len:
         curr = path[-1]
-        if not is_spiking(curr, memory):
-            break
+        # The start (path[0]) is an ANCHOR — endpoints have ~half the
+        # activations of intermediates (only one transition involves
+        # them) so we don't require it to spike. Every SUBSEQUENT node
+        # is gated by is_spiking(next_node) before being appended below.
         ref_ids = [t[4:] for t in curr.tags if t.startswith("ref:")]
         nodes = [by_id[r] for r in ref_ids if r in by_id]
         if not nodes:
@@ -186,7 +188,11 @@ def auto_compress_chasles(memory: "Memory", llm: Any,
     t_now = memory._now() if hasattr(memory, "_now") else 0.0
     events: List["CollisionEvent"] = []
     fired: set = set()
-    candidates = [p for p in memory.points if is_spiking(p, memory)]
+    # Candidates : any node that has emitted at least one hop (potential
+    # start anchor). Endpoints don't need to spike themselves — what
+    # matters is that they lead to spiking intermediates.
+    candidates = [p for p in memory.points
+                  if any(t.startswith("ref:") for t in p.tags)]
     for start in candidates:
         if start.id in fired:
             continue
