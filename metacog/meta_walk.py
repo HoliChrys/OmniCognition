@@ -1394,3 +1394,68 @@ class WalkerRegistry:
 
     def close(self, walk_id: str) -> None:
         self._walkers.pop(walk_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Semantic walk (kind-agnostic perception layer — PR n°1).
+#
+# Coexists with `MetaWalker` (the staged fact*->action*->thought reasoning
+# walk). This function does NOT route or compose — it only PERCEIVES :
+# returns a top-K of points enriched with behavior scores against the
+# four ConceptAnchors. The downstream orchestrator (PR n°3) will dispatch
+# one of three flat paths (executable / factual / reasoning) on top.
+# ---------------------------------------------------------------------------
+
+
+def walk_semantic(
+    query: str,
+    memory: Any,
+    *,
+    k: int = 7,
+    encoder: Any = None,
+    extractor: Any = None,
+    anchors: Any = None,
+) -> List[Dict[str, Any]]:
+    """Kind-agnostic semantic perception of the manifold for `query`.
+
+    Retrieves top-`k` points via the hybrid pipeline WITHOUT restricting
+    by PointKind — FACT / ACTION / THOUGHT are all candidates — then
+    scores each candidate against the four ConceptAnchors (factual /
+    reasoning / executable / topical). The orchestrator decides what to
+    do with the result ; this function is pure perception.
+
+    Entity beacons (`entity_*`) and atomic facts (`atom_*`) are NOT
+    filtered out — perception is raw, the caller can strip later.
+
+    Returns : list of dicts ordered by retrieval score :
+        {id, kind, tags, content, score, behavior_scores}
+    """
+    if not memory.points:
+        return []
+
+    enc = encoder if encoder is not None else memory.encoder
+    ext = extractor if extractor is not None else memory.extractor
+    t_now = memory._now() if hasattr(memory, "_now") else 0.0
+
+    if anchors is None:
+        from metacog.anchors import ConceptAnchors
+        anchors = ConceptAnchors(enc)
+
+    from metacog.geometry import retrieve_hybrid
+    results = retrieve_hybrid(
+        query, memory.points, k, t_now,
+        encoder=enc, extractor=ext,
+        use_lineage=True, use_spreading=True, use_fuzzy=True,
+    )
+
+    out: List[Dict[str, Any]] = []
+    for score, point in results:
+        out.append({
+            "id": point.id,
+            "kind": point.kind.value,
+            "tags": list(point.tags),
+            "content": point.content,
+            "score": score,
+            "behavior_scores": anchors.score(point, t_now),
+        })
+    return out
