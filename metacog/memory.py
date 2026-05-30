@@ -494,6 +494,18 @@ class Memory:
                 lineage_depth=lineage_depth,
                 prefer_kind=kind_filter,
             )
+            if atomics:
+                # Second pass over RAW turns only — atoms flood the joint
+                # pool and bury strong raw evidence below the over-fetch
+                # cutoff, so we need the TRUE raw ranking to interleave with.
+                raw_pts = [p for p in self.points
+                           if not p.id.startswith(("atom_", "entity_"))]
+                self._raw_results = retrieve_hybrid(
+                    query, raw_pts, k, t_now,
+                    encoder=self.encoder, extractor=self.extractor,
+                    use_lineage=use_lineage, use_spreading=use_spreading,
+                    lineage_depth=lineage_depth, prefer_kind=kind_filter,
+                )
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_with_lineage(
@@ -512,15 +524,21 @@ class Memory:
             # better of {raw-only, atom-only} per query : the raw stream
             # preserves the baseline (e.g. enumeration turns), the atom
             # stream adds the entity-lookup turns the raw extractor missed.
-            raw_stream, atom_stream = [], []
-            for s, p in results:
-                if p.id.startswith("entity_"):
-                    continue                       # beacon : drop
-                if p.id.startswith("atom_"):
-                    rid = self._atom_parent.get(p.id, p.id)
-                    atom_stream.append((s, rid))
-                else:
-                    raw_stream.append((s, p.id))
+            # Atom stream : atom-derived turns from the joint pool.
+            atom_stream = [
+                (s, self._atom_parent.get(p.id, p.id))
+                for s, p in results if p.id.startswith("atom_")
+            ]
+            # Raw stream : prefer the dedicated raw-only ranking (true
+            # baseline, computed above) ; fall back to the joint pool's
+            # non-atom hits (beacons-only case).
+            raw_src = getattr(self, "_raw_results", None)
+            if raw_src is not None:
+                raw_stream = [(s, p.id) for s, p in raw_src]
+                self._raw_results = None
+            else:
+                raw_stream = [(s, p.id) for s, p in results
+                              if not p.id.startswith(("atom_", "entity_"))]
             deduped, seen = [], set()
             ri = ai = 0
             while len(deduped) < k and (ri < len(raw_stream) or ai < len(atom_stream)):
