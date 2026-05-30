@@ -133,18 +133,11 @@ class SimpleKeywordExtractor:
     _WEAK = frozenset({
         "really", "very", "just", "actually", "basically", "honestly",
         "literally", "definitely", "probably", "maybe", "perhaps",
-        "awesome", "amazing", "great", "wonderful", "lovely", "nice",
-        "cool", "good", "bad", "happy", "sad", "excited", "exciting",
-        "incredible", "fantastic", "beautiful", "special", "inspiring",
-        "inspired", "powerful", "interesting", "important", "wow",
-        "yeah", "okay", "sure", "totally", "absolutely", "completely",
-        "recently", "lately", "soon", "already", "still", "always",
-        "never", "often", "sometimes", "everything", "anything",
-        "something", "nothing", "everyone", "anyone", "someone", "here",
-        "there", "today", "tomorrow", "yesterday", "thing", "things",
-        "stuff", "way", "ways", "lot", "lots", "bit", "kind", "sort",
-        "sounds", "sound", "looks", "look", "feel", "feels", "seems",
-        "guess", "think", "know", "want", "like", "love", "hope", "glad",
+        "awesome", "amazing", "wonderful", "lovely", "incredible",
+        "fantastic", "wow", "yeah", "okay", "sure", "totally",
+        "absolutely", "completely", "recently", "lately", "already",
+        "everything", "anything", "something", "nothing", "here",
+        "there", "thing", "things", "stuff", "kind", "sort",
         "thanks", "thank", "hey", "hello",
     })
 
