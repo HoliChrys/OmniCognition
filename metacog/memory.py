@@ -77,11 +77,18 @@ class Memory:
     # When set, each ingested FACT spawns tagged entity beacon nodes that
     # are geometrically pulled onto it (the edge-free "edges-equivalent").
     entity_extractor: Any = None
+    # Opt-in mem0-style atomic-fact extractor. When set, each ingested FACT
+    # spawns clean self-contained atomic FACTs (parents=[source dia_id],
+    # GENERATOR) that act as retrieval handles ; retrieval resolves an
+    # atomic hit back to its source turn (dia_id) and dedups.
+    atomic_extractor: Any = None
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
     observators: Dict[str, Observator] = field(default_factory=dict)
     conversation_log: ConversationLog = field(default_factory=ConversationLog)
+    # atomic-fact id -> source turn id (for retrieval resolution).
+    _atom_parent: Dict[str, str] = field(default_factory=dict)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
     _t_clock: float = 0.0
@@ -173,7 +180,47 @@ class Memory:
             except Exception:
                 # A flaky extractor must never break ingestion.
                 pass
+        if (
+            self.atomic_extractor is not None
+            and kind.upper() == "FACT"
+            and not id.startswith(("entity_", "atom_"))
+        ):
+            try:
+                self._spawn_atomics(point)
+            except Exception:
+                pass
         return point
+
+    def _spawn_atomics(self, source_fact: Point) -> None:
+        """Decompose a turn into clean atomic FACTs (mem0-style). Each is a
+        retrieval handle : GENERATOR-sourced, parents=[source id], pulled
+        onto the source turn ; retrieval resolves it back to the dia_id."""
+        # speaker / text from the "[date] Speaker: text" content
+        body = source_fact.content
+        spk, txt = "", body
+        if "]" in body:
+            body = body.split("]", 1)[1]
+        if ":" in body[:40]:
+            spk, txt = body.split(":", 1)[0].strip(), body.split(":", 1)[1].strip()
+        atoms = self.atomic_extractor.extract_atoms(txt, speaker=spk)
+        t_now = self._now()
+        for k, a in enumerate(atoms):
+            kws = self.extractor.extract(a, n=6) if self.extractor else []
+            kw_emb = (position_weighted_keyword_embedding(kws, self.encoder)
+                      if kws else None)
+            atom = Point(
+                id=f"atom_{source_fact.id}_{k}",
+                content=a,
+                embedding_orig=tuple(self.encoder.encode(a)),
+                kind=PointKind.FACT,
+                keywords=kws,
+                keywords_embedding=kw_emb,
+                keywords_source=SourceClass.GENERATOR,
+                parents=[source_fact.id],
+            )
+            self.points.append(atom)
+            self._atom_parent[atom.id] = source_fact.id
+            apply_pull(atom, source_fact, +1.0, t_now)
 
     # ------------------------------------------------------------------
     # Entity beacons (edge-free "edges" via geometric pull)
@@ -418,7 +465,14 @@ class Memory:
         # recall metric then measures real facts only, and beacons never
         # displace evidence. No-op / unchanged when no extractor is set.
         beacons = self.entity_extractor is not None
-        k_fetch = (k * 2 + 10) if beacons else k
+        atomics = self.atomic_extractor is not None or bool(self._atom_parent)
+        # Over-fetch more when atomic facts are present : many atoms resolve
+        # to the same source turn, so we need headroom to dedup to k turns.
+        k_fetch = k
+        if beacons:
+            k_fetch = k * 2 + 10
+        if atomics:
+            k_fetch = max(k_fetch, k * 5 + 20)
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
@@ -449,9 +503,24 @@ class Memory:
         else:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve(q_emb, self.points, k_fetch, t_now)
-        if beacons:
-            results = [(s, p) for s, p in results
-                       if not p.id.startswith("entity_")][:k]
+        if beacons or atomics:
+            by_id = {p.id: p for p in self.points}
+            deduped = []
+            seen: set = set()
+            for s, p in results:
+                if p.id.startswith("entity_"):
+                    continue                       # beacon : drop
+                # Resolve an atomic-fact hit back to its SOURCE turn (the
+                # raw turn keeps the [date] prefix needed to answer) and
+                # dedup so 3 atoms of one turn don't fill 3 slots.
+                rid = self._atom_parent.get(p.id, p.id)
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                deduped.append((s, by_id.get(rid, p)))
+                if len(deduped) >= k:
+                    break
+            results = deduped
         return [
             {
                 "id": p.id,
@@ -532,7 +601,9 @@ class Memory:
         }
 
     def resolve_alias(self, point_id: str) -> str:
-        """Resolve a (possibly absorbed) id to its surviving node id."""
+        """Resolve an id to its canonical node : an atomic-fact id maps to
+        its source turn (dia_id), and a merge-absorbed id to its survivor."""
+        point_id = self._atom_parent.get(point_id, point_id)
         seen = set()
         while point_id in self._merge_aliases and point_id not in seen:
             seen.add(point_id)

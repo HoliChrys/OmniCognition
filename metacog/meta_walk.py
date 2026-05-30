@@ -254,16 +254,27 @@ def nearest_facts_with_fallback(
         # already lifted the real facts. Drop them from the returned set so
         # the walk reasons over (and agent_recall counts) real facts only.
         results = retrieve_hybrid(
-            query_text, points, (k + len(exclude_ids)) * 2 + 10, t_now,
+            query_text, points, (k + len(exclude_ids)) * 5 + 20, t_now,
             encoder=encoder, extractor=extractor,
             use_lineage=True, use_spreading=True, use_fuzzy=True,
             restrict_kind=PointKind.FACT,
         )
+        by_id = {p.id: p for p in points}
         out: List[Point] = []
+        seen: set = set()
         for _s, p in results:
-            if p.id in exclude_ids or p.id.startswith("entity_"):
+            if p.id.startswith("entity_"):
+                continue                       # beacon : drop
+            # Resolve an atomic-fact hit ("atom_<dia>_<k>") back to its
+            # source turn (parents[0]) and dedup, so the agent reasons over
+            # real turns (with [date] prefix) and agent_recall counts dia_ids.
+            tgt = p
+            if p.id.startswith("atom_") and p.parents:
+                tgt = by_id.get(p.parents[0], p)
+            if tgt.id in exclude_ids or tgt.id in seen:
                 continue
-            out.append(p)
+            seen.add(tgt.id)
+            out.append(tgt)
             if len(out) >= k:
                 break
         return out

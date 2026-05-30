@@ -88,30 +88,39 @@ def ingest_conversation(
     "yesterday").
     """
     count = 0
-    # Pre-warm the entity extractor cache IN PARALLEL : entity extraction
-    # is one LLM call per turn ; done synchronously inside memory.ingest it
-    # serializes ~400 calls (minutes). Here we fan them out concurrently so
-    # the per-turn ingest below hits a warm cache. No-op when no extractor.
-    ex = getattr(memory, "entity_extractor", None)
-    if ex is not None and hasattr(ex, "extract_entities"):
-        from concurrent.futures import ThreadPoolExecutor
-        texts = []
-        for key in conv:
-            if not key.startswith("session_") or key.endswith("_date_time"):
-                continue
-            session_date = _clean_session_date(conv.get(f"{key}_date_time", ""))
-            prefix = f"[{session_date}] " if (with_dates and session_date) else ""
-            for turn in (conv[key] if isinstance(conv[key], list) else []):
-                if turn.get("text") and turn.get("dia_id"):
-                    texts.append(f"{prefix}{turn.get('speaker','')}: {turn['text']}")
-        # Force lazy client init BEFORE fanning out — the anthropic client's
-        # lazy build races (deadlocks) under concurrent first-touch.
+    # Pre-warm the LLM extractor caches IN PARALLEL : extraction is one LLM
+    # call per turn ; done synchronously inside memory.ingest it serializes
+    # ~400 calls (minutes). Fan them out so the per-turn ingest hits a warm
+    # cache. No-op when no extractor. (entity = full prefixed text ;
+    # atomic = bare text + speaker, matching memory._spawn_atomics.)
+    from concurrent.futures import ThreadPoolExecutor
+    ent_ex = getattr(memory, "entity_extractor", None)
+    atom_ex = getattr(memory, "atomic_extractor", None)
+    ent_texts, atom_args = [], []
+    for key in conv:
+        if not key.startswith("session_") or key.endswith("_date_time"):
+            continue
+        session_date = _clean_session_date(conv.get(f"{key}_date_time", ""))
+        prefix = f"[{session_date}] " if (with_dates and session_date) else ""
+        for turn in (conv[key] if isinstance(conv[key], list) else []):
+            if turn.get("text") and turn.get("dia_id"):
+                ent_texts.append(f"{prefix}{turn.get('speaker','')}: {turn['text']}")
+                atom_args.append((turn["text"], turn.get("speaker", "")))
+    if ent_ex is not None and hasattr(ent_ex, "extract_entities"):
         try:
-            _ = ex.llm.client
+            _ = ent_ex.llm.client
         except Exception:
             pass
         with ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(ex.extract_entities, texts))
+            list(pool.map(ent_ex.extract_entities, ent_texts))
+    if atom_ex is not None and hasattr(atom_ex, "extract_atoms"):
+        try:
+            _ = atom_ex.llm.client
+        except Exception:
+            pass
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda a: atom_ex.extract_atoms(a[0], speaker=a[1]),
+                          atom_args))
     for key in conv:
         if not key.startswith("session_") or key.endswith("_date_time"):
             continue
@@ -157,6 +166,7 @@ def evaluate_sample(
     claude_answerer=None,
     debug_writer=None,
     entities: bool = False,
+    atomic: bool = False,
     merge: bool = False,
     per_category: int = None,
     auto_cluster: bool = False,
@@ -187,7 +197,12 @@ def evaluate_sample(
     if entities:
         from metacog.entities import LLMEntityExtractor
         entity_extractor = LLMEntityExtractor()
-    memory = Memory(encoder=enc, entity_extractor=entity_extractor)
+    atomic_extractor = None
+    if atomic:
+        from metacog.atomic import AtomicFactExtractor
+        atomic_extractor = AtomicFactExtractor()
+    memory = Memory(encoder=enc, entity_extractor=entity_extractor,
+                    atomic_extractor=atomic_extractor)
     ingested = ingest_conversation(
         memory, sample["conversation"], with_dates=with_dates,
     )
@@ -491,6 +506,12 @@ def main():
                              "into day/month/year) pulled onto it geometrically — "
                              "the edge-free 'edges-equivalent' that lifts the real "
                              "fact into recall. One LLM call per turn (cached).")
+    parser.add_argument("--atomic", action="store_true",
+                        help="opt-in (mem0-style) : decompose each turn into clean "
+                             "self-contained atomic facts (LLM) used as retrieval "
+                             "handles ; a hit resolves back to its source dia_id. "
+                             "Breaks the retrieval ceiling on entity-lookup misses. "
+                             "One LLM call per turn (cached).")
     parser.add_argument("--merge", action="store_true",
                         help="opt-in : after ingest, collapse genuine same-info "
                              "turns (content-cosine >= 0.95) into single nodes, "
@@ -563,6 +584,7 @@ def main():
             claude_answerer=claude_answerer,
             debug_writer=debug_writer,
             entities=args.entities,
+            atomic=args.atomic,
             merge=args.merge,
             per_category=args.per_category,
             auto_cluster=args.auto_cluster,
