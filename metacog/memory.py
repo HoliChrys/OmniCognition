@@ -326,6 +326,75 @@ class Memory:
         return self.ingest(description, kind="ACTION", id=id, parents=parents)
 
     # ------------------------------------------------------------------
+    # Tools : tool-tagged ACTION points + sandboxed execution.
+    # ------------------------------------------------------------------
+
+    def ingest_tool(
+        self,
+        content: str,
+        code: str,
+        *,
+        lang: str = "python",
+        id: Optional[str] = None,
+    ) -> Point:
+        """Create an executable tool — an ACTION point with the "tool"
+        tag and a populated exec_spec. Discoverable via find_tools()
+        (semantic match) or directly by Memory.execute_tool(id, args).
+
+        Convention : `code` must define `def run(args: dict) -> JSON`.
+        """
+        p = self.ingest(content, kind="ACTION", id=id)
+        p.exec_spec = {"lang": lang, "code": code}
+        p.add_tag("tool")
+        return p
+
+    def find_tools(self, query: str, k: int = 5) -> List[Point]:
+        """Top-k tool-tagged ACTION points most semantically aligned
+        with `query`. Pure discovery — does NOT execute anything."""
+        results = self.retrieve(query, k=max(k * 2, k), use_hybrid=True)
+        by_id = {p.id: p for p in self.points}
+        out: List[Point] = []
+        for r in results:
+            p = by_id.get(r["id"])
+            if p is not None and p.has_tag("tool") and p not in out:
+                out.append(p)
+                if len(out) >= k:
+                    break
+        return out
+
+    def execute_tool(
+        self,
+        tool_id: str,
+        args: Dict[str, Any],
+        executor: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run a tool-tagged ACTION through the sandboxed executor.
+
+        Returns {ok, result, fact_id} on success — a FACT child is
+        created in memory (parents=[tool_id], tag "executed") whose
+        content is the str(result). On failure : {ok=False, error,
+        fact_id=None} and NO fact is created.
+        """
+        from metacog.executor import PyExecutor
+        tool = next((p for p in self.points if p.id == tool_id), None)
+        if tool is None:
+            raise ValueError(f"unknown tool id {tool_id!r}")
+        if not tool.has_tag("tool"):
+            raise ValueError(f"point {tool_id!r} is not tagged 'tool'")
+        if not tool.exec_spec:
+            raise ValueError(f"point {tool_id!r} has no exec_spec")
+        exe = executor if executor is not None else PyExecutor()
+        out = exe.execute(tool.exec_spec, args)
+        if not out.get("ok"):
+            return {"ok": False, "error": out.get("error", "unknown"),
+                    "fact_id": None}
+        result_fact = self.ingest(
+            content=str(out["result"]), kind="FACT", parents=[tool_id],
+        )
+        result_fact.add_tag("executed")
+        return {"ok": True, "result": out["result"], "fact_id": result_fact.id}
+
+    # ------------------------------------------------------------------
     # Observation
     # ------------------------------------------------------------------
 

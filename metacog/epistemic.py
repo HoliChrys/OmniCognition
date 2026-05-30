@@ -150,6 +150,15 @@ class Point:
     # transition. Calibrated by spike_threshold(memory) which scales
     # with population size — see metacog.spike.
     n_spike: int = 0
+    # Executable specification (opt-in) : when set, this Point can be
+    # ROLLED through a sandboxed executor (see metacog.executor.PyExecutor).
+    # Convention : {"lang": "python", "code": "def run(args: dict) -> Any: ..."}
+    # where `args` is the runtime payload and the return value must be
+    # JSON-serializable. Tagging the Point with "tool" together with
+    # exec_spec is what makes it a discoverable + executable tool ; one
+    # without the other is inert. A FACT result child is created by
+    # Memory.execute_tool, parented by this Point's id, tag "executed".
+    exec_spec: Optional[dict] = None
     state: EpistemicState = EpistemicState.CONJECTURE
     keywords: List[str] = field(default_factory=list)
     keywords_source: Optional[SourceClass] = None
