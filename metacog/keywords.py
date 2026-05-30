@@ -126,6 +126,28 @@ class SimpleKeywordExtractor:
         "saturday", "sunday",
     })
 
+    # Weak words : common adjectives / adverbs / interjections that carry
+    # little discriminative power and, being long, would crowd out the
+    # content nouns a query actually targets ("horse", "sunset"). Ranked
+    # AFTER real content words, never before.
+    _WEAK = frozenset({
+        "really", "very", "just", "actually", "basically", "honestly",
+        "literally", "definitely", "probably", "maybe", "perhaps",
+        "awesome", "amazing", "great", "wonderful", "lovely", "nice",
+        "cool", "good", "bad", "happy", "sad", "excited", "exciting",
+        "incredible", "fantastic", "beautiful", "special", "inspiring",
+        "inspired", "powerful", "interesting", "important", "wow",
+        "yeah", "okay", "sure", "totally", "absolutely", "completely",
+        "recently", "lately", "soon", "already", "still", "always",
+        "never", "often", "sometimes", "everything", "anything",
+        "something", "nothing", "everyone", "anyone", "someone", "here",
+        "there", "today", "tomorrow", "yesterday", "thing", "things",
+        "stuff", "way", "ways", "lot", "lots", "bit", "kind", "sort",
+        "sounds", "sound", "looks", "look", "feel", "feels", "seems",
+        "guess", "think", "know", "want", "like", "love", "hope", "glad",
+        "thanks", "thank", "hey", "hello",
+    })
+
     def extract(self, text: str, n: int = 5) -> List[str]:
         raw = text or ""
         # Drop a leading "[date] Speaker:" prefix so the date and the
@@ -158,9 +180,19 @@ class SimpleKeywordExtractor:
             and len(t) >= self.min_length
         ]
         freq: dict[str, int] = {}
-        for t in tokens:
+        first_pos: dict[str, int] = {}
+        for i, t in enumerate(tokens):
             freq[t] = freq.get(t, 0) + 1
-        ordered = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+            if t not in first_pos:
+                first_pos[t] = i
+        # Rank by : frequency (desc), content-before-weak, then EARLIEST
+        # occurrence. Position beats length — "horse" (early content noun)
+        # now outranks "recently"/"awesome" (later weak fillers) instead of
+        # losing the length tiebreak to them.
+        ordered = sorted(
+            freq.items(),
+            key=lambda x: (-x[1], x[0] in self._WEAK, first_pos[x[0]]),
+        )
         freq_ranked = [w for w, _ in ordered]
 
         # Proper nouns first (capped to leave room), then fill by frequency.
