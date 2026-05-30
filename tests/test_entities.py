@@ -50,11 +50,19 @@ def _mem(mapping):
     )
 
 
+def _sem(p):
+    """Semantic tags only — drop the auto-added kind/provenance tags so the
+    entity-type assertions are stable under the universal tagging layer."""
+    return [t for t in p.tags if t not in ("entity", "fact", "atomic",
+                                           "thought", "action", "generated")]
+
+
 # --- 1. schema -------------------------------------------------------------
 
-def test_point_has_tags_field_default_empty():
+def test_point_auto_tagged_by_kind():
+    # Universal typing : a default Point is FACT-kind -> auto-tagged "fact".
     p = Point(id="x", content="hi", embedding_orig=(1.0, 0.0))
-    assert p.tags == []
+    assert p.tags == ["fact"]
     # deltas still validate against embedding dim
     assert len(p.delta_active) == 2 and len(p.delta_latent) == 2
 
@@ -62,7 +70,8 @@ def test_point_has_tags_field_default_empty():
 def test_tags_roundtrip():
     p = Point(id="x", content="hi", embedding_orig=(1.0, 0.0),
               tags=["date", "year"])
-    assert p.tags == ["date", "year"]
+    assert _sem(p) == ["date", "year"]      # semantic tags preserved
+    assert p.has_tag("fact")                # kind auto-added
 
 
 # --- 2. spawning & date decomposition -------------------------------------
@@ -75,7 +84,7 @@ def test_date_decomposition_spawns_parent_and_components():
     beacons = [p for p in m.points if p.id.startswith("entity_")]
     # parent date + day + month + year = 4
     assert len(beacons) == 4
-    by_tags = {tuple(p.tags): p for p in beacons}
+    by_tags = {tuple(_sem(p)): p for p in beacons}
     assert ("date",) in by_tags                       # parent
     assert ("date", "day") in by_tags
     assert ("date", "month") in by_tags
@@ -91,7 +100,7 @@ def test_partial_date_only_emits_present_parts():
     m.ingest("happened in yr", kind="FACT", id="D1:1")
     beacons = [p for p in m.points if p.id.startswith("entity_")]
     # parent + year only
-    tagsets = sorted(tuple(p.tags) for p in beacons)
+    tagsets = sorted(tuple(_sem(p)) for p in beacons)
     assert tagsets == [("date",), ("date", "year")]
 
 
@@ -100,7 +109,7 @@ def test_non_date_entity_spawns_single_tagged_beacon():
     m.ingest("from swe originally", kind="FACT", id="D1:1")
     beacons = [p for p in m.points if p.id.startswith("entity_")]
     assert len(beacons) == 1
-    assert beacons[0].tags == ["place"]
+    assert _sem(beacons[0]) == ["place"]
     assert beacons[0].keywords[0] == "sweden"
 
 
