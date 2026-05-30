@@ -286,6 +286,18 @@ _INTERJECTION_RE = re.compile(
 # agent sometimes leaks into the answer.
 _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
 
+# Plural / enumeration questions whose gold answer is a LIST — trigger the
+# dedicated aggregation pass over relevant_collected.
+_ENUM_Q_RE = re.compile(
+    r"\b(what|which)\b.{0,40}\b(events?|cities|places|ways|things|hobbies|"
+    r"activities|projects?|crafts?|sports?|languages?|skills?|groups?|"
+    r"causes?|items?|gifts?|fields?|attributes?|traits?|books?|movies?|"
+    r"games?|pets?|countries|emotions?|recipes?|symbols?|organizations?|"
+    r"recommendations?|suggestions?|jobs?|kinds?|types?)\b"
+    r"|\bin what ways\b|\bhave in common\b|\bboth\b",
+    re.IGNORECASE,
+)
+
 # Absolute-date patterns for "when" question extraction, most specific first :
 #   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
 _MONTHS = (r"(?:January|February|March|April|May|June|July|August|"
@@ -719,6 +731,40 @@ class McpMetaAgent:
                         last_relevant_collected[0].get("content", "")).strip()
                 trace.append({"round": self.max_rounds,
                               "action": "forced_final"})
+
+            # ENUMERATION (cat1 multi-hop) : the walk's relevant_collected
+            # already gathers ALL the items across depth (verified), but
+            # Haiku collapses them to ONE in free composition. For a plural
+            # question, run a dedicated aggregation pass over relevant_
+            # collected that lists every distinct item — exploiting the
+            # MAP-REDUCE we already build instead of trusting free-form.
+            if (_ENUM_Q_RE.search(question or "")
+                    and len(last_relevant_collected) >= 2):
+                ev = "\n".join(
+                    f"- {e.get('content', '')}"
+                    for e in last_relevant_collected[:14])
+                try:
+                    er = self.client.messages.create(
+                        model=self.model, max_tokens=60, temperature=0,
+                        system=("List EVERY distinct item that answers the "
+                                "question, drawn from the facts. Output a "
+                                "comma-separated list of short items (1-3 "
+                                "words each), no prose, no repeats. If only "
+                                "one item, output it alone."),
+                        messages=[{"role": "user", "content":
+                                   f"Question: {question}\nFacts:\n{ev}"}],
+                    )
+                    if hasattr(er, "usage"):
+                        total_in += getattr(er.usage, "input_tokens", 0) or 0
+                        total_out += getattr(er.usage, "output_tokens", 0) or 0
+                    et = " ".join(b.text for b in er.content
+                                  if b.type == "text").strip()
+                    # Keep it only if it genuinely enumerates more than the
+                    # collapsed answer (more comma-items), else keep original.
+                    if et and et.count(",") > (answer_text or "").count(","):
+                        answer_text = et
+                except Exception:
+                    pass
 
         return {
             "answer": terse(answer_text, question),
