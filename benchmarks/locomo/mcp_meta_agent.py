@@ -281,6 +281,9 @@ _PREAMBLE_RE = re.compile(
     r"following the walk[^,.:]*[,.:]\s*|"
     r"the answer is[:\s]+|answer[:\s]+|i found that\s+|"
     r"i found (?:exactly |the answer|it|what)[^.!?]*[.!?]\s*|"
+    r"i now have (?:strong |clear |direct )?evidence[^.!?]*[.!?]\s*|"
+    r"looking at the (?:relevant )?(?:facts?|evidence|information)[^,.:]*[,.:]\s*|"
+    r"based on (?:all )?(?:the )?(?:facts?|evidence|information)[^,.:]*[,.:]\s*|"
     r"it (?:appears|seems) that\s+|"
     r"key (?:facts?|information|details?)[\w\s']+:\s*|"
     r"(?:here are|here is) (?:the )?(?:key )?(?:facts?|details?)[\w\s']*:\s*|"
@@ -604,7 +607,7 @@ class McpMetaAgent:
                         messages.append({"role": "assistant",
                                          "content": resp.content})
                         fr = self.client.messages.create(
-                            model=self.model, max_tokens=48, temperature=0,
+                            model=self.model, max_tokens=96, temperature=0,
                             system=AGENT_SYSTEM, tools=[_FINAL_ANSWER_TOOL],
                             tool_choice={"type": "tool",
                                          "name": "final_answer"},
