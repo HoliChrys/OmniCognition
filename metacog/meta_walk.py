@@ -45,8 +45,9 @@ THOUGHT/ACTION Points (which were appended to the memory).
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from metacog.epistemic import (
     DEFAULT_OBSERVATOR_ID,
@@ -70,6 +71,70 @@ from metacog.uncertainty import beta_sigma, node_sigma
 # keeps the worst-case generation cost at 3·2·50 = 300 output tokens.
 _GENERATION_TOKEN_BUDGET = 50
 _DEFAULT_STAGES = 3
+
+
+# ----------------------------------------------------------------------
+# HyDE — Hypothetical Document Embeddings (Gao et al., 2022), as an
+# ADDITIVE retrieval channel for the walk's stage-0 seed.
+#
+# Why this exists : LoCoMo "inference" questions (category 3) are
+# abstract — "What might John's financial status be?" — while the
+# evidence that answers them is concrete and lexically disjoint —
+# "my kids have so much". The raw question embeds FAR from its own
+# evidence, so keyword/BM25/content-cosine all miss it (r7 = 0).
+#
+# HyDE closes that gap with ZERO hardcoded vocabulary : we ask the LLM
+# to imagine a concrete diary/chat line that WOULD answer the question,
+# then retrieve against THAT. The hypothetical "John's family never
+# worries about money; his kids have everything" lands right next to
+# the real evidence. We keep the original-query channel too and only
+# ADD the hypothetical's hits — so factual/temporal questions
+# (categories 1,2,4) are never destabilised : their exact-match channel
+# is untouched and any spurious HyDE hit is dropped by Chain-of-Note.
+# ----------------------------------------------------------------------
+
+# Default ON. Set METACOG_HYDE=0 to disable (used for A/B benchmarking).
+def _hyde_enabled() -> bool:
+    return os.environ.get("METACOG_HYDE", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+# Process-global cache : one hypothetical per distinct query string.
+# Walks re-issue the same seed query across stages and the agent issues
+# the same question across retries — generate the passage once.
+_HYDE_CACHE: Dict[str, str] = {}
+
+
+def hyde_passage(query: str, llm: Any) -> str:
+    """Generate (and cache) a concrete hypothetical evidence passage for
+    `query` — the text a person might actually have written that would
+    directly answer it. Returns "" if no usable LLM or on any failure
+    (HyDE is strictly additive : a miss simply means no extra channel)."""
+    q = (query or "").strip()
+    if not q:
+        return ""
+    if q in _HYDE_CACHE:
+        return _HYDE_CACHE[q]
+    passage = ""
+    if hasattr(llm, "generate"):
+        prompt = (
+            "Someone is searching a personal conversation memory (diary / "
+            "chat logs) to answer this QUESTION:\n"
+            f"  {q}\n\n"
+            "Write ONE or TWO short sentences as if they were an actual "
+            "line from those logs that would DIRECTLY answer the question. "
+            "Use concrete, everyday wording a real person would say — "
+            "specific nouns and plain facts, first person where natural. "
+            "Do NOT restate or reference the question, do NOT hedge, do "
+            "NOT explain. Output only the hypothetical line."
+        )
+        try:
+            passage = (llm.generate(prompt, max_tokens=64) or "").strip()
+        except Exception:
+            passage = ""
+    _HYDE_CACHE[q] = passage
+    return passage
 # Match the system retrieval budget (k=7) so a walk's stage-0 facts are
 # the same top-k a single-shot retrieve would return — the walk can then
 # only ADD evidence across later stages, never lose what single-shot found.
@@ -1029,6 +1094,8 @@ class MetaWalker:
         self._enc = memory.encoder
         self._extr = memory.extractor
         self._llm = memory.llm
+        # HyDE additive retrieval channel (stage-0 seed). See module docstring.
+        self._use_hyde = _hyde_enabled()
 
         # Stage-0 seed embedding from the query keywords. Position-
         # weighted (1/(i+1) decay) so the top keyword drives the vector.
@@ -1192,6 +1259,32 @@ class MetaWalker:
             exclude_ids=self._visited_fact_ids,
             encoder=self._enc, extractor=self._extr,
         )
+
+        # HyDE additive channel (stage 0 only) : retrieve a second fact
+        # list against a hypothetical concrete answer to the ORIGINAL
+        # question, and APPEND its unique hits. The original-query facts
+        # keep their rank (so fact* / factual questions are unaffected) ;
+        # HyDE only widens recall for abstract inference questions whose
+        # evidence is lexically disjoint from the question. Chain-of-Note
+        # (below) drops any off-target HyDE hit from the focus set.
+        if self._stage_idx == 0 and self._use_hyde:
+            passage = hyde_passage(self.query, self._llm)
+            if passage:
+                h_kws = self._extr.extract(passage, n=8) if self._extr else []
+                h_emb = (
+                    position_weighted_keyword_embedding(h_kws, self._enc)
+                    if h_kws else tuple(self._enc.encode(passage))
+                )
+                seen = {f.id for f in facts} | set(self._visited_fact_ids)
+                hyde_facts = nearest_facts_with_fallback(
+                    h_emb, passage, pts, self.facts_per_stage, self.t_now,
+                    exclude_ids=self._visited_fact_ids,
+                    encoder=self._enc, extractor=self._extr,
+                )
+                for hf in hyde_facts:
+                    if hf.id not in seen:
+                        facts.append(hf)
+                        seen.add(hf.id)
 
         # Calibrate the walk-local σ threshold once from stage-0 facts.
         # median + std of pairwise cosine distances between the initial
