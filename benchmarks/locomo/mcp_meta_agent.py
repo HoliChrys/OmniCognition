@@ -130,16 +130,18 @@ Workflow :
    you the year. Also try synonyms: "adopt" = "get", "join" = "sign",
    "start" = "begin" = "launch".
    INFERENCE QUERY TIP (cat3): for "What might X's Y be?", "What is X
-   likely to enjoy?", "Is it likely X has Z?" — search for MULTIPLE TYPES
-   of indirect evidence. Run at least 2 diverse walks:
-   · First: specific to what the question asks (health → "X doctor weight
-     body medical", friends → "X social activity group teammates")
-   · Second: BROADER character traits (health → "X lifestyle exercise
-     diet fitness active sedentary", friends → "X people together team
-     club group")
+   likely to enjoy?", "Is it likely X has Z?", "suspected/probable Y" —
+   search for MULTIPLE TYPES of indirect evidence. Run at LEAST 3 diverse
+   walks with different vocabulary:
+   · Walk 1: direct question terms (health → "X doctor weight body medical")
+   · Walk 2: domain synonyms (health → "X obesity overweight diet exercise
+     fat fitness body shape"; friends → "X team game club social group")
+   · Walk 3: broader lifestyle clues (health → "X active sedentary food
+     eating habits walk run"; activity → "X cooking kitchen baking food
+     recipe home hobby indoor"; friends → "X online community play event")
    The correct evidence often uses DIFFERENT vocabulary than the question
-   (e.g. "obesity" ≠ "health problem" in a search). Use synonyms and
-   domain-specific terms, not just the question's exact words.
+   (e.g. "obesity" ≠ "health problem", "cook dog treats" ≠ "indoor activity"
+    in a search). Always try at least 3 synonym-diverse queries before giving up.
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
@@ -204,8 +206,13 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
     "Psychology, counseling" (fields list), "Obesity" (condition).
   NEVER answer "Not mentioned" for these — an educated guess IS
   the correct form of answer for open-estimation questions.
+- "What are X's suspected [Y]?" / "What is X's probable [Y]?" → also
+  OPEN-ESTIMATION: give a direct label even if indirect. E.g. "What are
+  John's suspected health problems?" → "Obesity" or "Weight issues", NOT
+  "Not mentioned". Try domain synonyms: "weight body overweight obese
+  fitness diet medical doctor" before concluding nothing is there.
 - not in the evidence / adversarial / unanswerable → "Not mentioned"
-  (NEVER for "Would/Could/might/likely" inference questions above).
+  (NEVER for "Would/Could/might/likely/suspected/probable" inference questions above).
 
 Hard rule : single-value answers (dates / places / one entity) above 5
 words are wrong — strip adjectives/conjunctions to the bare value.
