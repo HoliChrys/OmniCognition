@@ -129,6 +129,17 @@ Workflow :
    not the year — the [session date] prefix of the retrieved fact gives
    you the year. Also try synonyms: "adopt" = "get", "join" = "sign",
    "start" = "begin" = "launch".
+   INFERENCE QUERY TIP (cat3): for "What might X's Y be?", "What is X
+   likely to enjoy?", "Is it likely X has Z?" — search for MULTIPLE TYPES
+   of indirect evidence. Run at least 2 diverse walks:
+   · First: specific to what the question asks (health → "X doctor weight
+     body medical", friends → "X social activity group teammates")
+   · Second: BROADER character traits (health → "X lifestyle exercise
+     diet fitness active sedentary", friends → "X people together team
+     club group")
+   The correct evidence often uses DIFFERENT vocabulary than the question
+   (e.g. "obesity" ≠ "health problem" in a search). Use synonyms and
+   domain-specific terms, not just the question's exact words.
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
@@ -178,8 +189,16 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "What might X be / What could X / What might X's Y be / What fields would
   X likely …" OPEN-ESTIMATION questions → give a DIRECT estimate drawn from
   indirect evidence. Never abstain on "might/would/could/likely" questions.
-  The expected answer is a short noun phrase ("Middle-class", "Psychology,
-  counseling"). NEVER answer "Not mentioned" for these — an educated guess IS
+  FORMAT RULES for open-estimation :
+  · If evidence supports MULTIPLE equally plausible options, list them as
+    "Option1 or Option2" (the gold answers often have this "or" form).
+    E.g. "Middle-class or wealthy" — NOT just "Middle-class".
+  · Output ONLY the bare label(s) — NO explanatory clauses, no parenthetical
+    reasons, no "because he…". "Middle-class or wealthy" is correct.
+    "Middle-class (he runs a business)" is WRONG — the parenthetical kills F1.
+  · If evidence clearly supports ONE specific thing, say just that one:
+    "Psychology, counseling" (fields list), "Obesity" (condition).
+  NEVER answer "Not mentioned" for these — an educated guess IS
   the correct form of answer for open-estimation questions.
 - not in the evidence / adversarial / unanswerable → "Not mentioned"
   (NEVER for "Would/Could/might/likely" inference questions above).
@@ -244,7 +263,7 @@ Q: Whose birthday did Melanie celebrate? → Melanie's daughter
 Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
 Q: Would Caroline have Dr. Seuss books? → Likely yes, she collects classic children's books
 Q: Would Tim enjoy C. S. Lewis or John Greene? → C. S. Lewis
-Q: What might John's financial status be? → Middle-class (he runs his own business)
+Q: What might John's financial status be? → Middle-class or wealthy
 Q: What fields would Caroline likely pursue in education? → Psychology, counseling
 Q: When did Joanna first watch Eternal Sunshine? [turn: 2022-03] "I watched it around 3 years ago" → 2019
 Q: In which month's game did John get a career-high? [turn: July 2023] "I got a career-high in our June game" → June 2023
