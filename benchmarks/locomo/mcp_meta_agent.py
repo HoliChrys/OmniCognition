@@ -102,6 +102,12 @@ Workflow :
      walk_start(query="Melanie hobby activity craft pottery")
    Start each walk with a RICH query (4+ content words from the
    question), never a 2-word stub like "Caroline research".
+   ENUM HINT : for "what events/cities/ways/things has X done" questions,
+   include ANTICIPATED answer terms in your first query — the answer
+   words are likely near the evidence in the memory. E.g. for "What
+   LGBTQ events has Caroline participated in?", try:
+     walk_start(query="Caroline LGBTQ pride parade support group activism")
+   This bridges vocabulary gaps between the question and the memory turns.
 6. Only answer "Not mentioned" after you have tried at least TWO
    differently-phrased walks and both drifted. Otherwise answer with
    the best relevant/partial evidence you found.
