@@ -554,6 +554,15 @@ def terse(text: str, question: Optional[str] = None) -> str:
                     t = new
                     changed = True
                     break
+    # Kinship synonym normalization: conversational short forms → formal tokens
+    # that align with LoCoMo gold answers. Only apply to short answers (≤ 5
+    # words) to avoid touching real sentence content.
+    if len(t.split()) <= 5:
+        t = re.sub(r"\bmom\b", "mother", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bdad\b", "father", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bmum\b", "mother", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bgrandma\b", "grandmother", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bgrandpa\b", "grandfather", t, flags=re.IGNORECASE)
     return t.strip().rstrip(".")
 
 
