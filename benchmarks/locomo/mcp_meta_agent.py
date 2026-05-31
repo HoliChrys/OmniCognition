@@ -819,7 +819,7 @@ class McpMetaAgent:
                     # assistant turn (parallel tool calls), else the API errors.
                     if (_INFERENCE_Q_RE.search(question or "")
                             and walk_start_count < _MIN_WALKS_INFERENCE
-                            and round_idx < max_rounds - 1):
+                            and round_idx < self.max_rounds - 1):
                         step_label = ("B" if walk_start_count == 1
                                       else "C" if walk_start_count == 2
                                       else "A")
