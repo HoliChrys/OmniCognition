@@ -132,22 +132,33 @@ Workflow :
    INFERENCE QUERY TIP (cat3): for "What might X's Y be?", "What is X
    likely to enjoy?", "Is it likely X has Z?", "suspected/probable Y",
    "What fields would X pursue?" —
-   MANDATORY: Do NOT call final_answer until you have called walk_start
-   at least 3 times with DIFFERENT vocabulary. Calling final_answer with
-   fewer than 3 walks on these inference questions will miss critical evidence.
-   · Walk 1: direct question terms (career → "X career study education field")
-   · Walk 2: domain synonyms that the ANSWER might use, not the question
-     (career → "X psychology degree academic program certification major";
-      health → "X obesity overweight weight body diet medical fat";
-      friends → "X team game club social group activity")
-   · Walk 3: broader behavioural/contextual clues
-     (career → "X interest passion volunteer work therapy mental";
-      health → "X active sedentary eat food exercise lifestyle";
-      activity → "X cooking kitchen baking recipe food home indoor hobby")
-   The correct evidence often uses DIFFERENT vocabulary than the question
-   (e.g. "psychology" may appear as the answer but "counseling" or "therapy"
-   in the conversation; "obesity" ≠ "health problem"; "cook" ≠ "indoor
-   activity"). 3 synonym-diverse queries are the minimum, do more if needed.
+   MANDATORY SEQUENCE — you must do ALL 3 steps before calling final_answer:
+     Step A) walk_start(query="X <direct question terms>")
+             then walk_next until walk is done
+     Step B) walk_start(query="X <domain synonyms the ANSWER might use>")
+             then walk_next until walk is done
+     Step C) walk_start(query="X <broader lifestyle/context clues>")
+             then walk_next until walk is done
+   ONLY THEN call final_answer. n_stages on a single walk does NOT count as
+   multiple walks — you must call walk_start THREE separate times with three
+   DIFFERENT seed queries (Step A, Step B, Step C above).
+   Example queries per topic:
+   · education/career: A="X education career field study pursue"
+       B="X psychology degree certification academic program major counseling"
+       C="X passion interest volunteer mental health therapy work"
+   · health/body: A="X health doctor medical illness"
+       B="X obesity overweight weight body diet fat"
+       C="X active sedentary eat food exercise lifestyle"
+   · friends: A="X friends people social relationships"
+       B="X team game club community play online"
+       C="X tournament event server play together"
+   · financial: A="X financial income money work salary"
+       B="X house car travel vacation afford purchase own"
+       C="X kids children comfortable privileged blessed fortunate have lot"
+   The correct evidence often uses DIFFERENT vocabulary than the question.
+   CAUTION (financial/status): distinguish X commenting on SOCIAL ISSUES
+   ("unemployment in our area") from X's PERSONAL situation. Look for turns
+   where X describes their OWN lifestyle, possessions, family comfort, work.
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
