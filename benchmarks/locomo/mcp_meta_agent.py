@@ -193,16 +193,23 @@ the EXACT words from the conversation. If the fact says "counseling and
 mental health for transgender people", answer with those exact words, not
 a paraphrase like "therapy work".
 
-PRECISION / ADVERSARIAL GUARD : if your walk finds ZERO evidence that
-the specific event/action named in the question ever happened (even after
-two differently-phrased walks), answer "Not mentioned". Do NOT patch a
-false premise with related-but-different content. Example traps :
+PRECISION / ADVERSARIAL GUARD : only applicable when the question
+describes a scenario that CONFLICTS with all retrieved evidence (false
+premise). If your walk finds that the specific scenario never happened
+(two differently-phrased walks, all evidence contradicts the premise),
+answer "Not mentioned". Example traps :
 - question says "temp job Gina took" but evidence only shows Gina's
-  normal business activities → "Not mentioned"
-- question says "Jon's store" but Jon runs a dance studio → "Not mentioned"
-  (unless the evidence also calls it a store)
-If you find DIRECT evidence of the scenario (same person, same event),
-answer from it even if some peripheral details differ.
+  normal business activities (conflict) → "Not mentioned"
+- question says "Jon's store" but Jon runs a dance studio (conflict) →
+  "Not mentioned"
+Do NOT apply this guard for straightforward "Which/What/Who/When" factual
+questions where the scenario is plausible — if retrieval found nothing,
+try a THIRD walk with a different query before giving up. For "Which
+team did John sign with on [date]?" the scenario (signing with a team)
+is plausible and normal; missing evidence means poor retrieval, not an
+impossible premise — try harder before saying "Not mentioned".
+If you find DIRECT evidence of the scenario, answer from it even if
+peripheral details differ.
 EXCEPTION : "might/would/could/likely" open-estimation questions (e.g.
 "What might X's status be?", "What fields would X likely pursue?") are
 INFERENCE questions — NEVER apply the guard, always give an estimate.
