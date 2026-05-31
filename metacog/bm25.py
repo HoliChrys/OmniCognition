@@ -20,7 +20,7 @@ import re
 from typing import List, Optional, Sequence, Tuple
 
 
-_TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ]+")
+_TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ0-9]+")
 _K1 = 1.2
 _B = 0.75
 
