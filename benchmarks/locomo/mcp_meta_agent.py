@@ -422,6 +422,9 @@ def terse(text: str, question: Optional[str] = None) -> str:
     )
     if any(_tl.startswith(s) for s in _abstain_starts) and len(t.split()) > 2:
         return "Not mentioned"
+    # Strip leading bullet-point marker ("- " or "• ") — the agent sometimes
+    # returns the raw fact content prefixed with its bullet from the walk output.
+    t = re.sub(r"^[-•]\s+", "", t)
     # Skip compound-cutting when the prediction is ALREADY a comma-separated
     # list of short noun phrases — the agent has chosen to enumerate, and the
     # trailing-comma cutter would chop "Pride parade, school speech, support
