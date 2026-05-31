@@ -331,3 +331,54 @@ def test_metawalker_commit_false_does_not_record_hop():
 def test_spike_source_class_is_computation():
     from metacog.spike import SOURCE
     assert SOURCE is SourceClass.COMPUTATION
+
+
+# ---------------------------------------------------------------------------
+# Workflow (ACTION / tool chain) compression — in-depth Chasles on actions
+# ---------------------------------------------------------------------------
+
+def test_action_workflow_chain_compresses_into_shortcut():
+    """A recurring multi-step workflow — a chain of ACTION nodes (incl.
+    tool nodes, which are kind=ACTION) — is shortened by the in-depth
+    Chasles compression into a single optimized intermediate step."""
+    from metacog.epistemic import Point, PointKind
+    m = _mem(0)
+    # A 4-step workflow A0 -> A1 -> A2 -> A3, all kind=ACTION.
+    chain = []
+    for i in range(4):
+        a = Point(id=f"A{i}", content=f"shared workflow step chunk {i}",
+                  embedding_orig=tuple(m.encoder.encode(f"step {i}")),
+                  kind=PointKind.ACTION, n_spike=50)
+        chain.append(a)
+    # tag the first two as tool nodes : workflows of tools must compress too
+    chain[0].add_tag("tool", "tool_command")
+    chain[1].add_tag("tool", "tool_command")
+    m.points.extend(chain)
+    by_id = {p.id: p for p in m.points}
+    # distractor non-spiking nodes so concentrated() can fire (k=3 refs)
+    for d in ("D0", "D1", "D2", "D3"):
+        m.points.append(Point(id=d, content=d,
+                              embedding_orig=tuple(m.encoder.encode(d)),
+                              kind=PointKind.ACTION, n_spike=1))
+    by_id = {p.id: p for p in m.points}
+    by_id["A0"].tags.append("ref:A1")
+    for tag in ("ref:A2", "ref:D0", "ref:D1"):
+        by_id["A1"].tags.append(tag)
+    for tag in ("ref:A3", "ref:D2", "ref:D3"):
+        by_id["A2"].tags.append(tag)
+    m._spike_total_hops = 30
+
+    events = auto_compress_chasles(m, _FakeLLM(), m.encoder)
+    assert len(events) == 1                         # the workflow fired
+    ev = events[0]
+    # intermediates A1,A2 compressed into one child between anchors A0,A3
+    assert set(ev.parent_ids) == {"A1", "A2"}
+    assert set(ev.anchor_ids) == {"A0", "A3"}
+    child = next(p for p in m.points if p.id == ev.child_id)
+    assert child.kind == PointKind.ACTION           # stays an action step
+    # the compressed workflow is promoted to a reusable tool node
+    from metacog.skills import is_tool
+    assert is_tool(child) and "tool_workflow" in child.tags
+    # refractory reset on the whole fired path
+    for nid in ("A0", "A1", "A2", "A3"):
+        assert by_id[nid].n_spike == 0

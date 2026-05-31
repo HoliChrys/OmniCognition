@@ -209,6 +209,20 @@ def auto_compress_chasles(memory: "Memory", llm: Any,
         )
         if result is None:
             continue
+        # A compressed WORKFLOW : if the chain was made of tool/action steps,
+        # promote the shortcut child into a reusable TOOL node carrying the
+        # union of the path's tool genre/context tags — so the optimized
+        # (fewer-step) workflow becomes a first-class capability the walk can
+        # find and reuse, not just a geometric shortcut.
+        try:
+            from metacog.skills import TOOL_TAG, is_tool
+            if any(is_tool(n) for n in path):
+                ctx = {t for n in path for t in n.tags
+                       if t == TOOL_TAG or t.startswith("tool_")
+                       or not t.startswith(("ref:", "action", "fact", "thought"))}
+                result.child.add_tag(TOOL_TAG, "tool_workflow", *sorted(ctx))
+        except Exception:
+            pass
         memory.points.append(result.child)
         for node in path:                                # refractory reset
             node.n_spike = 0

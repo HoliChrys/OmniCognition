@@ -1449,6 +1449,7 @@ class MetaWalker:
                 action_star.n_uses += 1
                 # Spike-and-Path : record the multi-hop transition. The
                 # very first stage has no predecessor and is skipped.
+                from metacog.spike import record_hop
                 if self._prev_fact_star_id is not None:
                     prev_fact = next(
                         (p for p in self.memory.points
@@ -1456,9 +1457,18 @@ class MetaWalker:
                         None,
                     )
                     if prev_fact is not None:
-                        from metacog.spike import record_hop
                         record_hop(prev_fact, fact_star, self.memory)
                 self._prev_fact_star_id = fact_star.id
+                # WORKFLOW hop : also record the ACTION -> ACTION transition
+                # (the chosen action of the previous stage led to this one).
+                # This charges the ACTION chain so the in-depth Chasles
+                # compression can later shorten a recurring multi-step
+                # workflow (incl. tool nodes, which are kind=ACTION) into a
+                # single optimized step. self._prev_action still holds the
+                # previous stage's action here (updated at end of step).
+                if (self._prev_action is not None
+                        and self._prev_action.id != action_star.id):
+                    record_hop(self._prev_action, action_star, self.memory)
 
             thought = meta_thought(
                 fact_star, action_star, pts,
