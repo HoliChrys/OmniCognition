@@ -421,7 +421,11 @@ def terse(text: str, question: Optional[str] = None) -> str:
         "there's no information", "there isn't",
         "not stated", "not specified", "not provided",
     )
-    if any(_tl.startswith(s) for s in _abstain_starts) and len(t.split()) > 2:
+    # Only normalize short pure-abstentions (≤ 15 words). Longer preds that
+    # start with an abstain phrase often have real content mixed in ("The facts
+    # do not mention X, but she was accepted for a fashion internship") — let
+    # the rest of terse() handle them rather than discarding the content.
+    if any(_tl.startswith(s) for s in _abstain_starts) and 2 < len(t.split()) <= 15:
         return "Not mentioned"
     # Strip leading bullet-point marker ("- " or "• ") — the agent sometimes
     # returns the raw fact content prefixed with its bullet from the walk output.
