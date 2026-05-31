@@ -129,33 +129,27 @@ Workflow :
    not the year — the [session date] prefix of the retrieved fact gives
    you the year. Also try synonyms: "adopt" = "get", "join" = "sign",
    "start" = "begin" = "launch".
-   INFERENCE QUERY TIP (cat3): for "What might X's Y be?", "What is X
-   likely to enjoy?", "Is it likely X has Z?", "suspected/probable Y",
-   "What fields would X pursue?" —
-   MANDATORY SEQUENCE — you must do ALL 3 steps before calling final_answer:
-     Step A) walk_start(query="X <direct question terms>")
-             then walk_next until walk is done
-     Step B) walk_start(query="X <domain synonyms the ANSWER might use>")
-             then walk_next until walk is done
-     Step C) walk_start(query="X <broader lifestyle/context clues>")
-             then walk_next until walk is done
-   ONLY THEN call final_answer. n_stages on a single walk does NOT count as
-   multiple walks — you must call walk_start THREE separate times with three
-   DIFFERENT seed queries (Step A, Step B, Step C above).
-   Example queries per topic:
-   · education/career: A="X education career field study pursue"
-       B="X psychology degree certification academic program major counseling"
-       C="X passion interest volunteer mental health therapy work"
-   · health/body: A="X health doctor medical illness"
-       B="X obesity overweight weight body diet fat"
-       C="X active sedentary eat food exercise lifestyle"
-   · friends: A="X friends people social relationships"
-       B="X team game club community play online"
-       C="X tournament event server play together"
-   · financial: A="X financial income money work salary"
-       B="X house car travel vacation afford purchase own"
-       C="X kids children comfortable privileged blessed fortunate have lot"
-   The correct evidence often uses DIFFERENT vocabulary than the question.
+   PIVOT-ON-DRIFT (the core walk rule). A walk result carries `drifted`
+   and `n_relevant`. When a walk DRIFTS (drifted=true / n_relevant=0 /
+   nothing on-target collected), the single-hop retrieval was INCONCLUSIVE —
+   do NOT answer from a drifted walk. Pivot : call walk_start again with a
+   DIFFERENT vocabulary. Keep pivoting until a walk lands on-target (it
+   stops collecting evidence). This is what lets indirect / inference
+   questions work : the answer's words rarely match the question's words.
+   How to choose the next pivot's vocabulary — move OUTWARD each time :
+     1st seed : the question's own terms
+     2nd seed : domain synonyms the ANSWER might use, not the question
+     3rd seed : broader behavioural / lifestyle / context clues
+   Example progressions (only for inspiration — read the drift signal, not
+   the question's wording, to decide whether to pivot) :
+   · education/career: "X education field study" → "X psychology degree
+       certification program counseling" → "X passion volunteer therapy mental"
+   · health/body: "X health doctor illness" → "X obesity overweight diet fat"
+       → "X active sedentary eat food exercise lifestyle"
+   · friends: "X friends social" → "X team game club community play online"
+       → "X tournament event server play together"
+   · financial: "X financial income money" → "X house car travel afford own"
+       → "X kids children comfortable privileged blessed have lot"
    CAUTION (financial/status): distinguish X commenting on SOCIAL ISSUES
    ("unemployment in our area") from X's PERSONAL situation. Look for turns
    where X describes their OWN lifestyle, possessions, family comfort, work.
@@ -451,17 +445,13 @@ _ENUM_Q_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Absolute-date patterns for "when" question extraction, most specific first :
-# Inference questions (cat3): require 3 diverse walk_start calls before answering.
-_INFERENCE_Q_RE = re.compile(
-    r"\b(?:might|likely|suspected|probable)\b"
-    r"|^Is it likely\b"
-    r"|what fields\b.*\bpursue\b"
-    r"|\bwhat (?:is|are|would|could) \w+(?:'s)? (?:likely|probable|suspected)\b",
-    re.IGNORECASE,
-)
-_MIN_WALKS_INFERENCE = 3
+# Loop-safety cap on how many times we redirect a premature final_answer back
+# into a pivot when the walk evidence is still inconclusive (drifted / nothing
+# on-target). NOT a question-type rule — purely a bound so an answer that
+# genuinely isn't in memory (e.g. abstention questions) still terminates.
+_MAX_PIVOT_REDIRECTS = 3
 
+# Absolute-date patterns for "when" question extraction, most specific first :
 #   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
 _MONTHS = (r"(?:January|February|March|April|May|June|July|August|"
            r"September|October|November|December)")
@@ -730,6 +720,8 @@ class McpMetaAgent:
             answer_text = ""
             walk_start_count = 0   # total breadth pivots taken
             done_seen = False
+            last_walk_drifted = False  # latest walk drifted (n_relevant==0)
+            pivot_redirects = 0        # premature-answer redirects issued
             last_relevant_collected: List[dict] = []  # for forced-final evidence
 
             for round_idx in range(self.max_rounds):
@@ -813,48 +805,48 @@ class McpMetaAgent:
                 final_tu = next(
                     (b for b in tool_uses if b.name == "final_answer"), None)
                 if final_tu is not None:
-                    # Guard: inference questions require ≥3 diverse walk_start
-                    # calls. If the agent tries to answer too early, redirect.
+                    # SIGNAL-DRIVEN pivot (not question-type-driven). The
+                    # meta-walk should fire when single-hop retrieval is
+                    # INCONCLUSIVE — i.e. the latest walk drifted (n_relevant==0)
+                    # and nothing on-target was collected. In that case the
+                    # answer would come from a blank/drifted walk, so redirect
+                    # the agent to pivot with different vocabulary instead.
+                    # Bounded by _MAX_PIVOT_REDIRECTS so genuinely-absent
+                    # evidence (abstention questions) still terminates.
                     # We must provide a tool_result for EVERY tool_use in the
                     # assistant turn (parallel tool calls), else the API errors.
-                    if (_INFERENCE_Q_RE.search(question or "")
-                            and walk_start_count < _MIN_WALKS_INFERENCE
+                    evidence_inconclusive = (
+                        last_walk_drifted and not last_relevant_collected)
+                    if (evidence_inconclusive
+                            and pivot_redirects < _MAX_PIVOT_REDIRECTS
                             and round_idx < self.max_rounds - 1):
-                        step_label = ("B" if walk_start_count == 1
-                                      else "C" if walk_start_count == 2
-                                      else "A")
+                        pivot_redirects += 1
                         redirect_msg = (
-                            f"Not yet — this inference question requires at "
-                            f"least {_MIN_WALKS_INFERENCE} walk_start calls "
-                            f"with different vocabulary. You have done "
-                            f"{walk_start_count}. Do Step {step_label} now: "
-                            f"call walk_start with a DIFFERENT seed query "
-                            f"(domain synonyms or broader context clues)."
+                            "That walk DRIFTED (n_relevant=0, nothing on-target) "
+                            "— answering now would be from a blank walk. Pivot : "
+                            "call walk_start again with DIFFERENT vocabulary "
+                            "(synonyms the ANSWER might use, then broader context "
+                            "clues). Only answer once a walk lands on-target, or "
+                            "if you have genuinely exhausted the memory."
                         )
                         # Build tool_result for every tool_use in this turn.
                         redirect_results: List[Dict[str, Any]] = []
                         for tu in tool_uses:
-                            if tu.id == final_tu.id:
-                                redirect_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": tu.id,
-                                    "content": redirect_msg,
-                                })
-                            else:
-                                redirect_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": tu.id,
-                                    "content": ("Skipped — answering an "
-                                                "inference question too early; "
-                                                "do a new walk_start first."),
-                                })
+                            redirect_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tu.id,
+                                "content": (redirect_msg if tu.id == final_tu.id
+                                            else "Skipped — pivot first; the "
+                                                 "last walk drifted."),
+                            })
                         messages.append(
                             {"role": "assistant", "content": resp.content})
                         messages.append({"role": "user",
                                          "content": redirect_results})
                         trace.append({"round": round_idx,
-                                      "action": "redirect_inference_walk",
-                                      "walk_start_count": walk_start_count})
+                                      "action": "pivot_on_drift",
+                                      "walk_start_count": walk_start_count,
+                                      "pivot_redirects": pivot_redirects})
                         continue  # back to top of for-loop, don't break
                     answer_text = str((final_tu.input or {}).get("value", "")).strip()
                     # Never accept an empty answer : fall back to any prose
@@ -892,10 +884,15 @@ class McpMetaAgent:
                         if tu.name == "walk_start":
                             walk_start_count += 1
                             done_seen = False  # reset — new walk, new chance
-                        # Detect done flag for trace.
+                        # Detect done + drift flags for trace / pivot signal.
                         try:
-                            if json.loads(result_text).get("done"):
+                            obj2 = json.loads(result_text)
+                            if obj2.get("done"):
                                 done_seen = True
+                            # Track whether the latest walk stage drifted —
+                            # the inconclusiveness signal that drives pivoting.
+                            if "drifted" in obj2:
+                                last_walk_drifted = bool(obj2.get("drifted"))
                         except Exception:
                             pass
                     tool_results.append({
@@ -912,11 +909,15 @@ class McpMetaAgent:
                 # Force final answer only after the agent has had a chance
                 # to try a breadth pivot (second walk_start). A single
                 # done=true should be a signal to pivot, not to stop.
-                # For inference questions, require 3 walks before forcing final.
-                _min_w = (_MIN_WALKS_INFERENCE
-                          if _INFERENCE_Q_RE.search(question or "")
-                          else 2)
-                if done_seen and walk_start_count >= _min_w:
+                # Signal-driven : if the walk is done but DRIFTED with no
+                # on-target evidence and pivots remain, do NOT force — let the
+                # agent pivot to fresh vocabulary. Only force once we have
+                # evidence to synthesise, or the pivot budget is spent.
+                _have_evidence = bool(last_relevant_collected)
+                _pivots_spent = pivot_redirects >= _MAX_PIVOT_REDIRECTS
+                if (done_seen and walk_start_count >= 2
+                        and (_have_evidence or _pivots_spent
+                             or not last_walk_drifted)):
                     # Two breadth threads exhausted — synthesize from
                     # accumulated evidence, never from a blank slate.
                     if last_relevant_collected:
