@@ -1412,6 +1412,15 @@ class MetaWalker:
                 self._add_generated(generated)
                 actions = [generated]
                 gen_action = True
+                # SKILL crystallization signal : this re-derived action,
+                # scoped by the query + grounding facts, feeds the
+                # recurrence ledger. When the same action recurs across
+                # diverse queries it crystallizes into a persistent TOOL
+                # node. Only on committed (live) walks.
+                if self.commit and hasattr(self.memory, "record_action_generation"):
+                    self.memory.record_action_generation(
+                        generated, seed_emb, self.query, focus_facts,
+                    )
 
         # fact* is chosen among the FOCUSED facts (Chain-of-Note has
         # filtered the off-target turns) so the THOUGHT is seeded by a

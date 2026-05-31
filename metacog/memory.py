@@ -100,6 +100,13 @@ class Memory:
     # lateral_collapse(). Opt-in : recording is a no-op unless enabled.
     _lateral_ledger: Any = None
     lateral_enabled: bool = False
+    # Action-recurrence ledger driving SKILL/TOOL crystallization
+    # (metacog.skills). Accumulated via record_action_generation() ;
+    # consumed by crystallize_skills(). Crystallized tools are NORMAL nodes
+    # (kind=ACTION, tagged "tool") in self.points, so they persist with the
+    # cloud and the walk finds them recursively. Opt-in.
+    _skill_ledger: Any = None
+    skills_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.storage_path:
@@ -792,6 +799,73 @@ class Memory:
             "collided_groups": len(report.collided),
             "aliases": dict(report.aliases),
             "n_points": len(self.points),
+        }
+
+    def record_action_generation(
+        self, action: Point, query_emb: Optional[Sequence[float]],
+        query_text: str, facts: Sequence[Point],
+    ) -> None:
+        """Register one re-derived ACTION into the skill-recurrence ledger,
+        scoped by the query that triggered it and the grounding facts'
+        keywords. No-op unless `skills_enabled`."""
+        if not self.skills_enabled or action is None:
+            return
+        from metacog.skills import SkillLedger, record_action
+        if self._skill_ledger is None:
+            self._skill_ledger = SkillLedger()
+        fact_kw: List[str] = []
+        for f in facts[:5]:
+            fact_kw.extend(f.keywords or [])
+        record_action(
+            self._skill_ledger, action,
+            tuple(query_emb) if query_emb is not None else None,
+            query_text, fact_kw,
+        )
+
+    def crystallize_skills(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """Crystallize recurring actions into persistent TOOL nodes — normal
+        kind=ACTION Points tagged "tool", scoped by keywords, added to the
+        cloud (so the walk finds them recursively and they persist on save).
+        Gated on the emergent recurrence threshold. No-op when disabled."""
+        t_now = self._now(t)
+        if self._skill_ledger is None:
+            return {"crystallized": 0, "tool_ids": [], "n_points": len(self.points)}
+        from metacog.skills import detect_skill_candidates, synthesize_tool
+        existing = list(self.points)
+        cands = detect_skill_candidates(self._skill_ledger, existing_tools=existing)
+        new_ids: List[str] = []
+        for sig, trace in cands:
+            tool = synthesize_tool(
+                sig, trace, self.llm, self.encoder, t_now,
+            )
+            if tool is not None:
+                self.points.append(tool)
+                new_ids.append(tool.id)
+        return {
+            "crystallized": len(new_ids),
+            "tool_ids": new_ids,
+            "n_points": len(self.points),
+        }
+
+    def match_tool(self, query: str) -> Optional[Dict[str, Any]]:
+        """Capability-cache lookup : does a previously-generated TOOL node
+        already cover `query` ? Returns the tool summary + match score, or
+        None (the agent must think from scratch). The walk also surfaces
+        these tool nodes natively, so this is the explicit fast-path."""
+        from metacog.skills import match_tool as _match
+        q_kw = self.extractor.extract(query, n=8) if self.extractor else []
+        if q_kw:
+            q_emb = position_weighted_keyword_embedding(q_kw, self.encoder)
+        else:
+            q_emb = tuple(self.encoder.encode(query))
+        hit = _match(q_emb, self.points)
+        if hit is None:
+            return None
+        tool, score = hit
+        return {
+            "id": tool.id, "content": tool.content,
+            "keywords": list(tool.keywords or []), "tags": list(tool.tags or []),
+            "score": round(score, 4),
         }
 
     def resolve_alias(self, point_id: str) -> str:

@@ -252,6 +252,38 @@ def build_app(
         return result
 
     @app.tool()
+    def match_tool(query: str) -> Optional[dict]:
+        """Capability cache : does a previously-GENERATED tool already cover
+        this query? Returns the tool (id, content, keywords, tags, score) or
+        null. Call this BEFORE thinking from scratch — a hit means the
+        approach is already known and can be reused, skipping a think
+        phase."""
+        return memory.match_tool(query)
+
+    @app.tool()
+    def crystallize_skills() -> dict:
+        """Crystallize recurring actions (re-derived across diverse queries)
+        into persistent TOOL nodes — normal kind=ACTION points tagged
+        "tool", scoped by keywords, added to the cloud so the walk finds
+        them recursively and they persist on save."""
+        result = memory.crystallize_skills()
+        if memory.storage_path:
+            memory.save()
+        return result
+
+    @app.tool()
+    def list_tools_learned() -> List[dict]:
+        """List the TOOL nodes the system has generated so far (the closed,
+        self-built capability set), each with its id, content, genre/context
+        tags and scope keywords."""
+        from metacog.skills import tools_in
+        return [
+            {"id": p.id, "content": p.content,
+             "tags": list(p.tags or []), "keywords": list(p.keywords or [])}
+            for p in tools_in(memory.points)
+        ]
+
+    @app.tool()
     def inspect(point_id: str) -> Optional[dict]:
         """Return the full state of a single point."""
         return memory.inspect(point_id)
