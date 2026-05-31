@@ -129,6 +129,24 @@ def test_gate_opens_on_big_tag_rich_cloud():
 # ---------------------------------------------------------------------------
 
 
+def test_content_floor_rejects_cross_topic_pair():
+    """A pair that co-retrieves strongly under diverse queries but whose
+    CONTENT embeddings are dissimilar (different topics) must NOT collide —
+    the safety floor protects distinct information."""
+    pts = _tag_rich_cloud(80)
+    a = next(p for p in pts if p.id == "P0")
+    b = next(p for p in pts if p.id == "P1")
+    a.embedding_orig = (1.0, 0.0, 0.0)      # orthogonal contents
+    b.embedding_orig = (0.0, 1.0, 0.0)      # cosine 0 << 0.72 floor
+    led = LateralLedger()
+    for axis in range(8):
+        record_coretrieval(led, ["P0", "P1"], _orth(16, axis))
+    for axis in range(8):
+        record_coretrieval(led, [f"P{20+axis}", f"P{40+axis}"], _orth(16, axis))
+    # Strong co-retrieval, but content floor blocks the merge.
+    assert detect_lateral_groups(led, pts) == []
+
+
 def test_diverse_coretrieval_collapses_into_keeper():
     pts = _tag_rich_cloud(80)
     # Make P0 and P1 the laterally-redundant pair, retrieved together by
@@ -163,5 +181,9 @@ def test_diverse_coretrieval_collapses_into_keeper():
     keeper = next(p for p in pts if p.id == "P0")
     assert "beta" in keeper.keywords and "alpha" in keeper.keywords  # union
     assert keeper.n_uses == 13                                       # 10 + 3
-    assert all(p.id != "P1" for p in pts)                            # absorbed gone
-    assert len(pts) == n_before - 1
+    # NON-DESTRUCTIVE : P1 is retained (content preserved) but tagged out
+    # of the search pool and adopted as a child of the keeper.
+    p1 = next((p for p in pts if p.id == "P1"), None)
+    assert p1 is not None and "lateral_absorbed" in p1.tags
+    assert "P1" in keeper.children
+    assert len(pts) == n_before                                     # nothing removed

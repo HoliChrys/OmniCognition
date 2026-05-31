@@ -325,8 +325,12 @@ def nearest_facts_with_fallback(
         # from results. The pull benefit persists in the real facts' shifted
         # positions ; the walk stays fast. Atoms (id "atom_*") are kept — they
         # resolve to source turns below — so over-fetch headroom remains.
+        # Also drop nodes folded under a LATERAL keeper : they were tagged
+        # out of the pool so the keeper represents them in one kNN slot ;
+        # their content survives in the cloud as the keeper's children.
         search_points = [p for p in points
-                         if not p.id.startswith("entity_")]
+                         if not p.id.startswith("entity_")
+                         and "lateral_absorbed" not in p.tags]
         results = retrieve_hybrid(
             query_text, search_points, (k + len(exclude_ids)) * 5 + 20, t_now,
             encoder=encoder, extractor=extractor,

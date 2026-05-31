@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from metacog.epistemic import EpistemicState, Point
-from metacog.geometry import cosine
+from metacog.geometry import cosine, effective_embedding
 
 Vector = Tuple[float, ...]
 Pair = Tuple[str, str]
@@ -110,6 +110,19 @@ _MIN_NODES = 64        # gate : "un nombre assez conséquent de nodes".
 _MIN_DISTINCT_TAGS = 12     # gate : tag vocabulary must be rich…
 _MIN_MULTI_TAG_NODES = 16   # …and enough nodes must live in tag
                             # intersections (≥ 2 tags each).
+# Content-similarity FLOOR for an actual collision. Co-retrieval finds
+# CANDIDATES (nodes that behave alike under diverse probing) ; this floor
+# is the safety check that they are at least the SAME TOPIC. Calibrated on
+# conv-26 (SemanticEncoder) : genuine clusters sit at 0.76-0.89, a clear
+# cross-topic mis-pair ("kindness" vs "games night") at 0.69, loose
+# same-session pairs at 0.59-0.65. 0.72 admits the topic clusters and
+# rejects the cross-topic noise. NOTE : content-cosine CANNOT by itself
+# distinguish "same thing" from "same topic, complementary facts" (a turn
+# stating an interest vs a turn carrying a unique evidence detail can both
+# sit at 0.89) — which is exactly why collapse is NON-DESTRUCTIVE
+# (members are retained as children of the keeper, see resolve_lateral)
+# and why the whole mechanism is opt-in.
+_MIN_CONTENT_COSINE = 0.72
 
 
 def record_coretrieval(
@@ -238,13 +251,17 @@ def detect_lateral_groups(
     *,
     min_nodes: int = _MIN_NODES,
     require_gate: bool = True,
+    min_content_cosine: float = _MIN_CONTENT_COSINE,
+    t_now: float = 0.0,
 ) -> List[List[str]]:
     """Return groups (each ≥ 2 ids) of laterally-redundant, same-kind nodes.
 
     A pair qualifies when its diversity-weighted co-retrieval weight
-    exceeds the emergent Poisson threshold AND both endpoints are
-    eligible same-kind nodes that exist in `points`. Qualifying pairs are
-    transitively unioned into groups (one keeper per group downstream).
+    exceeds the emergent Poisson threshold, both endpoints are eligible
+    same-kind nodes, AND their content embeddings are at least
+    `min_content_cosine` similar (the safety floor : co-retrieval alone
+    would fold informationally-distinct same-topic turns). Qualifying
+    pairs are transitively unioned into groups.
     """
     if require_gate and not gate_ready(points, min_nodes=min_nodes):
         return []
@@ -252,6 +269,14 @@ def detect_lateral_groups(
     if thr is None:
         return []
     by_id = {p.id: p for p in points}
+    _emb_cache: Dict[str, Any] = {}
+
+    def _emb(p: Point):
+        e = _emb_cache.get(p.id)
+        if e is None:
+            e = effective_embedding(p, t_now)
+            _emb_cache[p.id] = e
+        return e
 
     # Union-find over qualifying pairs.
     parent: Dict[str, str] = {}
@@ -275,6 +300,10 @@ def detect_lateral_groups(
         if not _eligible(pa) or not _eligible(pb):
             continue
         if pa.kind != pb.kind:           # intra-kind only, like every collision
+            continue
+        # Safety floor : functional co-retrieval candidates must ALSO be
+        # about the same thing, or we would fold distinct same-topic turns.
+        if cosine(_emb(pa), _emb(pb)) < min_content_cosine:
             continue
         union(a, b)
 
@@ -314,6 +343,13 @@ def _keeper_of(group: Sequence[Point]) -> Point:
     )
 
 
+# Marker tag : a node folded under a lateral keeper. Excluded from the
+# kNN SEARCH POOL (it must stop squatting slots) but RETAINED in the cloud
+# as a child of the keeper, so its unique content is never lost and stays
+# reachable by lineage expansion from the keeper. Lowercase-safe.
+ABSORBED_TAG = "lateral_absorbed"
+
+
 def resolve_lateral(
     keeper: Point,
     absorbed: Sequence[Point],
@@ -323,14 +359,21 @@ def resolve_lateral(
     group_weight: float = 0.0,
     threshold: float = 0.0,
 ) -> LateralEvent:
-    """Fold `absorbed` into `keeper`. The keeper absorbs counters and —
-    crucially — the UNION of keywords and tags, so the single survivor
-    still matches every query angle the group covered. Its keyword
-    embedding is recomputed from the enlarged handle."""
+    """NON-DESTRUCTIVE fold of `absorbed` under `keeper`.
+
+    The keeper becomes the group's single retrieval representative : it
+    absorbs the members' counters and the UNION of their keywords/tags
+    (so it matches every query angle the group covered) and adopts them as
+    children. The members are NOT deleted — they are tagged `ABSORBED_TAG`
+    so retrieval drops them from the SEARCH POOL (they stop squatting kNN
+    slots) while their distinct content survives in the cloud, reachable
+    via the keeper's children. This is why content-cosine need only prove
+    'same topic', not 'same information' : nothing is thrown away."""
     from metacog.keywords import position_weighted_keyword_embedding
 
     merged_kws: List[str] = list(keeper.keywords or [])
     seen_kw = {k.lower() for k in merged_kws}
+    children = list(keeper.children)
     for p in absorbed:
         keeper.n_corrob += p.n_corrob + 1     # a redundant target is corroboration
         keeper.n_contra += p.n_contra
@@ -343,6 +386,12 @@ def resolve_lateral(
         for tg in (p.tags or []):
             if tg not in keeper.tags:
                 keeper.tags.append(tg)
+        if p.id not in children:
+            children.append(p.id)
+        # Mark the member out of the search pool ; keep its content intact.
+        if ABSORBED_TAG not in p.tags:
+            p.tags.append(ABSORBED_TAG)
+    keeper.children = children
     keeper.keywords = merged_kws
     if merged_kws and encoder is not None:
         emb = position_weighted_keyword_embedding(merged_kws, encoder)
@@ -373,14 +422,17 @@ def lateral_collapse(
     report = LateralReport()
     groups = detect_lateral_groups(
         ledger, points, min_nodes=min_nodes, require_gate=require_gate,
+        t_now=t_now,
     )
     if not groups:
         return report
     thr = lateral_threshold(ledger) or 0.0
     by_id = {p.id: p for p in points}
-    removed: set = set()
+    used: set = set()
     for gids in groups:
-        members = [by_id[i] for i in gids if i in by_id and i not in removed]
+        members = [by_id[i] for i in gids
+                   if i in by_id and i not in used
+                   and ABSORBED_TAG not in by_id[i].tags]
         if len(members) < 2:
             continue
         keeper = _keeper_of(members)
@@ -395,7 +447,8 @@ def lateral_collapse(
         report.collided.append(ev)
         for p in absorbed:
             report.aliases[p.id] = keeper.id
-            removed.add(p.id)
-    if removed:
-        points[:] = [p for p in points if p.id not in removed]
+            used.add(p.id)
+        used.add(keeper.id)
+    # NON-DESTRUCTIVE : members stay in `points` (tagged ABSORBED_TAG),
+    # so nothing is lost ; retrieval drops them from the search pool.
     return report

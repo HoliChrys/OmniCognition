@@ -698,17 +698,27 @@ class Memory:
     # ------------------------------------------------------------------
 
     def sleep(self, t: Optional[float] = None) -> Dict[str, Any]:
-        """Run a sleep cycle of collision resolution."""
+        """Run a sleep cycle of collision resolution.
+
+        After geometric (proximity-fission) collisions, also run one
+        LATERAL collision pass : functionally-redundant nodes that the
+        co-retrieval ledger has shown to always surface together under
+        diverse queries collapse into a single keeper. No-op unless
+        lateral collision is enabled and the cloud is past the gate."""
         t_now = self._now(t)
         report = sleep_cycle_collisions(
             self.points, self.llm, self.encoder, t_now=t_now,
         )
-        return {
+        out = {
             "iterations": report.iterations,
             "resolved_count": len(report.resolved),
             "new_children_ids": [p.id for p in report.new_children],
             "aborted_for_cascade_limit": report.aborted_for_cascade_limit,
         }
+        lat = self.lateral_collapse(t_now)
+        out["lateral_collided_groups"] = lat["collided_groups"]
+        out["lateral_aliases"] = lat["aliases"]
+        return out
 
     def compress_chasles(self) -> List[Dict[str, Any]]:
         """Auto-detect spike-driven Chasles paths and compress them.
