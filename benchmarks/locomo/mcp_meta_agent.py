@@ -271,6 +271,16 @@ answer "Not mentioned". Example trap SHAPES (synthetic) :
 - question says "<person>'s <place-of-business-A>" but evidence shows
   the person runs <place-of-business-B> (premise conflict) → "Not
   mentioned"
+ATTRIBUTION CHECK (the most common false premise) : the question names
+a SUBJECT performing/owning some action, fact, or object. Before
+answering, verify the retrieved evidence attributes that action/fact/
+object to THAT SAME named subject. If the relevant turn is spoken by /
+about a DIFFERENT person than the question names — even when the TOPIC
+matches perfectly — the premise is false → "Not mentioned". Do NOT
+transfer one person's statement onto the person in the question. The
+[date] Speaker: prefix tells you who is speaking ; an action described
+in first person ("I chose …") belongs to the SPEAKER, not to whoever
+the question happens to ask about.
 Do NOT apply this guard for straightforward "Which/What/Who/When" factual
 questions where the scenario is plausible — if retrieval found nothing,
 try a THIRD walk with a different query before giving up. Plausible-
