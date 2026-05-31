@@ -441,12 +441,20 @@ def terse(text: str, question: Optional[str] = None) -> str:
         "the facts provided do not", "the facts do not",
         "there's no information", "there isn't",
         "not stated", "not specified", "not provided",
+        "i was unable to find", "i'm unable to find", "unable to find",
+        "the conversation does not", "the conversation doesn't",
+        "there doesn't appear", "there does not appear",
+        "doesn't mention", "does not mention", "not mentioned in",
+        "no mention", "couldn't find", "could not find",
     )
-    # Only normalize short pure-abstentions (≤ 15 words). Longer preds that
-    # start with an abstain phrase often have real content mixed in ("The facts
-    # do not mention X, but she was accepted for a fashion internship") — let
-    # the rest of terse() handle them rather than discarding the content.
-    if any(_tl.startswith(s) for s in _abstain_starts) and 2 < len(t.split()) <= 15:
+    # Only normalize short pure-abstentions (≤ 12 words, no mixed-content
+    # "but" clause). Longer preds or preds with "but [real content]" after
+    # the abstain start often have real mixed-in content — let terse() handle
+    # them rather than discarding the content.
+    _has_but_clause = bool(re.search(r"\bbut\b.{8,}", t, re.IGNORECASE))
+    if (any(_tl.startswith(s) for s in _abstain_starts)
+            and 2 < len(t.split()) <= 12
+            and not _has_but_clause):
         return "Not mentioned"
     # Strip leading bullet-point marker ("- " or "• ") — the agent sometimes
     # returns the raw fact content prefixed with its bullet from the walk output.
