@@ -210,6 +210,14 @@ is plausible and normal; missing evidence means poor retrieval, not an
 impossible premise — try harder before saying "Not mentioned".
 If you find DIRECT evidence of the scenario, answer from it even if
 peripheral details differ.
+STRONG-VERB TRAP : questions with SPECIFIC experiential verbs (mesmerize,
+captivate, fascinate, obsess, enthrall, haunt, adore, detest, despise)
+require that the evidence uses the SAME strong verb or a close synonym.
+Weak positive sentiment ("Audrey likes/loves hummingbirds") does NOT
+satisfy "mesmerize" — answer "Not mentioned" unless the evidence has
+explicitly mesmerizing/captivating language. E.g. "Which bird mesmerizes
+Audrey?" + evidence "Audrey loves hummingbirds" → "Not mentioned" (wrong
+verb strength).
 EXCEPTION : "might/would/could/likely" open-estimation questions (e.g.
 "What might X's status be?", "What fields would X likely pursue?") are
 INFERENCE questions — NEVER apply the guard, always give an estimate.
