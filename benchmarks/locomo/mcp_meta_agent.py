@@ -924,9 +924,13 @@ class McpMetaAgent:
                                 "content": (
                                     "Call final_answer with the BARE value only, "
                                     "no narration, no lists, no 'the walk found'. "
-                                    "Follow the format rules (e.g. 'Likely yes, "
-                                    "<≤4-word reason>' for 'Is it likely / Would' "
-                                    "questions; shortest label otherwise)."
+                                    "KEEP the most concrete noun(s) from your "
+                                    "evidence (e.g. 'teammates', 'video game "
+                                    "team') — do NOT generalise them to vague "
+                                    "words like 'people'. Follow the format "
+                                    "rules (e.g. 'Likely yes, <≤4-word reason "
+                                    "using those nouns>' for 'Is it likely / "
+                                    "Would' questions; shortest label otherwise)."
                                 ),
                             }],
                         )
