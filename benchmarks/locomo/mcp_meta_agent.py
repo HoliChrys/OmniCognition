@@ -173,6 +173,10 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   of the LGBTQ community". "Teacher" not "A passionate elementary
   school teacher who loves kids". Pick the bare category noun.
 - "What did X do/like/research" → short noun phrase (1-4 words).
+- "What pets/animals/things does X have/own?" → the CATEGORY/TYPE of the
+  thing, not the individual names. E.g. "snakes" not "Susie and Seraphim".
+  "cats" not "Whisker and Fluffy". Exception: if the question asks "What
+  are the NAMES of X's pets?", then give the names.
 - PLURAL question ("What EVENTS / CITIES / WAYS / THINGS / HOBBIES /
   PROJECTS has X done", "Which X has Y done", "what do they have in
   COMMON") → list EVERY gathered item, comma-separated ("Paris, Rome" ;
