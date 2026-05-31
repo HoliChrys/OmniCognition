@@ -167,3 +167,36 @@ def test_assess_tool_intent_flags_executable_text():
 def test_assess_tool_intent_uses_llm_for_ambiguous():
     v = assess_tool_intent("search the article database for the topic", llm=_LLM())
     assert v.is_executable and v.kind == "command"
+
+
+# ---------------------------------------------------------------------------
+# 6) eager 'no tool -> generate it -> proceed' step
+# ---------------------------------------------------------------------------
+
+def test_ensure_tool_generates_then_reuses():
+    from metacog.memory import Memory
+
+    class _SimpleEnc:
+        def encode(self, text):
+            import hashlib
+            v = [0.0] * 8
+            for w in (text or "").lower().split():
+                v[int(hashlib.md5(w.encode()).hexdigest(), 16) % 8] += 1.0
+            return tuple(v)
+
+    mem = Memory(encoder=_SimpleEnc(), llm=_LLM())
+    mem.skills_enabled = True
+
+    # First need : no covering tool -> GENERATE.
+    r1 = mem.ensure_tool("search scientific articles about science",
+                         how="query the index by topic")
+    assert r1["reused"] is False and r1["tool"] is not None
+    tid = r1["tool"]["id"]
+    assert any(p.id == tid and "tool" in p.tags for p in mem.points)
+    n_after_gen = len(mem.points)
+
+    # Same need again : a covering tool now exists -> REUSE, no new node.
+    r2 = mem.ensure_tool("search scientific articles about science")
+    assert r2["reused"] is True
+    assert r2["tool"]["id"] == tid
+    assert len(mem.points) == n_after_gen        # nothing added on reuse

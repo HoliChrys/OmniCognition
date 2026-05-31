@@ -315,6 +315,81 @@ def synthesize_tool(
     return tool
 
 
+def synthesize_tool_from_intent(
+    query: str,
+    how: str,
+    llm: Any,
+    encoder: Any,
+    t_now: float,
+    *,
+    genre: str = "command",
+    scope_keywords: Optional[Sequence[str]] = None,
+    extractor: Any = None,
+    tool_id: Optional[str] = None,
+) -> Optional[Point]:
+    """EAGER single-shot crystallization : build a tool node NOW from one
+    query + the approach (`how`) the system just deduced, without waiting
+    for the action to recur. This is the 'no tool → generate it → proceed'
+    step : because generation is unconstrained it never blocks the agent,
+    it only ever ADDS a tool to the closed self-built set.
+
+    `how` is the metacognitive deduction (the generated action / approach).
+    Scope keywords come from the query (+ any supplied grounding)."""
+    if not (query or how):
+        return None
+    from metacog.keywords import position_weighted_keyword_embedding
+
+    scope_kw = list(scope_keywords or [])
+    if extractor is not None:
+        scope_kw = list(dict.fromkeys(
+            scope_kw + (extractor.extract(query, n=6) or [])))
+    if not scope_kw:
+        scope_kw = [w.lower() for w in (query or "").split()][:6]
+
+    name = "tool"
+    content = (how or query).strip()
+    if hasattr(llm, "generate"):
+        prompt = (
+            "The agent needs a capability it does not yet have. Crystallize "
+            "it into ONE reusable tool.\n"
+            f"Request: {query}\n"
+            f"Intended approach: {how}\n\n"
+            "Reply in 2 lines exactly:\n"
+            "NAME: <short snake_case tool name>\n"
+            "HOW: <one line — the reusable approach / command to perform it>"
+        )
+        try:
+            raw = (llm.generate(prompt, max_tokens=120) or "").strip()
+        except Exception:
+            raw = ""
+        for line in raw.splitlines():
+            ls = line.strip()
+            if ls.upper().startswith("NAME:"):
+                cand = ls.split(":", 1)[1].strip().replace(" ", "_")
+                if cand:
+                    name = cand
+            elif ls.upper().startswith("HOW:"):
+                content = ls.split(":", 1)[1].strip() or content
+
+    kws = list(dict.fromkeys([w for w in name.split("_") if w] + scope_kw))[:8]
+    kw_emb = (position_weighted_keyword_embedding(kws, encoder)
+              if kws and encoder is not None else None)
+    tid = tool_id or f"tool_{name}@{t_now:.3f}"
+    tool = Point(
+        id=tid,
+        content=content,
+        embedding_orig=tuple(encoder.encode(content)) if encoder is not None else (),
+        kind=PointKind.ACTION,
+        keywords=kws,
+        keywords_embedding=kw_emb,
+    )
+    tool.add_tag(TOOL_TAG, _genre_tag(genre))
+    for ctx in scope_kw[:5]:
+        tool.add_tag(ctx)
+    tool.add_tag("eager")           # provenance : generated on first need
+    return tool
+
+
 # ---------------------------------------------------------------------------
 # Explicit tool-intent metacognition
 # ---------------------------------------------------------------------------

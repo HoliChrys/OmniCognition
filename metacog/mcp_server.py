@@ -261,6 +261,19 @@ def build_app(
         return memory.match_tool(query)
 
     @app.tool()
+    def ensure_tool(query: str, how: str = "", genre: str = "command") -> dict:
+        """Get a tool for this need, generating it if absent. If a
+        previously-generated tool covers `query`, it is REUSED (skip
+        thinking). Otherwise a new tool is GENERATED from `query` + the
+        intended approach `how` and added to the self-built set. This is the
+        'no tool -> generate it -> proceed' step : it never blocks, it only
+        ever adds a capability. Returns {tool, reused}."""
+        result = memory.ensure_tool(query, how=how or None, genre=genre)
+        if memory.storage_path:
+            memory.save()
+        return result
+
+    @app.tool()
     def crystallize_skills() -> dict:
         """Crystallize recurring actions (re-derived across diverse queries)
         into persistent TOOL nodes — normal kind=ACTION points tagged

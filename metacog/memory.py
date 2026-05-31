@@ -868,6 +868,40 @@ class Memory:
             "score": round(score, 4),
         }
 
+    def ensure_tool(
+        self, query: str, *, how: Optional[str] = None, genre: str = "command",
+    ) -> Dict[str, Any]:
+        """The 'no tool → generate it → proceed' step. Looks up a covering
+        tool for `query` ; if one exists it is REUSED (no think phase) ;
+        otherwise a tool is GENERATED now from the query + the deduced
+        approach (`how`) and added to the cloud. Generation is
+        unconstrained — this never blocks the agent, it only ever grows the
+        self-built tool set. Returns {tool, reused}."""
+        existing = self.match_tool(query)
+        if existing is not None:
+            tid = existing["id"]
+            for p in self.points:
+                if p.id == tid:
+                    p.n_uses += 1
+                    break
+            return {"tool": existing, "reused": True}
+        from metacog.skills import synthesize_tool_from_intent
+        t_now = self._now()
+        tool = synthesize_tool_from_intent(
+            query, how or query, self.llm, self.encoder, t_now,
+            genre=genre, extractor=self.extractor,
+        )
+        if tool is None:
+            return {"tool": None, "reused": False}
+        self.points.append(tool)
+        return {
+            "tool": {
+                "id": tool.id, "content": tool.content,
+                "keywords": list(tool.keywords or []), "tags": list(tool.tags or []),
+            },
+            "reused": False,
+        }
+
     def resolve_alias(self, point_id: str) -> str:
         """Resolve an id to its canonical node : an atomic-fact id maps to
         its source turn (dia_id), and a merge-absorbed id to its survivor."""
