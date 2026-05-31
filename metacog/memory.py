@@ -282,38 +282,66 @@ class Memory:
         return beacon
 
     def _spawn_entities(self, source_fact: Point) -> None:
-        """Extract entities from a freshly ingested FACT and spawn their
-        beacon nodes. A date yields a full-date beacon plus day/month/year
-        component beacons — all tagged "date" and all pulled onto the SAME
-        source fact, so they cluster together near it (their geometric
-        "part_of" link is this shared co-location, not a separate pull,
-        which would only fight the source pull). One frozen t_now per fact
-        so pulls accumulate without inter-pull decay."""
+        """Extract entities from a freshly ingested FACT.
+
+        Two distinct paths, by design :
+
+        - DATES (etype=="date") still spawn beacon nodes so the temporal
+          questions (cat2) keep their structural day/month/year handles —
+          those score 1.0 F1 and we don't break what works.
+
+        - All other entities (people, places, topics, objects…) are
+          INJECTED directly as KEYWORDS on the source fact, no beacon, no
+          pull. This makes "implied topic" tags ("wealth", "privilege",
+          "psychology") matchable for the source fact through the existing
+          BM25/keyword-cosine retrieval, without bloating the cloud or
+          drifting the fact's effective position away from the query (the
+          beacon+pull experiment regressed Caroline recall 1.0->0.5 and
+          left John recall=0). The fact's keywords_embedding is
+          recomputed so position-weighted keyword retrieval sees the
+          augmented set.
+        """
         ents = self.entity_extractor.extract_entities(source_fact.content)
         if not ents:
             return
         t_now = self._now()
+        # Path A : dates keep the beacon mechanism (cat2 = 1.0, untouched).
+        for e in ents:
+            if e.etype != "date":
+                continue
+            self.ingest_entity(
+                e.value, source_fact=source_fact,
+                tags=["date"], t_now=t_now,
+            )
+            for part in ("day", "month", "year"):
+                val = (e.date_parts or {}).get(part)
+                if not val:
+                    continue
+                self.ingest_entity(
+                    val, source_fact=source_fact,
+                    tags=["date", part], t_now=t_now,
+                )
+        # Path B : inject non-date entity values as keywords on the source
+        # fact itself. Lowercase, dedup against existing keywords, cap the
+        # injection so it doesn't crowd out the originals.
+        existing = {k.lower() for k in (source_fact.keywords or [])}
+        injected: List[str] = []
         for e in ents:
             if e.etype == "date":
-                self.ingest_entity(
-                    e.value, source_fact=source_fact,
-                    tags=["date"], t_now=t_now,
-                )
-                for part in ("day", "month", "year"):
-                    val = (e.date_parts or {}).get(part)
-                    if not val:
-                        continue
-                    # Bare value ("20"/"january"/"2023") is the matchable
-                    # keyword ; the part lives in tags.
-                    self.ingest_entity(
-                        val, source_fact=source_fact,
-                        tags=["date", part], t_now=t_now,
-                    )
-            else:
-                self.ingest_entity(
-                    e.value, source_fact=source_fact,
-                    tags=[e.etype], t_now=t_now,
-                )
+                continue
+            v = (e.value or "").strip().lower()
+            if not v or v in existing:
+                continue
+            existing.add(v)
+            injected.append(v)
+        if not injected:
+            return
+        max_extra = 6  # bound the growth ; topics are the most useful first
+        new_kws = list(source_fact.keywords or []) + injected[:max_extra]
+        source_fact.keywords = new_kws
+        source_fact.keywords_embedding = position_weighted_keyword_embedding(
+            new_kws, self.encoder,
+        )
 
     def ingest_action(
         self,
