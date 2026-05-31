@@ -31,18 +31,40 @@ HuggingFace.
 # Plain cosine retrieval — chunk-dump answer (fast smoke)
 uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic
 
-# With lineage-traversal retrieval (cosine + parents/children/sequence + RRF)
-uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --lineage
+# Meta-cognitive walk answerer (the real system : walk_start/walk_next
+# over the FACT/THOUGHT/ACTION manifold, Claude as the driver)
+uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --answerer meta
+
+# Balanced smoke : 1 QA per category, a few conversations
+uv run python -m benchmarks.locomo.eval --samples 4 --per-category 1 --answerer meta
+
+# Opt-in retrieval handles
+uv run python -m benchmarks.locomo.eval --answerer meta --entities   # entity beacons
+uv run python -m benchmarks.locomo.eval --answerer meta --atomic     # atomic-fact handles
+uv run python -m benchmarks.locomo.eval --answerer meta --merge      # dedup identical turns
 
 # Extractive ReAct (roberta-base-squad2, local CPU)
 uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --answerer extractive
-
-# Claude-API ReAct (needs ANTHROPIC_API_KEY)
-uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --lineage --answerer claude
-
-# Claude smoke (cheap : 1 conv / 20 QAs)
-uv run python -m benchmarks.locomo.eval --samples 1 --max-qa 20 --encoder semantic --lineage --answerer claude
 ```
+
+### Targeted debuggers (no full bench)
+
+Fast, inspectable harnesses for stepping through the system on a tiny
+slice — index → one-shot retrieval → walk stage-by-stage → full agent,
+all in seconds. Built precisely to avoid "launch a 20-minute bench to
+discover nothing works".
+
+```bash
+# Step through indexation, retrieval and the walk on one cat-3 probe
+DEBUG_NSESS=0 DEBUG_PROBE=caroline python -m benchmarks.locomo.debug_walk all
+
+# Measure lateral-collision effect on kNN redundancy (before/after sleep)
+DEBUG_NSESS=0 python -m benchmarks.locomo.debug_lateral
+```
+
+`DEBUG_NSESS` = number of sessions to index (0 = whole conversation) ;
+`DEBUG_PROBE` = `caroline` | `john` ; `METACOG_HYDE=1` toggles the HyDE
+retrieval channel.
 
 Or via the Makefile :
 
@@ -74,22 +96,34 @@ uv run python -m benchmarks.locomo.eval --answerer claude --claude-model claude-
 | `--data`       | `benchmarks/locomo/data/locomo10.json` | path to the dataset                          |
 | `--samples`    | 10                                   | number of conversations to evaluate (1..10)    |
 | `--max-qa`     | None                                 | cap QA pairs per conversation (smoke runs)     |
-| `--k`          | 10                                   | retrieval top-k                                |
-| `--top-chunks` | 3                                    | chunks concatenated for the chunk-dump answer  |
+| `--per-category` | None                               | up to N QAs per category (balanced sampling)   |
+| `--k`          | 7                                    | retrieval top-k                                |
 | `--encoder`    | `semantic`                           | `simple` (simhash) or `semantic` (MiniLM)      |
+| `--answerer`   | `chunk`                              | `chunk`, `extractive` (roberta), `claude` (single-shot ReAct), `mcp`, `meta` (the walk) |
 | `--lineage`    | off                                  | enable cosine+lineage RRF retrieval            |
-| `--answerer`   | `chunk`                              | `chunk` (top-3 dump), `extractive` (roberta), `claude` (Claude API) |
+| `--entities`   | off                                  | spawn entity-beacon retrieval handles          |
+| `--atomic`     | off                                  | spawn mem0-style atomic-fact handles           |
+| `--merge`      | off                                  | merge identical turns (corroboration absorbed) |
+| `--auto-cluster` | off                                | Level-1 community / observator detection       |
+| `--agent-concurrency` | 10                            | parallel QA workers for `mcp`/`meta`           |
+| `--debug-jsonl` | None                                | per-QA trace dump for inspection               |
 | `--claude-model` | env or default                     | override Anthropic model id                    |
-| `--react`      | off                                  | deprecated alias for `--answerer extractive`   |
 
 ## Reported metrics
 
 For each QA pair :
-- **Recall@5 / Recall@10** : fraction of gold-evidence `dia_id`s
-  present in the top-k retrieved chunks.
-- **F1** : token-overlap F1 against the gold answer.
+- **Recall@5 / Recall@7** : fraction of gold-evidence `dia_id`s present
+  in the top-k retrieved set.
+- **agent_recall** (`mcp`/`meta`) : cumulative recall across all the
+  queries the agent issued during its walk — the evidence it actually saw,
+  not just a single top-k.
+- **F1** : per-category token-overlap F1 against the gold answer (category 5
+  is binary abstention : 1.0 iff the answer says "not mentioned").
 
-Aggregated per category (1..5) and overall.
+Aggregated per category (1 multi-hop · 2 temporal · 3 inference ·
+4 single-hop · 5 adversarial) and overall. `--debug-jsonl` writes a
+per-QA trace (question, gold, prediction, retrieved ids, react trace) for
+inspection.
 
 ## Reference numbers
 
@@ -106,15 +140,14 @@ GPT-4o-mini as answerer) :
 | MemoryOS      | 37%  | 2k     |
 | HeLa-Mem      | 42%  | 1k     |
 
-Our F1 with the **chunk-dump** stub answerer is around 3% — this is
-not a fair comparison ; the published baselines all use a real LLM
-to extract a precise span. Use `--react` (extractive roberta) for a
-fair automated F1, or wire your own LLM via the `Memory.llm`
-interface.
-
-In manual evaluation (Claude as the ReAct reasoner over the same
-retrieved chunks), the system reaches **F1 ≈ 87 %** on a 25-question
-sample of `conv-26`, surpassing all published baselines.
+The **chunk-dump** stub answerer is a retrieval-only smoke (no LLM span
+extraction) and is not directly comparable. For a real comparison use
+`--answerer meta` (the meta-cognitive walk driven by Claude). The system
+prompt deliberately carries **no dataset-specific answer vocabulary** —
+earlier few-shot leaks of gold answers were stripped, so the numbers are
+an honest no-hardcode baseline rather than a prompt-overfit one. Use the
+targeted debuggers above to attribute any gap to indexation, retrieval,
+the walk, or answer generation before launching a full run.
 
 ## What `--lineage` changes
 
