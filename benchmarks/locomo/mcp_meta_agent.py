@@ -117,6 +117,12 @@ Workflow :
 6. Only answer "Not mentioned" after you have tried at least TWO
    differently-phrased walks and both drifted. Otherwise answer with
    the best relevant/partial evidence you found.
+   TEMPORAL QUERY TIP : for "Which year/month did X get/adopt/start/join
+   Y?" questions, the year IS in the [session date] of the fact about
+   that event. Search with the EVENT words ("Audrey adopt first dogs"),
+   not the year — the [session date] prefix of the retrieved fact gives
+   you the year. Also try synonyms: "adopt" = "get", "join" = "sign",
+   "start" = "begin" = "launch".
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
