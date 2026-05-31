@@ -249,12 +249,18 @@ def nearest_facts_with_fallback(
 
     if encoder is not None and extractor is not None:
         from metacog.geometry import retrieve_hybrid
-        # Over-fetch : entity beacons (id "entity_*") are FACT-kind so they
-        # score here, but they are ingest-time pull agents — their pull
-        # already lifted the real facts. Drop them from the returned set so
-        # the walk reasons over (and agent_recall counts) real facts only.
+        # Entity beacons (id "entity_*") are ingest-time pull agents : their
+        # pull (first step 1/(1+0)=1.0) already lifted the real facts into
+        # position, so they are never wanted in walk results. Crucially they
+        # also BLOAT the cloud ~10x (5+ beacons/turn) and spreading activation
+        # is superlinear — so we EXCLUDE them from the search pool, not just
+        # from results. The pull benefit persists in the real facts' shifted
+        # positions ; the walk stays fast. Atoms (id "atom_*") are kept — they
+        # resolve to source turns below — so over-fetch headroom remains.
+        search_points = [p for p in points
+                         if not p.id.startswith("entity_")]
         results = retrieve_hybrid(
-            query_text, points, (k + len(exclude_ids)) * 5 + 20, t_now,
+            query_text, search_points, (k + len(exclude_ids)) * 5 + 20, t_now,
             encoder=encoder, extractor=extractor,
             use_lineage=True, use_spreading=True, use_fuzzy=True,
             restrict_kind=PointKind.FACT,

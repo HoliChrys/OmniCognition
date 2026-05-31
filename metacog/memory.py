@@ -539,6 +539,18 @@ class Memory:
         # displace evidence. No-op / unchanged when no extractor is set.
         beacons = self.entity_extractor is not None
         atomics = self.atomic_extractor is not None or bool(self._atom_parent)
+        # Entity beacons do their work AT INGESTION : apply_pull (first step
+        # = 1/(1+0) = 1.0) already shifted the real source facts toward each
+        # entity/topic value, so a matching query finds the shifted REAL fact
+        # directly. At query time the beacons are dead weight that would only
+        # bloat the search 10x (spreading activation is superlinear), so we
+        # exclude them from the SEARCH POOL entirely — the pull benefit
+        # persists in the real facts' positions. (Atomics keep the old joint-
+        # pool path, which already has its own entity_/atom_ handling below.)
+        search_pts = self.points
+        if beacons and not atomics:
+            search_pts = [p for p in self.points
+                          if not p.id.startswith("entity_")]
         # Over-fetch more when atomic facts are present : many atoms resolve
         # to the same source turn, so we need headroom to dedup to k turns.
         k_fetch = k
@@ -549,7 +561,7 @@ class Memory:
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
-                q_emb, self.points, k_fetch, t_now, observator_id,
+                q_emb, search_pts, k_fetch, t_now, observator_id,
             )
         elif use_hybrid:
             kind_filter: Optional[PointKind] = None
@@ -559,7 +571,7 @@ class Memory:
                     else PointKind[prefer_kind.upper()]
                 )
             results = retrieve_hybrid(
-                query, self.points, k_fetch, t_now,
+                query, search_pts, k_fetch, t_now,
                 encoder=self.encoder,
                 extractor=self.extractor,
                 use_lineage=use_lineage,
@@ -582,12 +594,12 @@ class Memory:
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_with_lineage(
-                q_emb, self.points, k_fetch, t_now,
+                q_emb, search_pts, k_fetch, t_now,
                 lineage_depth=lineage_depth,
             )
         else:
             q_emb = tuple(self.encoder.encode(query))
-            results = retrieve(q_emb, self.points, k_fetch, t_now)
+            results = retrieve(q_emb, search_pts, k_fetch, t_now)
         if beacons or atomics:
             by_id = {p.id: p for p in self.points}
             # Two streams, both resolved to source turns : raw-turn hits and
