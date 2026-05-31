@@ -1289,6 +1289,14 @@ class MetaWalker:
                         facts.append(hf)
                         seen.add(hf.id)
 
+        # Feed the LATERAL co-retrieval ledger : this ranked result, under
+        # this query direction, is one diversity-weighted vote about which
+        # facts keep surfacing together. No-op unless the memory has lateral
+        # collision enabled. Recorded only for committed (live) walks so
+        # isolated benchmark walks stay side-effect-free.
+        if self.commit and hasattr(self.memory, "record_retrieval"):
+            self.memory.record_retrieval([f.id for f in facts], seed_emb)
+
         # Calibrate the walk-local σ threshold once from stage-0 facts.
         # median + std of pairwise cosine distances between the initial
         # retrieved facts = "typical manifold resolution" at this query.
