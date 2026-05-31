@@ -131,13 +131,18 @@ if a focused walk drifts, pivot to a normal walk_start without the id.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").
-  SOURCE OF TRUTH: the [session date] prefix of the retrieved fact IS the
-  date of the event — use it directly. Do not guess from dates mentioned
-  inside the conversation content (e.g. if the turn says "last month in
-  July was rough" but the [session date] is 2023-06-15, the event happened
-  in June, not July).
-  ARITHMETIC: if content says "around 3 years ago" and [session date] is
-  2022-03, answer "2019" (2022 - 3). NEVER output relative phrasing.
+  TWO-RULE DATE SYSTEM:
+  A) EXPLICIT dates in content ("in our June game", "on 15 March", "in 2021")
+     → trust the explicit calendar reference from the content itself.
+     E.g. "[July 2023] John: I got my career-high in our June game" → June 2023
+     (use "June" from content + "2023" from [session date]).
+  B) RELATIVE dates in content ("last month", "recently", "around 3 years ago",
+     "a few weeks back") → compute from [session date].
+     E.g. "[June 2022] User: 'last month in July was rough'" → the event was
+     in May (session date June minus 1 month); ignore the misleading "July".
+     E.g. "[2022-03] User: 'around 3 years ago'" → answer "2019" (2022 - 3).
+  NEVER output relative phrasing. NEVER output just "July" — always include
+  the year if inferable ("July 2023", not "July").
 - "Where ..." → place only ("Sweden").
 - "How long" → "<n> <unit>" ("4 years").
 - "What/Who is X" / identity / role → the SHORTEST label that fits
@@ -215,6 +220,7 @@ Q: Would Tim enjoy C. S. Lewis or John Greene? → C. S. Lewis
 Q: What might John's financial status be? → Middle-class (he runs his own business)
 Q: What fields would Caroline likely pursue in education? → Psychology, counseling
 Q: When did Joanna first watch Eternal Sunshine? [turn: 2022-03] "I watched it around 3 years ago" → 2019
+Q: In which month's game did John get a career-high? [turn: July 2023] "I got a career-high in our June game" → June 2023
 Q: Which cities has Jon visited? → Paris, Rome
 Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
 Q: What do Jon and Gina have in common? → They lost their jobs and started their own businesses
@@ -445,6 +451,10 @@ def terse(text: str, question: Optional[str] = None) -> str:
     _abstain_starts = (
         "not mentioned", "no information", "there is no information",
         "i cannot find", "i can't find", "cannot find", "no record",
+        "i cannot determine", "i cannot identify", "i cannot confirm",
+        "i cannot locate", "i cannot tell", "i cannot say",
+        "i am unable to", "i'm unable to", "i was unable to",
+        "unable to determine", "unable to identify", "unable to locate",
         "the facts provided do not", "the facts do not",
         "there's no information", "there isn't",
         "not stated", "not specified", "not provided",
@@ -453,6 +463,7 @@ def terse(text: str, question: Optional[str] = None) -> str:
         "there doesn't appear", "there does not appear",
         "doesn't mention", "does not mention", "not mentioned in",
         "no mention", "couldn't find", "could not find",
+        "no specific", "no direct", "no explicit",
     )
     # Only normalize short pure-abstentions (≤ 12 words, no mixed-content
     # "but" clause). Longer preds or preds with "but [real content]" after
