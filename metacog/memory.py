@@ -939,6 +939,9 @@ class Memory:
                 }
                 for oid, v in p.observator_views.items()
             },
+            "keywords": list(p.keywords or []),
+            "tags": list(p.tags or []),
+            "n_spike": p.n_spike,
             "update_log_size": len(p.update_log),
             "execution_log_size": len(p.execution_log),
         }
