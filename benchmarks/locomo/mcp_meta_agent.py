@@ -125,8 +125,11 @@ if a focused walk drifts, pivot to a normal walk_start without the id.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").
-  Resolve any "yesterday / last week / X days ago" against the turn's
-  [session date] prefix into a calendar date. Never answer relative.
+  Resolve any "yesterday / last week / X days ago / around N years ago"
+  against the turn's [session date] prefix into a calendar date. ARITHMETIC:
+  if the turn is [2022-03-15] and they said "around 3 years ago", answer
+  "2019" (2022 - 3). NEVER output relative phrasing — always compute the
+  absolute year/month/date and output ONLY that value.
 - "Where ..." → place only ("Sweden").
 - "How long" → "<n> <unit>" ("4 years").
 - "What/Who is X" / identity / role → the SHORTEST label that fits
@@ -139,11 +142,14 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   COMMON") → list EVERY gathered item, comma-separated ("Paris, Rome" ;
   "Pride parade, school speech, support group"). One item only when there
   truly is one. Tokens count : each listed item earns score.
-- "Would / Could X likely … ?" inference (the question STARTS with
-  "Would" or "Could") → answer "Likely yes, <short reason>" or "Likely no,
-  <short reason>". Do NOT say "Not mentioned" on these — the answer is an
-  inference you DRAW from the retrieved facts. Other "yes/no" questions
-  follow the same pattern.
+- "Would / Could X likely … ?" inference (STARTS with "Would" or "Could")
+  → answer "Likely yes, <short reason>" or "Likely no, <short reason>".
+  Do NOT say "Not mentioned" on these — the answer is an inference you
+  DRAW from the retrieved facts. Other "yes/no" questions follow the same.
+  SPECIAL : "Would X enjoy A or B?" (a CHOICE between two options) → pick
+  the ONE that fits the evidence. Answer JUST the name/option, not
+  "Likely yes". E.g. "Would Tim enjoy C.S. Lewis or John Greene?" →
+  "C. S. Lewis" (not "Likely yes, he likes fantasy").
 - "What might X be / What could X / What might X's Y be / What fields would
   X likely …" OPEN-ESTIMATION questions → give a DIRECT estimate drawn from
   indirect evidence. Never abstain on "might/would/could/likely" questions.
@@ -197,8 +203,10 @@ Q: What career path did Caroline choose? → counseling, mental health
 Q: Whose birthday did Melanie celebrate? → Melanie's daughter
 Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
 Q: Would Caroline have Dr. Seuss books? → Likely yes, she collects classic children's books
+Q: Would Tim enjoy C. S. Lewis or John Greene? → C. S. Lewis
 Q: What might John's financial status be? → Middle-class (he runs his own business)
 Q: What fields would Caroline likely pursue in education? → Psychology, counseling
+Q: When did Joanna first watch Eternal Sunshine? [turn: 2022-03] "I watched it around 3 years ago" → 2019
 Q: Which cities has Jon visited? → Paris, Rome
 Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
 Q: What sports car does Jon drive? → Not mentioned"""
