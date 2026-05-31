@@ -19,9 +19,11 @@ import math
 
 from metacog.epistemic import Point, PointKind
 from metacog.lateral import (
+    ABSORBED_TAG,
     LateralLedger,
     detect_lateral_groups,
     gate_ready,
+    lateral_children,
     lateral_collapse,
     lateral_threshold,
     record_coretrieval,
@@ -187,3 +189,11 @@ def test_diverse_coretrieval_collapses_into_keeper():
     assert p1 is not None and "lateral_absorbed" in p1.tags
     assert "P1" in keeper.children
     assert len(pts) == n_before                                     # nothing removed
+
+    # The keeper can be EXPANDED back to its folded child on demand.
+    by_id = {p.id: p for p in pts}
+    kids = lateral_children(keeper, by_id)
+    assert [c.id for c in kids] == ["P1"]
+    assert kids[0].content == "P1"          # folded content preserved verbatim
+    # A plain (non-keeper) node has no lateral children.
+    assert lateral_children(by_id["P5"], by_id) == []

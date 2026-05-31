@@ -1343,6 +1343,30 @@ class MetaWalker:
             )
         rel_by_id = {f.id: relevance[i] for i, f in enumerate(facts)}
 
+        # LATERAL EXPANSION (on-demand) : a lateral keeper stands in for a
+        # folded group in the kNN. Once it is judged ON-TARGET, expand it to
+        # its absorbed children so the agent reasons over the exact folded
+        # detail (e.g. the specific evidence turn), not just the
+        # representative. Off-target keepers are never expanded, so the kNN
+        # stays deduplicated and no bloat leaks back in. Expanded children
+        # inherit the keeper's relevance label.
+        from metacog.lateral import lateral_children
+        by_id_all = {p.id: p for p in pts}
+        expanded: List[Point] = []
+        exp_label: dict = {}
+        for i, f in enumerate(facts):
+            if relevance[i] == "irrelevant":
+                continue
+            for child in lateral_children(f, by_id_all):
+                if child.id in rel_by_id or child.id in exp_label:
+                    continue
+                expanded.append(child)
+                exp_label[child.id] = relevance[i]
+        if expanded:
+            facts = list(facts) + expanded
+            relevance = list(relevance) + [exp_label[c.id] for c in expanded]
+            rel_by_id.update(exp_label)
+
         # REDUCE — fold this stage's on-target facts into the persistent
         # accumulator (dedup, order-preserving). Bridging evidence from
         # état -1 survives into état k ; going deeper never loses it.

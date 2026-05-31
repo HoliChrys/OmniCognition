@@ -350,6 +350,21 @@ def _keeper_of(group: Sequence[Point]) -> Point:
 ABSORBED_TAG = "lateral_absorbed"
 
 
+def lateral_children(keeper: Point, by_id: Dict[str, Point]) -> List[Point]:
+    """The members folded under `keeper` (its absorbed lateral group),
+    looked up from the live cloud. Empty when `keeper` is not a lateral
+    representative. Used by the walk to EXPAND a keeper to its specific
+    folded content once the keeper has been judged on-target — so the
+    agent reasons over the exact evidence detail, not just the
+    representative, while the kNN itself stays deduplicated."""
+    out: List[Point] = []
+    for cid in (keeper.children or []):
+        c = by_id.get(cid)
+        if c is not None and ABSORBED_TAG in c.tags:
+            out.append(c)
+    return out
+
+
 def resolve_lateral(
     keeper: Point,
     absorbed: Sequence[Point],
