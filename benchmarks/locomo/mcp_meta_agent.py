@@ -289,11 +289,24 @@ _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
 # Plural / enumeration questions whose gold answer is a LIST — trigger the
 # dedicated aggregation pass over relevant_collected.
 _ENUM_Q_RE = re.compile(
-    r"\b(what|which)\b.{0,40}\b(events?|cities|places|ways|things|hobbies|"
+    # "what/which <noun>" patterns (extended noun list, up to 60 chars gap)
+    r"\b(what|which)\b.{0,60}\b(events?|cities|places|ways|things|hobbies|"
     r"activities|projects?|crafts?|sports?|languages?|skills?|groups?|"
     r"causes?|items?|gifts?|fields?|attributes?|traits?|books?|movies?|"
     r"games?|pets?|countries|emotions?|recipes?|symbols?|organizations?|"
-    r"recommendations?|suggestions?|jobs?|kinds?|types?)\b"
+    r"recommendations?|suggestions?|jobs?|kinds?|types?|roles?|steps?|"
+    r"methods?|measures?|actions?|efforts?|initiatives?|strategies?|"
+    r"fundraisers?|interests?|topics?|themes?|habits?|practices?|"
+    r"volunteers?|achievements?|accomplishments?|plans?|goals?)\b"
+    # "what has/have/did X done/do/built/visited/tried/joined/made/started..."
+    r"|\bwhat\b.{0,60}\b(?:has|have|did|does)\b.{0,50}\b(?:done|do|built|"
+    r"visited|tried|joined|made|started|created|achieved|accomplished|"
+    r"organized|participated|promoted|raised|hosted|shared|shown)\b"
+    # "how did/has/does X verb..." (implies multiple actions)
+    r"|\bhow\b.{0,10}\b(?:did|has|have|does|do)\b.{0,60}"
+    r"\b(?:promot|participat|support|celebrat|involv|engag|contribut|"
+    r"rais|organiz|build|market|recruit|advertis|publiciz)\w*\b"
+    # fixed phrases
     r"|\bin what ways\b|\bhave in common\b|\bboth\b",
     re.IGNORECASE,
 )
@@ -377,14 +390,8 @@ def terse(text: str, question: Optional[str] = None) -> str:
     _is_list_pred = len(_segs) >= 2 and all(len(s.split()) <= 4 for s in _segs)
     # Plural question hint as a fallback (covers an empty-list pred where the
     # gold IS a list, e.g. cat1 enumeration questions).
-    _is_enum_q = _is_list_pred or bool(question and re.search(
-        r"\b(what|which)\b.{0,40}\b(events?|cities|places|ways|things|"
-        r"hobbies|activities|projects?|crafts?|sports?|languages?|skills?|"
-        r"groups?|causes?|items?|gifts?|fields?|attributes?|traits?|books?|"
-        r"movies?|games?|pets?|countries|emotions|recipes?|symbols?|"
-        r"organizations?|recommendations?|suggestions?|jobs?)\b"
-        r"|\bin what ways\b|\bhave in common\b|\bboth\b",
-        question, re.IGNORECASE))
+    _is_enum_q = _is_list_pred or bool(
+        question and _ENUM_Q_RE.search(question))
     # "When …" questions : if the agent dumped a citation instead of a bare
     # date, pull the date out. Only when the text is verbose (>5 words) —
     # a clean "19 January 2023" already passes through untouched.
@@ -572,11 +579,19 @@ class McpMetaAgent:
                                          "name": "final_answer"},
                             messages=messages + [{
                                 "role": "user",
-                                "content": ("Call final_answer with the bare "
-                                            "value, following the format rules "
-                                            "(absolute calendar date for "
-                                            "'when'; shortest label; full list "
-                                            "for plural). No narration."),
+                                "content": (
+                                    "Call final_answer with the bare value, "
+                                    "following the format rules (absolute "
+                                    "calendar date for 'when'; shortest label; "
+                                    + (
+                                        "THIS IS A PLURAL QUESTION — list "
+                                        "ALL items found, comma-separated. "
+                                        "Do NOT collapse to one item. "
+                                        if _ENUM_Q_RE.search(question or "")
+                                        else "full list for plural. "
+                                    )
+                                    + "No narration."
+                                ),
                             }],
                         )
                         if hasattr(fr, "usage"):
@@ -739,17 +754,17 @@ class McpMetaAgent:
             # collected that lists every distinct item — exploiting the
             # MAP-REDUCE we already build instead of trusting free-form.
             if (_ENUM_Q_RE.search(question or "")
-                    and len(last_relevant_collected) >= 2):
+                    and len(last_relevant_collected) >= 1):
                 ev = "\n".join(
                     f"- {e.get('content', '')}"
                     for e in last_relevant_collected[:14])
                 try:
                     er = self.client.messages.create(
-                        model=self.model, max_tokens=60, temperature=0,
+                        model=self.model, max_tokens=120, temperature=0,
                         system=("List EVERY distinct item that answers the "
                                 "question, drawn from the facts. Output a "
-                                "comma-separated list of short items (1-3 "
-                                "words each), no prose, no repeats. If only "
+                                "comma-separated list of short phrases (up to "
+                                "5 words each), no prose, no repeats. If only "
                                 "one item, output it alone."),
                         messages=[{"role": "user", "content":
                                    f"Question: {question}\nFacts:\n{ev}"}],
@@ -759,9 +774,10 @@ class McpMetaAgent:
                         total_out += getattr(er.usage, "output_tokens", 0) or 0
                     et = " ".join(b.text for b in er.content
                                   if b.type == "text").strip()
-                    # Keep it only if it genuinely enumerates more than the
-                    # collapsed answer (more comma-items), else keep original.
-                    if et and et.count(",") > (answer_text or "").count(","):
+                    # Replace when aggregation enumerates MORE items than the
+                    # current answer, or when the current answer is empty.
+                    cur_commas = (answer_text or "").count(",")
+                    if et and (et.count(",") > cur_commas or not answer_text):
                         answer_text = et
                 except Exception:
                     pass
