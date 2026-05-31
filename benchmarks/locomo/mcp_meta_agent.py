@@ -114,6 +114,12 @@ Workflow :
    TWO walks: one for shared experiences ("Jon Gina job work career
    challenge") and one for shared activities/traits. The answer is often
    about a major shared event, not just interests.
+   "WITH PARTNER/FRIEND" HINT : for "what activities has X pursued WITH Y?"
+   questions, include BOTH people in the query and try MULTIPLE angles:
+   first "X Y indoor activity hobby together", then try specific activity
+   types: "X Y game board game volunteer shelter cook". The activities
+   shared with a partner may be very specific (boardgames, cooking, shelter
+   volunteering) not just generic (dining, travel).
 6. Only answer "Not mentioned" after you have tried at least TWO
    differently-phrased walks and both drifted. Otherwise answer with
    the best relevant/partial evidence you found.
