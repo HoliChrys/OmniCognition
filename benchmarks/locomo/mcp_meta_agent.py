@@ -309,10 +309,15 @@ _ENUM_Q_RE = re.compile(
     r"methods?|measures?|actions?|efforts?|initiatives?|strategies?|"
     r"fundraisers?|interests?|topics?|themes?|habits?|practices?|"
     r"volunteers?|achievements?|accomplishments?|plans?|goals?)\b"
-    # "what has/have/did X done/do/built/visited/tried/joined/made/started..."
+    # "what has/have/did X [verb in past tense]..." — broad list of
+    # past participles / past-tense verbs that imply multiple outcomes
     r"|\bwhat\b.{0,60}\b(?:has|have|did|does)\b.{0,50}\b(?:done|do|built|"
     r"visited|tried|joined|made|started|created|achieved|accomplished|"
-    r"organized|participated|promoted|raised|hosted|shared|shown)\b"
+    r"organized|participated|promoted|raised|hosted|shared|shown|"
+    r"painted|drawn|written|read|played|cooked|eaten|collected|won|"
+    r"traveled|been|said|told|sent|given|published|produced|designed|"
+    r"developed|launched|released|discovered|explored|performed|"
+    r"taught|learned|studied|experienced|practiced)\b"
     # "how did/has/does X verb..." (implies multiple actions)
     r"|\bhow\b.{0,10}\b(?:did|has|have|does|do)\b.{0,60}"
     r"\b(?:promot|participat|support|celebrat|involv|engag|contribut|"
