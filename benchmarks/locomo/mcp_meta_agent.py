@@ -108,6 +108,12 @@ Workflow :
    LGBTQ events has Caroline participated in?", try:
      walk_start(query="Caroline LGBTQ pride parade support group activism")
    This bridges vocabulary gaps between the question and the memory turns.
+   "IN COMMON" HINT : for "what do X and Y have in common?" questions,
+   search BROADLY beyond hobbies — also look for shared life events (job
+   changes, moves, losses, decisions) and shared challenges. Run at least
+   TWO walks: one for shared experiences ("Jon Gina job work career
+   challenge") and one for shared activities/traits. The answer is often
+   about a major shared event, not just interests.
 6. Only answer "Not mentioned" after you have tried at least TWO
    differently-phrased walks and both drifted. Otherwise answer with
    the best relevant/partial evidence you found.
@@ -211,6 +217,7 @@ Q: What fields would Caroline likely pursue in education? → Psychology, counse
 Q: When did Joanna first watch Eternal Sunshine? [turn: 2022-03] "I watched it around 3 years ago" → 2019
 Q: Which cities has Jon visited? → Paris, Rome
 Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
+Q: What do Jon and Gina have in common? → They lost their jobs and started their own businesses
 Q: What sports car does Jon drive? → Not mentioned"""
 
 
