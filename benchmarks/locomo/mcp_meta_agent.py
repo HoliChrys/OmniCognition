@@ -144,12 +144,18 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   <short reason>". Do NOT say "Not mentioned" on these — the answer is an
   inference you DRAW from the retrieved facts. Other "yes/no" questions
   follow the same pattern.
+- "What might X be / What could X / What might X's Y be / What fields would
+  X likely …" OPEN-ESTIMATION questions → give a DIRECT estimate drawn from
+  indirect evidence. Never abstain on "might/would/could/likely" questions.
+  The expected answer is a short noun phrase ("Middle-class", "Psychology,
+  counseling"). NEVER answer "Not mentioned" for these — an educated guess IS
+  the correct form of answer for open-estimation questions.
 - not in the evidence / adversarial / unanswerable → "Not mentioned"
-  (NEVER for a "Would/Could … likely" question above).
+  (NEVER for "Would/Could/might/likely" inference questions above).
 
 Hard rule : single-value answers (dates / places / one entity) above 5
 words are wrong — strip adjectives/conjunctions to the bare value.
-EXCEPTION : the PLURAL and the "Would/Could likely" rules above keep
+EXCEPTION : the PLURAL and the "Would/Could/might likely" rules above keep
 their lists / clauses intact (do not trim them).
 
 NEVER output a dialog turn ID (D4:11, D10:12, etc.) as your answer.
@@ -178,6 +184,9 @@ false premise with related-but-different content. Example traps :
   (unless the evidence also calls it a store)
 If you find DIRECT evidence of the scenario (same person, same event),
 answer from it even if some peripheral details differ.
+EXCEPTION : "might/would/could/likely" open-estimation questions (e.g.
+"What might X's status be?", "What fields would X likely pursue?") are
+INFERENCE questions — NEVER apply the guard, always give an estimate.
 
 Few-shot (one per question type — match this terseness) :
 Q: What craft do Mel and her kids do besides pottery? → painting
@@ -188,6 +197,8 @@ Q: What career path did Caroline choose? → counseling, mental health
 Q: Whose birthday did Melanie celebrate? → Melanie's daughter
 Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
 Q: Would Caroline have Dr. Seuss books? → Likely yes, she collects classic children's books
+Q: What might John's financial status be? → Middle-class (he runs his own business)
+Q: What fields would Caroline likely pursue in education? → Psychology, counseling
 Q: Which cities has Jon visited? → Paris, Rome
 Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
 Q: What sports car does Jon drive? → Not mentioned"""
