@@ -452,6 +452,16 @@ _ENUM_Q_RE = re.compile(
 )
 
 # Absolute-date patterns for "when" question extraction, most specific first :
+# Inference questions (cat3): require 3 diverse walk_start calls before answering.
+_INFERENCE_Q_RE = re.compile(
+    r"\b(?:might|likely|suspected|probable)\b"
+    r"|^Is it likely\b"
+    r"|what fields\b.*\bpursue\b"
+    r"|\bwhat (?:is|are|would|could) \w+(?:'s)? (?:likely|probable|suspected)\b",
+    re.IGNORECASE,
+)
+_MIN_WALKS_INFERENCE = 3
+
 #   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
 _MONTHS = (r"(?:January|February|March|April|May|June|July|August|"
            r"September|October|November|December)")
@@ -803,6 +813,33 @@ class McpMetaAgent:
                 final_tu = next(
                     (b for b in tool_uses if b.name == "final_answer"), None)
                 if final_tu is not None:
+                    # Guard: inference questions require ≥3 diverse walk_start
+                    # calls. If the agent tries to answer too early, redirect.
+                    if (_INFERENCE_Q_RE.search(question or "")
+                            and walk_start_count < _MIN_WALKS_INFERENCE
+                            and round_idx < max_rounds - 1):
+                        remaining = _MIN_WALKS_INFERENCE - walk_start_count
+                        step_label = ("B" if walk_start_count == 1
+                                      else "C" if walk_start_count == 2
+                                      else "A")
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": final_tu.id,
+                            "content": (
+                                f"Not yet — this inference question requires at "
+                                f"least {_MIN_WALKS_INFERENCE} walk_start calls "
+                                f"with different vocabulary. You have done "
+                                f"{walk_start_count}. Do Step {step_label} now: "
+                                f"call walk_start with a DIFFERENT seed query "
+                                f"(domain synonyms or broader context clues)."
+                            ),
+                        }]})
+                        trace.append({"round": round_idx,
+                                      "action": "redirect_inference_walk",
+                                      "walk_start_count": walk_start_count})
+                        continue  # back to top of for-loop, don't break
                     answer_text = str((final_tu.input or {}).get("value", "")).strip()
                     # Never accept an empty answer : fall back to any prose
                     # in the turn, then to the strongest accumulated fact.
@@ -859,7 +896,11 @@ class McpMetaAgent:
                 # Force final answer only after the agent has had a chance
                 # to try a breadth pivot (second walk_start). A single
                 # done=true should be a signal to pivot, not to stop.
-                if done_seen and walk_start_count >= 2:
+                # For inference questions, require 3 walks before forcing final.
+                _min_w = (_MIN_WALKS_INFERENCE
+                          if _INFERENCE_Q_RE.search(question or "")
+                          else 2)
+                if done_seen and walk_start_count >= _min_w:
                     # Two breadth threads exhausted — synthesize from
                     # accumulated evidence, never from a blank slate.
                     if last_relevant_collected:
