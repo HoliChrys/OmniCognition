@@ -415,6 +415,37 @@ _INTERJECTION_RE = re.compile(
 # agent sometimes leaks into the answer.
 _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
 
+# Narration markers : phrases / structure that mean the model stuffed its
+# REASONING into the answer instead of a bare value (Nate's bug — it called
+# final_answer with a whole "The walk found … 1. … 2. …" paragraph, F1≈0
+# despite recall=1). A comma-list of noun phrases (valid plural answer) does
+# NOT match these — they key on sentences / list structure / meta-phrases.
+_NARRATION_RE = re.compile(
+    r"\bthe walk found\b|\bthese facts?\b|\bi have (?:strong|clear|enough)\b|"
+    r"\bto answer this question\b|\bevidence (?:retrieved|shows?|demonstrat)\b|"
+    r"\bdemonstrat(?:e|es|ing)\b|\bretrieved\b|\bmultiple relevant\b|"
+    r"\bshow(?:s|ing)? that\b|\baccording to\b",
+    re.IGNORECASE,
+)
+# A newline-numbered / bulleted list ("1. …" / "- …" on its own line).
+_LIST_STRUCTURE_RE = re.compile(r"(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+", re.MULTILINE)
+
+
+def _looks_like_narration(text: str) -> bool:
+    """True when a final_answer `value` is a reasoning dump, not a bare value.
+
+    Triggers on : explicit narration markers, an embedded numbered/bulleted
+    list, or 2+ sentences in a long-ish answer. Deliberately ignores plain
+    comma-separated lists (legitimate plural answers stay untouched).
+    """
+    if not text:
+        return False
+    if _NARRATION_RE.search(text) or _LIST_STRUCTURE_RE.search(text):
+        return True
+    # 2+ sentence-final punctuation marks within a long answer = prose.
+    n_sentences = len(re.findall(r"[.!?](?:\s|$)", text))
+    return n_sentences >= 2 and len(text.split()) > 15
+
 # Plural / enumeration questions whose gold answer is a LIST — trigger the
 # dedicated aggregation pass over relevant_collected.
 _ENUM_Q_RE = re.compile(
@@ -446,10 +477,16 @@ _ENUM_Q_RE = re.compile(
 )
 
 # Loop-safety cap on how many times we redirect a premature final_answer back
-# into a pivot when the walk evidence is still inconclusive (drifted / nothing
-# on-target). NOT a question-type rule — purely a bound so an answer that
-# genuinely isn't in memory (e.g. abstention questions) still terminates.
+# into a pivot when the walk evidence is still inconclusive (weak grounding).
+# NOT a question-type rule — purely a bound so an answer that genuinely isn't
+# in memory (e.g. abstention questions) still terminates.
 _MAX_PIVOT_REDIRECTS = 3
+
+# Grounding floor : a single on-target fact is thin evidence for ANY question.
+# When fewer than this many DISTINCT on-target facts have been collected across
+# all walks so far, the single-hop result is inconclusive → pivot. Reads the
+# walk's own relevant_collected output, never the question wording.
+_MIN_GROUNDING_FACTS = 2
 
 # Absolute-date patterns for "when" question extraction, most specific first :
 #   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
@@ -722,6 +759,7 @@ class McpMetaAgent:
             done_seen = False
             last_walk_drifted = False  # latest walk drifted (n_relevant==0)
             pivot_redirects = 0        # premature-answer redirects issued
+            relevant_ids_seen: set = set()  # distinct on-target fact ids (grounding)
             last_relevant_collected: List[dict] = []  # for forced-final evidence
 
             for round_idx in range(self.max_rounds):
@@ -806,28 +844,30 @@ class McpMetaAgent:
                     (b for b in tool_uses if b.name == "final_answer"), None)
                 if final_tu is not None:
                     # SIGNAL-DRIVEN pivot (not question-type-driven). The
-                    # meta-walk should fire when single-hop retrieval is
-                    # INCONCLUSIVE — i.e. the latest walk drifted (n_relevant==0)
-                    # and nothing on-target was collected. In that case the
-                    # answer would come from a blank/drifted walk, so redirect
-                    # the agent to pivot with different vocabulary instead.
-                    # Bounded by _MAX_PIVOT_REDIRECTS so genuinely-absent
-                    # evidence (abstention questions) still terminates.
+                    # meta-walk fires when single-hop retrieval is INCONCLUSIVE,
+                    # measured by GROUNDING : how many DISTINCT on-target facts
+                    # the walks have collected. Fewer than _MIN_GROUNDING_FACTS
+                    # (covers total drift AND thin single-fact grounding) → the
+                    # answer would rest on too little, so redirect the agent to
+                    # pivot with different vocabulary. Bounded by
+                    # _MAX_PIVOT_REDIRECTS so genuinely-absent evidence
+                    # (abstention questions) still terminates.
                     # We must provide a tool_result for EVERY tool_use in the
                     # assistant turn (parallel tool calls), else the API errors.
-                    evidence_inconclusive = (
-                        last_walk_drifted and not last_relevant_collected)
+                    n_grounding = len(relevant_ids_seen)
+                    evidence_inconclusive = n_grounding < _MIN_GROUNDING_FACTS
                     if (evidence_inconclusive
                             and pivot_redirects < _MAX_PIVOT_REDIRECTS
                             and round_idx < self.max_rounds - 1):
                         pivot_redirects += 1
                         redirect_msg = (
-                            "That walk DRIFTED (n_relevant=0, nothing on-target) "
-                            "— answering now would be from a blank walk. Pivot : "
+                            f"Only {n_grounding} on-target fact(s) collected so "
+                            f"far — that is thin grounding to answer from. Pivot : "
                             "call walk_start again with DIFFERENT vocabulary "
                             "(synonyms the ANSWER might use, then broader context "
-                            "clues). Only answer once a walk lands on-target, or "
-                            "if you have genuinely exhausted the memory."
+                            "clues). Answer once you have solid on-target "
+                            "evidence, or if you have genuinely exhausted the "
+                            "memory."
                         )
                         # Build tool_result for every tool_use in this turn.
                         redirect_results: List[Dict[str, Any]] = []
@@ -836,16 +876,17 @@ class McpMetaAgent:
                                 "type": "tool_result",
                                 "tool_use_id": tu.id,
                                 "content": (redirect_msg if tu.id == final_tu.id
-                                            else "Skipped — pivot first; the "
-                                                 "last walk drifted."),
+                                            else "Skipped — pivot first; "
+                                                 "grounding is thin."),
                             })
                         messages.append(
                             {"role": "assistant", "content": resp.content})
                         messages.append({"role": "user",
                                          "content": redirect_results})
                         trace.append({"round": round_idx,
-                                      "action": "pivot_on_drift",
+                                      "action": "pivot_on_weak_grounding",
                                       "walk_start_count": walk_start_count,
+                                      "n_grounding": n_grounding,
                                       "pivot_redirects": pivot_redirects})
                         continue  # back to top of for-loop, don't break
                     answer_text = str((final_tu.input or {}).get("value", "")).strip()
@@ -856,6 +897,47 @@ class McpMetaAgent:
                     if not answer_text and last_relevant_collected:
                         answer_text = str(
                             last_relevant_collected[0].get("content", "")).strip()
+                    # Narration guard : the agent stuffed its REASONING into the
+                    # final_answer value ("The walk found … 1. … 2. …") instead
+                    # of a bare value — re-ask once, forcing a terse value via
+                    # tool_choice, so the retrieved answer isn't lost (Nate bug).
+                    if _looks_like_narration(answer_text):
+                        messages.append({"role": "assistant",
+                                         "content": resp.content})
+                        # Provide a tool_result for every tool_use this turn.
+                        narr_results = [{
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": ("Your value was a reasoning paragraph, "
+                                        "not a bare answer. Re-call final_answer "
+                                        "with ONLY the short value."
+                                        if tu.id == final_tu.id
+                                        else "Skipped."),
+                        } for tu in tool_uses]
+                        messages.append({"role": "user", "content": narr_results})
+                        fr = self.client.messages.create(
+                            model=self.model, max_tokens=96, temperature=0,
+                            system=AGENT_SYSTEM, tools=[_FINAL_ANSWER_TOOL],
+                            tool_choice={"type": "tool", "name": "final_answer"},
+                            messages=messages + [{
+                                "role": "user",
+                                "content": (
+                                    "Call final_answer with the BARE value only, "
+                                    "no narration, no lists, no 'the walk found'. "
+                                    "Follow the format rules (e.g. 'Likely yes, "
+                                    "<≤4-word reason>' for 'Is it likely / Would' "
+                                    "questions; shortest label otherwise)."
+                                ),
+                            }],
+                        )
+                        if hasattr(fr, "usage"):
+                            total_in += getattr(fr.usage, "input_tokens", 0) or 0
+                            total_out += getattr(fr.usage, "output_tokens", 0) or 0
+                        fa = next((b for b in fr.content if b.type == "tool_use"
+                                   and b.name == "final_answer"), None)
+                        val = str((fa.input or {}).get("value", "")).strip() if fa else ""
+                        if val:
+                            answer_text = val
                     trace.append({"round": round_idx, "action": "final_tool",
                                   "text": answer_text[:200]})
                     break
@@ -873,12 +955,19 @@ class McpMetaAgent:
                         call_result = await session.call_tool(tu.name, tu.input)
                         result_text = _tool_result_text(call_result)
                         seen_ids.update(_extract_fact_ids(call_result))
-                        # Track the latest relevant_collected for forced-final.
+                        # Track the latest relevant_collected for forced-final,
+                        # and accumulate distinct on-target fact ids as the
+                        # grounding signal that drives weak-grounding pivoting.
                         try:
                             obj = json.loads(result_text)
                             rc = obj.get("relevant_collected")
                             if isinstance(rc, list) and rc:
                                 last_relevant_collected = rc
+                                for _e in rc:
+                                    _id = (_e.get("id") if isinstance(_e, dict)
+                                           else None)
+                                    if _id:
+                                        relevant_ids_seen.add(_id)
                         except Exception:
                             pass
                         if tu.name == "walk_start":
@@ -909,15 +998,14 @@ class McpMetaAgent:
                 # Force final answer only after the agent has had a chance
                 # to try a breadth pivot (second walk_start). A single
                 # done=true should be a signal to pivot, not to stop.
-                # Signal-driven : if the walk is done but DRIFTED with no
-                # on-target evidence and pivots remain, do NOT force — let the
-                # agent pivot to fresh vocabulary. Only force once we have
-                # evidence to synthesise, or the pivot budget is spent.
-                _have_evidence = bool(last_relevant_collected)
+                # Signal-driven : if the walk is done but grounding is still
+                # THIN (< _MIN_GROUNDING_FACTS on-target) and pivots remain, do
+                # NOT force — let the agent pivot to fresh vocabulary. Only
+                # force once grounding is solid, or the pivot budget is spent.
+                _have_evidence = len(relevant_ids_seen) >= _MIN_GROUNDING_FACTS
                 _pivots_spent = pivot_redirects >= _MAX_PIVOT_REDIRECTS
                 if (done_seen and walk_start_count >= 2
-                        and (_have_evidence or _pivots_spent
-                             or not last_walk_drifted)):
+                        and (_have_evidence or _pivots_spent)):
                     # Two breadth threads exhausted — synthesize from
                     # accumulated evidence, never from a blank slate.
                     if last_relevant_collected:
