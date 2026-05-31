@@ -251,8 +251,11 @@ def evaluate_sample(
                     if attempt == 0:
                         time.sleep(3)
                         continue
+                    import traceback as _tb
+                    tb_str = _tb.format_exc()
                     print(f"  [warn] QA {idx} failed twice ({exc}); "
                           "recording empty answer")
+                    print(f"  [traceback] {tb_str[-1500:]}")
                     return idx, {"answer": "", "trace": [], "retrieved_ids": []}
 
         with ThreadPoolExecutor(max_workers=agent_concurrency) as ex:
