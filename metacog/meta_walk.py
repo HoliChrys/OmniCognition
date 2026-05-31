@@ -93,10 +93,13 @@ _DEFAULT_STAGES = 3
 # is untouched and any spurious HyDE hit is dropped by Chain-of-Note.
 # ----------------------------------------------------------------------
 
-# Default ON. Set METACOG_HYDE=0 to disable (used for A/B benchmarking).
+# Default OFF — empirically the additive HyDE channel displaces
+# correct evidence on conv-26 cat3 Caroline (recall 1.0->0.5,
+# F1 0.33->0.15 in targeted debug). Kept available as an
+# experimental flag : set METACOG_HYDE=1 to enable.
 def _hyde_enabled() -> bool:
-    return os.environ.get("METACOG_HYDE", "1").strip().lower() not in (
-        "0", "false", "no", "off", "",
+    return os.environ.get("METACOG_HYDE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
     )
 
 

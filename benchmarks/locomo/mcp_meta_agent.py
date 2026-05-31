@@ -58,8 +58,8 @@ _FINAL_ANSWER_TOOL = {
         "properties": {
             "value": {
                 "type": "string",
-                "description": "the bare answer value, e.g. 'Sweden' / "
-                               "'7 May 2023' / 'painting' / 'Not mentioned'",
+                "description": "the bare answer value (a place / date / "
+                               "short noun phrase / 'Not mentioned')",
             },
         },
         "required": ["value"],
@@ -96,23 +96,23 @@ Workflow :
    — name what you are looking for in concrete entity words
    — call `walk_start(query=<targeted phrase>)` with the FULL specific
      phrasing, not a 2-word stub. Use the entities from the question.
-   Example : question "What did Caroline research?" drifted →
-     walk_start(query="Caroline researching adoption agencies family")
-   Example : found running but not the second hobby →
-     walk_start(query="Melanie hobby activity craft pottery")
+   Example shape (synthetic) : Q "What did <person> research?" drifts →
+     walk_start(query="<person> researching <plausible-domain-nouns>")
+   Example shape (synthetic) : found one item of a list, missing the
+   second → walk_start(query="<person> <category> <near-synonym-nouns>")
    Start each walk with a RICH query (4+ content words from the
-   question), never a 2-word stub like "Caroline research".
+   question), never a 2-word stub.
    ENUM HINT : for "what events/cities/ways/things has X done" questions,
-   include ANTICIPATED answer terms in your first query — the answer
-   words are likely near the evidence in the memory. E.g. for "What
-   LGBTQ events has Caroline participated in?", try:
-     walk_start(query="Caroline LGBTQ pride parade support group activism")
+   include ANTICIPATED answer terms — concrete words a person would
+   actually use in a chat log for that category — in your first query.
+   The answer words are likely near the evidence in the memory.
    This bridges vocabulary gaps between the question and the memory turns.
    "IN COMMON" HINT : for "what do X and Y have in common?" questions,
    search BROADLY beyond hobbies — also look for shared life events (job
    changes, moves, losses, decisions) and shared challenges. Run at least
-   TWO walks: one for shared experiences ("Jon Gina job work career
-   challenge") and one for shared activities/traits. The answer is often
+   TWO walks: one for shared life experiences (use both names + life-
+   event nouns like job/work/career/loss/move) and one for shared
+   activities/traits. The answer is often
    about a major shared event, not just interests.
    "WITH PARTNER/FRIEND" HINT : for "what activities has X pursued WITH Y?"
    questions, include BOTH people in the query and try MULTIPLE angles:
@@ -125,8 +125,8 @@ Workflow :
    the best relevant/partial evidence you found.
    TEMPORAL QUERY TIP : for "Which year/month did X get/adopt/start/join
    Y?" questions, the year IS in the [session date] of the fact about
-   that event. Search with the EVENT words ("Audrey adopt first dogs"),
-   not the year — the [session date] prefix of the retrieved fact gives
+   that event. Search with the EVENT WORDS (subject + verb + object of
+   the event), not the year — the [session date] prefix of the retrieved fact gives
    you the year. Also try synonyms: "adopt" = "get", "join" = "sign",
    "start" = "begin" = "launch".
    PIVOT-ON-DRIFT (the core walk rule). A walk result carries `drifted`
@@ -137,22 +137,20 @@ Workflow :
    stops collecting evidence). This is what lets indirect / inference
    questions work : the answer's words rarely match the question's words.
    How to choose the next pivot's vocabulary — move OUTWARD each time :
-     1st seed : the question's own terms
-     2nd seed : domain synonyms the ANSWER might use, not the question
-     3rd seed : broader behavioural / lifestyle / context clues
-   Example progressions (only for inspiration — read the drift signal, not
-   the question's wording, to decide whether to pivot) :
-   · education/career: "X education field study" → "X psychology degree
-       certification program counseling" → "X passion volunteer therapy mental"
-   · health/body: "X health doctor illness" → "X obesity overweight diet fat"
-       → "X active sedentary eat food exercise lifestyle"
-   · friends: "X friends social" → "X team game club community play online"
-       → "X tournament event server play together"
-   · financial: "X financial income money" → "X house car travel afford own"
-       → "X kids children comfortable privileged blessed have lot"
-   CAUTION (financial/status): distinguish X commenting on SOCIAL ISSUES
-   ("unemployment in our area") from X's PERSONAL situation. Look for turns
-   where X describes their OWN lifestyle, possessions, family comfort, work.
+     1st seed : the question's own terms (literal restatement)
+     2nd seed : DOMAIN SYNONYMS the ANSWER might use — the everyday,
+                concrete words a person would write in a chat log to
+                EXPRESS the concept the question abstracts. Generate
+                these yourself for the question's domain ; the prompt
+                does not list them, because reusing the answer's
+                vocabulary verbatim would be cheating.
+     3rd seed : broader BEHAVIOURAL / lifestyle / context clues — what
+                someone in the described situation would mention about
+                daily life, family, possessions, routines.
+   CAUTION (any "personal status" inference) : distinguish the SUBJECT
+   commenting on SOCIAL/EXTERNAL issues from the subject describing
+   their OWN life. Anchor on first-person turns where the subject
+   describes their own routine, possessions, family, work, body.
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
@@ -166,25 +164,26 @@ the whole memory normally. Never let it make you answer "Not mentioned" —
 if a focused walk drifts, pivot to a normal walk_start without the id.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
-- "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").
+- "When ..." → ABSOLUTE date only (full date / "<Month> <YYYY>" / "<YYYY>").
   TWO-RULE DATE SYSTEM:
   A) EXPLICIT dates in content ("in our June game", "on 15 March", "in 2021")
      → trust the explicit calendar reference from the content itself.
-     E.g. "[July 2023] John: I got my career-high in our June game" → June 2023
-     (use "June" from content + "2023" from [session date]).
+     E.g. "[<Month> <YYYY>] <speaker>: I got my career-high in our <PrevMonth> game"
+     → <PrevMonth> <YYYY> (month from content + year from [session date]).
   B) RELATIVE dates in content ("last month", "recently", "around 3 years ago",
      "a few weeks back") → compute from [session date].
      E.g. "[June 2022] User: 'last month in July was rough'" → the event was
      in May (session date June minus 1 month); ignore the misleading "July".
      E.g. "[2022-03] User: 'around 3 years ago'" → answer "2019" (2022 - 3).
-  NEVER output relative phrasing. NEVER output just "July" — always include
-  the year if inferable ("July 2023", not "July").
-- "Where ..." → place only ("Sweden").
+  NEVER output relative phrasing. NEVER output just a month name —
+  always include the year if inferable ("<Month> <YYYY>", not "<Month>").
+- "Where ..." → place only (a single proper noun).
 - "How long" → "<n> <unit>" ("4 years").
 - "What/Who is X" / identity / role → the SHORTEST label that fits
-  (1-3 words). "Transgender woman" not "Transgender artist and member
-  of the LGBTQ community". "Teacher" not "A passionate elementary
-  school teacher who loves kids". Pick the bare category noun.
+  (1-3 words). Bare category noun, not a descriptive sentence : prefer
+  "Teacher" over "A passionate elementary school teacher who loves
+  kids"; prefer a one-word identity tag over "<tag> and member of the
+  <group> community". Pick the bare category noun.
 - "What did X do/like/research" → short noun phrase (1-4 words).
 - "What pets/animals/things does X have/own?" → the CATEGORY/TYPE of the
   thing, not the individual names. E.g. "snakes" not "Susie and Seraphim".
@@ -192,42 +191,46 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   are the NAMES of X's pets?", then give the names.
 - PLURAL question ("What EVENTS / CITIES / WAYS / THINGS / HOBBIES /
   PROJECTS has X done", "Which X has Y done", "what do they have in
-  COMMON") → list EVERY gathered item, comma-separated ("Paris, Rome" ;
-  "Pride parade, school speech, support group"). One item only when there
+  COMMON") → list EVERY gathered item, comma-separated (a list of bare
+  nouns / short noun phrases, one per item). One item only when there
   truly is one. Tokens count : each listed item earns score.
 - "Would / Could X likely … ?" inference (STARTS with "Would" or "Could")
   → answer "Likely yes, <short reason ≤4 words>" or "Likely no, <short reason ≤4 words>".
-  CRITICAL: keep the reason VERY short — 2-4 words max. NOT "Likely yes, she is a fan
-  of classical music like Bach and Mozart" — that is WAY too long. Correct:
-  "Likely yes, classical music." or "Likely yes, enjoys outdoors."
+  CRITICAL: keep the reason VERY short — 2-4 words max. Reason form
+  examples (synthetic) : "Likely yes, <one-noun cue>." / "Likely yes,
+  enjoys <activity>." Avoid long descriptive clauses.
   Do NOT say "Not mentioned" on these — the answer is an inference you
   DRAW from the retrieved facts. NO evidence of X being Y → "Likely no,
   no evidence". Other "yes/no" questions follow the same rule.
   SPECIAL : "Would X enjoy A or B?" OR "Would X be more interested in A or B?"
   OR "Would X prefer A or B?" (a CHOICE between exactly two options) → pick
   the ONE that fits the evidence. Answer JUST the name/option, not
-  "Likely yes". E.g. "Would Tim enjoy C.S. Lewis or John Greene?" →
-  "C. S. Lewis". "Would X be more interested in national park or theme park?" →
-  "National park" (NOT "Enjoys hiking in mountains").
+  "Likely yes". E.g. "Would <person> prefer <A> or <B>?" → "<A>" (NOT
+  "<a-trait-sentence>"). Answer ONLY the chosen option's name, nothing else.
 - "What might X be / What could X / What might X's Y be / What fields would
   X likely …" OPEN-ESTIMATION questions → give a DIRECT estimate drawn from
   indirect evidence. Never abstain on "might/would/could/likely" questions.
   FORMAT RULES for open-estimation :
   · If evidence supports MULTIPLE equally plausible options, list them as
-    "Option1 or Option2" (the gold answers often have this "or" form).
-    E.g. "Middle-class or wealthy" — NOT just "Middle-class".
-  · Output ONLY the bare label(s) — NO explanatory clauses, no parenthetical
-    reasons, no "because he…". "Middle-class or wealthy" is correct.
-    "Middle-class (he runs a business)" is WRONG — the parenthetical kills F1.
-  · If evidence clearly supports ONE specific thing, say just that one:
-    "Psychology, counseling" (fields list), "Obesity" (condition).
+    "Option1 or Option2" / "Option1, Option2" (gold answers often have
+    this disjunctive form). Cover the obvious adjacent bracket too, not
+    just the single most-cited option.
+  · Output ONLY the bare label(s) — NO explanatory clauses, no
+    parenthetical reasons, no "because …". A parenthetical kills F1.
+  · INFERENCE, not echo : the gold label is the canonical concept the
+    evidence IMPLIES, which may use DIFFERENT vocabulary than the
+    evidence turns. If the evidence describes activities/symptoms/
+    interests, name the academic field, condition, or category they
+    belong to (apply general world knowledge to map specifics →
+    canonical label), not the verbatim words from the turns.
   NEVER answer "Not mentioned" for these — an educated guess IS
   the correct form of answer for open-estimation questions.
 - "What are X's suspected [Y]?" / "What is X's probable [Y]?" → also
-  OPEN-ESTIMATION: give a direct label even if indirect. E.g. "What are
-  John's suspected health problems?" → "Obesity" or "Weight issues", NOT
-  "Not mentioned". Try domain synonyms: "weight body overweight obese
-  fitness diet medical doctor" before concluding nothing is there.
+  OPEN-ESTIMATION : give a direct canonical label even when only
+  indirect evidence exists. If a first walk returns nothing, pivot
+  breadth with related-domain vocabulary before concluding nothing is
+  there — the evidence will use everyday wording, not clinical /
+  academic terms.
 - not in the evidence / adversarial / unanswerable → "Not mentioned"
   (NEVER for "Would/Could/might/likely/suspected/probable" inference questions above).
 
@@ -239,66 +242,74 @@ their lists / clauses intact (do not trim them).
 NEVER output a dialog turn ID (D4:11, D10:12, etc.) as your answer.
 Output the CONTENT of the fact, not its reference ID.
 
-Examples of GOOD answers : "7 May 2023" · "Sweden" · "4 years" ·
-"adoption agencies" · "Transgender woman" · "Not mentioned".
+Examples of GOOD answer SHAPES (synthetic, format-only) : a bare date
+("3 January 2024") · a single place ("Lisbon") · a duration ("4
+years") · a short noun phrase ("research labs") · a one-noun identity
+tag ("Engineer") · "Not mentioned".
 Example of BAD : "Based on the walk, the support group was on …" —
 too verbose, will score poorly. Just the value.
 Example of BAD : "Transgender artist and member of the LGBTQ
-community" — has "and", strip to "Transgender woman".
+community" — has "and" + extra clause ; strip to the bare identity tag.
 
-EXTRACTIVE RULE : copy the answer VERBATIM from the evidence — reuse the
+EXTRACTIVE RULE : for FACTUAL questions (when / where / what did X do /
+which / who) copy the answer VERBATIM from the evidence — reuse the
 speaker's own words, do not paraphrase. The token-overlap score rewards
-the EXACT words from the conversation. If the fact says "counseling and
-mental health for transgender people", answer with those exact words, not
-a paraphrase like "therapy work".
+the EXACT words from the conversation.
+INFERENCE EXCEPTION : for "might / would / could / likely / suspected /
+probable" open-estimation questions, the gold label is the canonical
+CATEGORY the evidence IMPLIES, not the verbatim words ; map the
+evidence's specifics to that canonical label via general world knowledge.
 
 PRECISION / ADVERSARIAL GUARD : only applicable when the question
 describes a scenario that CONFLICTS with all retrieved evidence (false
 premise). If your walk finds that the specific scenario never happened
 (two differently-phrased walks, all evidence contradicts the premise),
-answer "Not mentioned". Example traps :
-- question says "temp job Gina took" but evidence only shows Gina's
-  normal business activities (conflict) → "Not mentioned"
-- question says "Jon's store" but Jon runs a dance studio (conflict) →
+answer "Not mentioned". Example trap SHAPES (synthetic) :
+- question says "the temp job <person> took" but evidence shows the
+  person doing their normal business activities (premise conflict) →
   "Not mentioned"
+- question says "<person>'s <place-of-business-A>" but evidence shows
+  the person runs <place-of-business-B> (premise conflict) → "Not
+  mentioned"
 Do NOT apply this guard for straightforward "Which/What/Who/When" factual
 questions where the scenario is plausible — if retrieval found nothing,
-try a THIRD walk with a different query before giving up. For "Which
-team did John sign with on [date]?" the scenario (signing with a team)
-is plausible and normal; missing evidence means poor retrieval, not an
-impossible premise — try harder before saying "Not mentioned".
+try a THIRD walk with a different query before giving up. Plausible-
+but-unfound scenarios (e.g. "Which team did <person> sign with on
+<date>?" — signing with a team is normal) indicate poor retrieval, not
+an impossible premise — try harder before saying "Not mentioned".
 If you find DIRECT evidence of the scenario, answer from it even if
 peripheral details differ.
 STRONG-VERB TRAP : questions with SPECIFIC experiential verbs (mesmerize,
 captivate, fascinate, obsess, enthrall, haunt, adore, detest, despise)
 require that the evidence uses the SAME strong verb or a close synonym.
-Weak positive sentiment ("Audrey likes/loves hummingbirds") does NOT
+Weak positive sentiment ("<person> likes/loves <thing>") does NOT
 satisfy "mesmerize" — answer "Not mentioned" unless the evidence has
-explicitly mesmerizing/captivating language. E.g. "Which bird mesmerizes
-Audrey?" + evidence "Audrey loves hummingbirds" → "Not mentioned" (wrong
-verb strength).
+explicitly mesmerizing/captivating language. Wrong verb strength = "Not
+mentioned".
 EXCEPTION : "might/would/could/likely" open-estimation questions (e.g.
 "What might X's status be?", "What fields would X likely pursue?") are
 INFERENCE questions — NEVER apply the guard, always give an estimate.
 
-Few-shot (one per question type — match this terseness) :
-Q: What craft do Mel and her kids do besides pottery? → painting
-Q: Where did Caroline move from? → Sweden
-Q: When did Caroline attend the pride parade? → August 2023
-Q: How long have they been friends? → 4 years
-Q: What career path did Caroline choose? → counseling, mental health
-Q: Whose birthday did Melanie celebrate? → Melanie's daughter
-Q: Would Melanie enjoy classical music? → Likely yes, she likes Bach
-Q: Would Caroline have Dr. Seuss books? → Likely yes, she collects classic children's books
-Q: Would Tim enjoy C. S. Lewis or John Greene? → C. S. Lewis
-Q: What might John's financial status be? → Middle-class or wealthy
-Q: What fields would Caroline likely pursue in education? → Psychology, counseling
-Q: When did Joanna first watch Eternal Sunshine? [turn: 2022-03] "I watched it around 3 years ago" → 2019
-Q: In which month's game did John get a career-high? [turn: July 2023] "I got a career-high in our June game" → June 2023
-Q: Which cities has Jon visited? → Paris, Rome
-Q: What LGBTQ+ events has Caroline joined? → pride parade, school speech, support group
-Q: What do Jon and Gina have in common? → They lost their jobs and started their own businesses
-Q: What sports car does Jon drive? → Not mentioned"""
+Few-shot — these are FORMAT examples on SYNTHETIC names (not from your
+memory). They teach the SHAPE of the answer for each question type ;
+ignore their content, copy only their terseness :
+Q: What hobby do Alex and his sister share? → gardening
+Q: Where did Priya move from? → Lisbon
+Q: When did Sam attend the symposium? → 14 October 2024
+Q: How long have they been colleagues? → 4 years
+Q: What career path did Lena choose? → architecture, urban design
+Q: Whose birthday did Otto celebrate? → Otto's son
+Q: Would Maya enjoy classical music? → Likely yes, plays violin
+Q: Would Theo have detective novels? → Likely yes, he collects mystery books
+Q: Would Rin prefer Murakami or Le Guin? → Murakami
+Q: What might Dario's financial status be? → Working-class or modest
+Q: What fields would Iris likely pursue in graduate study? → Linguistics, education
+Q: When did Naoko first watch a 2003 film? [turn: 2022-03] "I watched it around 3 years ago" → 2019
+Q: In which month's game did Noah get a career-high? [turn: <Month> YYYY] "...in our <PrevMonth> game" → <PrevMonth> YYYY
+Q: Which cities has Yuna visited? → Kyoto, Hanoi
+Q: What community events has Felix joined? → harvest festival, open mic, hackathon
+Q: What do Mira and Jules have in common? → They lost their jobs and started their own businesses
+Q: What sports car does Kai drive? → Not mentioned"""
 
 
 def _resolve_client(api_key: Optional[str]):

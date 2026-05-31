@@ -179,6 +179,39 @@ def cmd_walk(mem: Optional[Memory] = None) -> Memory:
     return mem
 
 
+# ----------------------------------------------------------------------
+# STEP 4 — the FULL agent path (mcp_meta_agent.answer), end-to-end
+# ----------------------------------------------------------------------
+def cmd_agent(mem: Optional[Memory] = None) -> Memory:
+    print("\n" + "=" * 70)
+    print("STEP 4 — FULL AGENT PATH (answer + agent_recall + F1)")
+    print("=" * 70)
+    mem = mem or build_memory(verbose=False)
+    from benchmarks.locomo.mcp_meta_agent import McpMetaAgent
+    from benchmarks.locomo.eval import official_score
+
+    agent = McpMetaAgent()
+    result = agent.answer(mem, PROBE_Q, k=7, max_steps=3, use_lineage=False)
+    pred = result.get("answer", "")
+    retrieved = result.get("retrieved_ids", []) or []
+    trace = result.get("trace") or []
+
+    hits = sorted(set(retrieved) & set(PROBE_GOLD))
+    recall = len(hits) / max(1, len(PROBE_GOLD))
+    f1 = official_score(pred, PROBE_ANSWER, 3)
+
+    print(f"[agent] question : {PROBE_Q}")
+    print(f"[agent] gold     : {PROBE_ANSWER}")
+    print(f"[agent] PREDICTED: {pred!r}")
+    print(f"[agent] F1            = {f1:.3f}")
+    print(f"[agent] agent_recall  = {recall:.3f}  hits={hits}  gold={PROBE_GOLD}")
+    print(f"[agent] retrieved_ids = {retrieved}")
+    print(f"[agent] trace ({len(trace)} steps) :")
+    for t in trace:
+        print(f"   - {str(t)[:140]}")
+    return mem
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     if cmd == "index":
@@ -187,10 +220,13 @@ def main() -> None:
         cmd_retrieve()
     elif cmd == "walk":
         cmd_walk()
+    elif cmd == "agent":
+        cmd_agent()
     else:
         mem = cmd_index()
         cmd_retrieve(mem)
         cmd_walk(mem)
+        cmd_agent(mem)
 
 
 if __name__ == "__main__":
