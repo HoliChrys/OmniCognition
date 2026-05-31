@@ -815,27 +815,43 @@ class McpMetaAgent:
                 if final_tu is not None:
                     # Guard: inference questions require ≥3 diverse walk_start
                     # calls. If the agent tries to answer too early, redirect.
+                    # We must provide a tool_result for EVERY tool_use in the
+                    # assistant turn (parallel tool calls), else the API errors.
                     if (_INFERENCE_Q_RE.search(question or "")
                             and walk_start_count < _MIN_WALKS_INFERENCE
                             and round_idx < max_rounds - 1):
-                        remaining = _MIN_WALKS_INFERENCE - walk_start_count
                         step_label = ("B" if walk_start_count == 1
                                       else "C" if walk_start_count == 2
                                       else "A")
+                        redirect_msg = (
+                            f"Not yet — this inference question requires at "
+                            f"least {_MIN_WALKS_INFERENCE} walk_start calls "
+                            f"with different vocabulary. You have done "
+                            f"{walk_start_count}. Do Step {step_label} now: "
+                            f"call walk_start with a DIFFERENT seed query "
+                            f"(domain synonyms or broader context clues)."
+                        )
+                        # Build tool_result for every tool_use in this turn.
+                        redirect_results: List[Dict[str, Any]] = []
+                        for tu in tool_uses:
+                            if tu.id == final_tu.id:
+                                redirect_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tu.id,
+                                    "content": redirect_msg,
+                                })
+                            else:
+                                redirect_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tu.id,
+                                    "content": ("Skipped — answering an "
+                                                "inference question too early; "
+                                                "do a new walk_start first."),
+                                })
                         messages.append(
                             {"role": "assistant", "content": resp.content})
-                        messages.append({"role": "user", "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": final_tu.id,
-                            "content": (
-                                f"Not yet — this inference question requires at "
-                                f"least {_MIN_WALKS_INFERENCE} walk_start calls "
-                                f"with different vocabulary. You have done "
-                                f"{walk_start_count}. Do Step {step_label} now: "
-                                f"call walk_start with a DIFFERENT seed query "
-                                f"(domain synonyms or broader context clues)."
-                            ),
-                        }]})
+                        messages.append({"role": "user",
+                                         "content": redirect_results})
                         trace.append({"round": round_idx,
                                       "action": "redirect_inference_walk",
                                       "walk_start_count": walk_start_count})
