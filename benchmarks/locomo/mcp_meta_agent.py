@@ -162,6 +162,17 @@ the EXACT words from the conversation. If the fact says "counseling and
 mental health for transgender people", answer with those exact words, not
 a paraphrase like "therapy work".
 
+PRECISION / ADVERSARIAL GUARD : if your walk finds ZERO evidence that
+the specific event/action named in the question ever happened (even after
+two differently-phrased walks), answer "Not mentioned". Do NOT patch a
+false premise with related-but-different content. Example traps :
+- question says "temp job Gina took" but evidence only shows Gina's
+  normal business activities → "Not mentioned"
+- question says "Jon's store" but Jon runs a dance studio → "Not mentioned"
+  (unless the evidence also calls it a store)
+If you find DIRECT evidence of the scenario (same person, same event),
+answer from it even if some peripheral details differ.
+
 Few-shot (one per question type — match this terseness) :
 Q: What craft do Mel and her kids do besides pottery? → painting
 Q: Where did Caroline move from? → Sweden
