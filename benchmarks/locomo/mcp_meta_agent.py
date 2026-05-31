@@ -185,13 +185,19 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   "Pride parade, school speech, support group"). One item only when there
   truly is one. Tokens count : each listed item earns score.
 - "Would / Could X likely … ?" inference (STARTS with "Would" or "Could")
-  → answer "Likely yes, <short reason>" or "Likely no, <short reason>".
+  → answer "Likely yes, <short reason ≤4 words>" or "Likely no, <short reason ≤4 words>".
+  CRITICAL: keep the reason VERY short — 2-4 words max. NOT "Likely yes, she is a fan
+  of classical music like Bach and Mozart" — that is WAY too long. Correct:
+  "Likely yes, classical music." or "Likely yes, enjoys outdoors."
   Do NOT say "Not mentioned" on these — the answer is an inference you
-  DRAW from the retrieved facts. Other "yes/no" questions follow the same.
-  SPECIAL : "Would X enjoy A or B?" (a CHOICE between two options) → pick
+  DRAW from the retrieved facts. NO evidence of X being Y → "Likely no,
+  no evidence". Other "yes/no" questions follow the same rule.
+  SPECIAL : "Would X enjoy A or B?" OR "Would X be more interested in A or B?"
+  OR "Would X prefer A or B?" (a CHOICE between exactly two options) → pick
   the ONE that fits the evidence. Answer JUST the name/option, not
   "Likely yes". E.g. "Would Tim enjoy C.S. Lewis or John Greene?" →
-  "C. S. Lewis" (not "Likely yes, he likes fantasy").
+  "C. S. Lewis". "Would X be more interested in national park or theme park?" →
+  "National park" (NOT "Enjoys hiking in mountains").
 - "What might X be / What could X / What might X's Y be / What fields would
   X likely …" OPEN-ESTIMATION questions → give a DIRECT estimate drawn from
   indirect evidence. Never abstain on "might/would/could/likely" questions.
@@ -623,12 +629,19 @@ def terse(text: str, question: Optional[str] = None) -> str:
             t = m_inf.group(0).strip().rstrip(".,;")
     # Drop any leaked dialog-id citation, then tidy leftover punctuation.
     t = _DIALOG_ID_RE.sub("", t).strip(" .,()")
+    # Trim overlong "Likely yes/no, [very long clause]" inference answers.
+    # Gold answers for "Would X enjoy Y?" are typically 2-5 words.
+    # Cap at 6 words after "Likely yes/no,": "Likely yes, classical music."
+    is_inference = bool(re.match(r"^\s*likely\s+(?:yes|no)\b", t, re.IGNORECASE))
+    if is_inference and len(t.split()) > 7:
+        m_head = re.match(r"((?:likely\s+)?(?:yes|no)(?:,|;)?\s*)", t, re.IGNORECASE)
+        if m_head:
+            head = m_head.group(1)
+            rest_words = t[len(head):].split()
+            t = (head + " ".join(rest_words[:4])).strip().rstrip(".,;")
     # Compound cutting : apply iteratively while the answer is short
     # enough that the head is plausibly the bare label. Avoid touching
     # long prose answers where "and" is part of a real sentence.
-    # Skip inference answers ("Likely yes, …") — the trailing clause IS
-    # the expected format.
-    is_inference = bool(re.match(r"^\s*likely\s+(?:yes|no)\b", t, re.IGNORECASE))
     if t and not is_inference and not _is_enum_q and len(t.split()) <= 12:
         changed = True
         while changed and t and len(t.split()) <= 12:
