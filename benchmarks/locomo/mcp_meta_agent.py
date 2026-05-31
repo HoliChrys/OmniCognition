@@ -130,18 +130,24 @@ Workflow :
    you the year. Also try synonyms: "adopt" = "get", "join" = "sign",
    "start" = "begin" = "launch".
    INFERENCE QUERY TIP (cat3): for "What might X's Y be?", "What is X
-   likely to enjoy?", "Is it likely X has Z?", "suspected/probable Y" —
-   search for MULTIPLE TYPES of indirect evidence. Run at LEAST 3 diverse
-   walks with different vocabulary:
-   · Walk 1: direct question terms (health → "X doctor weight body medical")
-   · Walk 2: domain synonyms (health → "X obesity overweight diet exercise
-     fat fitness body shape"; friends → "X team game club social group")
-   · Walk 3: broader lifestyle clues (health → "X active sedentary food
-     eating habits walk run"; activity → "X cooking kitchen baking food
-     recipe home hobby indoor"; friends → "X online community play event")
+   likely to enjoy?", "Is it likely X has Z?", "suspected/probable Y",
+   "What fields would X pursue?" —
+   MANDATORY: Do NOT call final_answer until you have called walk_start
+   at least 3 times with DIFFERENT vocabulary. Calling final_answer with
+   fewer than 3 walks on these inference questions will miss critical evidence.
+   · Walk 1: direct question terms (career → "X career study education field")
+   · Walk 2: domain synonyms that the ANSWER might use, not the question
+     (career → "X psychology degree academic program certification major";
+      health → "X obesity overweight weight body diet medical fat";
+      friends → "X team game club social group activity")
+   · Walk 3: broader behavioural/contextual clues
+     (career → "X interest passion volunteer work therapy mental";
+      health → "X active sedentary eat food exercise lifestyle";
+      activity → "X cooking kitchen baking recipe food home indoor hobby")
    The correct evidence often uses DIFFERENT vocabulary than the question
-   (e.g. "obesity" ≠ "health problem", "cook dog treats" ≠ "indoor activity"
-    in a search). Always try at least 3 synonym-diverse queries before giving up.
+   (e.g. "psychology" may appear as the answer but "counseling" or "therapy"
+   in the conversation; "obesity" ≠ "health problem"; "cook" ≠ "indoor
+   activity"). 3 synonym-diverse queries are the minimum, do more if needed.
 
 sigma_path measures geometric drift ; drifted / n_relevant measure
 CONTENT relevance and are the stronger pivot signal — act on them.
