@@ -26,16 +26,38 @@ from benchmarks.locomo.encoders import SemanticEncoder
 from metacog.memory import Memory
 
 DATA = "benchmarks/locomo/data/locomo10.json"
-SAMPLE = "conv-26"
+SAMPLE = os.environ.get("DEBUG_SAMPLE", "conv-26")
 # Slice size : DEBUG_NSESS=0 (or unset large) ingests the WHOLE conversation
 # (~400 turns) to reproduce real-bench competition ; small N for fast probes.
 N_SESSIONS = int(os.environ.get("DEBUG_NSESS", "2"))
 
-# The targeted probe : an INFERENCE (cat3) question whose evidence is in
-# the slice. This is the case that scores r7=0 in the full bench.
-PROBE_Q = "What fields would Caroline be likely to pursue in her career?"
-PROBE_GOLD = ["D1:9", "D1:11"]
-PROBE_ANSWER = "Psychology, counseling certification"
+# Targeted probes. Pick via DEBUG_PROBE=caroline | john (default caroline).
+# Both are cat3 INFERENCE questions whose evidence is lexically disjoint
+# from the question — the exact failure mode we are debugging.
+_PROBES = {
+    "caroline": {
+        "sample": "conv-26",
+        "question": "What fields would Caroline be likely to pursue in her career?",
+        "gold": ["D1:9", "D1:11"],
+        "answer": "Psychology, counseling certification",
+        "category": 3,
+    },
+    "john": {
+        # John's "kids have so much" wealth-implying turn.
+        "sample": "conv-41",
+        "question": "What might John's financial status be?",
+        "gold": ["D5:5"],
+        "answer": "Middle-class or wealthy",
+        "category": 3,
+    },
+}
+_PROBE_KEY = os.environ.get("DEBUG_PROBE", "caroline").lower()
+_PROBE = _PROBES.get(_PROBE_KEY, _PROBES["caroline"])
+SAMPLE = _PROBE["sample"] if "DEBUG_SAMPLE" not in os.environ else SAMPLE
+PROBE_Q = _PROBE["question"]
+PROBE_GOLD = list(_PROBE["gold"])
+PROBE_ANSWER = _PROBE["answer"]
+PROBE_CATEGORY = _PROBE["category"]
 
 
 def _slice_conversation() -> Dict[str, Any]:
@@ -198,7 +220,7 @@ def cmd_agent(mem: Optional[Memory] = None) -> Memory:
 
     hits = sorted(set(retrieved) & set(PROBE_GOLD))
     recall = len(hits) / max(1, len(PROBE_GOLD))
-    f1 = official_score(pred, PROBE_ANSWER, 3)
+    f1 = official_score(pred, PROBE_ANSWER, PROBE_CATEGORY)
 
     print(f"[agent] question : {PROBE_Q}")
     print(f"[agent] gold     : {PROBE_ANSWER}")

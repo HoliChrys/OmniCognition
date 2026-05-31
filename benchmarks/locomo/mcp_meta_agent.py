@@ -290,26 +290,38 @@ EXCEPTION : "might/would/could/likely" open-estimation questions (e.g.
 "What might X's status be?", "What fields would X likely pursue?") are
 INFERENCE questions — NEVER apply the guard, always give an estimate.
 
-Few-shot — these are FORMAT examples on SYNTHETIC names (not from your
-memory). They teach the SHAPE of the answer for each question type ;
-ignore their content, copy only their terseness :
-Q: What hobby do Alex and his sister share? → gardening
-Q: Where did Priya move from? → Lisbon
-Q: When did Sam attend the symposium? → 14 October 2024
-Q: How long have they been colleagues? → 4 years
-Q: What career path did Lena choose? → architecture, urban design
-Q: Whose birthday did Otto celebrate? → Otto's son
-Q: Would Maya enjoy classical music? → Likely yes, plays violin
-Q: Would Theo have detective novels? → Likely yes, he collects mystery books
-Q: Would Rin prefer Murakami or Le Guin? → Murakami
-Q: What might Dario's financial status be? → Working-class or modest
-Q: What fields would Iris likely pursue in graduate study? → Linguistics, education
-Q: When did Naoko first watch a 2003 film? [turn: 2022-03] "I watched it around 3 years ago" → 2019
-Q: In which month's game did Noah get a career-high? [turn: <Month> YYYY] "...in our <PrevMonth> game" → <PrevMonth> YYYY
-Q: Which cities has Yuna visited? → Kyoto, Hanoi
-Q: What community events has Felix joined? → harvest festival, open mic, hackathon
-Q: What do Mira and Jules have in common? → They lost their jobs and started their own businesses
-Q: What sports car does Kai drive? → Not mentioned"""
+Answer-shape rules — apply them from first principles, no examples
+needed. The score rewards TOKEN OVERLAP with a TERSE gold label, so
+every word past the bare answer dilutes precision and lowers F1.
+
+LENGTH CAPS (hard) — exceeding them is the #1 way to lose F1 :
+- factual single value (when / where / who / which / what did X) :
+  ≤ 5 words. Just the bare value (date, place, name, short noun
+  phrase), no clause, no preamble, no "and …" tail.
+- "How long" / duration : exactly "<n> <unit>", 2 words.
+- identity / role / category : 1-3 words, the bare category noun
+  only, no descriptive tail.
+- plural / enumeration : 2-4 items max, each item 1-3 words, comma-
+  separated. Stop after the items that the EVIDENCE supports — do
+  NOT pad with adjacent inferences or near-synonym variants of the
+  same item.
+- yes/no inference ("Would / Could X likely …") : "Likely yes, <2-4
+  word reason>" or "Likely no, <2-4 word reason>". Total answer
+  ≤ 7 words.
+- two-choice ("Would X prefer A or B?") : ONLY the chosen option, 1-3
+  words. No "Likely yes" prefix here, no reason.
+- open-estimation inference ("What might X / What could X / What
+  fields would X likely pursue / What is X's suspected / probable
+  Y") : the CANONICAL category the evidence implies, formatted as a
+  short noun phrase or "A, B" / "A or B" if multiple distinct
+  categories truly fit. 1-4 words total. CRITICAL : apply world
+  knowledge to map evidence specifics → the canonical label (e.g.
+  the academic field a described activity belongs to), do NOT echo
+  evidence vocabulary verbatim ; one canonical label beats multiple
+  near-synonyms of the same thing.
+- adversarial / unanswerable / premise-conflict : "Not mentioned"
+  (never for the "might/would/could/likely/suspected/probable" set
+  above — those always get an estimate)."""
 
 
 def _resolve_client(api_key: Optional[str]):
