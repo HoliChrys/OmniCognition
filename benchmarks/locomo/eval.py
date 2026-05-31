@@ -113,6 +113,9 @@ def ingest_conversation(
             pass
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(ent_ex.extract_entities, ent_texts))
+        # Persist the freshly-warmed cache so the next run reloads instantly.
+        if hasattr(ent_ex, "flush"):
+            ent_ex.flush()
     if atom_ex is not None and hasattr(atom_ex, "extract_atoms"):
         try:
             _ = atom_ex.llm.client

@@ -22,11 +22,21 @@ the keyword manifold.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
 
 from metacog.epistemic import SourceClass
+
+# Default on-disk cache so the (rate-limited, slow) extraction runs ONCE and
+# every re-ingestion of the same turns is instant. Override with the
+# METACOG_ENTITY_CACHE env var or the cache_path constructor arg.
+_DEFAULT_ENTITY_CACHE = os.environ.get(
+    "METACOG_ENTITY_CACHE",
+    os.path.join(os.path.expanduser("~"), ".cache", "metacog_entities.json"),
+)
 
 
 @dataclass
@@ -102,12 +112,12 @@ class LLMEntityExtractor:
         max_tokens: int = 256,
         api_key: Optional[str] = None,
         llm: Any = None,
+        cache_path: Optional[str] = _DEFAULT_ENTITY_CACHE,
     ) -> None:
         if llm is not None:
             self.llm = llm
         else:
             from metacog.llm import ClaudeLLM
-            import os
 
             self.llm = ClaudeLLM(
                 model=model or os.environ.get(
@@ -119,12 +129,68 @@ class LLMEntityExtractor:
             )
         self.max_tokens = max_tokens
         self._cache: Dict[str, List[ExtractedEntity]] = {}
+        self._cache_path = cache_path
+        self._lock = threading.Lock()
+        self._dirty = 0
+        self._load_disk_cache()
+
+    # ------------------------------------------------------------------
+    # Persistent disk cache : extraction is slow + rate-limited, so run it
+    # once and reload instantly on every subsequent ingestion.
+    # ------------------------------------------------------------------
+    def _load_disk_cache(self) -> None:
+        if not self._cache_path or not os.path.exists(self._cache_path):
+            return
+        try:
+            with open(self._cache_path, "r") as f:
+                raw = json.load(f)
+            for text, items in raw.items():
+                self._cache[text] = [
+                    ExtractedEntity(
+                        etype=i["etype"], value=i["value"],
+                        date_parts=i.get("date_parts"),
+                    )
+                    for i in items
+                ]
+        except Exception:
+            # A corrupt cache must never break ingestion.
+            pass
+
+    def _flush_disk_cache(self, force: bool = False) -> None:
+        if not self._cache_path:
+            return
+        # Batch writes : only persist every 25 new entries (or on force).
+        if not force and self._dirty < 25:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._cache_path) or ".", exist_ok=True)
+            serializable = {
+                text: [
+                    {"etype": e.etype, "value": e.value,
+                     "date_parts": e.date_parts}
+                    for e in ents
+                ]
+                for text, ents in self._cache.items()
+            }
+            tmp = self._cache_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(serializable, f)
+            os.replace(tmp, self._cache_path)
+            self._dirty = 0
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        """Force-persist the cache (call after a batch ingestion)."""
+        with self._lock:
+            self._flush_disk_cache(force=True)
 
     def extract_entities(self, text: str) -> List[ExtractedEntity]:
         if not text:
             return []
-        if text in self._cache:
-            return self._cache[text]
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached
 
         raw = ""
         try:
@@ -133,7 +199,10 @@ class LLMEntityExtractor:
             return []
 
         ents = self._parse(raw)
-        self._cache[text] = ents
+        with self._lock:
+            self._cache[text] = ents
+            self._dirty += 1
+            self._flush_disk_cache()
         return ents
 
     # ------------------------------------------------------------------
