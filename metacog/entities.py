@@ -68,20 +68,32 @@ class LLMEntityExtractor:
     source: SourceClass = SourceClass.GENERATOR
 
     _SYSTEM = (
-        "You extract the salient ENTITIES from a short conversational "
-        "message. Decide yourself which entities matter : people, "
-        "places, organizations, dates, objects, events. "
+        "You index a short conversational message for later retrieval. "
+        "Emit two kinds of items.\n"
+        "(1) NAMED ENTITIES actually present : people, places, "
+        "organizations, dates, objects, events. "
         "For every DATE, decompose it into day / month / year fields "
-        "(omit any part the text does not give). "
+        "(omit any part the text does not give).\n"
+        "(2) IMPLIED TOPICS (type \"topic\") : up to 3 concepts the "
+        "message REVEALS or IMPLIES about the speaker or subject that "
+        "someone might later SEARCH for, even when the word is NOT in the "
+        "text. Infer the underlying category. Examples : 'my kids have so "
+        "much and others don't' -> topics wealth, comfort, privilege ; "
+        "'keen on counseling or mental health' -> topics psychology, "
+        "counseling ; 'won my video game tournament with my team' -> "
+        "topics teammates, gaming, friends ; 'I've been so tired and "
+        "down lately' -> topics depression, fatigue. Only add a topic "
+        "you are confident the message genuinely implies ; never invent.\n"
         "Return ONLY a strict JSON array, no prose, no code fences. "
         "Each item: {\"type\":<lowercase>, \"value\":<lowercase>}. "
         "Date items add \"parts\": {\"day\":\"20\",\"month\":\"january\","
         "\"year\":\"2023\"} (any subset). "
         "Example: [{\"type\":\"person\",\"value\":\"melanie\"},"
         "{\"type\":\"place\",\"value\":\"sweden\"},"
+        "{\"type\":\"topic\",\"value\":\"wealth\"},"
         "{\"type\":\"date\",\"value\":\"20 january 2023\","
         "\"parts\":{\"day\":\"20\",\"month\":\"january\",\"year\":\"2023\"}}]. "
-        "If there are no entities, return []."
+        "If there is nothing salient, return []."
     )
 
     def __init__(
