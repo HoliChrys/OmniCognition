@@ -332,14 +332,14 @@ _DIALOG_ID_RE = re.compile(r"\(?(?:from\s+)?\bd\d+:\d+\b\)?", re.IGNORECASE)
 # dedicated aggregation pass over relevant_collected.
 _ENUM_Q_RE = re.compile(
     # "what/which <noun>" patterns (extended noun list, up to 60 chars gap)
-    r"\b(what|which)\b.{0,60}\b(events?|cities|places|ways|things|hobbies|"
-    r"activities|projects?|crafts?|sports?|languages?|skills?|groups?|"
-    r"causes?|items?|gifts?|fields?|attributes?|traits?|books?|movies?|"
-    r"games?|pets?|countries|emotions?|recipes?|symbols?|organizations?|"
-    r"recommendations?|suggestions?|jobs?|kinds?|types?|roles?|steps?|"
-    r"methods?|measures?|actions?|efforts?|initiatives?|strategies?|"
-    r"fundraisers?|interests?|topics?|themes?|habits?|practices?|"
-    r"volunteers?|achievements?|accomplishments?|plans?|goals?)\b"
+    r"\b(what|which)\b.{0,60}\b(events|cities|places|ways|things|hobbies|"
+    r"activities|projects|crafts|sports|languages|skills|groups|"
+    r"causes|items|gifts|fields|attributes|traits|books|movies|"
+    r"games|pets|countries|emotions|recipes|symbols|organizations|"
+    r"recommendations|suggestions|jobs|kinds|types|roles|steps|"
+    r"methods|measures|actions|efforts|initiatives|strategies|"
+    r"fundraisers|interests|topics|themes|habits|practices|"
+    r"volunteers|achievements|accomplishments|plans|goals)\b"
     # "what has/have/did X [verb in past tense]..." — broad list of
     # past participles / past-tense verbs that imply multiple outcomes
     r"|\bwhat\b.{0,60}\b(?:has|have|did|does)\b.{0,50}\b(?:done|do|built|"
