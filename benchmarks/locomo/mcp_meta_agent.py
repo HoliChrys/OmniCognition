@@ -125,11 +125,13 @@ if a focused walk drifts, pivot to a normal walk_start without the id.
 
 CRITICAL — final answer format. Output ONLY the bare value, no prose :
 - "When ..." → ABSOLUTE date only ("7 May 2023" / "June 2023" / "2022").
-  Resolve any "yesterday / last week / X days ago / around N years ago"
-  against the turn's [session date] prefix into a calendar date. ARITHMETIC:
-  if the turn is [2022-03-15] and they said "around 3 years ago", answer
-  "2019" (2022 - 3). NEVER output relative phrasing — always compute the
-  absolute year/month/date and output ONLY that value.
+  SOURCE OF TRUTH: the [session date] prefix of the retrieved fact IS the
+  date of the event — use it directly. Do not guess from dates mentioned
+  inside the conversation content (e.g. if the turn says "last month in
+  July was rough" but the [session date] is 2023-06-15, the event happened
+  in June, not July).
+  ARITHMETIC: if content says "around 3 years ago" and [session date] is
+  2022-03, answer "2019" (2022 - 3). NEVER output relative phrasing.
 - "Where ..." → place only ("Sweden").
 - "How long" → "<n> <unit>" ("4 years").
 - "What/Who is X" / identity / role → the SHORTEST label that fits
