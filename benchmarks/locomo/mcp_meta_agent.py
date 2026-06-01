@@ -28,10 +28,11 @@ from typing import Any, Dict, List, Optional
 
 _DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "256"))
-# 8 rounds: 3 walk_start + 2 walk_next each = 5 tool rounds, leaving 3 for
-# synthesis. Previously 5 rounds let 3 breadth pivots exhaust the budget with
-# no synthesis round, causing "Not mentioned" despite recall=1.
-_MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
+# 16 rounds: each walk can run up to 8 stages (walk_start + 7 walk_next),
+# and the walk stops naturally when no new unseen facts arrive (the
+# |seen ∩ gold| / |gold| proxy). With 16 rounds two full-depth walks fit
+# (2 × 8), or one deep walk + one breadth pivot, leaving rounds for synthesis.
+_MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "16"))
 
 # Only the walk tools — the agent should NOT bypass the walk by
 # calling raw retrieve. This is enforced server-side AND client-side.

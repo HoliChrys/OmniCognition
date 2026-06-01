@@ -168,7 +168,7 @@ def build_app(
     @app.tool()
     def walk_start(
         query: str,
-        n_stages: int = 3,
+        n_stages: int = 8,
         facts_per_stage: int = 7,
         actions_per_stage: int = 3,
         commit: bool = False,

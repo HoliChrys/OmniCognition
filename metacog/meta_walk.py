@@ -67,10 +67,14 @@ from metacog.uncertainty import beta_sigma, node_sigma
 
 
 # Hard caps per generation step. Not tuning knobs : token budget per
-# generation (50) is the contract stated by the design ; n_stages=3
-# keeps the worst-case generation cost at 3·2·50 = 300 output tokens.
+# generation (50) is the contract stated by the design.
+# n_stages=8 is a soft cap — the walk stops naturally as soon as no
+# new unseen facts are returned (fact_star=None → cant_continue), which
+# is the |seen ∩ gold| / |gold| = 1 proxy at inference time. The 3
+# previous hard cap was masking early-stopping on multi-hop questions
+# where evidence spans more than 3 retrieval hops.
 _GENERATION_TOKEN_BUDGET = 50
-_DEFAULT_STAGES = 3
+_DEFAULT_STAGES = 8
 
 
 # ----------------------------------------------------------------------

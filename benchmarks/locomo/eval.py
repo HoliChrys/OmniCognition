@@ -99,22 +99,42 @@ def _add_month(day, mon, yr, n_months):
     return day, mon, yr
 
 
-def _fmt_date(day, mon, yr):
-    month_name = _MONTHS[mon - 1].capitalize()
-    return f"{day} {month_name} {yr}"
+def _fmt_date_ref(day, mon, yr):
+    """Format as structured date ref: ref:date:day:N ref:date:month:name ref:date:year:N.
+
+    Three grouped components (never standalone 'march' — always under
+    ref:date:month: so BM25/keyword compounds are day/month/year-typed
+    and won't collapse across different years or months).
+    """
+    month_name = _MONTHS[mon - 1]
+    parts = [
+        f"ref:date:day:{day}",
+        f"ref:date:month:{month_name}",
+        f"ref:date:year:{yr}",
+    ]
+    return " ".join(parts)
+
+
+def _fmt_month_year_ref(mon, yr):
+    """Partial ref: ref:date:month:name ref:date:year:N (no day)."""
+    month_name = _MONTHS[mon - 1]
+    return f"ref:date:month:{month_name} ref:date:year:{yr}"
 
 
 def _expand_relative_dates(text: str, session_date_str: str) -> str:
     """Append computed absolute dates for relative references in turn text.
 
     "yesterday I went bowling" + session "17 March 2022"
-    → "yesterday I went bowling [ref: 16 March 2022]"
+    → "... [ref:date:day:16 ref:date:month:march ref:date:year:2022]"
 
     "I've had them for 3 years" + session "27 March 2023"
-    → "I've had them for 3 years [ref: since ~2020]"
+    → "... [ref:date:year:~2020]"
 
-    Only fires when the session date is parseable. Appends a bracketed
-    [ref: ...] annotation so retrieval can match absolute date queries.
+    Structured ref:date:* compounds let the keyword extractor emit typed
+    tokens (ref:date:month:march) rather than bare 'march', preventing
+    IDF dilution from session-date prefixes that mention the same month
+    in every turn. Components stay grouped under ref:date:* so month:
+    and year: are always co-typed and cross-date collisions are minimal.
     Non-destructive — original content is unchanged."""
     parsed = _parse_session_date(session_date_str)
     if not parsed:
@@ -124,7 +144,6 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
 
     # "yesterday"
     if re.search(r'\byesterday\b', text, re.IGNORECASE):
-        # day - 1
         d, m, y = s_day - 1, s_mon, s_yr
         if d <= 0:
             m -= 1
@@ -133,29 +152,29 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
             days_in_prev = [31, 28 if y % 4 else 29, 31, 30, 31, 30,
                             31, 31, 30, 31, 30, 31][m - 1]
             d = days_in_prev
-        annotations.append(_fmt_date(d, m, y))
+        annotations.append(_fmt_date_ref(d, m, y))
 
     # "N years ago" or "for N years" (possession duration)
     m_ya = re.search(r'\b(\d+)\s+years?\b', text, re.IGNORECASE)
     if m_ya:
         n = int(m_ya.group(1))
-        annotations.append(f"~{s_yr - n}")
+        annotations.append(f"ref:date:year:~{s_yr - n}")
 
     # "N months ago" / "for N months"
     m_ma = re.search(r'\b(\d+)\s+months?\b', text, re.IGNORECASE)
     if m_ma:
         n = int(m_ma.group(1))
         _, rm, ry = _add_month(s_day, s_mon, s_yr, -n)
-        annotations.append(f"{_MONTHS[rm-1].capitalize()} {ry}")
+        annotations.append(_fmt_month_year_ref(rm, ry))
 
     # "last month"
     if re.search(r'\blast\s+month\b', text, re.IGNORECASE):
         _, rm, ry = _add_month(s_day, s_mon, s_yr, -1)
-        annotations.append(f"{_MONTHS[rm-1].capitalize()} {ry}")
+        annotations.append(_fmt_month_year_ref(rm, ry))
 
     # "last year"
     if re.search(r'\blast\s+year\b', text, re.IGNORECASE):
-        annotations.append(str(s_yr - 1))
+        annotations.append(f"ref:date:year:{s_yr - 1}")
 
     # "last week"
     if re.search(r'\blast\s+week\b', text, re.IGNORECASE):
@@ -167,17 +186,17 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
             days_in_prev = [31, 28 if y % 4 else 29, 31, 30, 31, 30,
                             31, 31, 30, 31, 30, 31][m - 1]
             d += days_in_prev
-        annotations.append(_fmt_date(d, m, y))
+        annotations.append(_fmt_date_ref(d, m, y))
 
     # "recently" / "a few weeks ago" / "a couple of months ago"
     if re.search(r'\ba few weeks? ago\b|\brecently\b|\ba couple of\b',
                  text, re.IGNORECASE):
-        annotations.append(f"~{_MONTHS[s_mon-1].capitalize()} {s_yr}")
+        annotations.append(_fmt_month_year_ref(s_mon, s_yr))
 
     if not annotations:
         return text
     deduped = list(dict.fromkeys(annotations))
-    return text + " [ref: " + ", ".join(deduped) + "]"
+    return text + " [" + " | ".join(deduped) + "]"
 
 
 def _clean_session_date(raw: str) -> str:
