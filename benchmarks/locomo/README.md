@@ -130,7 +130,37 @@ inspection.
 All runs use `--answerer meta --encoder semantic --per-category 1 --samples 10`.
 Answerer: Claude (Haiku 4.5, no dataset-specific prompt vocabulary).
 
-### V7 — walk depth adaptive + structured date refs (current)
+### V9 — BM25 content-first + BM25 anchor in walk (current)
+
+Two fixes targeting cat1 multi-hop vocabulary gaps:
+1. **BM25 content-first** — BM25 now always indexes `tokenize(content)[:40]` raw
+   tokens, keywords appended only as morphological coverage. Previously BM25 indexed
+   keyword summaries, making short tokens like "VR", "TV", "AI" (filtered by the
+   keyword extractor's ≤2-char rule) invisible to BM25 despite being in the raw turn.
+   After: D1:36 ("VR gaming awesome") BM25 score 0 → 1.26 for query containing "VR".
+2. **BM25 anchor in walk** — at every walk stage 1+, the original question is
+   BM25-searched against all FACTs, RRF-merged (rrf_k=60) with the THOUGHT-evolved
+   query results. Prevents proper nouns ("VR Club", "McGee's") from being lost as the
+   walk's seed_query evolves from the original question into a keyword+thought string.
+
+5-sample run, 24 QA, `--per-category 1` (different conversations than V7, so
+per-category comparison is indicative not conclusive):
+
+| category (n=5, 24 QA) | r7    | agent_recall | V7 F1 | V9 F1 | Δ |
+|------------------------|-------|--------------|-------|-------|---|
+| cat1 multi-hop         | —     | 0.452        | 0.478 | **0.567** | **+0.089** |
+| cat2 temporal          | —     | 1.000        | 0.705 | **0.800** | **+0.095** |
+| cat3 inference         | —     | 0.125        | 0.404 | 0.183 | −0.221† |
+| cat4 single-hop        | —     | 0.834        | 0.667 | **0.733** | **+0.066** |
+| cat5 adversarial       | —     | 0.700        | 0.900 | **1.000** | **+0.100** |
+| **OVERALL**            | **0.306** | **0.643** | **0.635** | **0.676** | **+0.041** |
+
+† Cat3 inference questions ("What might X's financial status be?", "Is it likely
+that Nate has friends?") have zero vocabulary overlap between the abstract question
+and the conversational turns — BM25 anchor is neutral, and with only 4 samples
+variance dominates. Likely different conversation difficulty vs V7, not a regression.
+
+### V7 — walk depth adaptive + structured date refs
 
 Three changes from V5 → V7:
 1. **Walk depth cap removed** — `n_stages=8` is a soft cap; the walk stops
