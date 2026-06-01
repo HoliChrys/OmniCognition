@@ -411,11 +411,20 @@ def nearest_facts_with_fallback(
         # rrf_k=60 (Cormack et al. 2009 canonical). The original-question
         # channel keeps its top ranks (so factual cat1/2/4 are stable);
         # HyDE only lifts items that ALSO match the hypothetical.
+        #
+        # NOTE: per-entity BM25 passes (one per entity_anchor) were tested
+        # and HURT retrieval — entity names appear in hundreds of turns in
+        # personal conversations (low IDF), so a per-name BM25 pass floods
+        # the pool with off-topic turns and pushes relevant ones out. The
+        # entity_anchors parameter is kept in the signature for callers but
+        # the BM25 passes are disabled. The benefit is delivered instead via
+        # the keyword-fallback in MetaWalker (entity names used as
+        # query_keywords when the extractor returns []), which gives a
+        # semantically targeted signal without the broad-name BM25 noise.
         rrf_k = 60
         has_anchor = bool(anchor_query and anchor_query != query_text)
-        has_entities = bool(entity_anchors)
         has_hyde = bool(hyde_passage_text)
-        if has_anchor or has_entities or has_hyde:
+        if has_anchor or has_hyde:
             rrf_scores: dict = {}
             pid_map: dict = {}
             for rank, (_, p) in enumerate(results):
@@ -428,18 +437,6 @@ def nearest_facts_with_fallback(
                 ):
                     rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
                     pid_map.setdefault(p.id, p)
-            if has_entities:
-                # One BM25 pass per entity name — ensures turns that mention
-                # entity X (even as speaker prefix) score for X's signal
-                # independently of the combined-query signal. Multiple
-                # entities each contribute 1/(rrf_k+rank) so the RRF score
-                # accumulates for turns that appear in several entity lists.
-                for entity in entity_anchors:
-                    for rank, (_, p) in enumerate(
-                        bm25_score(entity, fact_pts_bm25, k_pool=overfetch)
-                    ):
-                        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
-                        pid_map.setdefault(p.id, p)
             if has_hyde:
                 hyde_pool = retrieve_hybrid(
                     hyde_passage_text, search_points, overfetch, t_now,
