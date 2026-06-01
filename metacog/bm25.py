@@ -78,13 +78,19 @@ def bm25_score(
         return []
 
     # Build stemmed keyword-based documents for each point.
+    # Include content tokens so proper nouns / abbreviations absent from
+    # the keyword set (e.g. "VR" filtered as 2-letter) still get a BM25
+    # signal.  Content tokens are de-duped against keywords so they don't
+    # inflate IDF — the primary signal stays the keyword set.
     docs: List[List[str]] = []
     for p in points:
-        if p.keywords:
-            docs.append(stem_tokens([kw.lower() for kw in p.keywords]))
-        else:
-            # Fallback for points with no keywords: tokenize short content.
-            docs.append(stem_tokens(tokenize(p.content or "")[:20]))
+        kw_tokens = stem_tokens([kw.lower() for kw in p.keywords]) if p.keywords else []
+        content_tokens = stem_tokens(tokenize(p.content or "")[:30])
+        # Merge: keywords first (higher weight via position in avgdl), then
+        # content tokens not already covered.
+        kw_set = set(kw_tokens)
+        extra = [t for t in content_tokens if t not in kw_set]
+        docs.append(kw_tokens + extra[:10])
 
     non_empty = sum(1 for d in docs if d)
     if non_empty == 0:
