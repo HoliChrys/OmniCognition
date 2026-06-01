@@ -456,18 +456,12 @@ def retrieve_hybrid(
     content_pool.sort(key=lambda x: x[0], reverse=True)
     content_pool = content_pool[:pool_per_signal]
 
-    # Phase 2 — BM25 on point keywords + content tokens.
-    # query_keywords may drop short abbreviations like "VR", "TV", "AI"
-    # (≤2-char tokens filtered by the keyword extractor). Re-merge the
-    # raw query tokens so rare abbreviations still generate a BM25 signal.
-    from metacog.bm25 import tokenize as _bm25_tok
-    raw_q_tokens = _bm25_tok(query_text)
-    kw_set = {k.lower() for k in query_kw}
-    extra_raw = [t for t in raw_q_tokens if t.lower() not in kw_set]
-    bm25_query_kw = (list(query_kw) + extra_raw) if query_kw else None
+    # Phase 2 — BM25 on raw content text (pure lexical channel).
+    # bm25_score now always indexes content tokens — query_keywords are
+    # passed only to add stemmed-variant coverage on top of raw tokens.
     bm25_pool = bm25_score(
         query_text, points, k_pool=pool_per_signal,
-        query_keywords=bm25_query_kw,
+        query_keywords=query_kw or None,
     )
 
     # Phase 2b — fuzzy lexical (Levenshtein) : recovers morphological /

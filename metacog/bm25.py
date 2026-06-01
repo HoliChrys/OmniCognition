@@ -66,31 +66,30 @@ def bm25_score(
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Score points against the query and return the top k_pool by BM25.
 
-    Indexes on point KEYWORDS (already extracted, stop-word-free) with
-    minimal suffix-stripping on both sides so that morphological
-    variants (researching ↔ research, studied ↔ study) are matched.
+    Indexes on raw content tokens — BM25 is the pure lexical channel and
+    must always run on the actual text, not on the keyword summary.
+    Keywords are for the semantic embedding channel; BM25 handles verbatim
+    matches, rare tokens, abbreviations (VR, AI, TV), and proper nouns
+    that the keyword extractor may filter or miss.
 
-    query_keywords — if provided, use these pre-extracted keywords as the
-    query token set (symmetric with the points' keywords).  When absent,
-    tokenize query directly (used as a fallback in the meta-walk).
+    query_keywords — when provided, also appended to the raw query tokens
+    so the two channels reinforce each other on stemmed variants.
     """
     if not points:
         return []
 
-    # Build stemmed keyword-based documents for each point.
-    # Include content tokens so proper nouns / abbreviations absent from
-    # the keyword set (e.g. "VR" filtered as 2-letter) still get a BM25
-    # signal.  Content tokens are de-duped against keywords so they don't
-    # inflate IDF — the primary signal stays the keyword set.
+    # Index on raw content: always content-first, keywords appended for
+    # morphological coverage (stem variants the content tokeniser misses).
     docs: List[List[str]] = []
     for p in points:
-        kw_tokens = stem_tokens([kw.lower() for kw in p.keywords]) if p.keywords else []
-        content_tokens = stem_tokens(tokenize(p.content or "")[:30])
-        # Merge: keywords first (higher weight via position in avgdl), then
-        # content tokens not already covered.
-        kw_set = set(kw_tokens)
-        extra = [t for t in content_tokens if t not in kw_set]
-        docs.append(kw_tokens + extra[:10])
+        content_tokens = stem_tokens(tokenize(p.content or "")[:40])
+        if p.keywords:
+            kw_tokens = stem_tokens([kw.lower() for kw in p.keywords])
+            content_set = set(content_tokens)
+            extra_kw = [t for t in kw_tokens if t not in content_set]
+            docs.append(content_tokens + extra_kw[:8])
+        else:
+            docs.append(content_tokens)
 
     non_empty = sum(1 for d in docs if d)
     if non_empty == 0:
@@ -98,10 +97,13 @@ def bm25_score(
     avgdl = sum(len(d) for d in docs) / non_empty
     n_total = len(docs)
 
+    # Always start from raw query tokens; append extracted keywords for
+    # stemmed-variant coverage without losing verbatim terms.
+    q_tokens = stem_tokens(tokenize(query))
     if query_keywords:
-        q_tokens = stem_tokens([kw.lower() for kw in query_keywords])
-    else:
-        q_tokens = stem_tokens(tokenize(query))
+        kw_set = set(q_tokens)
+        q_tokens = q_tokens + [t for t in stem_tokens([k.lower() for k in query_keywords])
+                                if t not in kw_set]
     if not q_tokens:
         return []
 
