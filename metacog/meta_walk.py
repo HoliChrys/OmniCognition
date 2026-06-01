@@ -301,6 +301,7 @@ def nearest_facts_with_fallback(
     exclude_ids: Optional[set] = None,
     encoder: Any = None,
     extractor: Any = None,
+    anchor_query: Optional[str] = None,
 ) -> List[Point]:
     """FACT retrieval — delegates to the FULL hybrid pipeline.
 
@@ -313,6 +314,15 @@ def nearest_facts_with_fallback(
     re-derives its own signals from `query_text`) but kept in the
     signature for callers that still pass it.
 
+    anchor_query — the ORIGINAL question text (unchanged across stages).
+    At stage 1+ the walk's `query_text` is a composed THOUGHT whose
+    keywords may have drifted from the question's verbatim terms
+    (proper nouns, abbreviations). A second BM25 pass on `anchor_query`
+    anchors every stage on the verbatim question tokens and is RRF-merged
+    with the main results. This is the "mix agentic recall + BM25"
+    invariant: semantic drift is fine for the embedding channel but BM25
+    must always stay anchored on the original question.
+
     When `encoder`/`extractor` are not supplied we fall back to the old
     keyword-cosine + BM25 path (used by unit tests that call this
     helper directly without a full Memory).
@@ -321,6 +331,7 @@ def nearest_facts_with_fallback(
 
     if encoder is not None and extractor is not None:
         from metacog.geometry import retrieve_hybrid
+        from metacog.bm25 import bm25_score
         # Entity beacons (id "entity_*") are ingest-time pull agents : their
         # pull (first step 1/(1+0)=1.0) already lifted the real facts into
         # position, so they are never wanted in walk results. Crucially they
@@ -335,12 +346,34 @@ def nearest_facts_with_fallback(
         search_points = [p for p in points
                          if not p.id.startswith("entity_")
                          and "lateral_absorbed" not in p.tags]
+        overfetch = (k + len(exclude_ids)) * 5 + 20
         results = retrieve_hybrid(
-            query_text, search_points, (k + len(exclude_ids)) * 5 + 20, t_now,
+            query_text, search_points, overfetch, t_now,
             encoder=encoder, extractor=extractor,
             use_lineage=True, use_spreading=True, use_fuzzy=True,
             restrict_kind=PointKind.FACT,
         )
+
+        # BM25 anchor pass on the original question — runs every stage so
+        # verbatim proper nouns / abbreviations absent from the evolved
+        # THOUGHT still score. RRF-merge with the main results (rrf_k=60).
+        rrf_k = 60
+        if anchor_query and anchor_query != query_text:
+            anchor_pool = bm25_score(
+                anchor_query,
+                [p for p in search_points if p.kind == PointKind.FACT],
+                k_pool=overfetch,
+            )
+            rrf_scores: dict = {}
+            for rank, (_, p) in enumerate(results):
+                rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+            for rank, (_, p) in enumerate(anchor_pool):
+                rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+            pid_map = {p.id: p for _, p in results}
+            pid_map.update({p.id: p for _, p in anchor_pool})
+            merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
+            results = [(sc, pid_map[pid]) for pid, sc in merged if pid in pid_map]
+
         by_id = {p.id: p for p in points}
         out: List[Point] = []
         seen: set = set()
@@ -1269,6 +1302,7 @@ class MetaWalker:
             self.facts_per_stage, self.t_now,
             exclude_ids=self._visited_fact_ids,
             encoder=self._enc, extractor=self._extr,
+            anchor_query=self.query if seed_query != self.query else None,
         )
 
         # HyDE additive channel (stage 0 only) : retrieve a second fact
