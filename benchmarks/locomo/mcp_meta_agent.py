@@ -571,6 +571,75 @@ _COMPOUND_CUTTERS = [
 ]
 
 
+def _extract_ab_options(question: Optional[str]):
+    """Extract (opt_a, opt_b) from 'Would X enjoy A or B?' style questions.
+
+    Splits at the LAST ' or ' in the question, takes the last ≤4 words before it
+    as option A and the words up to '?' as option B. Returns None if not found
+    or if options look like full clauses (> 4 words each)."""
+    if not question:
+        return None
+    q = question.strip().rstrip("?").strip()
+    # Find the last ' or ' (case-insensitive) — the choice separator
+    lower_q = q.lower()
+    idx = lower_q.rfind(" or ")
+    if idx < 0:
+        return None
+    after = q[idx + 4:].strip()     # option B
+    before = q[:idx].strip()         # everything before "or"
+    # Take last ≤4 words of before as option A
+    before_words = before.split()
+    # Take last ≤4 words; strip leading stop-words (prepositions, articles,
+    # pronouns, auxiliaries, verbs) that are context, not the option name.
+    # E.g. "Would Sarah prefer coffee" → last 4 → strip context → "coffee"
+    #      "reading books by C. S. Lewis" → last 4 → strip "by" → "C. S. Lewis"
+    _STOP = {
+        "by", "in", "at", "on", "the", "a", "an", "from", "to", "of",
+        "with", "about", "for", "reading", "watching", "listening",
+        "would", "could", "should", "prefer", "enjoy", "like", "love",
+        "choose", "pick", "select", "between",
+        "he", "she", "they", "we", "i", "you", "it",
+    }
+    raw_a = before_words[-4:] if before_words else []
+    while raw_a and raw_a[0].lower().rstrip(".,") in _STOP:
+        raw_a = raw_a[1:]
+    # Also strip leading proper-noun subject (single capitalized word before verb)
+    # e.g. ["Sarah", "prefer", "coffee"] → strip "Sarah" since "prefer" follows
+    if (len(raw_a) >= 2
+            and raw_a[0][0].isupper()
+            and raw_a[1].lower().rstrip(".,") in _STOP):
+        raw_a = raw_a[1:]
+        while raw_a and raw_a[0].lower().rstrip(".,") in _STOP:
+            raw_a = raw_a[1:]
+    opt_a = " ".join(raw_a) if raw_a else ""
+    opt_b = after
+    # Sanity: both options must be plausible labels (1-4 words, not a clause)
+    if (not opt_a or not opt_b
+            or len(opt_a.split()) > 4 or len(opt_b.split()) > 4):
+        return None
+    # Reject if option B looks like a clause (contains a verb pattern)
+    if re.search(r"\b(?:is|are|was|were|have|has|would|could|should)\b",
+                 opt_b, re.IGNORECASE):
+        return None
+    return opt_a, opt_b
+
+
+def _ab_choice_hint(question: Optional[str]) -> str:
+    """Return a forced-final hint when the question presents exactly two options.
+
+    "Would X enjoy A or B?" → model must output one of the two option names,
+    not "Likely yes". Returns the hint string, or "" if pattern not found."""
+    opts = _extract_ab_options(question)
+    if not opts:
+        return ""
+    opt_a, opt_b = opts
+    return (
+        f"CHOICE QUESTION — the two options are '{opt_a}' and '{opt_b}'. "
+        f"Pick EXACTLY ONE by name. Do NOT write 'Likely yes'. "
+        f"Value must be '{opt_a}' or '{opt_b}' (verbatim). "
+    )
+
+
 def terse(text: str, question: Optional[str] = None) -> str:
     """Strip Haiku's preamble/interjection wrapping. Mirrors the helper
     in mcp_agent.py — keeps the bare value the F1 metric scores on.
@@ -716,6 +785,20 @@ def terse(text: str, question: Optional[str] = None) -> str:
             t = m_inf.group(0).strip().rstrip(".,;")
     # Drop any leaked dialog-id citation, then tidy leftover punctuation.
     t = _DIALOG_ID_RE.sub("", t).strip(" .,()")
+    # Binary A-or-B choice detection: "Would X enjoy A or B?" → pick the ONE option.
+    # When the question gives exactly two options and the answer is "Likely yes/no, ..."
+    # the agent should output just the chosen option name (not "Likely yes").
+    _ab_opts = _extract_ab_options(question)
+    if _ab_opts and re.match(r"^\s*likely\s+(?:yes|no)\b", t, re.IGNORECASE):
+        opt_a, opt_b = _ab_opts
+        tl = t.lower()
+        a_hit = opt_a.lower() in tl
+        b_hit = opt_b.lower() in tl
+        if a_hit and not b_hit:
+            t = opt_a
+        elif b_hit and not a_hit:
+            t = opt_b
+        # both or neither → fall through to normal processing
     # Trim overlong "Likely yes/no, [very long clause]" inference answers.
     # Gold answers for "Would X enjoy Y?" are typically 2-5 words.
     # Cap at 6 words after "Likely yes/no,": "Likely yes, classical music."
@@ -844,7 +927,8 @@ class McpMetaAgent:
                             messages=messages + [{
                                 "role": "user",
                                 "content": (
-                                    "Call final_answer with the bare value, "
+                                    _ab_choice_hint(question)
+                                    + "Call final_answer with the bare value, "
                                     "following the format rules (absolute "
                                     "calendar date for 'when'; shortest label; "
                                     + (
@@ -955,7 +1039,8 @@ class McpMetaAgent:
                             messages=messages + [{
                                 "role": "user",
                                 "content": (
-                                    "Call final_answer with the BARE value only, "
+                                    _ab_choice_hint(question)
+                                    + "Call final_answer with the BARE value only, "
                                     "no narration, no lists, no 'the walk found'. "
                                     "KEEP the most concrete noun(s) from your "
                                     "evidence (e.g. 'teammates', 'video game "
@@ -1065,7 +1150,8 @@ class McpMetaAgent:
                     messages.append({
                         "role": "user",
                         "content": (
-                            f"Walk finished.{ev_ctx}"
+                            _ab_choice_hint(question)
+                            + f"Walk finished.{ev_ctx}"
                             "Call final_answer now with the bare value, "
                             "copied verbatim from the evidence."
                         ),
@@ -1095,7 +1181,8 @@ class McpMetaAgent:
                     messages=messages + [{
                         "role": "user",
                         "content": (
-                            f"Stop searching.{forced_evidence}"
+                            _ab_choice_hint(question)
+                            + f"Stop searching.{forced_evidence}"
                             "Call final_answer with the bare value, copied "
                             "verbatim from the evidence."
                         ),
