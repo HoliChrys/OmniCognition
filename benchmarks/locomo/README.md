@@ -143,28 +143,25 @@ Three changes from V5 → V7:
    prefix `[17 March 2022]` that appears in every turn.
 3. Entity beacons (`--entities`) — opt-in; not included in the numbers below.
 
-| category (n=10 balanced) | V5 F1 | V7 F1 | Δ |
-|--------------------------|-------|-------|---|
-| cat1 multi-hop           | 0.600 | 0.507 | −0.093 |
-| cat2 temporal            | 0.800 | 0.800 |  0.000 |
-| cat3 inference           | 0.045 | 0.243 | +0.197 |
-| cat4 single-hop          | 0.533 | 0.733 | +0.200 |
-| cat5 adversarial         | 0.800 | 0.800 |  0.000 |
-| **OVERALL**              | **0.599** | **0.632** | **+0.033** |
+| category (n=10 balanced, 49 QA) | r7    | agent_recall | V5 F1 | V7 F1 | Δ |
+|----------------------------------|-------|--------------|-------|-------|---|
+| cat1 multi-hop                   | 0.190 | 0.363        | 0.600 | 0.478 | −0.122 |
+| cat2 temporal                    | 0.400 | 0.700        | 0.800 | 0.705 | −0.095 |
+| cat3 inference                   | 0.167 | 0.444        | 0.045 | **0.404** | **+0.359** |
+| cat4 single-hop                  | 0.367 | 0.883        | 0.533 | 0.667 | +0.134 |
+| cat5 adversarial                 | 0.050 | 0.850        | 0.800 | **0.900** | +0.100 |
+| **OVERALL**                      | **0.236** | **0.652** | **0.599** | **0.635** | **+0.036** |
 
-> V7 partial (6/10 samples; full 10-sample run in progress when committed).
+**Retrieval gap** — r7 = 0.236 → agent_recall = 0.652 (×2.8). The walk finds
+evidence the static top-7 retriever misses entirely. Cat5 adversarial
+agent_recall=0.850 with F1=0.900 shows correct "not mentioned" abstention.
+Cat3 inference +0.359 is the dominant gain: deeper walks allow multi-hop
+indirect evidence chains that a single retrieval pass cannot surface.
 
-**Retrieval gap** (first 6 samples, V7):
-
-| metric         | value |
-|----------------|-------|
-| Recall@7       | 0.24  |
-| **agent_recall** | **0.66** |
-
-The walk finds evidence the static top-7 retriever misses — two conversations
-(conv-30, conv-44) had r7=0 but agent_recall=0.70–0.75. This is the
-multi-hop cascade working: a date-ref beacon or a basketball turn co-locates
-adjacent turns that are invisible to single-pass cosine.
+Cat1/cat2 regressions (~0.1) are under investigation — likely LLM
+non-determinism in Chain-of-Note relevance judgments on a deeper walk
+occasionally drifting from the correct answer cluster. Entity beacons
+(`--entities`) are the next planned recall handle for temporal (cat2).
 
 ### V5 baseline (walk depth=3, plain date strings)
 

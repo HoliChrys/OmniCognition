@@ -50,9 +50,11 @@ The walk has **no hard depth cap**. It stops naturally when no new unseen
 facts are available (`fact_star = None → done = True`), which is the
 `|seen ∩ gold| / |gold| = 1` proxy at inference time. `n_stages = 8` is a
 soft ceiling; at least 3 stages are always explored before natural stopping
-kicks in. On LoCoMo this produces a measured jump from Recall@7 = 0.24
-(static top-7) to agent_recall = 0.66 — the walk finds evidence the
-single-pass retriever misses entirely.
+kicks in. On LoCoMo (49 QA, 10 conversations, 5 balanced categories) this
+produces a measured jump from Recall@7 = 0.24 (static top-7) to
+agent_recall = 0.65 — the walk finds 2.8× more evidence than a single-pass
+retriever, with cat3 inference rising from F1=0.045 to 0.404 (+0.359) and
+overall F1 from 0.599 to 0.635.
 
 ## One emergent law, four consolidations
 
