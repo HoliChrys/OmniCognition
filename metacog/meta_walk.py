@@ -1249,11 +1249,13 @@ class MetaWalker:
         q_kws = self._extr.extract(query, n=8) if self._extr else []
         # The keyword extractor returns [] for pure-question inputs like
         # "What do X and Y have in common?" (no indexable content). When
-        # that happens, fall back to the entity anchors so the seed is a
-        # proper keyword embedding rather than a full-sentence one.
-        # Without this, the σ-path hop from stage-0 (full-sentence) to
-        # stage-1 (thought keywords) is enormous and triggers early stop.
-        if not q_kws and self._entity_anchors:
+        # that happens, fall back to the entity anchors ONLY when there are
+        # 2+ entities — comparison/multi-hop questions where the full-sentence
+        # embedding is weak because it asks about the INTERSECTION.
+        # For single-entity questions ("What did Caroline research?") the
+        # full-sentence embedding captures both entity+activity and is
+        # stronger than a single-name keyword embedding.
+        if not q_kws and len(self._entity_anchors) >= 2:
             q_kws = list(self._entity_anchors)
         self._query_keywords = q_kws
         pwe0 = position_weighted_keyword_embedding(q_kws, self._enc) if q_kws else None
