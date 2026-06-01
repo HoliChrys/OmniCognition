@@ -59,6 +59,126 @@ def load_locomo(path: str) -> List[Dict[str, Any]]:
 
 _DATE_AFTER_ON_RE = re.compile(r"\bon\s+(.+)$")
 
+_MONTHS = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+]
+_MONTH_NUM = {m: i + 1 for i, m in enumerate(_MONTHS)}
+
+
+def _parse_session_date(s: str):
+    """'17 March 2022' or '27 March 2023' → (day, month_int, year) or None."""
+    if not s:
+        return None
+    parts = s.strip().split()
+    if len(parts) == 3:
+        try:
+            day = int(parts[0])
+            mon = _MONTH_NUM.get(parts[1].lower().rstrip(","))
+            yr = int(parts[2])
+            if mon and 2000 < yr < 2100:
+                return (day, mon, yr)
+        except ValueError:
+            pass
+    elif len(parts) == 2:
+        try:
+            mon = _MONTH_NUM.get(parts[0].lower().rstrip(","))
+            yr = int(parts[1])
+            if mon and 2000 < yr < 2100:
+                return (1, mon, yr)
+        except ValueError:
+            pass
+    return None
+
+
+def _add_month(day, mon, yr, n_months):
+    """Add n_months to (day, mon, yr), return (day, mon, yr)."""
+    total_month = (mon - 1) + n_months
+    yr += total_month // 12
+    mon = (total_month % 12) + 1
+    return day, mon, yr
+
+
+def _fmt_date(day, mon, yr):
+    month_name = _MONTHS[mon - 1].capitalize()
+    return f"{day} {month_name} {yr}"
+
+
+def _expand_relative_dates(text: str, session_date_str: str) -> str:
+    """Append computed absolute dates for relative references in turn text.
+
+    "yesterday I went bowling" + session "17 March 2022"
+    → "yesterday I went bowling [ref: 16 March 2022]"
+
+    "I've had them for 3 years" + session "27 March 2023"
+    → "I've had them for 3 years [ref: since ~2020]"
+
+    Only fires when the session date is parseable. Appends a bracketed
+    [ref: ...] annotation so retrieval can match absolute date queries.
+    Non-destructive — original content is unchanged."""
+    parsed = _parse_session_date(session_date_str)
+    if not parsed:
+        return text
+    s_day, s_mon, s_yr = parsed
+    annotations = []
+
+    # "yesterday"
+    if re.search(r'\byesterday\b', text, re.IGNORECASE):
+        # day - 1
+        d, m, y = s_day - 1, s_mon, s_yr
+        if d <= 0:
+            m -= 1
+            if m <= 0:
+                m, y = 12, y - 1
+            days_in_prev = [31, 28 if y % 4 else 29, 31, 30, 31, 30,
+                            31, 31, 30, 31, 30, 31][m - 1]
+            d = days_in_prev
+        annotations.append(_fmt_date(d, m, y))
+
+    # "N years ago" or "for N years" (possession duration)
+    m_ya = re.search(r'\b(\d+)\s+years?\b', text, re.IGNORECASE)
+    if m_ya:
+        n = int(m_ya.group(1))
+        annotations.append(f"~{s_yr - n}")
+
+    # "N months ago" / "for N months"
+    m_ma = re.search(r'\b(\d+)\s+months?\b', text, re.IGNORECASE)
+    if m_ma:
+        n = int(m_ma.group(1))
+        _, rm, ry = _add_month(s_day, s_mon, s_yr, -n)
+        annotations.append(f"{_MONTHS[rm-1].capitalize()} {ry}")
+
+    # "last month"
+    if re.search(r'\blast\s+month\b', text, re.IGNORECASE):
+        _, rm, ry = _add_month(s_day, s_mon, s_yr, -1)
+        annotations.append(f"{_MONTHS[rm-1].capitalize()} {ry}")
+
+    # "last year"
+    if re.search(r'\blast\s+year\b', text, re.IGNORECASE):
+        annotations.append(str(s_yr - 1))
+
+    # "last week"
+    if re.search(r'\blast\s+week\b', text, re.IGNORECASE):
+        d, m, y = s_day - 7, s_mon, s_yr
+        if d <= 0:
+            m -= 1
+            if m <= 0:
+                m, y = 12, y - 1
+            days_in_prev = [31, 28 if y % 4 else 29, 31, 30, 31, 30,
+                            31, 31, 30, 31, 30, 31][m - 1]
+            d += days_in_prev
+        annotations.append(_fmt_date(d, m, y))
+
+    # "recently" / "a few weeks ago" / "a couple of months ago"
+    if re.search(r'\ba few weeks? ago\b|\brecently\b|\ba couple of\b',
+                 text, re.IGNORECASE):
+        annotations.append(f"~{_MONTHS[s_mon-1].capitalize()} {s_yr}")
+
+    if not annotations:
+        return text
+    deduped = list(dict.fromkeys(annotations))
+    return text + " [ref: " + ", ".join(deduped) + "]"
+
 
 def _clean_session_date(raw: str) -> str:
     """'1:56 pm on 8 May, 2023' → '8 May 2023'.
@@ -139,9 +259,13 @@ def ingest_conversation(
             dia_id = turn.get("dia_id")
             if not text or not dia_id:
                 continue
+            # Expand relative date references → absolute dates for retrieval.
+            # Only when with_dates=True (we have a session date to compute from).
+            expanded = (_expand_relative_dates(text, session_date)
+                        if with_dates and session_date else text)
             try:
                 memory.ingest(
-                    content=f"{prefix}{speaker}: {text}",
+                    content=f"{prefix}{speaker}: {expanded}",
                     kind="FACT",
                     id=dia_id,
                     sequence_prev=prev_id,
