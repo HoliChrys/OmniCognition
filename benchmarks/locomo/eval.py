@@ -441,6 +441,7 @@ def evaluate_sample(
             overall["agent_recall"] = round(
                 total["agent_recall"] / total["agent_recall_n"], 4
             )
+            overall["agent_recall_n"] = total["agent_recall_n"]
         if total["tokens_in"] or total["tokens_out"]:
             overall["tokens_in_per_qa"] = round(total["tokens_in"] / total["n"], 1)
             overall["tokens_out_per_qa"] = round(total["tokens_out"] / total["n"], 1)
@@ -569,6 +570,7 @@ def main():
 
     results = []
     overall = {"n": 0, "recall_at_5": 0.0, "recall_at_7": 0.0, "f1": 0.0,
+               "agent_recall": 0.0, "agent_recall_n": 0,
                "tokens_in": 0.0, "tokens_out": 0.0, "steps": 0.0}
     t0 = time.time()
     for i, sample in enumerate(data[: args.samples]):
@@ -603,6 +605,10 @@ def main():
             overall["recall_at_5"] += o["recall_at_5"] * o["n"]
             overall["recall_at_7"] += o["recall_at_7"] * o["n"]
             overall["f1"] += o["f1"] * o["n"]
+            if "agent_recall" in o and "agent_recall_n" in o:
+                ar_n = o["agent_recall_n"]
+                overall["agent_recall"] += o["agent_recall"] * ar_n
+                overall["agent_recall_n"] += ar_n
             if "tokens_in_per_qa" in o:
                 overall["tokens_in"] += o["tokens_in_per_qa"] * o["n"]
                 overall["tokens_out"] += o["tokens_out_per_qa"] * o["n"]
@@ -619,8 +625,11 @@ def main():
             "recall_at_5": round(overall["recall_at_5"] / overall["n"], 4),
             "recall_at_7": round(overall["recall_at_7"] / overall["n"], 4),
             "f1": round(overall["f1"] / overall["n"], 4),
-            "elapsed_seconds": round(time.time() - t0, 2),
         }
+        if overall.get("agent_recall_n"):
+            agg["agent_recall"] = round(
+                overall["agent_recall"] / overall["agent_recall_n"], 4)
+        agg["elapsed_seconds"] = round(time.time() - t0, 2)
         if overall["tokens_in"] or overall["tokens_out"]:
             n = overall["n"]
             agg["tokens_in_per_qa"] = round(overall["tokens_in"] / n, 1)
