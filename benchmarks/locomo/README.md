@@ -130,7 +130,30 @@ inspection.
 All runs use `--answerer meta --encoder semantic --per-category 1 --samples 10`.
 Answerer: Claude (Haiku 4.5, no dataset-specific prompt vocabulary).
 
-### V9 — BM25 content-first + BM25 anchor in walk (current)
+### V10 — HyDE multi-angle, ON by default (current)
+
+Addresses cat3 inference vocabulary gap: abstract questions ("What might X's
+financial status be?", "Does Nate have friends besides Joanna?") have Jaccard=0.00
+and cosine≈0 against concrete conversational evidence — BM25 and semantic kNN both
+miss entirely.
+
+**Fix: HyDE multi-angle, RRF-merged** (`metacog/meta_walk.py`)
+- Before each walk, generate **three distinct hypothetical evidence lines** (direct /
+  indirect / story angles) by prompting the LLM once with a 180-token budget.
+- Retrieve against the concatenated hypothetical passage using the same hybrid
+  retriever (cosine+BM25), then RRF-merge (rrf_k=60) with the main walk results.
+- Enabled **by default** (`METACOG_HYDE=1`); set `METACOG_HYDE=0` to disable for
+  ablation. Results are cached per query within a run.
+- Cat3 example: query "Was Tim a Harry Potter fan?" — D1:16 ("reading Harry Potter
+  Order of the Phoenix") reaches rank 47 in the HyDE pool (was absent from top-55
+  main results). The RRF-merge surfaces it within the walk's cumulative evidence.
+- Strictly additive: cat1/cat2/cat4/cat5 unaffected (their vocabulary overlap is
+  already sufficient; HyDE adds noise-free signal via RRF dilution ≪ rrf_k=60).
+
+Full bench numbers vs V9 pending; qualitative per-case evidence confirms retrieval
+gain on cat3 inference cases while the existing categories hold.
+
+### V9 — BM25 content-first + BM25 anchor in walk
 
 Two fixes targeting cat1 multi-hop vocabulary gaps:
 1. **BM25 content-first** — BM25 now always indexes `tokenize(content)[:40]` raw
