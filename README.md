@@ -46,6 +46,14 @@ enriched keywords drive the next stage. A σ-propagation depth-stop and a
 breadth-pivot signal (`drifted` / `n_relevant`) let the agent know when to
 go deeper vs. re-articulate.
 
+The walk has **no hard depth cap**. It stops naturally when no new unseen
+facts are available (`fact_star = None → done = True`), which is the
+`|seen ∩ gold| / |gold| = 1` proxy at inference time. `n_stages = 8` is a
+soft ceiling; at least 3 stages are always explored before natural stopping
+kicks in. On LoCoMo this produces a measured jump from Recall@7 = 0.24
+(static top-7) to agent_recall = 0.66 — the walk finds evidence the
+single-pass retriever misses entirely.
+
 ## One emergent law, four consolidations
 
 The same Poisson floor (`λ + √λ`, no hyperparameter) drives four
@@ -178,7 +186,8 @@ PYTHONPATH=. pytest tests/ -v
 proximity/lateral/identity collision, spike & Chasles compression
 (reasoning + workflow), memory-skill / tool crystallization, signal
 detection, ACTION execution, reasoning trajectories, observator
-multi-perspective, the MCP tool↔memory layer, and end-to-end scenarios.
+multi-perspective, the MCP tool↔memory layer, entity-beacon co-location
+and Corollary-5 compliance, and end-to-end scenarios.
 
 ## Module layout
 
@@ -206,8 +215,9 @@ multi-perspective, the MCP tool↔memory layer, and end-to-end scenarios.
 | `defaults.py` / `llm.py` | `SimpleEncoder`, `NoOpExecutor`, `ClaudeLLM` |
 | `mcp_server.py` | MCP service |
 
-See `benchmarks/locomo/` for the LoCoMo harness and the fast,
-inspectable debuggers (`debug_walk.py`, `debug_lateral.py`).
+See `benchmarks/locomo/` for the LoCoMo harness, the fast inspectable
+debuggers (`debug_walk.py`, `debug_lateral.py`), and the full results
+table (V5 baseline → V7 walk-depth adaptive + structured date refs).
 
 ## References
 

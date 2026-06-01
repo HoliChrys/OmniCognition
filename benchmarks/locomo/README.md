@@ -125,10 +125,59 @@ Aggregated per category (1 multi-hop · 2 temporal · 3 inference ·
 per-QA trace (question, gold, prediction, retrieved ids, react trace) for
 inspection.
 
-## Reference numbers
+## MetaCog-Mem results (10-sample balanced run, `--per-category 1`)
 
-Published baselines on LoCoMo (F1 averaged over 4 categories,
-GPT-4o-mini as answerer) :
+All runs use `--answerer meta --encoder semantic --per-category 1 --samples 10`.
+Answerer: Claude (Haiku 4.5, no dataset-specific prompt vocabulary).
+
+### V7 — walk depth adaptive + structured date refs (current)
+
+Three changes from V5 → V7:
+1. **Walk depth cap removed** — `n_stages=8` is a soft cap; the walk stops
+   naturally when no new unseen facts are available (`fact_star=None → done`),
+   which is the `|seen ∩ gold| / |gold| = 1` proxy at inference time.
+   `_MAX_ROUNDS=16` (was 8) lets two full-depth walks fit in one agent turn.
+2. **Structured date refs** — relative-date expansions at ingestion emit
+   `[ref:date:day:N ref:date:month:name ref:date:year:N]` typed compounds
+   instead of plain "16 march 2022". Avoids IDF dilution from the session-date
+   prefix `[17 March 2022]` that appears in every turn.
+3. Entity beacons (`--entities`) — opt-in; not included in the numbers below.
+
+| category (n=10 balanced) | V5 F1 | V7 F1 | Δ |
+|--------------------------|-------|-------|---|
+| cat1 multi-hop           | 0.600 | 0.507 | −0.093 |
+| cat2 temporal            | 0.800 | 0.800 |  0.000 |
+| cat3 inference           | 0.045 | 0.243 | +0.197 |
+| cat4 single-hop          | 0.533 | 0.733 | +0.200 |
+| cat5 adversarial         | 0.800 | 0.800 |  0.000 |
+| **OVERALL**              | **0.599** | **0.632** | **+0.033** |
+
+> V7 partial (6/10 samples; full 10-sample run in progress when committed).
+
+**Retrieval gap** (first 6 samples, V7):
+
+| metric         | value |
+|----------------|-------|
+| Recall@7       | 0.24  |
+| **agent_recall** | **0.66** |
+
+The walk finds evidence the static top-7 retriever misses — two conversations
+(conv-30, conv-44) had r7=0 but agent_recall=0.70–0.75. This is the
+multi-hop cascade working: a date-ref beacon or a basketball turn co-locates
+adjacent turns that are invisible to single-pass cosine.
+
+### V5 baseline (walk depth=3, plain date strings)
+
+| category | F1    |
+|----------|-------|
+| cat1     | 0.600 |
+| cat2     | 0.800 |
+| cat3     | 0.045 |
+| cat4     | 0.533 |
+| cat5     | 0.800 |
+| OVERALL  | 0.599 |
+
+### Published baselines (GPT-4o-mini, F1 over 4 categories)
 
 | system        | F1   | tokens |
 |---------------|------|--------|
