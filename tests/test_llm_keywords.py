@@ -113,15 +113,23 @@ def test_cache_keyed_by_n():
 # ---------- K7 ------------------------------------------------------------
 
 
-def test_extract_returns_empty_on_api_failure():
+def test_extract_falls_back_on_api_failure():
+    # On API failure we no longer silently return [] (the original bug :
+    # one 529 poisoned the cache with [] for every subsequent call for
+    # that text, and downstream cosine retrieval then fell back to the
+    # raw sentence embedding which mismatches the keyword-embedding
+    # space). The extractor now delegates to the deterministic
+    # SimpleKeywordExtractor so retrieval always has real keywords.
     with patch("anthropic.Anthropic") as mock_cls:
         client = MagicMock()
         client.messages.create.side_effect = Exception("rate limit")
         mock_cls.return_value = client
         ext = LLMKeywordExtractor(api_key="test")
     ext.client.messages.create.side_effect = Exception("rate limit")
-    kws = ext.extract("anything", n=5)
-    assert kws == []
+    kws = ext.extract("Alpha and Beta met in Sweden", n=5)
+    # SimpleKeywordExtractor picks up the proper nouns deterministically.
+    assert "sweden" in kws
+    assert "beta" in kws
 
 
 # ---------- K8 ------------------------------------------------------------

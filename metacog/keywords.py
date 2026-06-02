@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import List, Optional, Protocol
 
 from metacog.epistemic import SourceClass
@@ -213,6 +214,24 @@ class LLMKeywordExtractor:
             "CLAUDE_KW_MODEL", "claude-haiku-4-5-20251001",
         )
         self.max_tokens = max_tokens
+        # Deterministic fallback when the LLM returns nothing (rate limit,
+        # transient 529, or genuinely terse input it judges as having
+        # no informative keywords — e.g. a question composed mostly of
+        # stop words). Without this, retrieval falls back to the raw
+        # sentence embedding, which mismatches the keyword-embedding
+        # space the indexed points live in.
+        self._fallback = SimpleKeywordExtractor()
+        # Retryable transient API errors (overloaded / 5xx).
+        try:
+            self._retryable = tuple(
+                e for e in (
+                    getattr(anthropic, "OverloadedError", None),
+                    getattr(anthropic, "InternalServerError", None),
+                )
+                if e is not None
+            )
+        except Exception:
+            self._retryable = ()
         self._cache: dict[str, List[str]] = {}
 
     def extract(self, text: str, n: int = 5) -> List[str]:
@@ -226,19 +245,25 @@ class LLMKeywordExtractor:
             f"Extract up to {n} keywords from this text:\n{text}\n\n"
             f"Output: lowercase comma-separated, max {n} items."
         )
-        try:
-            resp = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self._SYSTEM,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            raw = resp.content[0].text if resp.content else ""
-        except Exception:
-            # If the LLM call fails (no API key, rate limit), fall back
-            # to silence — the system stays usable, just with no
-            # LLM-extracted keywords for this chunk.
-            return []
+        raw = ""
+        for attempt in range(4):
+            try:
+                resp = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    system=self._SYSTEM,
+                    messages=[{"role": "user", "content": user_msg}],
+                )
+                raw = resp.content[0].text if resp.content else ""
+                break
+            except Exception as exc:
+                # Retry transient 5xx / overloaded ; on any other failure
+                # bail to the deterministic fallback below.
+                if self._retryable and isinstance(exc, self._retryable):
+                    time.sleep(2 ** attempt)
+                    continue
+                raw = ""
+                break
 
         # Strip code fences if any, then split on commas
         raw = raw.strip()
@@ -246,8 +271,19 @@ class LLMKeywordExtractor:
         if m:
             raw = m.group(1).strip()
         kws = [w.strip().lower() for w in raw.split(",") if w.strip()]
-        # Drop trailing punctuation
         kws = [w.rstrip(".;:!?") for w in kws if w.rstrip(".;:!?")]
         kws = kws[:n]
+
+        # If the LLM produced nothing usable, fall back to the
+        # deterministic SimpleKeywordExtractor. Never CACHE an empty
+        # result — a transient failure must not poison subsequent calls
+        # for the same text (the original bug : one 529 would silently
+        # zero out every query for that string for the rest of the run).
+        if not kws:
+            kws = self._fallback.extract(text, n=n)
+            if not kws:
+                return []
+            return kws
+
         self._cache[cache_key] = kws
         return kws
