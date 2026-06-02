@@ -196,13 +196,22 @@ class LLMEntityExtractor:
         try:
             raw = self.llm.generate(text, max_tokens=self.max_tokens)
         except Exception:
+            # Don't cache — a transient API failure must not permanently
+            # zero entity extraction for this text. Same bug class as
+            # LLMKeywordExtractor had : empty cached → every subsequent
+            # call for the same text returns [] for the rest of the run.
             return []
 
         ents = self._parse(raw)
-        with self._lock:
-            self._cache[text] = ents
-            self._dirty += 1
-            self._flush_disk_cache()
+        # Only cache on a successful, non-empty parse. Empty results
+        # could stem from a transient LLM hiccup or a malformed response ;
+        # caching them poisons future calls and there is no way for the
+        # caller to recover.
+        if ents:
+            with self._lock:
+                self._cache[text] = ents
+                self._dirty += 1
+                self._flush_disk_cache()
         return ents
 
     # ------------------------------------------------------------------

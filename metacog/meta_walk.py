@@ -165,7 +165,11 @@ def hyde_passage(query: str, llm: Any) -> str:
             passage = " ".join(lines[:3])
         except Exception:
             passage = ""
-    _HYDE_CACHE[q] = passage
+    # Only cache successful, non-empty passages. A transient 529 or empty
+    # response must not permanently disable HyDE for this query for the
+    # rest of the run.
+    if passage:
+        _HYDE_CACHE[q] = passage
     return passage
 # Match the system retrieval budget (k=7) so a walk's stage-0 facts are
 # the same top-k a single-shot retrieve would return — the walk can then

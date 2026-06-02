@@ -39,7 +39,37 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
+
+try:
+    import anthropic as _ant_mod
+    _RETRYABLE_API_ERRORS = tuple(
+        e for e in (
+            getattr(_ant_mod, "OverloadedError", None),
+            getattr(_ant_mod, "InternalServerError", None),
+        )
+        if e is not None
+    )
+except ImportError:
+    _RETRYABLE_API_ERRORS = ()
+
+
+def _create_with_retry(client, **kwargs):
+    """Up to 4 retries with exponential backoff on transient API errors
+    (529 overloaded, 5xx). Prevents a single Anthropic-side blip from
+    crashing the whole QA agentic loop."""
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(4):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if _RETRYABLE_API_ERRORS and isinstance(exc, _RETRYABLE_API_ERRORS):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise last_exc
 
 # NOTE: `mcp` and `metacog.mcp_server` are imported lazily inside
 # _answer_async so that the lightweight helpers (terse, credential
@@ -279,7 +309,7 @@ class McpReactAgent:
             answer_text = ""
 
             for round_idx in range(self.max_rounds):
-                resp = self.client.messages.create(
+                resp = _create_with_retry(self.client, 
                     model=self.model,
                     max_tokens=self.max_tokens,
                     system=AGENT_SYSTEM,
@@ -374,7 +404,7 @@ class McpReactAgent:
     def _extract_value(self, question: str, verbose_answer: str):
         """One small call : distill a verbose answer to the bare value."""
         try:
-            resp = self.client.messages.create(
+            resp = _create_with_retry(self.client, 
                 model=self.model,
                 max_tokens=40,
                 system=EXTRACT_SYSTEM,
@@ -396,7 +426,7 @@ class McpReactAgent:
             "role": "user",
             "content": "Stop searching. Give the final answer now, text only.",
         })
-        resp = self.client.messages.create(
+        resp = _create_with_retry(self.client, 
             model=self.model,
             max_tokens=self.max_tokens,
             system=AGENT_SYSTEM,

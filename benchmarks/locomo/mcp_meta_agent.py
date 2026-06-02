@@ -23,7 +23,40 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
+
+try:
+    import anthropic as _ant_mod
+    _RETRYABLE_API_ERRORS = tuple(
+        e for e in (
+            getattr(_ant_mod, "OverloadedError", None),
+            getattr(_ant_mod, "InternalServerError", None),
+        )
+        if e is not None
+    )
+except ImportError:
+    _RETRYABLE_API_ERRORS = ()
+
+
+def _create_with_retry(client, **kwargs):
+    """Call client.messages.create with up to 4 retries on transient API
+    errors (529 overloaded / 5xx). Without this, a single momentary
+    Anthropic-side hiccup crashes the entire QA — and worse, the failure
+    is indistinguishable from "agent gave up", so the bench reports
+    empty answers as a model issue when the real cause was an API
+    server-side blip."""
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(4):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if _RETRYABLE_API_ERRORS and isinstance(exc, _RETRYABLE_API_ERRORS):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise last_exc
 
 
 _DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
@@ -880,7 +913,7 @@ class McpMetaAgent:
             last_relevant_collected: List[dict] = []  # for forced-final evidence
 
             for round_idx in range(self.max_rounds):
-                resp = self.client.messages.create(
+                resp = _create_with_retry(self.client, 
                     model=self.model,
                     max_tokens=self.max_tokens,
                     temperature=0,
@@ -920,7 +953,7 @@ class McpMetaAgent:
                     elif len(raw.split()) > 6:
                         messages.append({"role": "assistant",
                                          "content": resp.content})
-                        fr = self.client.messages.create(
+                        fr = _create_with_retry(self.client, 
                             model=self.model, max_tokens=96, temperature=0,
                             system=AGENT_SYSTEM, tools=[_FINAL_ANSWER_TOOL],
                             tool_choice={"type": "tool",
@@ -1033,7 +1066,7 @@ class McpMetaAgent:
                                         else "Skipped."),
                         } for tu in tool_uses]
                         messages.append({"role": "user", "content": narr_results})
-                        fr = self.client.messages.create(
+                        fr = _create_with_retry(self.client, 
                             model=self.model, max_tokens=96, temperature=0,
                             system=AGENT_SYSTEM, tools=[_FINAL_ANSWER_TOOL],
                             tool_choice={"type": "tool", "name": "final_answer"},
@@ -1172,7 +1205,7 @@ class McpMetaAgent:
                         f"\n\nYour accumulated evidence (all on-target facts "
                         f"gathered so far):\n{ev_lines}\n\nUse this to answer. "
                     )
-                resp = self.client.messages.create(
+                resp = _create_with_retry(self.client, 
                     model=self.model,
                     max_tokens=48,
                     temperature=0,
@@ -1221,7 +1254,7 @@ class McpMetaAgent:
                     f"- {e.get('content', '')}"
                     for e in last_relevant_collected[:14])
                 try:
-                    er = self.client.messages.create(
+                    er = _create_with_retry(self.client, 
                         model=self.model, max_tokens=120, temperature=0,
                         system=("List EVERY distinct item that answers the "
                                 "question, drawn from the facts. Output a "
