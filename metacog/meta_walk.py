@@ -1288,8 +1288,12 @@ class MetaWalker:
         self._relevant_cum: List[Point] = []
         self._relevant_ids: set = set()
         self._relevant_label: dict = {}
-        # σ-propagation depth-stop state.
+        # σ-propagation depth-stop state. `_sigma_grace_used` lets the
+        # walk run one extra stage past the first σ-cutoff hit, so the
+        # thought chain has a chance to surface late-emerging evidence
+        # before the walk terminates.
         self._sigma_path: float = 0.0
+        self._sigma_grace_used: bool = False
         self._prev_seed_emb: Optional[tuple] = None
         # Walk-local emergent threshold : median + std of pairwise cosine
         # distances between stage-0 retrieved facts. Set once after the
@@ -1414,21 +1418,34 @@ class MetaWalker:
         # (median + std of stage-0 fact pairwise distances), depth is
         # exhausted ; the agent should pivot breadth via a new walk_start
         # with a query targeting the missing aspect.
+        #
+        # GRACE STAGE : the first time σ exceeds the cutoff we DO NOT stop
+        # — we run one extra stage so the chain has a chance to confirm or
+        # find late-emerging evidence (cat3 inference where the bridging
+        # turn surfaces only after several hops of accumulated reasoning).
+        # If σ exceeds again on the next call, we stop for real.
         if self._stage_idx > 0 and self._prev_seed_emb is not None:
             hop = max(0.0, 1.0 - cosine(self._prev_seed_emb, seed_emb))
             self._sigma_path = math.sqrt(self._sigma_path ** 2 + hop ** 2)
             cutoff = self._walk_sigma_cutoff
             if cutoff is not None and self._sigma_path > cutoff:
-                self._done = True
-                return StageOutput(
-                    stage=self._stage_idx,
-                    facts=[], actions=[],
-                    chosen_fact=None, chosen_action=None, thought=None,
-                    generated_action=False, generated_thought=False,
-                    fact_ids_cumulative=list(self._fact_ids_cum),
-                    done=True,
-                    sigma_path=self._sigma_path,
-                )
+                if not self._sigma_grace_used:
+                    self._sigma_grace_used = True
+                    # Reset σ_path to the cutoff so a second over-threshold
+                    # this step actually stops (otherwise the grace window
+                    # could last several stages if drift keeps growing).
+                    self._sigma_path = cutoff
+                else:
+                    self._done = True
+                    return StageOutput(
+                        stage=self._stage_idx,
+                        facts=[], actions=[],
+                        chosen_fact=None, chosen_action=None, thought=None,
+                        generated_action=False, generated_thought=False,
+                        fact_ids_cumulative=list(self._fact_ids_cum),
+                        done=True,
+                        sigma_path=self._sigma_path,
+                    )
         self._prev_seed_emb = seed_emb
 
         pts = self._all_points()
