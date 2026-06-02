@@ -26,7 +26,20 @@ else through api_key= (x-api-key).
 from __future__ import annotations
 
 import os
+import time
 from typing import List, Optional, Sequence, Tuple
+
+try:
+    import anthropic as _ant_module
+    _RETRYABLE_ERRORS = tuple(
+        e for e in (
+            getattr(_ant_module, "OverloadedError", None),
+            getattr(_ant_module, "InternalServerError", None),
+        )
+        if e is not None
+    )
+except ImportError:
+    _RETRYABLE_ERRORS = ()
 
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
@@ -124,17 +137,25 @@ class ClaudeLLM:
         if not prompt:
             return ""
         budget = max(8, max_tokens or self.max_tokens)
-        try:
-            resp = self.client.messages.create(
-                model=self.model,
-                max_tokens=budget,
-                temperature=0,
-                system=self.system,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        except MissingCredential:
-            raise
-        except Exception:
+        for attempt in range(4):
+            try:
+                resp = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=budget,
+                    temperature=0,
+                    system=self.system,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                break
+            except MissingCredential:
+                raise
+            except Exception as exc:
+                # Retry on transient server errors (529 overloaded, 5xx).
+                if _RETRYABLE_ERRORS and isinstance(exc, _RETRYABLE_ERRORS):
+                    time.sleep(2 ** attempt)
+                    continue
+                return ""
+        else:
             return ""
         self.n_calls += 1
         if hasattr(resp, "usage"):
