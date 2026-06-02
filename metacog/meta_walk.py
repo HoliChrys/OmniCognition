@@ -789,6 +789,8 @@ def meta_thought(
     t_now: float,
     *,
     prev_thoughts: Sequence[Point] = (),
+    prev_facts: Sequence[Point] = (),
+    prev_actions: Sequence[Point] = (),
     query: Optional[str] = None,
 ) -> Optional[Point]:
     """Generate a meta-cognitive THOUGHT that fuses the keyword axes of
@@ -866,43 +868,58 @@ def meta_thought(
     # the reflection itself.
     parent_kws: List[str] = []
     seen: set = set()
-    # Chain carry-over : prior thoughts' keywords are also candidate
-    # parents — they encode where the chain has already pointed. Without
-    # this, each thought drops the accumulated direction at every hop.
-    chain_kws: List[str] = []
-    for t in list(prev_thoughts)[-3:]:
-        for kw in t.keywords or []:
-            if kw and kw not in seen:
-                seen.add(kw)
-                chain_kws.append(kw)
     for kw in list(fact.keywords) + list(action.keywords):
         if kw and kw not in seen:
             seen.add(kw)
             parent_kws.append(kw)
+    # WALKED carry-over : the THOUGHT's keyword pool is built ONLY from
+    # PREEXISTING keywords of points the walk has already touched —
+    # prior fact★, prior action★, prior thoughts — never from the LLM's
+    # free reasoning vocabulary. This is what keeps the chain grounded :
+    # each thought reorders an established index of walked tokens, never
+    # invents abstract relational words that drift retrieval off-source.
+    chain_kws: List[str] = []
+    for src_list in (
+        list(prev_facts)[-3:],
+        list(prev_actions)[-3:],
+        list(prev_thoughts)[-3:],
+    ):
+        for p in src_list:
+            for kw in p.keywords or []:
+                if kw and kw not in seen:
+                    seen.add(kw)
+                    chain_kws.append(kw)
 
     # Tokens the reflection emphasises (lowercased word set).
     refl_tokens = {w.strip(".,;:!?\"'()").lower() for w in text.split()}
-    # Concrete vocabulary the parents are actually made of (incl. chain).
-    chain_content = " ".join(t.content for t in list(prev_thoughts)[-3:])
+    # Concrete vocabulary the WALKED points are actually made of.
+    walked_content = " ".join(
+        p.content for p in
+        list(prev_facts)[-3:] + list(prev_actions)[-3:] + list(prev_thoughts)[-3:]
+    )
     content_vocab = {
         w.strip(".,;:!?\"'()").lower()
-        for w in (fact.content + " " + action.content + " " + chain_content).split()
+        for w in (fact.content + " " + action.content + " " + walked_content).split()
         if len(w) >= 4
     }
 
-    # 1. Parent keywords the reflection emphasised come FIRST (reordered
-    #    by metacognitive relevance), then chain keywords still echoed by
-    #    the new reflection, then the remaining parent keywords.
+    # 1. Walked keywords (parents + chain) the reflection emphasised come
+    #    FIRST, reordered by metacognitive relevance ; remaining parent
+    #    keywords next ; chain keywords not emphasised last.
     pool = parent_kws + chain_kws
     emphasised = [k for k in pool if k.lower() in refl_tokens]
-    rest = [k for k in parent_kws if k.lower() not in refl_tokens]
-    # 2. ENRICH : concrete content tokens the reflection surfaced that are
-    #    not already keywords (grounded entities, never abstract prose).
+    rest_parent = [k for k in parent_kws if k.lower() not in refl_tokens]
+    rest_chain = [k for k in chain_kws if k.lower() not in refl_tokens]
+    # 2. ENRICH : concrete content tokens (from WALKED content) the
+    #    reflection surfaced that are not already keywords. Bounded by
+    #    content_vocab membership, so the LLM's abstract relational prose
+    #    can never leak in — only words that actually appear in the
+    #    walked fact/action/thought content qualify.
     enrich = [
         w for w in refl_tokens
         if w in content_vocab and w not in seen
     ]
-    kws = (emphasised + rest + enrich)[:8]
+    kws = (emphasised + rest_parent + enrich + rest_chain)[:8]
     if not kws:
         kws = parent_kws[:8]
     kw_emb = position_weighted_keyword_embedding(kws, encoder)
@@ -1094,6 +1111,8 @@ def meta_walk(
     prev_action = action_star
     cur_thought = thought
     thought_chain: List[Point] = [thought]
+    fact_chain: List[Point] = [fact_star]
+    action_chain: List[Point] = [action_star]
 
     for stage in range(1, n_stages):
         # Re-anchor : original query keywords FIRST (so position weighting
@@ -1152,6 +1171,8 @@ def meta_walk(
             fact_star_next, action_next, memory.points,
             llm, enc, extractor, t_now,
             prev_thoughts=thought_chain,
+            prev_facts=fact_chain,
+            prev_actions=action_chain,
             query=query,
         )
         if thought_next is None:
@@ -1163,6 +1184,8 @@ def meta_walk(
         prev_action = action_next
         cur_thought = thought_next
         thought_chain.append(thought_next)
+        fact_chain.append(fact_star_next)
+        action_chain.append(action_next)
 
     return traj
 
@@ -1270,12 +1293,14 @@ class MetaWalker:
         self._visited_action_ids: set = set()
         self._prev_action: Optional[Point] = None
         self._cur_thought: Optional[Point] = None
-        # REDUCE chain of THOUGHTs across stages. Each new thought is
-        # generated with the prior chain as context, so depth contributes
-        # cumulative reasoning to the next retrieval seed and to the final
-        # synthesis. Bounded slice (~last 4) is passed to the LLM to cap
-        # prompt growth.
+        # REDUCE chain across stages : prior fact★ / action★ / thought
+        # are all preserved so the next thought's keyword pool is built
+        # from PREEXISTING tokens of walked points only — no abstract
+        # vocabulary leaks in. Each thought reorders the walked index.
+        # Bounded slice (~last 3) passed to the LLM to cap prompt growth.
         self._thought_chain: List[Point] = []
+        self._fact_star_chain: List[Point] = []
+        self._action_star_chain: List[Point] = []
         self._stage_idx = 0
         self._done = False
         self._generated_ids: List[str] = []
@@ -1390,24 +1415,15 @@ class MetaWalker:
             seed_query = self.query
             seed_emb = self._cur_emb
         else:
-            # Anchor on query keywords FIRST (position-weighting keeps
-            # them dominant), then enrich with the cumulative chain
-            # reasoning vocabulary. Most-recent thought first inside the
-            # chain block so its keywords get higher weight than older ones.
-            # Without the chain carry-over, depth retrieval anchors on the
-            # last thought alone and loses bridging tokens earlier
-            # reflections surfaced.
-            anchored_kws: List[str] = []
-            seen_kws: set = set()
-            for kw in self._query_keywords:
-                if kw and kw not in seen_kws:
-                    seen_kws.add(kw)
-                    anchored_kws.append(kw)
-            for t in reversed(self._thought_chain[-3:]):
-                for kw in (t.keywords or []):
-                    if kw and kw not in seen_kws:
-                        seen_kws.add(kw)
-                        anchored_kws.append(kw)
+            # Stage 1+ : anchor on query keywords (position-weighted, kept
+            # dominant) + the LATEST thought's keywords only. The chain's
+            # cumulative reasoning is already folded INSIDE that latest
+            # thought (meta_thought consumes prev_thoughts when generating
+            # it), so we don't pile multiple thoughts' kws into the seed —
+            # that would drown the query and pull retrieval away from gold
+            # vocabulary on multi-hop comparison questions.
+            thought_kws = self._cur_thought.keywords if self._cur_thought else []
+            anchored_kws = list(self._query_keywords) + list(thought_kws)
             seed_query = " ".join(anchored_kws) if anchored_kws else self.query
             pwe = position_weighted_keyword_embedding(anchored_kws, self._enc)
             seed_emb = pwe if pwe is not None else self._cur_emb
@@ -1643,6 +1659,8 @@ class MetaWalker:
                 fact_star, action_star, pts,
                 self._llm, self._enc, self._extr, self.t_now,
                 prev_thoughts=self._thought_chain,
+                prev_facts=self._fact_star_chain,
+                prev_actions=self._action_star_chain,
                 query=self.query,
             )
             if thought is not None:
@@ -1650,6 +1668,8 @@ class MetaWalker:
                 gen_thought = True
                 self._cur_thought = thought
                 self._thought_chain.append(thought)
+                self._fact_star_chain.append(fact_star)
+                self._action_star_chain.append(action_star)
                 # Refresh the query embedding for the NEXT stage from
                 # the thought's enriched keywords.
                 kws = thought.keywords or self._query_keywords
