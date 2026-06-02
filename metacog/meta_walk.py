@@ -787,6 +787,9 @@ def meta_thought(
     encoder: Any,
     extractor: Any,
     t_now: float,
+    *,
+    prev_thoughts: Sequence[Point] = (),
+    query: Optional[str] = None,
 ) -> Optional[Point]:
     """Generate a meta-cognitive THOUGHT that fuses the keyword axes of
     a FACT and an ACTION, INFORMED by the fact's metacognitive state.
@@ -797,6 +800,12 @@ def meta_thought(
       - META-STATE of the fact (confidence, σ, n_uses, hub status)
       - if the fact is a HUB, a small cluster of its manifold neighbours
         (edge-free analog of HeLa's reflective Hebbian distillation)
+      - **REDUCE chain** : prior reflections from earlier stages, so the
+        new thought *extends* the reasoning rather than restarting it.
+        Each thought = fold(prev_thoughts, new fact, new action).
+        Without this, depth contributes parallel reflections that the
+        next retrieval can't compose — a thought that doesn't enrich the
+        next hop's vocabulary is dead weight.
 
     A(·) ⊥ P : the meta-state is computed from integer counters and the
     population's distance distribution only — no foreign P-content
@@ -824,11 +833,19 @@ def meta_thought(
             "\nCLUSTER (manifold neighbours of this hub, for consolidation) :\n"
             + "\n".join(f"  - {c}" for c in cluster_lines)
         )
+    chain_block = ""
+    if prev_thoughts:
+        chain_lines = [f"  - {t.content}" for t in list(prev_thoughts)[-3:]]
+        chain_block = (
+            "PRIOR (chain so far) :\n" + "\n".join(chain_lines) + "\n"
+        )
+    query_block = f"QUERY : {query}\n" if query else ""
     prompt = (
-        "Write ONE short RETROSPECTIVE reflection (≤ 15 words) on the "
-        "situation — what the FACT means given the ACTION, taking the "
-        "fact's epistemic state into account. This is a thought looking "
-        "BACK on the fact and action it is born from.\n\n"
+        "Write ONE short reflection (≤ 15 words) on the NEW fact+action "
+        "that EXTENDS the prior chain toward the QUERY. Plain sentence, "
+        "no headers, no markdown.\n\n"
+        f"{query_block}"
+        f"{chain_block}"
         f"{meta_line}\n"
         f"FACT [{fact_kws}] : {fact.content}\n"
         f"ACTION [{action_kws}] : {action.content}"
@@ -849,6 +866,15 @@ def meta_thought(
     # the reflection itself.
     parent_kws: List[str] = []
     seen: set = set()
+    # Chain carry-over : prior thoughts' keywords are also candidate
+    # parents — they encode where the chain has already pointed. Without
+    # this, each thought drops the accumulated direction at every hop.
+    chain_kws: List[str] = []
+    for t in list(prev_thoughts)[-3:]:
+        for kw in t.keywords or []:
+            if kw and kw not in seen:
+                seen.add(kw)
+                chain_kws.append(kw)
     for kw in list(fact.keywords) + list(action.keywords):
         if kw and kw not in seen:
             seen.add(kw)
@@ -856,16 +882,19 @@ def meta_thought(
 
     # Tokens the reflection emphasises (lowercased word set).
     refl_tokens = {w.strip(".,;:!?\"'()").lower() for w in text.split()}
-    # Concrete vocabulary the parents are actually made of.
+    # Concrete vocabulary the parents are actually made of (incl. chain).
+    chain_content = " ".join(t.content for t in list(prev_thoughts)[-3:])
     content_vocab = {
         w.strip(".,;:!?\"'()").lower()
-        for w in (fact.content + " " + action.content).split()
+        for w in (fact.content + " " + action.content + " " + chain_content).split()
         if len(w) >= 4
     }
 
     # 1. Parent keywords the reflection emphasised come FIRST (reordered
-    #    by metacognitive relevance), then the remaining parent keywords.
-    emphasised = [k for k in parent_kws if k.lower() in refl_tokens]
+    #    by metacognitive relevance), then chain keywords still echoed by
+    #    the new reflection, then the remaining parent keywords.
+    pool = parent_kws + chain_kws
+    emphasised = [k for k in pool if k.lower() in refl_tokens]
     rest = [k for k in parent_kws if k.lower() not in refl_tokens]
     # 2. ENRICH : concrete content tokens the reflection surfaced that are
     #    not already keywords (grounded entities, never abstract prose).
@@ -948,24 +977,34 @@ def synthesize_answer_from_walk(
             for s in trajectory.stages if s.chosen_fact_id
         )
     by_id = {p.id: p for p in memory.points}
-    lines: List[str] = []
+    fact_lines: List[str] = []
+    chain_lines: List[str] = []
     for s in trajectory.stages:
         f = by_id.get(s.chosen_fact_id or "")
-        a = by_id.get(s.chosen_action_id or "")
         t = by_id.get(s.thought_id or "")
         if f:
-            lines.append(f"  Fact[{s.stage}] : {f.content}")
-        if a:
-            lines.append(f"  Action[{s.stage}] : {a.content}")
+            fact_lines.append(f"  [{s.stage}] {f.content}")
         if t:
-            lines.append(f"  Thought[{s.stage}] : {t.content}")
+            chain_lines.append(f"  [{s.stage}] {t.content}")
+    # Expose the THOUGHT chain as a continuous reasoning trace (the
+    # reduce-fold the walk produced) AND the evidence facts separately.
+    # The chain tells the answerer where the walk's reasoning pointed ;
+    # the facts are the raw evidence to ground the final value on.
+    chain_block = ""
+    if chain_lines:
+        chain_block = (
+            "REASONING CHAIN (each stage extends the prior) :\n"
+            + "\n".join(chain_lines) + "\n\n"
+        )
     prompt = (
-        "Answer the question by composing across the stages (multi-hop "
-        "filiation). Reply with the bare value matching the gold style "
+        "Answer the question by composing across the walk. Use the "
+        "REASONING CHAIN as your reasoning thread and the EVIDENCE as "
+        "ground. Reply with the bare value matching the gold style "
         "(date only / place only / short noun phrase / Not mentioned). "
         "No prose.\n\n"
-        f"QUERY : {query}\n"
-        "WALK :\n" + "\n".join(lines)
+        f"QUERY : {query}\n\n"
+        f"{chain_block}"
+        "EVIDENCE :\n" + "\n".join(fact_lines)
     )
     try:
         return memory.llm.generate(prompt, max_tokens=max_tokens).strip()
@@ -1038,6 +1077,8 @@ def meta_walk(
     thought = meta_thought(
         fact_star, action_star, memory.points,
         llm, enc, extractor, t_now,
+        prev_thoughts=(),
+        query=query,
     )
     if thought is not None:
         memory.points.append(thought)
@@ -1052,6 +1093,7 @@ def meta_walk(
     visited_action_ids: set = set(record.action_ids)
     prev_action = action_star
     cur_thought = thought
+    thought_chain: List[Point] = [thought]
 
     for stage in range(1, n_stages):
         # Re-anchor : original query keywords FIRST (so position weighting
@@ -1109,6 +1151,8 @@ def meta_walk(
         thought_next = meta_thought(
             fact_star_next, action_next, memory.points,
             llm, enc, extractor, t_now,
+            prev_thoughts=thought_chain,
+            query=query,
         )
         if thought_next is None:
             return traj
@@ -1118,6 +1162,7 @@ def meta_walk(
         traj.generated_point_ids.append(thought_next.id)
         prev_action = action_next
         cur_thought = thought_next
+        thought_chain.append(thought_next)
 
     return traj
 
@@ -1225,6 +1270,12 @@ class MetaWalker:
         self._visited_action_ids: set = set()
         self._prev_action: Optional[Point] = None
         self._cur_thought: Optional[Point] = None
+        # REDUCE chain of THOUGHTs across stages. Each new thought is
+        # generated with the prior chain as context, so depth contributes
+        # cumulative reasoning to the next retrieval seed and to the final
+        # synthesis. Bounded slice (~last 4) is passed to the LLM to cap
+        # prompt growth.
+        self._thought_chain: List[Point] = []
         self._stage_idx = 0
         self._done = False
         self._generated_ids: List[str] = []
@@ -1335,8 +1386,24 @@ class MetaWalker:
             seed_query = self.query
             seed_emb = self._cur_emb
         else:
-            thought_kws = self._cur_thought.keywords if self._cur_thought else []
-            anchored_kws = list(self._query_keywords) + list(thought_kws)
+            # Anchor on query keywords FIRST (position-weighting keeps
+            # them dominant), then enrich with the cumulative chain
+            # reasoning vocabulary. Most-recent thought first inside the
+            # chain block so its keywords get higher weight than older ones.
+            # Without the chain carry-over, depth retrieval anchors on the
+            # last thought alone and loses bridging tokens earlier
+            # reflections surfaced.
+            anchored_kws: List[str] = []
+            seen_kws: set = set()
+            for kw in self._query_keywords:
+                if kw and kw not in seen_kws:
+                    seen_kws.add(kw)
+                    anchored_kws.append(kw)
+            for t in reversed(self._thought_chain[-3:]):
+                for kw in (t.keywords or []):
+                    if kw and kw not in seen_kws:
+                        seen_kws.add(kw)
+                        anchored_kws.append(kw)
             seed_query = " ".join(anchored_kws) if anchored_kws else self.query
             pwe = position_weighted_keyword_embedding(anchored_kws, self._enc)
             seed_emb = pwe if pwe is not None else self._cur_emb
@@ -1415,12 +1482,16 @@ class MetaWalker:
         # dropping any fact from the recall set : precision up, recall held.
         relevance: List[str] = ["relevant"] * len(facts)
         if self.use_chain_of_note and facts:
+            # Pass the FULL thought chain content (concatenated last 3)
+            # so the relevance reading reflects what the walk has already
+            # reasoned, not just the last reflection in isolation.
+            chain_text = " | ".join(
+                t.content for t in self._thought_chain[-3:]
+            ) or (self._cur_thought.content if self._cur_thought else None)
             relevance = chain_of_note(
                 self.query, facts, self._llm,
                 collected=self._relevant_cum,
-                current_thought=(
-                    self._cur_thought.content if self._cur_thought else None
-                ),
+                current_thought=chain_text,
             )
         rel_by_id = {f.id: relevance[i] for i, f in enumerate(facts)}
 
@@ -1554,11 +1625,14 @@ class MetaWalker:
             thought = meta_thought(
                 fact_star, action_star, pts,
                 self._llm, self._enc, self._extr, self.t_now,
+                prev_thoughts=self._thought_chain,
+                query=self.query,
             )
             if thought is not None:
                 self._add_generated(thought)
                 gen_thought = True
                 self._cur_thought = thought
+                self._thought_chain.append(thought)
                 # Refresh the query embedding for the NEXT stage from
                 # the thought's enriched keywords.
                 kws = thought.keywords or self._query_keywords
