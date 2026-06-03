@@ -1342,27 +1342,20 @@ class MetaWalker:
         # the FLOOR / CAP / gold-gate use it.
         self._sigma_path: float = 0.0
         self._prev_fact_star_emb: Optional[tuple] = None
-        # Gold-retrieval gate : number of NEW relevant facts the last stage
-        # added to the cumulative set. While > 0 the walk is still
-        # surfacing gold, so the σ-cap is held off ; the cap only fires
-        # once this plateaus to 0 (no new gold on this trail). Seeded to 1
-        # so the floor stages always run.
-        self._added_relevant_last: int = 1
         # DEPTH is governed by UNCERTAINTY PROPAGATION (GUM quadrature),
         # not by a fixed stage count and not by an LLM "can I answer" gate.
-        # Two parameters, both emergent / structural (no magic numbers) :
+        # Both parameters are emergent / structural (no magic numbers) :
         #  - a hard FLOOR of `_MIN_STAGES` hops always runs before σ may
         #    terminate (always explore the multi-hop neighbourhood) ;
         #  - the σ-cutoff (median + std of stage-0 pairwise distances) is
-        #    the CAP : once propagated uncertainty exceeds the manifold's
-        #    local resolution the walk's position is too uncertain to
-        #    trust, so it stops. There is NO maximum stage count driving
-        #    the walk — `n_stages` is only a generous safety bound.
-        #  - `_last_on_target` GATES the σ-cap on gold retrieval : while
-        #    the walk keeps pulling in on-target (relevant) evidence the
-        #    drift is legitimate multi-hop travel toward the gold and the
-        #    cap is held off ; σ only terminates once the walk is ALSO
-        #    off-target (genuinely lost).
+        #    the CAP : once propagated uncertainty over the fact★→fact★
+        #    evidence chain exceeds the manifold's local resolution the
+        #    chain has wandered out of the coherent neighbourhood, so the
+        #    walk stops. Gold-retrieval extension is intrinsic to σ (a
+        #    coherent trail = small hops = slow σ = deep walk), so no
+        #    separate relevance gate is needed. `n_stages` is only a
+        #    generous safety bound.
+        # `_last_on_target` is kept only to expose `out.drifted` downstream.
         self._last_on_target: int = 1
         # Walk-local emergent threshold : median + std of pairwise cosine
         # distances between stage-0 retrieved facts. Set once after the
@@ -1491,17 +1484,21 @@ class MetaWalker:
         #            manifold's local resolution), the evidence chain has
         #            travelled beyond the coherent neighbourhood and the
         #            walk stops. There is NO fixed maximum stage count.
-        #   GOLD-GATE — the cap is GATED on retrieval progress : while the
-        #            walk keeps surfacing NEW gold-relevant evidence
-        #            (`_added_relevant_last > 0`), the travel is legitimate
-        #            multi-hop progress toward the gold and σ does not
-        #            terminate. σ only caps once the relevant set has
-        #            PLATEAUED — no new gold on this trail — at which point
-        #            high accumulated uncertainty means stop.
+        #
+        # GOLD-RETRIEVAL IS INTRINSIC TO σ, NOT A SEPARATE GATE. Because σ
+        # is the quadrature sum of fact★→fact★ hops, a coherent evidence
+        # chain (the gold trail) has SMALL consecutive hops, so σ grows
+        # slowly and the walk goes deep on its own ; wandering into
+        # unrelated turns adds a LARGE hop, so σ trips quickly. The earlier
+        # Chain-of-Note "still finding new relevant" gate was removed : it
+        # made depth hostage to a stochastic, bimodal LLM relevance signal
+        # (one run labels every turn relevant → walk never plateaus → 16
+        # stages / 80 facts ; the next labels none relevant → walk
+        # strangled at the floor). The σ measure already encodes
+        # "extend on a coherent trail, cap when wandering" — deterministically.
         if (self._stage_idx >= _MIN_STAGES
                 and self._walk_sigma_cutoff is not None
-                and self._sigma_path > self._walk_sigma_cutoff
-                and self._added_relevant_last == 0):
+                and self._sigma_path > self._walk_sigma_cutoff):
             self._done = True
             return StageOutput(
                 stage=self._stage_idx,
@@ -1604,19 +1601,13 @@ class MetaWalker:
         # REDUCE — fold this stage's on-target facts into the persistent
         # accumulator (dedup, order-preserving). Bridging evidence from
         # état -1 survives into état k ; going deeper never loses it.
-        added_relevant = 0
+        # (Depth is no longer gated on this count — σ over the evidence
+        # chain governs the cap ; see the depth block above.)
         for i, f in enumerate(facts):
             if relevance[i] != "irrelevant" and f.id not in self._relevant_ids:
                 self._relevant_cum.append(f)
                 self._relevant_ids.add(f.id)
                 self._relevant_label[f.id] = relevance[i]
-                added_relevant += 1
-        # Did this stage discover NEW gold-relevant evidence ? This — not
-        # "was anything on-target" — is the gold-retrieval signal that
-        # holds off the σ-cap : the walk extends while it keeps surfacing
-        # new relevant turns, and only becomes capped-eligible once the
-        # relevant set plateaus (no new gold to find on this trail).
-        self._added_relevant_last = added_relevant
 
         # The subset the reasoning trusts : everything except clearly
         # off-target turns. "contradicts" is kept (the THOUGHT must see
