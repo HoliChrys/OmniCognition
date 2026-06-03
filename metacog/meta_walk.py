@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -66,15 +67,19 @@ from metacog.keywords import position_weighted_keyword_embedding
 from metacog.uncertainty import beta_sigma, node_sigma
 
 
-# Hard caps per generation step. Not tuning knobs : token budget per
-# generation (50) is the contract stated by the design.
-# n_stages=8 is a soft cap — the walk stops naturally as soon as no
-# new unseen facts are returned (fact_star=None → cant_continue), which
-# is the |seen ∩ gold| / |gold| = 1 proxy at inference time. The 3
-# previous hard cap was masking early-stopping on multi-hop questions
-# where evidence spans more than 3 retrieval hops.
+# Token budget per generation (50) is the contract stated by the design.
 _GENERATION_TOKEN_BUDGET = 50
-_DEFAULT_STAGES = 8
+
+# DEPTH is governed by uncertainty propagation, not by a stage count :
+#  - `_MIN_STAGES` : the FLOOR. The walk always runs at least this many
+#    hops before σ-propagation is allowed to terminate it — always explore
+#    the multi-hop neighbourhood.
+#  - `_DEFAULT_STAGES` : a GENEROUS safety bound, NOT the controller. The
+#    σ-cap (combined uncertainty exceeds the manifold's local resolution)
+#    and the gold-retrieval gate decide when the walk actually stops ; this
+#    number only prevents an unbounded loop if σ never trips.
+_MIN_STAGES = 3
+_DEFAULT_STAGES = 16
 
 
 # ----------------------------------------------------------------------
@@ -1331,13 +1336,34 @@ class MetaWalker:
         self._relevant_cum: List[Point] = []
         self._relevant_ids: set = set()
         self._relevant_label: dict = {}
-        # σ-propagation depth-stop state. `_sigma_grace_used` lets the
-        # walk run one extra stage past the first σ-cutoff hit, so the
-        # thought chain has a chance to surface late-emerging evidence
-        # before the walk terminates.
+        # σ-propagation state : cumulative combined uncertainty over the
+        # evidence chain's hops (fact★→fact★, GUM quadrature). Accumulated
+        # at the end of each stage. See the depth block in step() for how
+        # the FLOOR / CAP / gold-gate use it.
         self._sigma_path: float = 0.0
-        self._sigma_grace_used: bool = False
-        self._prev_seed_emb: Optional[tuple] = None
+        self._prev_fact_star_emb: Optional[tuple] = None
+        # Gold-retrieval gate : number of NEW relevant facts the last stage
+        # added to the cumulative set. While > 0 the walk is still
+        # surfacing gold, so the σ-cap is held off ; the cap only fires
+        # once this plateaus to 0 (no new gold on this trail). Seeded to 1
+        # so the floor stages always run.
+        self._added_relevant_last: int = 1
+        # DEPTH is governed by UNCERTAINTY PROPAGATION (GUM quadrature),
+        # not by a fixed stage count and not by an LLM "can I answer" gate.
+        # Two parameters, both emergent / structural (no magic numbers) :
+        #  - a hard FLOOR of `_MIN_STAGES` hops always runs before σ may
+        #    terminate (always explore the multi-hop neighbourhood) ;
+        #  - the σ-cutoff (median + std of stage-0 pairwise distances) is
+        #    the CAP : once propagated uncertainty exceeds the manifold's
+        #    local resolution the walk's position is too uncertain to
+        #    trust, so it stops. There is NO maximum stage count driving
+        #    the walk — `n_stages` is only a generous safety bound.
+        #  - `_last_on_target` GATES the σ-cap on gold retrieval : while
+        #    the walk keeps pulling in on-target (relevant) evidence the
+        #    drift is legitimate multi-hop travel toward the gold and the
+        #    cap is held off ; σ only terminates once the walk is ALSO
+        #    off-target (genuinely lost).
+        self._last_on_target: int = 1
         # Walk-local emergent threshold : median + std of pairwise cosine
         # distances between stage-0 retrieved facts. Set once after the
         # first retrieval. Replaces prune_threshold(points) which returns
@@ -1446,41 +1472,46 @@ class MetaWalker:
             pwe = position_weighted_keyword_embedding(anchored_kws, self._enc)
             seed_emb = pwe if pwe is not None else self._cur_emb
 
-        # σ-propagation depth-stop — the cumulative embedding drift
-        # between successive walk seeds, propagated in GUM quadrature.
-        # When the total drift exceeds the walk-local emergent threshold
-        # (median + std of stage-0 fact pairwise distances), depth is
-        # exhausted ; the agent should pivot breadth via a new walk_start
-        # with a query targeting the missing aspect.
+        # ── DEPTH = UNCERTAINTY PROPAGATION ──────────────────────────────
+        # The walk's depth is governed by GUM-style propagation of
+        # uncertainty (https://en.wikipedia.org/wiki/Propagation_of_
+        # uncertainty) over the EVIDENCE CHAIN, NOT by a fixed stage count.
+        # `_sigma_path` is accumulated at the END of each stage as the
+        # quadrature sum of the hop uncertainties between consecutive
+        # chosen facts : σ_path = √(Σ (1 − cos(fact★ₖ₋₁, fact★ₖ))²)
+        # (uncertainty.py, GUM 1995). Seed-to-seed drift is NOT used — the
+        # seed is re-anchored on the query each stage so it barely moves ;
+        # the real uncertainty is how far the EVIDENCE travels.
         #
-        # GRACE STAGE : the first time σ exceeds the cutoff we DO NOT stop
-        # — we run one extra stage so the chain has a chance to confirm or
-        # find late-emerging evidence (cat3 inference where the bridging
-        # turn surfaces only after several hops of accumulated reasoning).
-        # If σ exceeds again on the next call, we stop for real.
-        if self._stage_idx > 0 and self._prev_seed_emb is not None:
-            hop = max(0.0, 1.0 - cosine(self._prev_seed_emb, seed_emb))
-            self._sigma_path = math.sqrt(self._sigma_path ** 2 + hop ** 2)
-            cutoff = self._walk_sigma_cutoff
-            if cutoff is not None and self._sigma_path > cutoff:
-                if not self._sigma_grace_used:
-                    self._sigma_grace_used = True
-                    # Reset σ_path to the cutoff so a second over-threshold
-                    # this step actually stops (otherwise the grace window
-                    # could last several stages if drift keeps growing).
-                    self._sigma_path = cutoff
-                else:
-                    self._done = True
-                    return StageOutput(
-                        stage=self._stage_idx,
-                        facts=[], actions=[],
-                        chosen_fact=None, chosen_action=None, thought=None,
-                        generated_action=False, generated_thought=False,
-                        fact_ids_cumulative=list(self._fact_ids_cum),
-                        done=True,
-                        sigma_path=self._sigma_path,
-                    )
-        self._prev_seed_emb = seed_emb
+        #   FLOOR  — the first `_MIN_STAGES` hops ALWAYS run ; σ may not
+        #            terminate the walk before then (always explore the
+        #            multi-hop neighbourhood).
+        #   CAP    — once σ_path exceeds the walk-local emergent threshold
+        #            (median + std of stage-0 pairwise distances = the
+        #            manifold's local resolution), the evidence chain has
+        #            travelled beyond the coherent neighbourhood and the
+        #            walk stops. There is NO fixed maximum stage count.
+        #   GOLD-GATE — the cap is GATED on retrieval progress : while the
+        #            walk keeps surfacing NEW gold-relevant evidence
+        #            (`_added_relevant_last > 0`), the travel is legitimate
+        #            multi-hop progress toward the gold and σ does not
+        #            terminate. σ only caps once the relevant set has
+        #            PLATEAUED — no new gold on this trail — at which point
+        #            high accumulated uncertainty means stop.
+        if (self._stage_idx >= _MIN_STAGES
+                and self._walk_sigma_cutoff is not None
+                and self._sigma_path > self._walk_sigma_cutoff
+                and self._added_relevant_last == 0):
+            self._done = True
+            return StageOutput(
+                stage=self._stage_idx,
+                facts=[], actions=[],
+                chosen_fact=None, chosen_action=None, thought=None,
+                generated_action=False, generated_thought=False,
+                fact_ids_cumulative=list(self._fact_ids_cum),
+                done=True,
+                sigma_path=self._sigma_path,
+            )
 
         pts = self._all_points()
         facts = nearest_facts_with_fallback(
@@ -1573,11 +1604,19 @@ class MetaWalker:
         # REDUCE — fold this stage's on-target facts into the persistent
         # accumulator (dedup, order-preserving). Bridging evidence from
         # état -1 survives into état k ; going deeper never loses it.
+        added_relevant = 0
         for i, f in enumerate(facts):
             if relevance[i] != "irrelevant" and f.id not in self._relevant_ids:
                 self._relevant_cum.append(f)
                 self._relevant_ids.add(f.id)
                 self._relevant_label[f.id] = relevance[i]
+                added_relevant += 1
+        # Did this stage discover NEW gold-relevant evidence ? This — not
+        # "was anything on-target" — is the gold-retrieval signal that
+        # holds off the σ-cap : the walk extends while it keeps surfacing
+        # new relevant turns, and only becomes capped-eligible once the
+        # relevant set plateaus (no new gold to find on this trail).
+        self._added_relevant_last = added_relevant
 
         # The subset the reasoning trusts : everything except clearly
         # off-target turns. "contradicts" is kept (the THOUGHT must see
@@ -1630,6 +1669,23 @@ class MetaWalker:
         # fact that actually bears on the query.
         fact_star = least_uncertain(focus_facts)
         action_star = actions[0] if actions else None
+
+        # ── Accumulate the evidence-chain uncertainty (GUM quadrature) ──
+        # The hop from the previous stage's fact★ to this one is the real
+        # uncertainty the walk adds : a coherent multi-hop chain keeps
+        # consecutive evidence close (small hop → σ grows slowly → walk
+        # goes deep), while a jump to unrelated territory adds a large hop
+        # (σ rises → the cap trips). This is what the depth check at the
+        # top of the NEXT step() reads.
+        if fact_star is not None:
+            e_cur = effective_keyword_embedding(fact_star, self.t_now)
+            if e_cur is not None:
+                if self._prev_fact_star_emb is not None:
+                    hop = max(0.0, 1.0 - cosine(self._prev_fact_star_emb, e_cur))
+                    self._sigma_path = math.sqrt(
+                        self._sigma_path ** 2 + hop ** 2
+                    )
+                self._prev_fact_star_emb = e_cur
 
         # Accumulate FACT ids (this is the "effective recall" the
         # answerer sees across the whole walk).
@@ -1736,6 +1792,8 @@ class MetaWalker:
         )
         out.n_relevant = on_target
         out.drifted = self.use_chain_of_note and bool(facts) and on_target == 0
+        # Record progress for the NEXT stage's progress-gated σ-stop.
+        self._last_on_target = on_target
 
         # Terminal conditions for the NEXT step (drift NOT among them).
         next_idx = self._stage_idx + 1
