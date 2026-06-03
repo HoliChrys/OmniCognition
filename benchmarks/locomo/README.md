@@ -31,8 +31,9 @@ HuggingFace.
 # Plain cosine retrieval — chunk-dump answer (fast smoke)
 uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic
 
-# Meta-cognitive walk answerer (the real system : walk_start/walk_next
-# over the FACT/THOUGHT/ACTION manifold, Claude as the driver)
+# Meta-cognitive walk answerer (the real system : a single walk_start runs
+# the full uncertainty-governed walk over the FACT/THOUGHT/ACTION manifold,
+# Claude drives breadth pivots)
 uv run python -m benchmarks.locomo.eval --samples 10 --encoder semantic --answerer meta
 
 # Balanced smoke : 1 QA per category, a few conversations
@@ -130,7 +131,46 @@ inspection.
 All runs use `--answerer meta --encoder semantic --per-category 1 --samples 10`.
 Answerer: Claude (Haiku 4.5, no dataset-specific prompt vocabulary).
 
-### V10 — HyDE multi-angle, ON by default (current)
+### V11 — uncertainty-governed depth + breadth-only agent (current)
+
+The walk's depth is now governed by **uncertainty propagation over the
+evidence chain** (GUM quadrature), with a single `walk_start` running the
+**complete** depth in one call and the agent doing only breadth pivots.
+
+Root cause this fixed: earlier, `walk_next` advanced the walk one stage per
+agent tool-call, and Claude short-circuited after ≈2.5 calls — so the
+σ-depth machinery never ran in the bench (steps_per_qa ≈ 2.5). The walk
+also relied on a silently-broken keyword extractor (a cached `[]` after one
+transient 529 dropped every query to a raw-sentence embedding, mismatching
+the keyword-embedding index and tripping the σ-stop at stage 1-2).
+
+Fixes, in order:
+1. **Silent-failure cleanup** — retry on `OverloadedError`/5xx and never
+   cache an empty result in `LLMKeywordExtractor` / `LLMEntityExtractor` /
+   `hyde_passage`; retry wrapper on every agentic-loop API call.
+2. **σ on the evidence chain** — `σ_hop` = smallest keyword-distance from
+   the previous fact★ to any fact reachable this stage (coherence), not the
+   dead seed-to-seed drift. Floor 3, σ-cap at the emergent threshold, no
+   hard maximum.
+3. **Single full-depth `walk_start`** — loops `step()` to completion; the
+   agent does breadth pivots only (`walk_next` deprecated, removed from the
+   exposed tools).
+4. **Token discipline** — composable evidence capped to `_MAX_EVIDENCE`
+   (ranked by label + chain-vocabulary overlap) and a deterministic
+   keyword-coverage metacognitive stop, so easy queries terminate early and
+   the synthesis is not drowned by a bloated relevant set.
+
+Effect (5-sample balanced, 24 QA): **agent_recall ≈ 0.60 → 0.85** — the
+walk now surfaces ~0.85 of the gold evidence (static Recall@7 ≈ 0.31). On
+the six hardest hand-picked cases, single-walk recall is ~19% but the full
+agent with breadth pivots recovers it (jon/gina 3/4, joanna 3/7, political
+& Dr. Seuss 1/1). The bottleneck moved from retrieval to **synthesis** and
+to **token cost** (deep walks × breadth pivots) — the V11 token-discipline
+items above target exactly that. Token-F1 stays ≈ 0.63-0.68, much of the
+residual being metric artefact ("progressive" ≠ "liberal"; gold turns that
+carry only an attached image).
+
+### V10 — HyDE multi-angle, ON by default
 
 Addresses cat3 inference vocabulary gap: abstract questions ("What might X's
 financial status be?", "Does Nate have friends besides Joanna?") have Jaccard=0.00

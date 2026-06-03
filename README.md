@@ -42,19 +42,45 @@ Retrieval is a coordinated **walk** over three kinds at once
 ACTIONs to the query, generates any missing kind under a strict token
 budget (`source=GENERATOR`, never evidence), reads each retrieved fact
 with a **Chain-of-Note** relevance pass, and synthesizes a THOUGHT whose
-enriched keywords drive the next stage. A σ-propagation depth-stop and a
-breadth-pivot signal (`drifted` / `n_relevant`) let the agent know when to
-go deeper vs. re-articulate.
+keywords — drawn only from the *walked* points' preexisting keywords, never
+invented — extend a REDUCE-folded reasoning chain that drives the next
+stage.
 
-The walk has **no hard depth cap**. It stops naturally when no new unseen
-facts are available (`fact_star = None → done = True`), which is the
-`|seen ∩ gold| / |gold| = 1` proxy at inference time. `n_stages = 8` is a
-soft ceiling; at least 3 stages are always explored before natural stopping
-kicks in. On LoCoMo (49 QA, 10 conversations, 5 balanced categories) this
-produces a measured jump from Recall@7 = 0.24 (static top-7) to
-agent_recall = 0.65 — the walk finds 2.8× more evidence than a single-pass
-retriever, with cat3 inference rising from F1=0.045 to 0.404 (+0.359) and
-overall F1 from 0.599 to 0.635.
+**Depth is governed by uncertainty propagation, not a stage count.**
+Following the GUM (BIPM 1995) combination of independent uncertainties,
+the walk accumulates `σ_path = √(Σ σ_hop²)` over its evidence chain, where
+each `σ_hop` is the smallest keyword-embedding distance from the previous
+fact★ to any fact reachable this stage (chain *coherence*, not the
+volatility of the fact choice). Three structural rules, no tuning knobs:
+
+- **Floor** — at least `_MIN_STAGES = 3` hops always run.
+- **σ-cap** — once `σ_path` exceeds the walk-local emergent threshold
+  (median + std of the stage-0 facts' pairwise distances = the manifold's
+  local resolution), the chain has wandered out of the coherent
+  neighbourhood and the walk stops. A coherent gold trail keeps hops small,
+  so σ grows slowly and the walk goes deep on its own; wandering trips it
+  fast. Gold-retrieval extension is therefore *intrinsic* to σ — no
+  separate (and noisy) relevance gate.
+- **Keyword-coverage stop** — a cheap, deterministic metacognitive check:
+  once the gathered evidence's keywords cover every query keyword, the walk
+  has turns bearing on each facet of the question and stops. Vocabulary-gap
+  questions (cat3: "political leaning" vs "LGBTQ advocacy") never reach
+  full coverage, so σ governs those instead — they are never cut short.
+
+A single `walk_start` runs this **complete** depth in one call; the agent
+above it does only **breadth pivots** (re-issue `walk_start` with different
+vocabulary), never stage-by-stage micro-driving. The composable evidence
+returned to the answerer is capped (`_MAX_EVIDENCE`, ranked by relevance
+label then chain-vocabulary overlap) so a bloated relevant set never drowns
+the synthesis — full recall is preserved in `fact_ids_cumulative`.
+
+On LoCoMo (balanced per-category sampling) the walk lifts evidence
+**agent_recall to ≈ 0.85** versus a static Recall@7 ≈ 0.31 — it surfaces
+~2.7× the gold evidence of a single-pass retriever, and most of the
+remaining answer error is metric artefact (token-F1 counts "progressive" ≠
+"liberal" as a miss) or evidence labelled on a turn that carries no text
+(an attached image). See `benchmarks/locomo/README.md` for the per-version
+breakdown.
 
 ## One emergent law, four consolidations
 
@@ -133,8 +159,8 @@ ingest              add a FACT / THOUGHT / ACTION
 observe             apply an Observation on existing point(s)
 process_turn        record a conversation turn (detectors fire)
 retrieve            top-k hybrid retrieval
-walk_start          begin a meta-cognitive walk for a query
-walk_next           advance the walk one stage
+walk_start          run a complete uncertainty-governed walk for a query
+walk_next           deprecated (walk_start now runs to completion); no-op
 reason              full reasoning trajectory until output convenable
 sleep               geometric collision + lateral collapse pass
 match_tool          capability cache : is a generated tool covering this query?
