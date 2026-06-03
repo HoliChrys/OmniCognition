@@ -168,39 +168,47 @@ def build_app(
     @app.tool()
     def walk_start(
         query: str,
-        n_stages: int = 8,
+        n_stages: int = 16,
         facts_per_stage: int = 7,
         actions_per_stage: int = 3,
         commit: bool = False,
         observator_id: str = "",
     ) -> dict:
-        """Open a meta-cognitive walk and return its STAGE 0.
+        """Run a COMPLETE meta-cognitive walk and return its result.
 
         The walk traverses three coordinated kinds (FACT / ACTION /
-        THOUGHT) over the memory. Each call returns ONE stage — the
-        agent then calls `walk_next(walk_id)` for the next stage
-        until `done=True`. This is how multi-hop filiation is
-        preserved : each step is sent back to the agent who composes
-        the answer across stages.
+        THOUGHT) over the memory. Its DEPTH is governed by UNCERTAINTY
+        PROPAGATION, not by the caller : a floor of at least 3 hops always
+        runs, then the walk continues as long as it keeps surfacing new
+        gold-relevant evidence, and stops once the propagated σ over the
+        evidence chain exceeds the manifold's local resolution (the
+        gold-retrieval-gated σ-cap). There is no fixed maximum — `n_stages`
+        is only a generous safety bound.
 
-        Stage 0 output schema :
-          walk_id              : str  — pass to walk_next
-          stage                : int  — starts at 0
-          facts                : list of nodes with full INDEXED CONTENT,
-                                  keywords, confidence, uncertainty,
-                                  counters — the agent sees the text,
-                                  not just ids.
-          actions              : same
-          chosen_fact / action : the most-certain fact + first action
-          thought              : the THOUGHT that fuses fact+action
-                                  keywords (generated, kind=THOUGHT,
-                                  source=GENERATOR)
-          generated_action     : True if no ACTION existed and one was
-                                  generated from the facts
-          generated_thought    : True if the THOUGHT was generated
-          fact_ids_cumulative  : every FACT id seen so far (effective
-                                  retrieval set for the answerer)
-          done                 : True if no further stage is available
+        This single call loops the walk to completion internally, so the
+        agent does NOT micro-drive depth stage-by-stage. The agent's job
+        is BREADTH : read the gathered evidence, answer if it is enough, or
+        call `walk_start` again with different / more targeted vocabulary
+        (a breadth pivot).
+
+        Result schema :
+          walk_id              : str  (the walk is already complete/closed)
+          stages_run           : int  — how many hops the σ-walk took
+          facts                : union of retrieved FACTs across ALL stages,
+                                 each with full INDEXED CONTENT, keywords,
+                                 confidence, uncertainty, relevance label
+          relevant_collected   : the MAP-REDUCE set of every on-target fact
+                                 gathered across the whole walk
+                                 ({id, content, relevance}) — COMPOSE THE
+                                 ANSWER over this
+          reasoning_chain      : the THOUGHT chain (one reflection per hop,
+                                 each extending the prior) — the walk's
+                                 reasoning thread
+          fact_ids_cumulative  : every FACT id seen (effective retrieval set)
+          sigma_path           : final propagated uncertainty
+          drifted / n_relevant : last-hop content-relevance signals — if the
+                                 whole walk drifted, pivot with new vocabulary
+          done                 : always True (the walk ran to completion)
         """
         walker = MetaWalker(
             query, memory,
@@ -211,28 +219,53 @@ def build_app(
             observator_id=observator_id or None,
         )
         walk_id = walkers.open(walker)
-        stage = walker.step()
-        out = stage.to_dict()
+        # Loop the walk to completion : depth is the walk's own
+        # uncertainty-propagation decision, not a per-tool-call step.
+        _SAFETY = 40
+        agg_facts: dict = {}
+        stages_run = 0
+        last = None
+        while stages_run < _SAFETY:
+            last = walker.step()
+            stages_run += 1
+            for f in (last.facts or []):
+                fid = f.get("id") if isinstance(f, dict) else None
+                if fid and fid not in agg_facts:
+                    agg_facts[fid] = f
+            if last.done:
+                break
+        out = last.to_dict()
         out["walk_id"] = walk_id
-        if stage.done:
-            walkers.close(walk_id)
+        out["stages_run"] = stages_run
+        # Expose the UNION of retrieved facts across all hops (content),
+        # not just the final hop, plus the full reasoning chain.
+        out["facts"] = list(agg_facts.values())
+        out["reasoning_chain"] = [
+            t.content for t in getattr(walker, "_thought_chain", [])
+        ]
+        out["done"] = True
+        walkers.close(walk_id)
         return out
 
     @app.tool()
     def walk_next(walk_id: str) -> dict:
-        """Advance the walk identified by walk_id by ONE stage.
-
-        Returns the same shape as walk_start (without walk_id). The
-        agent should keep calling this until `done=True` is returned
-        OR until it has enough evidence to answer.
-        """
+        """DEPRECATED. `walk_start` now runs the whole uncertainty-governed
+        walk to completion in one call (depth is decided by σ-propagation,
+        not by the caller). This remains only for backward compatibility :
+        the walk is already complete, so it reports done immediately. To go
+        further, issue a new `walk_start` with different vocabulary (a
+        breadth pivot)."""
         walker = walkers.get(walk_id)
         if walker is None:
-            return {"done": True, "error": f"unknown walk_id {walk_id!r}"}
-        stage = walker.step()
-        out = stage.to_dict()
-        if stage.done:
-            walkers.close(walk_id)
+            return {"done": True,
+                    "note": "walk already complete — call walk_start to pivot"}
+        # If somehow still open, drive it to completion too.
+        last = walker.step()
+        while not last.done:
+            last = walker.step()
+        walkers.close(walk_id)
+        out = last.to_dict()
+        out["done"] = True
         return out
 
     @app.tool()

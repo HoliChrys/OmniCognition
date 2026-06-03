@@ -1,17 +1,19 @@
 """
-MCP-driven meta agent : runs the meta-cognitive walk STEP BY STEP
-through the metacog MCP server, with Claude orchestrating.
+MCP-driven meta agent : runs the meta-cognitive walk through the metacog
+MCP server, with Claude orchestrating BREADTH (not depth).
 
-Each tool call returns ONE stage of the walk (with full INDEXED
-CONTENT of every retrieved node) ; Claude reads it, decides whether
-to call `walk_next` for the next stage or to answer. Multi-hop
-filiation is preserved because the agent sees every stage in its
-conversation history before composing the answer.
+`walk_start` runs a COMPLETE uncertainty-governed walk in one call : the
+depth is decided by σ-propagation over the evidence chain (floor of 3
+hops, gold-retrieval-gated σ-cap, no fixed maximum), NOT by the agent.
+Claude reads the gathered evidence (`relevant_collected` + the reasoning
+chain) and either answers or issues a fresh `walk_start` with different
+vocabulary — a BREADTH PIVOT. Depth is the walk's own decision ; the
+agent only chooses where to start each thread.
 
-The agent NEVER does ReAct over a raw `retrieve` call : the walk
-already coordinates FACT + ACTION + THOUGHT inside the memory. The
-only ReAct-style step is between successive `walk_next` calls — and
-that loop has a hard termination via the walker's `done=True`.
+The agent NEVER does ReAct over a raw `retrieve` call : the walk already
+coordinates FACT + ACTION + THOUGHT inside the memory. Multi-hop
+filiation is preserved inside a single walk (the REDUCE accumulator) and
+across breadth pivots (the agent sees every walk's evidence in history).
 
 Credentials : api_key arg → ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN.
 sk-ant-oat* tokens go through auth_token= (OAuth bearer).
@@ -61,15 +63,19 @@ def _create_with_retry(client, **kwargs):
 
 _DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "256"))
-# 16 rounds: each walk can run up to 8 stages (walk_start + 7 walk_next),
-# and the walk stops naturally when no new unseen facts arrive (the
-# |seen ∩ gold| / |gold| proxy). With 16 rounds two full-depth walks fit
-# (2 × 8), or one deep walk + one breadth pivot, leaving rounds for synthesis.
-_MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "16"))
+# Each round is now ONE complete walk (walk_start runs the full
+# σ-governed depth internally), so a round = a whole breadth thread, not a
+# single stage. 8 rounds leaves room for several breadth pivots plus the
+# forced-final synthesis while keeping the agentic loop cheap.
+_MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
 
 # Only the walk tools — the agent should NOT bypass the walk by
 # calling raw retrieve. This is enforced server-side AND client-side.
-_ALLOWED_TOOLS = {"walk_start", "walk_next", "list_communities"}
+# `walk_start` now runs the COMPLETE uncertainty-governed walk in one
+# call (depth = σ-propagation, not caller-driven), so `walk_next` is no
+# longer exposed : the agent does breadth pivots (new walk_start), never
+# stage-by-stage micro-driving.
+_ALLOWED_TOOLS = {"walk_start", "list_communities"}
 
 # Constrained final-answer tool (literature : constrained decoding +
 # strict tool-use tames the verbose tail that costs token-F1). The agent
@@ -105,25 +111,28 @@ AGENT_SYSTEM = """You answer questions about a long conversation by
 driving a meta-cognitive walk through tools.
 
 Workflow :
-1. Call `walk_start(query=…)` to begin. You get ONE stage : its facts,
-   its action, its thought (the meta-cognitive bridge), and the
-   `walk_id`. Each fact / action / thought carries its full content,
-   keywords, confidence and uncertainty — read those.
-2. If the chosen fact at this stage already answers the question,
-   answer now (no more tool calls).
-3. READ THE RELEVANCE NOTES. Each fact has a `relevance` tag :
-   relevant / partial / contradicts / irrelevant. Trust only
-   relevant + partial + contradicts ; ignore irrelevant facts (they are
-   adjacent-but-off-target conversation turns). The stage also returns
-   `relevant_collected` — the running MAP-REDUCE set of every on-target
-   fact gathered SO FAR across all stages (bridging facts from earlier
-   stages are kept here, never lost). COMPOSE YOUR ANSWER over
-   `relevant_collected`, not just the latest stage : a multi-hop answer
-   chains facts collected across several stages.
-4. DEPTH : call `walk_next(walk_id=…)` for the next stage when the
-   current thread is still on-topic. Multi-hop questions often need 2-3
-   depth stages.
-5. BREADTH PIVOT — this is REQUIRED, not optional. When a stage returns
+1. Call `walk_start(query=…)` to begin. This runs a COMPLETE walk : its
+   DEPTH is decided automatically by uncertainty propagation (a floor of
+   at least 3 hops, then it keeps going as long as it surfaces new
+   on-target evidence, and stops when the propagated σ over the evidence
+   chain exceeds the manifold's local resolution). You do NOT drive depth
+   stage-by-stage — one walk_start gives you the whole deep walk.
+2. READ THE RESULT. The key fields :
+   — `relevant_collected` : the MAP-REDUCE set of every ON-TARGET fact the
+     walk gathered across ALL its hops ({id, content, relevance}). This is
+     your evidence — COMPOSE THE ANSWER over it, chaining facts for
+     multi-hop questions. Bridging facts from early hops are kept here,
+     never lost.
+   — `reasoning_chain` : the walk's thought thread (one reflection per hop,
+     each extending the prior) — follow it as the reasoning.
+   — `facts` : the union of all retrieved turns (content + a `relevance`
+     tag : relevant / partial / contradicts / irrelevant — trust only the
+     first three).
+   — `drifted` / `n_relevant` : if the WHOLE walk drifted (nothing
+     on-target), the query vocabulary missed — pivot (step 5).
+3. If `relevant_collected` answers the question, answer now (no more tools).
+4. (depth is automatic — there is no walk_next; to search further, pivot.)
+5. BREADTH PIVOT — this is REQUIRED, not optional. When a walk returns
    `drifted=true` or `n_relevant=0` (every fact reads irrelevant), the
    query phrasing is wrong, NOT the memory. Do NOT answer "Not
    mentioned" yet. Instead:
@@ -1178,8 +1187,8 @@ class McpMetaAgent:
                         # facts irrelevant) but the answer IS in your tool results.
                         ev_ctx = (
                             " The answer IS in your earlier tool results — "
-                            "re-read the 'facts' arrays from each walk_start/"
-                            "walk_next result above to find it. "
+                            "re-read the 'facts' and 'relevant_collected' "
+                            "arrays from each walk_start result above to find it. "
                         )
                     messages.append({
                         "role": "user",
