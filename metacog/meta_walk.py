@@ -81,6 +81,15 @@ _GENERATION_TOKEN_BUDGET = 50
 _MIN_STAGES = 3
 _DEFAULT_STAGES = 16
 
+# Token discipline : the synthesis / agent never needs the full MAP-REDUCE
+# set (it can reach dozens of facts and only bloats the prompt without
+# improving the answer — recall is already captured in fact_ids_cumulative).
+# We expose at most this many on-target facts as the composable evidence,
+# ranked by relevance label then keyword overlap with the walk's own
+# (query + thought-chain) vocabulary so vocabulary-distant gold the chain
+# bridged to is kept, not the raw query terms.
+_MAX_EVIDENCE = 15
+
 
 # ----------------------------------------------------------------------
 # HyDE — Hypothetical Document Embeddings (Gao et al., 2022), as an
@@ -1427,6 +1436,75 @@ class MetaWalker:
     # The step
     # ----------------------------------------------------------------
 
+    def _composable_evidence(self) -> List[dict]:
+        """Top-`_MAX_EVIDENCE` on-target facts as the COMPOSABLE evidence
+        for the agent / synthesis — bounded so a bloated MAP-REDUCE set
+        (CoN sometimes labels dozens of turns relevant) doesn't drown the
+        answer prompt or blow up the agent's context tokens.
+
+        Ranking is KEYWORD-ORIENTED and deterministic (no LLM) :
+          1. relevance label priority  (relevant > contradicts > partial)
+          2. keyword overlap with the walk's own vocabulary — the union of
+             the query keywords and the thought-chain keywords. Using the
+             CHAIN vocabulary (not the raw query) keeps vocabulary-distant
+             gold the walk bridged to, instead of demoting it.
+        Full recall is unaffected : `fact_ids_cumulative` still lists every
+        fact seen ; this only bounds what is COMPOSED over.
+        """
+        cum = self._relevant_cum
+        if len(cum) <= _MAX_EVIDENCE:
+            return [
+                {"id": p.id, "content": p.content,
+                 "relevance": self._relevant_label.get(p.id, "relevant")}
+                for p in cum
+            ]
+        # Walk vocabulary : query kws ∪ chain-thought kws (lowercased).
+        vocab: set = {k.lower() for k in (self._query_keywords or [])}
+        for t in self._thought_chain:
+            for k in (t.keywords or []):
+                vocab.add(k.lower())
+        _label_rank = {"relevant": 0, "contradicts": 1, "partial": 2}
+
+        def _score(p):
+            label = self._relevant_label.get(p.id, "relevant")
+            pk = {k.lower() for k in (p.keywords or [])}
+            overlap = len(pk & vocab)
+            return (_label_rank.get(label, 3), -overlap)
+
+        ranked = sorted(cum, key=_score)[:_MAX_EVIDENCE]
+        return [
+            {"id": p.id, "content": p.content,
+             "relevance": self._relevant_label.get(p.id, "relevant")}
+            for p in ranked
+        ]
+
+    def _query_covered(self) -> bool:
+        """True when every query keyword appears in the gathered evidence's
+        keywords or content (case-insensitive, stem-tolerant prefix match).
+        Deterministic, no LLM. Used as a metacognitive depth-stop only once
+        the relevant set is substantial."""
+        q = [k.lower() for k in (self._query_keywords or []) if len(k) >= 3]
+        if not q:
+            return False
+        bag: set = set()
+        for p in self._relevant_cum:
+            for k in (p.keywords or []):
+                bag.add(k.lower())
+            for w in (p.content or "").lower().split():
+                w = w.strip(".,;:!?\"'()")
+                if len(w) >= 3:
+                    bag.add(w)
+        bag_list = list(bag)
+        for term in q:
+            # exact, or prefix either way (cheap stem tolerance)
+            if term in bag:
+                continue
+            if any(term[:5] == b[:5] and (term in b or b in term)
+                   for b in bag_list):
+                continue
+            return False
+        return True
+
     def step(self) -> StageOutput:
         """Advance one stage and return the StageOutput. Sets done=True
         on the returned output when the walk cannot continue further."""
@@ -1499,6 +1577,31 @@ class MetaWalker:
         if (self._stage_idx >= _MIN_STAGES
                 and self._walk_sigma_cutoff is not None
                 and self._sigma_path > self._walk_sigma_cutoff):
+            self._done = True
+            return StageOutput(
+                stage=self._stage_idx,
+                facts=[], actions=[],
+                chosen_fact=None, chosen_action=None, thought=None,
+                generated_action=False, generated_thought=False,
+                fact_ids_cumulative=list(self._fact_ids_cum),
+                done=True,
+                sigma_path=self._sigma_path,
+            )
+
+        # ── METACOGNITIVE STOP : query-keyword COVERAGE ──────────────────
+        # Triggered only once the evidence is SUBSTANTIAL (past the floor
+        # and a non-trivial relevant set gathered) — a cheap, deterministic,
+        # KEYWORD-ORIENTED "is more search necessary?" check, no LLM call.
+        # If every keyword of the query is already covered by the keywords /
+        # content of the gathered evidence, the walk has turns bearing on
+        # every facet of the question — continuing only burns tokens, so
+        # stop. Vocabulary-gap questions (cat3 : "political leaning" vs
+        # "LGBTQ advocacy") never reach full coverage, so this never cuts
+        # them short — σ governs those.
+        if (self._stage_idx >= _MIN_STAGES
+                and len(self._relevant_cum) >= _MIN_STAGES
+                and self._query_keywords
+                and self._query_covered()):
             self._done = True
             return StageOutput(
                 stage=self._stage_idx,
@@ -1778,11 +1881,7 @@ class MetaWalker:
             fact_ids_cumulative=list(self._fact_ids_cum),
             done=False,
             sigma_path=self._sigma_path,
-            relevant_collected=[
-                {"id": p.id, "content": p.content,
-                 "relevance": self._relevant_label.get(p.id, "relevant")}
-                for p in self._relevant_cum
-            ],
+            relevant_collected=self._composable_evidence(),
         )
 
         self._prev_action = action_star
