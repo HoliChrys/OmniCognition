@@ -1662,20 +1662,40 @@ class MetaWalker:
         action_star = actions[0] if actions else None
 
         # ── Accumulate the evidence-chain uncertainty (GUM quadrature) ──
-        # The hop from the previous stage's fact★ to this one is the real
-        # uncertainty the walk adds : a coherent multi-hop chain keeps
-        # consecutive evidence close (small hop → σ grows slowly → walk
-        # goes deep), while a jump to unrelated territory adds a large hop
-        # (σ rises → the cap trips). This is what the depth check at the
-        # top of the NEXT step() reads.
+        # The hop signal measures CHAIN COHERENCE, not the volatility of
+        # the `least_uncertain` choice. Earlier we tried hop =
+        # 1 − cos(prev_fact★, fact★) ; that made σ track the seismic jumps
+        # of `least_uncertain` from one stage's most-certain fact to the
+        # next, which is roughly constant (~0.25/hop) regardless of whether
+        # the chain stayed coherent or wandered — so σ never adapted.
+        #
+        # Better signal : the hop is the SMALLEST distance from the previous
+        # fact★ to ANY fact this stage retrieved (focus subset). Reading :
+        #   small min-distance → there IS a fact near where the chain just
+        #     stood ; the trail can extend smoothly → low hop → σ grows
+        #     slowly → walk goes deep on coherent trails (cat3 included).
+        #   large min-distance → nothing this stage retrieved is close to
+        #     the chain's last position ; the walk has WANDERED off the
+        #     coherent neighbourhood → big hop → σ trips fast → cap fires.
+        # The choice of `least_uncertain` no longer dominates the signal ;
+        # only the geometry of what was REACHABLE this stage does. Pure
+        # COMPUTATION, no LLM-relevance dependency.
         if fact_star is not None:
             e_cur = effective_keyword_embedding(fact_star, self.t_now)
             if e_cur is not None:
-                if self._prev_fact_star_emb is not None:
-                    hop = max(0.0, 1.0 - cosine(self._prev_fact_star_emb, e_cur))
-                    self._sigma_path = math.sqrt(
-                        self._sigma_path ** 2 + hop ** 2
-                    )
+                if self._prev_fact_star_emb is not None and facts:
+                    min_dist = None
+                    for f in facts:
+                        e_f = effective_keyword_embedding(f, self.t_now)
+                        if e_f is None:
+                            continue
+                        d = max(0.0, 1.0 - cosine(self._prev_fact_star_emb, e_f))
+                        if min_dist is None or d < min_dist:
+                            min_dist = d
+                    if min_dist is not None:
+                        self._sigma_path = math.sqrt(
+                            self._sigma_path ** 2 + min_dist ** 2
+                        )
                 self._prev_fact_star_emb = e_cur
 
         # Accumulate FACT ids (this is the "effective recall" the
