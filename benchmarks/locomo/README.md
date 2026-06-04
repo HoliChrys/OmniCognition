@@ -126,9 +126,10 @@ Aggregated per category (1 multi-hop · 2 temporal · 3 inference ·
 per-QA trace (question, gold, prediction, retrieved ids, react trace) for
 inspection.
 
-## MetaCog-Mem results (10-sample balanced run, `--per-category 1`)
+## MetaCog-Mem results (balanced per-category sampling)
 
-All runs use `--answerer meta --encoder semantic --per-category 1 --samples 10`.
+All runs use `--answerer meta --encoder semantic --per-category 1`
+(`--samples` noted per version: 5 for V9/V11, 10 for V7).
 Answerer: Claude (Haiku 4.5, no dataset-specific prompt vocabulary).
 
 ### V11 — uncertainty-governed depth + breadth-only agent (current)
