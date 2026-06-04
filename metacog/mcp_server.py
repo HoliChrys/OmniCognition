@@ -375,6 +375,31 @@ def build_app(
         return _session_skills.get((user_id, session_id), {})
 
     @app.tool()
+    def capture_code_tool(
+        code: str, context: str = "", lang: str = "python",
+        user_id: str = "", session_id: str = "",
+    ) -> dict:
+        """Chat-side hook : after generating code, ask whether it is a
+        REUSABLE TOOL and, if so, FEED IT INTO THE RAG. Self-assesses via
+        tool-intent ; on yes, re-indexes the code as an executable tool node
+        (tagged tool·skill·code·name:·user:·session:·date:) the walk can
+        retrieve like any fact and reuse next time. Returns
+        {"captured": bool, "id", "name", "kind"}."""
+        p = memory.capture_code_tool(
+            code, context=context, lang=lang,
+            user_id=user_id, session_id=session_id,
+        )
+        if memory.storage_path and p is not None:
+            memory.save()
+        if p is None:
+            return {"captured": False}
+        name = next((t.split(":", 1)[1] for t in p.tags
+                     if t.startswith("name:")), "")
+        kind = next((t.split(":", 1)[1] for t in p.tags
+                     if t.startswith("kind:")), "")
+        return {"captured": True, "id": p.id, "name": name, "kind": kind}
+
+    @app.tool()
     def sleep() -> dict:
         """Run a sleep cycle of collision resolution."""
         result = memory.sleep()

@@ -612,6 +612,79 @@ class Memory:
         p.add_tag("tool")
         return p
 
+    def capture_code_tool(
+        self,
+        code: str,
+        *,
+        context: str = "",
+        lang: str = "python",
+        user_id: str = "",
+        session_id: str = "",
+        date: Optional[str] = None,
+    ) -> Optional[Point]:
+        """Chat-side hook : whenever code is GENERATED, ask whether it is a
+        reusable TOOL and, if so, FEED IT INTO THE RAG.
+
+        Self-assessment uses `assess_tool_intent` (surface markers + LLM
+        adjudication) over the code + its context. When it reads as an
+        executable capability, the code is re-indexed as a normal tool node
+        — an `ACTION` point with `exec_spec` (executable) tagged
+        `tool · skill · code · kind:<…> · name:<…> · user:<id> ·
+        session:<id> · date:<…>`. Being a normal node it is retrieved by
+        the walk like any fact (gold = tool fact OR semantic fact), reused
+        via match_tool, and persisted with the cloud.
+
+        Returns the created tool Point, or None when the code is judged not
+        a reusable tool. Fail-safe : any error → None (chat never blocked)."""
+        from metacog.skills import assess_tool_intent
+        code = (code or "").strip()
+        if not code:
+            return None
+        try:
+            intent = assess_tool_intent(f"{context}\n\n{code[:600]}", self.llm)
+        except Exception:
+            return None
+        if not intent.is_executable:
+            return None
+        if date is None:
+            from datetime import date as _date
+            date = _date.today().isoformat()
+        import re as _re
+        mname = (_re.search(r"\bdef\s+([A-Za-z_]\w*)", code)
+                 or _re.search(r"\bfunction\s+([A-Za-z_]\w*)", code))
+        name = (mname.group(1) if mname else
+                (_re.sub(r"[^a-z0-9]+", "_", (context or "tool").lower())
+                 .strip("_")[:40] or "tool"))
+        desc = context.strip() or f"tool {name} ({intent.kind})"
+        content = f"tool[{name}] {desc}"
+        kws: List[str] = []
+        seen: set = set()
+        for w in (_re.findall(r"[A-Za-z_]\w{2,}", name + " " + desc)
+                  + _re.findall(r"[A-Za-z_]\w{3,}", code)[:10]):
+            wl = w.lower()
+            if wl not in seen:
+                seen.add(wl); kws.append(wl)
+        kw_emb = position_weighted_keyword_embedding(kws[:12], self.encoder)
+        tags = ["tool", "skill", "code", f"kind:{intent.kind}", f"name:{name}"]
+        if user_id:
+            tags.append(f"user:{user_id}")
+        if session_id:
+            tags.append(f"session:{session_id}")
+        tags.append(f"date:{date}")
+        tool = Point(
+            id=f"skill_{uuid.uuid4().hex[:8]}",
+            content=content,
+            embedding_orig=tuple(self.encoder.encode(content)),
+            kind=PointKind.ACTION,
+            keywords=kws[:12],
+            keywords_embedding=kw_emb,
+            keywords_source=SourceClass.GENERATOR,
+            tags=tags,
+        )
+        tool.exec_spec = {"lang": lang, "code": code}
+        self.points.append(tool)
+        return tool
+
     def find_tools(self, query: str, k: int = 5) -> List[Point]:
         """Top-k tool-tagged ACTION points most semantically aligned
         with `query`. Pure discovery — does NOT execute anything."""
