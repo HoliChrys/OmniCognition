@@ -312,6 +312,66 @@ def retrieve_with_lineage(
     return [(score, points_by_id[pid]) for pid, score in ranked]
 
 
+def geometric_spread(
+    seed_points: Sequence["Point"],  # noqa: F821
+    all_points: Sequence["Point"],  # noqa: F821
+    t_now: float,
+) -> List[Tuple[float, "Point"]]:
+    """Edge-free analog of HeLa-Mem's spreading activation.
+
+    HeLa propagates base scores through LEARNED Hebbian edges
+    (S(v_j) += β·Σ S(v_i)·w_ij, with hyperparameters β and a threshold
+    θ). We have no edges — but `apply_pull` already drags co-corroborated
+    points together IN THE MANIFOLD, so co-activation is encoded as
+    geometric proximity rather than as an edge weight. Spreading is then
+    just : for each base seed, gather its manifold neighbours.
+
+    Neighbour membership uses the SAME emergent threshold the collision
+    machinery uses — (median − σ) of all pairwise keyword-embedding
+    distances — so there is NO new hyperparameter (no β, no θ). A point
+    is a spread-neighbour of a seed iff its distance is below that
+    population-derived cutoff.
+
+    Returns (distance, point) for every neighbour found, closest first,
+    de-duplicated. The seeds themselves are excluded.
+    """
+    if len(all_points) < 4 or not seed_points:
+        return []
+
+    # Emergent threshold over keyword-embedding distances (same statistic
+    # as collision_threshold : median − σ).
+    embs = {p.id: effective_keyword_embedding(p, t_now) for p in all_points}
+    dists: List[float] = []
+    pts = list(all_points)
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            dists.append(distance(embs[pts[i].id], embs[pts[j].id]))
+    if not dists:
+        return []
+    dists.sort()
+    median = dists[len(dists) // 2]
+    mean = sum(dists) / len(dists)
+    sigma = math.sqrt(sum((d - mean) ** 2 for d in dists) / len(dists))
+    threshold = max(0.0, median - sigma)
+
+    seed_ids = {p.id for p in seed_points}
+    found: dict[str, float] = {}
+    for seed in seed_points:
+        es = embs.get(seed.id)
+        if es is None:
+            continue
+        for p in all_points:
+            if p.id in seed_ids:
+                continue
+            d = distance(es, embs[p.id])
+            if d < threshold:
+                if p.id not in found or d < found[p.id]:
+                    found[p.id] = d
+    by_id = {p.id: p for p in all_points}
+    ranked = sorted(found.items(), key=lambda x: x[1])
+    return [(d, by_id[pid]) for pid, d in ranked]
+
+
 def retrieve_hybrid(
     query_text: str,
     points: Sequence["Point"],  # noqa: F821
@@ -321,10 +381,13 @@ def retrieve_hybrid(
     encoder,
     extractor,
     use_lineage: bool = False,
+    use_spreading: bool = False,
+    use_fuzzy: bool = True,
     lineage_depth: int = 7,
-    pool_per_signal: int = 14,
+    pool_per_signal: int = 20,
     rrf_k: int = 60,
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
+    restrict_kind: Optional["PointKind"] = None,  # noqa: F821
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -351,13 +414,23 @@ def retrieve_hybrid(
     """
     from metacog.bm25 import bm25_score
 
+    # Restrict the candidate set to a single kind when asked (the
+    # meta-walk retrieves FACT-only / ACTION-only). Applied before any
+    # pool is built so every signal respects it ; lineage stays within
+    # the restricted set too.
+    if restrict_kind is not None:
+        points = [p for p in points if p.kind == restrict_kind]
+
     points_by_id = {p.id: p for p in points}
 
     # Phase 1 — cosine on keyword embeddings
     query_kw = extractor.extract(query_text, n=8) if extractor else []
     if query_kw:
-        query_kw_text = " ".join(query_kw)
-        query_kw_emb = tuple(encoder.encode(query_kw_text))
+        # Symmetric with the points' position-weighted keyword
+        # embedding so the cosine respects keyword salience order.
+        from metacog.keywords import position_weighted_keyword_embedding
+        pwe = position_weighted_keyword_embedding(query_kw, encoder)
+        query_kw_emb = pwe if pwe is not None else tuple(encoder.encode(query_text))
     else:
         query_kw_emb = tuple(encoder.encode(query_text))
 
@@ -370,18 +443,42 @@ def retrieve_hybrid(
     cosine_pool.sort(key=lambda x: x[0], reverse=True)
     cosine_pool = cosine_pool[:pool_per_signal]
 
-    # Phase 2 — BM25 on full content
-    bm25_pool = bm25_score(query_text, points, k_pool=pool_per_signal)
+    # Phase 1b — dense cosine on the FULL-CONTENT effective embedding.
+    # Keyword cosine matches at the entity level but discards most of the
+    # turn's meaning ; full-content dense cosine is the strong semantic
+    # signal (especially with a real sentence encoder). The two are
+    # complementary and fused below. COMPUTATION on vectors — A(·) ⊥ P.
+    query_content_emb = tuple(encoder.encode(query_text))
+    content_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
+    for p in points:
+        eff = effective_embedding(p, t_now)
+        content_pool.append((cosine(query_content_emb, eff), p))
+    content_pool.sort(key=lambda x: x[0], reverse=True)
+    content_pool = content_pool[:pool_per_signal]
 
-    # Phase 3 — Reciprocal Rank Fusion
+    # Phase 2 — BM25 on raw content text (pure lexical channel).
+    # bm25_score now always indexes content tokens — query_keywords are
+    # passed only to add stemmed-variant coverage on top of raw tokens.
+    bm25_pool = bm25_score(
+        query_text, points, k_pool=pool_per_signal,
+        query_keywords=query_kw or None,
+    )
+
+    # Phase 2b — fuzzy lexical (Levenshtein) : recovers morphological /
+    # spelling variants of rare entities that exact BM25 misses. Edit
+    # budget is length-relative (parameter-free).
+    fuzzy_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
+    if use_fuzzy:
+        from metacog.fuzzy import fuzzy_score
+        fuzzy_pool = fuzzy_score(query_text, points, k_pool=pool_per_signal)
+
+    # Phase 3 — Reciprocal Rank Fusion across all base signals
     rrf_scores: dict[str, float] = {}
     best_rank_by_id: dict[str, int] = {}
-    for rank, (_, p) in enumerate(cosine_pool):
-        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
-        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
-    for rank, (_, p) in enumerate(bm25_pool):
-        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
-        best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
+    for pool in (cosine_pool, content_pool, bm25_pool, fuzzy_pool):
+        for rank, (_, p) in enumerate(pool):
+            rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+            best_rank_by_id[p.id] = min(best_rank_by_id.get(p.id, rank), rank)
 
     # Étape 5 — preference routing : 3rd RRF signal for matching kind.
     # Points of the preferred kind that are already candidates get an
@@ -402,6 +499,19 @@ def retrieve_hybrid(
 
     fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
     top_ids = [pid for pid, _ in fused[:k]]
+
+    # Phase 3.5 — geometric spreading activation (edge-free analog of
+    # HeLa's Hebbian spreading). Spread from the fused base top-k to
+    # their manifold neighbours and add a RRF signal. Parameter-free :
+    # neighbour membership uses the emergent (median − σ) threshold.
+    if use_spreading:
+        seeds = [points_by_id[pid] for pid in top_ids if pid in points_by_id]
+        spread = geometric_spread(seeds, points, t_now)
+        for srank, (_dist, p) in enumerate(spread):
+            rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + srank)
+        if spread:
+            fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+            top_ids = [pid for pid, _ in fused[:k]]
 
     # Phase 4 — optional lineage expansion with uncertainty propagation
     if use_lineage:

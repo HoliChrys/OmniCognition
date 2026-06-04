@@ -43,10 +43,18 @@ from metacog.epistemic import (
 )
 from metacog.geometry import (
     apply_pull,
+    cosine,
     distance,
     effective_embedding,
     effective_keyword_embedding,
 )
+
+# "Really the same information" is the extreme top tail of semantic
+# similarity : near-identical full-content meaning. Empirically (LoCoMo)
+# content-cosine ≥ 0.95 isolates genuine restatements with no false
+# positives, while merely-related adjacent turns sit well below. This is a
+# semantic-IDENTITY cutoff (deliberately high), not a relatedness knob.
+MERGE_COSINE_IDENTITY = 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -328,4 +336,111 @@ def sleep_cycle_collisions(
         if detect_collisions(points, t_now):
             report.aborted_for_cascade_limit = True
 
+    return report
+
+
+# ---------------------------------------------------------------------------
+# True merge (deduplication) — "quand l'info est pareille"
+# ---------------------------------------------------------------------------
+#
+# Distinct from fission above : when two same-kind points carry the SAME
+# information they collapse into a SINGLE node — the duplicate is dropped,
+# NOT kept as a trimmed parent. A genuine duplicate is corroboration, so the
+# survivor absorbs the other's counters and gains one corroboration. Pure
+# COMPUTATION : no LLM (the manifold's own near-identity is the signal).
+
+
+@dataclass(frozen=True)
+class MergeEvent:
+    """One row in the merge audit log : `absorbed_id` folded into
+    `keeper_id` because their information was the same."""
+
+    timestamp: float
+    keeper_id: str
+    absorbed_id: str
+    trigger_distance: float
+    threshold: float
+    detection_class: SourceClass = SourceClass.COMPUTATION
+
+
+def _normalize_content(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def detect_identical(
+    points: Sequence[Point], t_now: float,
+    *, cosine_identity: float = MERGE_COSINE_IDENTITY,
+) -> List[Tuple[Point, Point, float]]:
+    """Same-kind, eligible pairs whose information is the SAME : identical
+    normalized content, OR full-CONTENT-embedding cosine ≥ `cosine_identity`
+    (semantic restatement). High precision — merely-related turns are well
+    below the cutoff. Sorted most-similar-first."""
+    eligible = [
+        p for p in points
+        if p.state not in {EpistemicState.DEPRECATED, EpistemicState.INVALID}
+    ]
+    embs = [effective_embedding(p, t_now) for p in eligible]
+    norms = [_normalize_content(p.content) for p in eligible]
+    pairs: List[Tuple[Point, Point, float]] = []
+    for i in range(len(eligible)):
+        for j in range(i + 1, len(eligible)):
+            if eligible[i].kind != eligible[j].kind:
+                continue
+            same_text = norms[i] and norms[i] == norms[j]
+            c = cosine(embs[i], embs[j])
+            if same_text or c >= cosine_identity:
+                pairs.append((eligible[i], eligible[j], c))
+    # most-similar first (highest cosine)
+    pairs.sort(key=lambda triple: triple[2], reverse=True)
+    return pairs
+
+
+def resolve_merge(keeper: Point, absorbed: Point, t_now: float,
+                  *, trigger_distance: float = 0.0,
+                  threshold: float = 0.0) -> MergeEvent:
+    """Fold `absorbed` into `keeper` (Option Z-free : single surviving node).
+
+    The duplicate IS corroboration : keeper absorbs the other's counters
+    and gains one extra corroboration. The caller removes `absorbed` from
+    the point list and records the id alias."""
+    keeper.n_corrob += absorbed.n_corrob + 1
+    keeper.n_contra += absorbed.n_contra
+    keeper.n_uses += absorbed.n_uses
+    keeper.t_last_obs = max(keeper.t_last_obs, absorbed.t_last_obs, t_now)
+    return MergeEvent(
+        timestamp=t_now,
+        keeper_id=keeper.id,
+        absorbed_id=absorbed.id,
+        trigger_distance=trigger_distance,
+        threshold=threshold,
+    )
+
+
+@dataclass
+class MergeReport:
+    merged: List[MergeEvent] = field(default_factory=list)
+    aliases: dict = field(default_factory=dict)  # absorbed_id -> keeper_id
+
+
+def merge_duplicates(points: List[Point], t_now: float) -> MergeReport:
+    """One pass of true-merge deduplication, closest-first. Mutates
+    `points` in place : absorbed duplicates are REMOVED (no parent
+    retention). A point is touched at most once per pass."""
+    report = MergeReport()
+    pairs = detect_identical(points, t_now)
+    touched: set[str] = set()
+    to_remove: List[Point] = []
+    for keeper, absorbed, sim in pairs:
+        if keeper.id in touched or absorbed.id in touched:
+            continue
+        ev = resolve_merge(keeper, absorbed, t_now,
+                           trigger_distance=sim,
+                           threshold=MERGE_COSINE_IDENTITY)
+        report.merged.append(ev)
+        report.aliases[absorbed.id] = keeper.id
+        touched.add(keeper.id)
+        touched.add(absorbed.id)
+        to_remove.append(absorbed)
+    remove_ids = {p.id for p in to_remove}
+    points[:] = [p for p in points if p.id not in remove_ids]
     return report

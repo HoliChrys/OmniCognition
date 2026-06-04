@@ -25,11 +25,22 @@ class SemanticEncoder:
             _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
         self.model = _MODEL_CACHE[model_name]
         self.dim = self.model.get_sentence_embedding_dimension()
+        # Memoize per-string encodings. Entity beacons re-encode the SAME
+        # short values thousands of times ("wealth", "john", "january",
+        # "2023", date parts) — without this, --entities ingestion does
+        # ~10k redundant CPU transformer passes per conversation.
+        self._enc_cache: dict = {}
 
     def encode(self, text: str) -> Tuple[float, ...]:
+        key = text or " "
+        hit = self._enc_cache.get(key)
+        if hit is not None:
+            return hit
         vec = self.model.encode(
-            text or " ",
+            key,
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        return tuple(float(x) for x in vec)
+        out = tuple(float(x) for x in vec)
+        self._enc_cache[key] = out
+        return out

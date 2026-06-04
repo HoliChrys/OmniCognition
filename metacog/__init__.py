@@ -27,7 +27,8 @@ from metacog.geometry import retrieve_for_observator, retrieve_hybrid, retrieve_
 from metacog.keywords import KeywordExtractor, LLMKeywordExtractor, SimpleKeywordExtractor
 from metacog.bm25 import bm25_score
 from metacog.uncertainty import beta_sigma, hop_sigma, propagate, prune_threshold
-from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
+from metacog.defaults import NoOpExecutor, SimpleEncoder
+from metacog.llm import ClaudeLLM, MissingCredential
 from metacog.memory import Memory
 from metacog.compression import (
     CompressionEvent,
@@ -131,10 +132,11 @@ __all__ = [
     "hop_sigma",
     "propagate",
     "prune_threshold",
-    # defaults + top-level wrapper
+    # defaults + LLM + top-level wrapper
     "NoOpExecutor",
     "SimpleEncoder",
-    "SimpleLLM",
+    "ClaudeLLM",
+    "MissingCredential",
     "Memory",
     # compression (Chasles)
     "CompressionEvent",

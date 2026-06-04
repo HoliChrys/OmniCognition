@@ -25,9 +25,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from metacog.audit import audit, assert_no_laundering, inputs_of_A
-from metacog.collision import sleep_cycle_collisions
+from metacog.collision import merge_duplicates, sleep_cycle_collisions
 from metacog.compression import compress_trajectory
-from metacog.defaults import NoOpExecutor, SimpleEncoder, SimpleLLM
+from metacog.defaults import NoOpExecutor, SimpleEncoder
+from metacog.llm import ClaudeLLM
 from metacog.detectors import ConversationLog, TurnRecord, analyze_user_turn
 from metacog.epistemic import (
     DEFAULT_OBSERVATOR_ID,
@@ -41,13 +42,18 @@ from metacog.epistemic import (
 )
 from metacog.execution import execute_action
 from metacog.geometry import (
+    apply_pull,
     effective_embedding,
     retrieve,
     retrieve_for_observator,
     retrieve_hybrid,
     retrieve_with_lineage,
 )
-from metacog.keywords import KeywordExtractor, SimpleKeywordExtractor
+from metacog.keywords import (
+    KeywordExtractor,
+    SimpleKeywordExtractor,
+    position_weighted_keyword_embedding,
+)
 from metacog.observator import (
     Observator,
     delegate_query,
@@ -64,15 +70,43 @@ class Memory:
     """High-level service object that orchestrates the whole pipeline."""
 
     encoder: Any = field(default_factory=SimpleEncoder)
-    llm: Any = field(default_factory=SimpleLLM)
+    llm: Any = field(default_factory=ClaudeLLM)
     executor: Any = field(default_factory=NoOpExecutor)
     extractor: Any = field(default_factory=SimpleKeywordExtractor)
+    # Opt-in LLM entity extractor. None = current behavior unchanged.
+    # When set, each ingested FACT spawns tagged entity beacon nodes that
+    # are geometrically pulled onto it (the edge-free "edges-equivalent").
+    entity_extractor: Any = None
+    # Opt-in mem0-style atomic-fact extractor. When set, each ingested FACT
+    # spawns clean self-contained atomic FACTs (parents=[source dia_id],
+    # GENERATOR) that act as retrieval handles ; retrieval resolves an
+    # atomic hit back to its source turn (dia_id) and dedups.
+    atomic_extractor: Any = None
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
     observators: Dict[str, Observator] = field(default_factory=dict)
     conversation_log: ConversationLog = field(default_factory=ConversationLog)
+    # atomic-fact id -> source turn id (for retrieval resolution).
+    _atom_parent: Dict[str, str] = field(default_factory=dict)
+    # absorbed point id -> surviving node id, from consolidate_duplicates().
+    _merge_aliases: Dict[str, str] = field(default_factory=dict)
+    # Total number of multi-hop transitions recorded by record_hop ;
+    # drives the Poisson baseline used by spike_threshold(). Persisted.
+    _spike_total_hops: int = 0
     _t_clock: float = 0.0
+    # Diversity-weighted co-retrieval ledger driving LATERAL collision
+    # (metacog.lateral). Accumulated via record_retrieval() ; consumed by
+    # lateral_collapse(). Opt-in : recording is a no-op unless enabled.
+    _lateral_ledger: Any = None
+    lateral_enabled: bool = False
+    # Action-recurrence ledger driving SKILL/TOOL crystallization
+    # (metacog.skills). Accumulated via record_action_generation() ;
+    # consumed by crystallize_skills(). Crystallized tools are NORMAL nodes
+    # (kind=ACTION, tagged "tool") in self.points, so they persist with the
+    # cloud and the walk finds them recursively. Opt-in.
+    _skill_ledger: Any = None
+    skills_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.storage_path:
@@ -121,7 +155,7 @@ class Memory:
         if self.extractor is not None:
             kws = self.extractor.extract(content, n=5)
             if kws:
-                kw_emb = tuple(self.encoder.encode(" ".join(kws)))
+                kw_emb = position_weighted_keyword_embedding(kws, self.encoder)
                 kw_src = getattr(self.extractor, "source", SourceClass.COMPUTATION)
         point = Point(
             id=id,
@@ -149,7 +183,149 @@ class Memory:
             for p in self.points:
                 if p.id in parent_set and id not in p.children:
                     p.children = list(p.children) + [id]
+        # Spawn entity beacon nodes (opt-in). Only from genuine FACTs —
+        # never recurse on entity-derived facts (their ids start "entity_").
+        if (
+            self.entity_extractor is not None
+            and kind.upper() == "FACT"
+            and not id.startswith("entity_")
+        ):
+            try:
+                self._spawn_entities(point)
+            except Exception:
+                # A flaky extractor must never break ingestion.
+                pass
+        if (
+            self.atomic_extractor is not None
+            and kind.upper() == "FACT"
+            and not id.startswith(("entity_", "atom_"))
+        ):
+            try:
+                self._spawn_atomics(point)
+            except Exception:
+                pass
         return point
+
+    def _spawn_atomics(self, source_fact: Point) -> None:
+        """Decompose a turn into clean atomic FACTs (mem0-style). Each is a
+        retrieval handle : GENERATOR-sourced, parents=[source id], pulled
+        onto the source turn ; retrieval resolves it back to the dia_id."""
+        # speaker / text from the "[date] Speaker: text" content
+        body = source_fact.content
+        spk, txt = "", body
+        if "]" in body:
+            body = body.split("]", 1)[1]
+        if ":" in body[:40]:
+            spk, txt = body.split(":", 1)[0].strip(), body.split(":", 1)[1].strip()
+        atoms = self.atomic_extractor.extract_atoms(txt, speaker=spk)
+        t_now = self._now()
+        for k, a in enumerate(atoms):
+            kws = self.extractor.extract(a, n=6) if self.extractor else []
+            kw_emb = (position_weighted_keyword_embedding(kws, self.encoder)
+                      if kws else None)
+            atom = Point(
+                id=f"atom_{source_fact.id}_{k}",
+                content=a,
+                embedding_orig=tuple(self.encoder.encode(a)),
+                kind=PointKind.FACT,
+                keywords=kws,
+                keywords_embedding=kw_emb,
+                keywords_source=SourceClass.GENERATOR,
+                parents=[source_fact.id],
+                tags=["atomic"],
+            )
+            self.points.append(atom)
+            self._atom_parent[atom.id] = source_fact.id
+            apply_pull(atom, source_fact, +1.0, t_now)
+
+    # ------------------------------------------------------------------
+    # Entity beacons (edge-free "edges" via geometric pull)
+    # ------------------------------------------------------------------
+
+    def ingest_entity(
+        self,
+        value: str,
+        *,
+        source_fact: Point,
+        tags: Optional[List[str]] = None,
+        parent_entity: Optional[Point] = None,
+        t_now: Optional[float] = None,
+    ) -> Point:
+        """Create a tagged entity beacon node and relate it to its source
+        fact GEOMETRICALLY — there are no stored edges.
+
+        The beacon is a PointKind.FACT carrying a clean entity value +
+        type tags so a query matches it easily ; `apply_pull` then drags
+        BOTH the beacon and `source_fact` together in the manifold. The
+        fact's effective (content) embedding shifts toward the entity
+        value, so a query for that value retrieves the real fact directly
+        — this is the edges-equivalent. Date components are also pulled
+        onto their `parent_entity` (the shared `date` beacon).
+
+        Per-fact (NOT deduplicated across facts) : the same entity in two
+        facts spawns two beacons, each co-located with its own fact, so a
+        query surfaces ALL facts that mention it (parallel paths).
+
+        Cor. 5 : the beacon is GENERATOR-sourced and never produces an
+        Observation — apply_pull is called directly.
+        """
+        tags = tags or []
+        if t_now is None:
+            t_now = self._now()
+        kws = [value] + [t for t in tags if t and t != value]
+        kw_emb = position_weighted_keyword_embedding(kws, self.encoder)
+        beacon = Point(
+            id=f"entity_{uuid.uuid4().hex[:8]}",
+            content=(":".join(tags) + " " + value).strip() if tags else value,
+            embedding_orig=tuple(self.encoder.encode(value)),
+            kind=PointKind.FACT,
+            keywords=kws,
+            keywords_embedding=kw_emb,
+            keywords_source=SourceClass.GENERATOR,
+            tags=list(tags) + ["entity"],
+        )
+        self.points.append(beacon)
+        # Geometric "edges" : pull the beacon onto its source fact, and
+        # date components onto their parent date. Shared t_now so intra-fact
+        # decay never wipes the accumulating pulls.
+        apply_pull(beacon, source_fact, +1.0, t_now)
+        if parent_entity is not None:
+            apply_pull(beacon, parent_entity, +1.0, t_now)
+        return beacon
+
+    def _spawn_entities(self, source_fact: Point) -> None:
+        """Extract entities from a freshly ingested FACT and spawn their
+        beacon nodes. A date yields a full-date beacon plus day/month/year
+        component beacons — all tagged "date" and all pulled onto the SAME
+        source fact, so they cluster together near it (their geometric
+        "part_of" link is this shared co-location, not a separate pull,
+        which would only fight the source pull). One frozen t_now per fact
+        so pulls accumulate without inter-pull decay."""
+        ents = self.entity_extractor.extract_entities(source_fact.content)
+        if not ents:
+            return
+        t_now = self._now()
+        for e in ents:
+            if e.etype == "date":
+                self.ingest_entity(
+                    e.value, source_fact=source_fact,
+                    tags=["date"], t_now=t_now,
+                )
+                for part in ("day", "month", "year"):
+                    val = (e.date_parts or {}).get(part)
+                    if not val:
+                        continue
+                    # Bare value ("20"/"january"/"2023") is the matchable
+                    # keyword ; the part lives in tags.
+                    self.ingest_entity(
+                        val, source_fact=source_fact,
+                        tags=["date", part], t_now=t_now,
+                    )
+            else:
+                self.ingest_entity(
+                    e.value, source_fact=source_fact,
+                    tags=[e.etype], t_now=t_now,
+                )
 
     def ingest_action(
         self,
@@ -160,6 +336,75 @@ class Memory:
     ) -> Point:
         """Convenience : ingest an ACTION point."""
         return self.ingest(description, kind="ACTION", id=id, parents=parents)
+
+    # ------------------------------------------------------------------
+    # Tools : tool-tagged ACTION points + sandboxed execution.
+    # ------------------------------------------------------------------
+
+    def ingest_tool(
+        self,
+        content: str,
+        code: str,
+        *,
+        lang: str = "python",
+        id: Optional[str] = None,
+    ) -> Point:
+        """Create an executable tool — an ACTION point with the "tool"
+        tag and a populated exec_spec. Discoverable via find_tools()
+        (semantic match) or directly by Memory.execute_tool(id, args).
+
+        Convention : `code` must define `def run(args: dict) -> JSON`.
+        """
+        p = self.ingest(content, kind="ACTION", id=id)
+        p.exec_spec = {"lang": lang, "code": code}
+        p.add_tag("tool")
+        return p
+
+    def find_tools(self, query: str, k: int = 5) -> List[Point]:
+        """Top-k tool-tagged ACTION points most semantically aligned
+        with `query`. Pure discovery — does NOT execute anything."""
+        results = self.retrieve(query, k=max(k * 2, k), use_hybrid=True)
+        by_id = {p.id: p for p in self.points}
+        out: List[Point] = []
+        for r in results:
+            p = by_id.get(r["id"])
+            if p is not None and p.has_tag("tool") and p not in out:
+                out.append(p)
+                if len(out) >= k:
+                    break
+        return out
+
+    def execute_tool(
+        self,
+        tool_id: str,
+        args: Dict[str, Any],
+        executor: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run a tool-tagged ACTION through the sandboxed executor.
+
+        Returns {ok, result, fact_id} on success — a FACT child is
+        created in memory (parents=[tool_id], tag "executed") whose
+        content is the str(result). On failure : {ok=False, error,
+        fact_id=None} and NO fact is created.
+        """
+        from metacog.executor import PyExecutor
+        tool = next((p for p in self.points if p.id == tool_id), None)
+        if tool is None:
+            raise ValueError(f"unknown tool id {tool_id!r}")
+        if not tool.has_tag("tool"):
+            raise ValueError(f"point {tool_id!r} is not tagged 'tool'")
+        if not tool.exec_spec:
+            raise ValueError(f"point {tool_id!r} has no exec_spec")
+        exe = executor if executor is not None else PyExecutor()
+        out = exe.execute(tool.exec_spec, args)
+        if not out.get("ok"):
+            return {"ok": False, "error": out.get("error", "unknown"),
+                    "fact_id": None}
+        result_fact = self.ingest(
+            content=str(out["result"]), kind="FACT", parents=[tool_id],
+        )
+        result_fact.add_tag("executed")
+        return {"ok": True, "result": out["result"], "fact_id": result_fact.id}
 
     # ------------------------------------------------------------------
     # Observation
@@ -189,7 +434,9 @@ class Memory:
         if new_kws == list(point.keywords):
             return  # no change, skip embedding recompute
         point.keywords = new_kws
-        point.keywords_embedding = tuple(self.encoder.encode(" ".join(new_kws)))
+        point.keywords_embedding = position_weighted_keyword_embedding(
+            new_kws, self.encoder,
+        )
         # source class follows the extractor
         point.keywords_source = getattr(
             self.extractor, "source", SourceClass.COMPUTATION,
@@ -277,6 +524,7 @@ class Memory:
         observator_id: Optional[str] = None,
         use_lineage: bool = False,
         use_hybrid: bool = False,
+        use_spreading: bool = False,
         lineage_depth: int = 7,
         prefer_kind: Optional[str] = None,
         t: Optional[float] = None,
@@ -296,10 +544,36 @@ class Memory:
         Default k=7 (≈ matches LoCoMo / typical agentic context budget).
         """
         t_now = self._now(t)
+        # When entity beacons exist they act as ingest-time pull agents :
+        # their geometric pull already shifted the real facts, so we drop
+        # them from the RETURNED ids (over-fetching to backfill to k) — the
+        # recall metric then measures real facts only, and beacons never
+        # displace evidence. No-op / unchanged when no extractor is set.
+        beacons = self.entity_extractor is not None
+        atomics = self.atomic_extractor is not None or bool(self._atom_parent)
+        # Entity beacons do their work AT INGESTION : apply_pull (first step
+        # = 1/(1+0) = 1.0) already shifted the real source facts toward each
+        # entity/topic value, so a matching query finds the shifted REAL fact
+        # directly. At query time the beacons are dead weight that would only
+        # bloat the search 10x (spreading activation is superlinear), so we
+        # exclude them from the SEARCH POOL entirely — the pull benefit
+        # persists in the real facts' positions. (Atomics keep the old joint-
+        # pool path, which already has its own entity_/atom_ handling below.)
+        search_pts = self.points
+        if beacons and not atomics:
+            search_pts = [p for p in self.points
+                          if not p.id.startswith("entity_")]
+        # Over-fetch more when atomic facts are present : many atoms resolve
+        # to the same source turn, so we need headroom to dedup to k turns.
+        k_fetch = k
+        if beacons:
+            k_fetch = k * 2 + 10
+        if atomics:
+            k_fetch = max(k_fetch, k * 5 + 20)
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
-                q_emb, self.points, k, t_now, observator_id,
+                q_emb, search_pts, k_fetch, t_now, observator_id,
             )
         elif use_hybrid:
             kind_filter: Optional[PointKind] = None
@@ -309,22 +583,78 @@ class Memory:
                     else PointKind[prefer_kind.upper()]
                 )
             results = retrieve_hybrid(
-                query, self.points, k, t_now,
+                query, search_pts, k_fetch, t_now,
                 encoder=self.encoder,
                 extractor=self.extractor,
                 use_lineage=use_lineage,
+                use_spreading=use_spreading,
                 lineage_depth=lineage_depth,
                 prefer_kind=kind_filter,
             )
+            if atomics:
+                # Second pass over RAW turns only — atoms flood the joint
+                # pool and bury strong raw evidence below the over-fetch
+                # cutoff, so we need the TRUE raw ranking to interleave with.
+                raw_pts = [p for p in self.points
+                           if not p.id.startswith(("atom_", "entity_"))]
+                self._raw_results = retrieve_hybrid(
+                    query, raw_pts, k, t_now,
+                    encoder=self.encoder, extractor=self.extractor,
+                    use_lineage=use_lineage, use_spreading=use_spreading,
+                    lineage_depth=lineage_depth, prefer_kind=kind_filter,
+                )
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_with_lineage(
-                q_emb, self.points, k, t_now,
+                q_emb, search_pts, k_fetch, t_now,
                 lineage_depth=lineage_depth,
             )
         else:
             q_emb = tuple(self.encoder.encode(query))
-            results = retrieve(q_emb, self.points, k, t_now)
+            results = retrieve(q_emb, search_pts, k_fetch, t_now)
+        if beacons or atomics:
+            by_id = {p.id: p for p in self.points}
+            # Two streams, both resolved to source turns : raw-turn hits and
+            # atom-derived hits. Atoms make many turns competitive, so pure
+            # score order lets atoms displace strong raw evidence (multi-hop
+            # recall drops). INTERLEAVING the streams keeps recall >= the
+            # better of {raw-only, atom-only} per query : the raw stream
+            # preserves the baseline (e.g. enumeration turns), the atom
+            # stream adds the entity-lookup turns the raw extractor missed.
+            # Atom stream : atom-derived turns from the joint pool.
+            atom_stream = [
+                (s, self._atom_parent.get(p.id, p.id))
+                for s, p in results if p.id.startswith("atom_")
+            ]
+            # Raw stream : prefer the dedicated raw-only ranking (true
+            # baseline, computed above) ; fall back to the joint pool's
+            # non-atom hits (beacons-only case).
+            raw_src = getattr(self, "_raw_results", None)
+            if raw_src is not None:
+                raw_stream = [(s, p.id) for s, p in raw_src]
+                self._raw_results = None
+            else:
+                raw_stream = [(s, p.id) for s, p in results
+                              if not p.id.startswith(("atom_", "entity_"))]
+            deduped, seen = [], set()
+            ri = ai = 0
+            while len(deduped) < k and (ri < len(raw_stream) or ai < len(atom_stream)):
+                for stream, idx_name in ((raw_stream, "r"), (atom_stream, "a")):
+                    i = ri if idx_name == "r" else ai
+                    while i < len(stream) and stream[i][1] in seen:
+                        i += 1
+                    if i < len(stream):
+                        s, rid = stream[i]
+                        seen.add(rid)
+                        deduped.append((s, by_id.get(rid)))
+                        i += 1
+                    if idx_name == "r":
+                        ri = i
+                    else:
+                        ai = i
+                    if len(deduped) >= k:
+                        break
+            results = [(s, p) for s, p in deduped if p is not None]
         return [
             {
                 "id": p.id,
@@ -375,17 +705,212 @@ class Memory:
     # ------------------------------------------------------------------
 
     def sleep(self, t: Optional[float] = None) -> Dict[str, Any]:
-        """Run a sleep cycle of collision resolution."""
+        """Run a sleep cycle of collision resolution.
+
+        After geometric (proximity-fission) collisions, also run one
+        LATERAL collision pass : functionally-redundant nodes that the
+        co-retrieval ledger has shown to always surface together under
+        diverse queries collapse into a single keeper. No-op unless
+        lateral collision is enabled and the cloud is past the gate."""
         t_now = self._now(t)
         report = sleep_cycle_collisions(
             self.points, self.llm, self.encoder, t_now=t_now,
         )
-        return {
+        out = {
             "iterations": report.iterations,
             "resolved_count": len(report.resolved),
             "new_children_ids": [p.id for p in report.new_children],
             "aborted_for_cascade_limit": report.aborted_for_cascade_limit,
         }
+        lat = self.lateral_collapse(t_now)
+        out["lateral_collided_groups"] = lat["collided_groups"]
+        out["lateral_aliases"] = lat["aliases"]
+        return out
+
+    def compress_chasles(self) -> List[Dict[str, Any]]:
+        """Auto-detect spike-driven Chasles paths and compress them.
+
+        Each path of >= 4 same-kind spiking nodes (start, ≥2 intermediates,
+        end) triggers resolve_collision on the intermediates with start /
+        end as anchors. Reset n_spike to 0 on every node of a fired path
+        (refractory period). Returns the list of CollisionEvent dicts."""
+        from metacog.spike import auto_compress_chasles
+        events = auto_compress_chasles(self, self.llm, self.encoder)
+        return [
+            {
+                "child_id": ev.child_id,
+                "parent_ids": list(ev.parent_ids),
+                "anchor_ids": list(ev.anchor_ids),
+                "timestamp": ev.timestamp,
+            }
+            for ev in events
+        ]
+
+    def consolidate_duplicates(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """True-merge deduplication : same-kind points carrying the SAME
+        information collapse into a single node (the duplicate is dropped,
+        its corroboration absorbed). Records id aliases so a dropped id can
+        still be resolved to its survivor (e.g. evidence-id scoring)."""
+        t_now = self._now(t)
+        report = merge_duplicates(self.points, t_now)
+        # Chain aliases through the existing map so older absorbed ids still
+        # resolve to the final survivor.
+        for absorbed, keeper in report.aliases.items():
+            self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
+        return {
+            "merged_count": len(report.merged),
+            "aliases": dict(report.aliases),
+            "n_points": len(self.points),
+        }
+
+    def record_retrieval(
+        self, ranked_ids: Sequence[str], query_emb: Optional[Sequence[float]] = None,
+    ) -> None:
+        """Fold one retrieval's ranked result ids into the lateral
+        co-retrieval ledger. No-op unless `lateral_enabled`. Cheap
+        (O(k·window)) so it can sit on the retrieval hot path."""
+        if not self.lateral_enabled:
+            return
+        from metacog.lateral import LateralLedger, record_coretrieval
+        if self._lateral_ledger is None:
+            self._lateral_ledger = LateralLedger()
+        record_coretrieval(
+            self._lateral_ledger, list(ranked_ids),
+            tuple(query_emb) if query_emb is not None else None,
+        )
+
+    def lateral_collapse(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """LATERAL collision : nodes that the co-retrieval ledger shows to
+        be functionally redundant (always surfaced together by DIVERSE
+        queries) collapse into a single keeper. Gated on a large, tag-rich
+        cloud. Records absorbed->keeper aliases (chained through the merge
+        map) so dropped ids still resolve. No-op when disabled or below
+        the gate."""
+        t_now = self._now(t)
+        if self._lateral_ledger is None:
+            return {"collided_groups": 0, "aliases": {}, "n_points": len(self.points)}
+        from metacog.lateral import lateral_collapse as _collapse
+        report = _collapse(
+            self.points, self._lateral_ledger, self.encoder, t_now,
+        )
+        for absorbed, keeper in report.aliases.items():
+            self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
+        return {
+            "collided_groups": len(report.collided),
+            "aliases": dict(report.aliases),
+            "n_points": len(self.points),
+        }
+
+    def record_action_generation(
+        self, action: Point, query_emb: Optional[Sequence[float]],
+        query_text: str, facts: Sequence[Point],
+    ) -> None:
+        """Register one re-derived ACTION into the skill-recurrence ledger,
+        scoped by the query that triggered it and the grounding facts'
+        keywords. No-op unless `skills_enabled`."""
+        if not self.skills_enabled or action is None:
+            return
+        from metacog.skills import SkillLedger, record_action
+        if self._skill_ledger is None:
+            self._skill_ledger = SkillLedger()
+        fact_kw: List[str] = []
+        for f in facts[:5]:
+            fact_kw.extend(f.keywords or [])
+        record_action(
+            self._skill_ledger, action,
+            tuple(query_emb) if query_emb is not None else None,
+            query_text, fact_kw,
+        )
+
+    def crystallize_skills(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """Crystallize recurring actions into persistent TOOL nodes — normal
+        kind=ACTION Points tagged "tool", scoped by keywords, added to the
+        cloud (so the walk finds them recursively and they persist on save).
+        Gated on the emergent recurrence threshold. No-op when disabled."""
+        t_now = self._now(t)
+        if self._skill_ledger is None:
+            return {"crystallized": 0, "tool_ids": [], "n_points": len(self.points)}
+        from metacog.skills import detect_skill_candidates, synthesize_tool
+        existing = list(self.points)
+        cands = detect_skill_candidates(self._skill_ledger, existing_tools=existing)
+        new_ids: List[str] = []
+        for sig, trace in cands:
+            tool = synthesize_tool(
+                sig, trace, self.llm, self.encoder, t_now,
+            )
+            if tool is not None:
+                self.points.append(tool)
+                new_ids.append(tool.id)
+        return {
+            "crystallized": len(new_ids),
+            "tool_ids": new_ids,
+            "n_points": len(self.points),
+        }
+
+    def match_tool(self, query: str) -> Optional[Dict[str, Any]]:
+        """Capability-cache lookup : does a previously-generated TOOL node
+        already cover `query` ? Returns the tool summary + match score, or
+        None (the agent must think from scratch). The walk also surfaces
+        these tool nodes natively, so this is the explicit fast-path."""
+        from metacog.skills import match_tool as _match
+        q_kw = self.extractor.extract(query, n=8) if self.extractor else []
+        if q_kw:
+            q_emb = position_weighted_keyword_embedding(q_kw, self.encoder)
+        else:
+            q_emb = tuple(self.encoder.encode(query))
+        hit = _match(q_emb, self.points)
+        if hit is None:
+            return None
+        tool, score = hit
+        return {
+            "id": tool.id, "content": tool.content,
+            "keywords": list(tool.keywords or []), "tags": list(tool.tags or []),
+            "score": round(score, 4),
+        }
+
+    def ensure_tool(
+        self, query: str, *, how: Optional[str] = None, genre: str = "command",
+    ) -> Dict[str, Any]:
+        """The 'no tool → generate it → proceed' step. Looks up a covering
+        tool for `query` ; if one exists it is REUSED (no think phase) ;
+        otherwise a tool is GENERATED now from the query + the deduced
+        approach (`how`) and added to the cloud. Generation is
+        unconstrained — this never blocks the agent, it only ever grows the
+        self-built tool set. Returns {tool, reused}."""
+        existing = self.match_tool(query)
+        if existing is not None:
+            tid = existing["id"]
+            for p in self.points:
+                if p.id == tid:
+                    p.n_uses += 1
+                    break
+            return {"tool": existing, "reused": True}
+        from metacog.skills import synthesize_tool_from_intent
+        t_now = self._now()
+        tool = synthesize_tool_from_intent(
+            query, how or query, self.llm, self.encoder, t_now,
+            genre=genre, extractor=self.extractor,
+        )
+        if tool is None:
+            return {"tool": None, "reused": False}
+        self.points.append(tool)
+        return {
+            "tool": {
+                "id": tool.id, "content": tool.content,
+                "keywords": list(tool.keywords or []), "tags": list(tool.tags or []),
+            },
+            "reused": False,
+        }
+
+    def resolve_alias(self, point_id: str) -> str:
+        """Resolve an id to its canonical node : an atomic-fact id maps to
+        its source turn (dia_id), and a merge-absorbed id to its survivor."""
+        point_id = self._atom_parent.get(point_id, point_id)
+        seen = set()
+        while point_id in self._merge_aliases and point_id not in seen:
+            seen.add(point_id)
+            point_id = self._merge_aliases[point_id]
+        return point_id
 
     # ------------------------------------------------------------------
     # Observators
@@ -408,6 +933,53 @@ class Memory:
         obs.ensure_keywords_embedding(self.encoder)
         self.observators[id] = obs
         return obs
+
+    def auto_cluster_observators(
+        self,
+        *,
+        min_cluster_size: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Detect Level-1 communities over the FACTs and instantiate one
+        named observator per community (à la GraphRAG / LightRAG).
+
+        Single-pass Louvain on the cleaned-content similarity graph.
+        THOUGHTs, ACTIONs, and entity beacons are excluded ; FACTs not in
+        a large-enough community stay attached only to the default
+        observator.
+
+        Each point in a community gets an ObservatorView marker so
+        retrieve_for_observator / select_observators can route to it.
+        Observators can call each other via observator.delegate_query
+        (cycle- and depth-bounded).
+
+        Returns a list of {id, name, keywords, point_ids} dicts.
+        """
+        from metacog.communities import detect_level1_communities
+        from metacog.observator import ObservatorView
+
+        comms = detect_level1_communities(
+            self.points, self.encoder,
+            min_cluster_size=min_cluster_size,
+        )
+        out: List[Dict[str, Any]] = []
+        for c in comms:
+            obs = self.declare_observator(
+                c.id,
+                name=" / ".join(c.keywords[:3]) if c.keywords else c.id,
+                keywords=c.keywords,
+            )
+            member_set = set(c.point_ids)
+            for p in self.points:
+                if p.id in member_set and obs.id not in p.observator_views:
+                    p.observator_views[obs.id] = ObservatorView()
+            out.append({
+                "id": obs.id,
+                "name": obs.name,
+                "keywords": c.keywords,
+                "point_ids": c.point_ids,
+                "n_points": len(c.point_ids),
+            })
+        return out
 
     def detect_polarized_points(self) -> List[str]:
         return [p.id for p in self.points if detect_polarization(p)]
@@ -475,6 +1047,9 @@ class Memory:
                 }
                 for oid, v in p.observator_views.items()
             },
+            "keywords": list(p.keywords or []),
+            "tags": list(p.tags or []),
+            "n_spike": p.n_spike,
             "update_log_size": len(p.update_log),
             "execution_log_size": len(p.execution_log),
         }
@@ -517,6 +1092,7 @@ class Memory:
             "observators": self.observators,
             "conversation_log": self.conversation_log,
             "_t_clock": self._t_clock,
+            "_spike_total_hops": self._spike_total_hops,
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -532,3 +1108,4 @@ class Memory:
         self.observators = snapshot.get("observators", {})
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)
+        self._spike_total_hops = snapshot.get("_spike_total_hops", 0)

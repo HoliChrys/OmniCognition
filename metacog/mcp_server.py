@@ -35,10 +35,31 @@ from mcp.server.fastmcp import FastMCP
 
 from metacog.memory import Memory
 
+# Hard cap on facts returned by walk_start : a deep walk can retrieve 100+
+# turns, and shipping all their content to the agent is the dominant
+# input-token cost. The composable (relevance-ranked) evidence comes first,
+# topped up to this bound — recall is unaffected (fact_ids_cumulative still
+# lists every id).
+_MAX_RETURNED_FACTS = 20
 
-def build_app(storage_path: Optional[str] = None) -> FastMCP:
+
+def build_app(
+    storage_path: Optional[str] = None,
+    memory: Optional[Memory] = None,
+) -> FastMCP:
+    """Build the metacog MCP app.
+
+    `memory` lets a caller inject an already-populated Memory (e.g. a
+    benchmark conversation pre-ingested in-process) instead of creating
+    an empty one. When omitted, a fresh Memory(storage_path=…) is used.
+    """
+    from metacog.meta_walk import MetaWalker, WalkerRegistry
+
     app = FastMCP("metacog")
-    memory = Memory(storage_path=storage_path)
+    if memory is None:
+        memory = Memory(storage_path=storage_path)
+
+    walkers = WalkerRegistry()
 
     @app.tool()
     def ingest(content: str, kind: str = "FACT", id: Optional[str] = None) -> dict:
@@ -113,9 +134,159 @@ def build_app(storage_path: Optional[str] = None) -> FastMCP:
         }
 
     @app.tool()
-    def retrieve(query: str, k: int = 5, observator_id: Optional[str] = None) -> List[dict]:
-        """Retrieve top-k points. Optionally route through a named observator."""
-        return memory.retrieve(query, k=k, observator_id=observator_id)
+    def retrieve(
+        query: str,
+        k: int = 5,
+        observator_id: Optional[str] = None,
+        use_hybrid: bool = True,
+        use_lineage: bool = True,
+        use_spreading: bool = True,
+        prefer_kind: Optional[str] = None,
+    ) -> List[dict]:
+        """Retrieve top-k points for a query.
+
+        Args:
+          query:        natural-language search text.
+          k:            number of points to return.
+          observator_id: route through a named observator's view (optional).
+          use_hybrid:   keyword-embedding cosine + BM25 fallback + RRF
+                        (default True ; the primary retrieval path).
+          use_lineage:  expand the fused top-k along parent/child/sequence
+                        links with uncertainty-pruned RRF (default True).
+          use_spreading: geometric spreading activation — expand the base
+                        top-k to their manifold neighbours (edge-free
+                        analog of associative spreading; default True).
+          prefer_kind:  boost a PointKind in ranking — FACT | THOUGHT |
+                        ACTION. Use ACTION for "how do I X" queries.
+
+        k is capped at 7 (the system's retrieval budget).
+        """
+        k = min(max(1, k), 7)
+        return memory.retrieve(
+            query, k=k, observator_id=observator_id,
+            use_hybrid=use_hybrid, use_lineage=use_lineage,
+            use_spreading=use_spreading, prefer_kind=prefer_kind,
+        )
+
+    # ----------------------------------------------------------------
+    # Meta-cognitive walk — streaming, step-by-step
+    # ----------------------------------------------------------------
+
+    @app.tool()
+    def walk_start(
+        query: str,
+        n_stages: int = 16,
+        facts_per_stage: int = 7,
+        actions_per_stage: int = 3,
+        commit: bool = False,
+        observator_id: str = "",
+    ) -> dict:
+        """Run a COMPLETE meta-cognitive walk and return its result.
+
+        The walk traverses three coordinated kinds (FACT / ACTION /
+        THOUGHT) over the memory. Its DEPTH is governed by UNCERTAINTY
+        PROPAGATION, not by the caller : a floor of at least 3 hops always
+        runs, then the walk continues as long as it keeps surfacing new
+        gold-relevant evidence, and stops once the propagated σ over the
+        evidence chain exceeds the manifold's local resolution (the
+        gold-retrieval-gated σ-cap). There is no fixed maximum — `n_stages`
+        is only a generous safety bound.
+
+        This single call loops the walk to completion internally, so the
+        agent does NOT micro-drive depth stage-by-stage. The agent's job
+        is BREADTH : read the gathered evidence, answer if it is enough, or
+        call `walk_start` again with different / more targeted vocabulary
+        (a breadth pivot).
+
+        Result schema :
+          walk_id              : str  (the walk is already complete/closed)
+          stages_run           : int  — how many hops the σ-walk took
+          facts                : union of retrieved FACTs across ALL stages,
+                                 each with full INDEXED CONTENT, keywords,
+                                 confidence, uncertainty, relevance label
+          relevant_collected   : the MAP-REDUCE set of every on-target fact
+                                 gathered across the whole walk
+                                 ({id, content, relevance}) — COMPOSE THE
+                                 ANSWER over this
+          reasoning_chain      : the THOUGHT chain (one reflection per hop,
+                                 each extending the prior) — the walk's
+                                 reasoning thread
+          fact_ids_cumulative  : every FACT id seen (effective retrieval set)
+          sigma_path           : final propagated uncertainty
+          drifted / n_relevant : last-hop content-relevance signals — if the
+                                 whole walk drifted, pivot with new vocabulary
+          done                 : always True (the walk ran to completion)
+        """
+        walker = MetaWalker(
+            query, memory,
+            n_stages=max(1, n_stages),
+            facts_per_stage=max(1, facts_per_stage),
+            actions_per_stage=max(1, actions_per_stage),
+            commit=commit,
+            observator_id=observator_id or None,
+        )
+        walk_id = walkers.open(walker)
+        # Loop the walk to completion : depth is the walk's own
+        # uncertainty-propagation decision, not a per-tool-call step.
+        _SAFETY = 40
+        agg_facts: dict = {}
+        stages_run = 0
+        last = None
+        while stages_run < _SAFETY:
+            last = walker.step()
+            stages_run += 1
+            for f in (last.facts or []):
+                fid = f.get("id") if isinstance(f, dict) else None
+                if fid and fid not in agg_facts:
+                    agg_facts[fid] = f
+            if last.done:
+                break
+        out = last.to_dict()
+        out["walk_id"] = walk_id
+        out["stages_run"] = stages_run
+        # TOKEN DISCIPLINE — the agent never needs the full per-stage union
+        # (a deep walk can retrieve 100+ facts ; sending all their content
+        # is the dominant input-token sink). Expose the COMPOSABLE evidence
+        # (the bounded, relevance-ranked on-target set) as the primary
+        # `facts`, and only top up with a few extra retrieved turns. The
+        # walk's σ-cap/coverage early-returns leave the final StageOutput's
+        # relevant_collected empty, so pull it straight from the walker.
+        evidence = walker._composable_evidence()
+        ev_ids = {e["id"] for e in evidence}
+        extra = [f for f in agg_facts.values()
+                 if isinstance(f, dict) and f.get("id") not in ev_ids]
+        out["relevant_collected"] = evidence
+        out["facts"] = (
+            [agg_facts[e["id"]] for e in evidence if e["id"] in agg_facts]
+            + extra
+        )[:_MAX_RETURNED_FACTS]
+        out["reasoning_chain"] = [
+            t.content for t in getattr(walker, "_thought_chain", [])
+        ]
+        out["done"] = True
+        walkers.close(walk_id)
+        return out
+
+    @app.tool()
+    def walk_next(walk_id: str) -> dict:
+        """DEPRECATED. `walk_start` now runs the whole uncertainty-governed
+        walk to completion in one call (depth is decided by σ-propagation,
+        not by the caller). This remains only for backward compatibility :
+        the walk is already complete, so it reports done immediately. To go
+        further, issue a new `walk_start` with different vocabulary (a
+        breadth pivot)."""
+        walker = walkers.get(walk_id)
+        if walker is None:
+            return {"done": True,
+                    "note": "walk already complete — call walk_start to pivot"}
+        # If somehow still open, drive it to completion too.
+        last = walker.step()
+        while not last.done:
+            last = walker.step()
+        walkers.close(walk_id)
+        out = last.to_dict()
+        out["done"] = True
+        return out
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
@@ -132,6 +303,51 @@ def build_app(storage_path: Optional[str] = None) -> FastMCP:
         if memory.storage_path:
             memory.save()
         return result
+
+    @app.tool()
+    def match_tool(query: str) -> Optional[dict]:
+        """Capability cache : does a previously-GENERATED tool already cover
+        this query? Returns the tool (id, content, keywords, tags, score) or
+        null. Call this BEFORE thinking from scratch — a hit means the
+        approach is already known and can be reused, skipping a think
+        phase."""
+        return memory.match_tool(query)
+
+    @app.tool()
+    def ensure_tool(query: str, how: str = "", genre: str = "command") -> dict:
+        """Get a tool for this need, generating it if absent. If a
+        previously-generated tool covers `query`, it is REUSED (skip
+        thinking). Otherwise a new tool is GENERATED from `query` + the
+        intended approach `how` and added to the self-built set. This is the
+        'no tool -> generate it -> proceed' step : it never blocks, it only
+        ever adds a capability. Returns {tool, reused}."""
+        result = memory.ensure_tool(query, how=how or None, genre=genre)
+        if memory.storage_path:
+            memory.save()
+        return result
+
+    @app.tool()
+    def crystallize_skills() -> dict:
+        """Crystallize recurring actions (re-derived across diverse queries)
+        into persistent TOOL nodes — normal kind=ACTION points tagged
+        "tool", scoped by keywords, added to the cloud so the walk finds
+        them recursively and they persist on save."""
+        result = memory.crystallize_skills()
+        if memory.storage_path:
+            memory.save()
+        return result
+
+    @app.tool()
+    def list_tools_learned() -> List[dict]:
+        """List the TOOL nodes the system has generated so far (the closed,
+        self-built capability set), each with its id, content, genre/context
+        tags and scope keywords."""
+        from metacog.skills import tools_in
+        return [
+            {"id": p.id, "content": p.content,
+             "tags": list(p.tags or []), "keywords": list(p.keywords or [])}
+            for p in tools_in(memory.points)
+        ]
 
     @app.tool()
     def inspect(point_id: str) -> Optional[dict]:
@@ -180,6 +396,29 @@ def build_app(storage_path: Optional[str] = None) -> FastMCP:
     def route(query: str, k: int = 1) -> List[dict]:
         """Pick the top-k observators most aligned with the query."""
         return memory.route(query, k=k)
+
+    @app.tool()
+    def list_communities() -> List[dict]:
+        """List the Level-1 topical communities (auto-detected observators).
+
+        Each is {id, name, keywords, n_points}. Pass an `id` to
+        `walk_start(observator_id=…)` to FOCUS the walk's FACT retrieval on
+        that community's turns (entity beacons + scaffolding stay visible).
+        Returns [] when no communities were detected — then just walk over
+        the whole memory as usual.
+        """
+        out: List[dict] = []
+        for oid, obs in memory.observators.items():
+            if not oid.startswith("auto-comm-"):
+                continue
+            n = sum(1 for p in memory.points if oid in p.observator_views)
+            out.append({
+                "id": oid,
+                "name": obs.name,
+                "keywords": obs.keywords[:8],
+                "n_points": n,
+            })
+        return out
 
     @app.tool()
     def save() -> str:

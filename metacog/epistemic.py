@@ -146,10 +146,31 @@ class Point:
     n_contra: int = 0
     n_uses: int = 0
     n_revision: int = 0  # Option Z : incremented on collision revision
+    # Spike counter : incremented by record_hop on every multi-hop
+    # transition. Calibrated by spike_threshold(memory) which scales
+    # with population size — see metacog.spike.
+    n_spike: int = 0
+    # Executable specification (opt-in) : when set, this Point can be
+    # ROLLED through a sandboxed executor (see metacog.executor.PyExecutor).
+    # Convention : {"lang": "python", "code": "def run(args: dict) -> Any: ..."}
+    # where `args` is the runtime payload and the return value must be
+    # JSON-serializable. Tagging the Point with "tool" together with
+    # exec_spec is what makes it a discoverable + executable tool ; one
+    # without the other is inert. A FACT result child is created by
+    # Memory.execute_tool, parented by this Point's id, tag "executed".
+    exec_spec: Optional[dict] = None
     state: EpistemicState = EpistemicState.CONJECTURE
     keywords: List[str] = field(default_factory=list)
     keywords_source: Optional[SourceClass] = None
     keywords_embedding: Optional[Vector] = None
+    # Evolutive, agnostic node typing. `tags` is an OPEN-vocabulary,
+    # MULTI-tag list that types the node : its kind ("fact"/"action"/
+    # "thought" — auto-added in __post_init__, and a node may carry SEVERAL
+    # kind tags = multi-kind), provenance ("atomic"/"entity"/"generated"),
+    # and any semantic type (a LLM tagger or the walk may append more over
+    # time, letting the system improve its own typing). Edge-free : a tag
+    # never stores a relation, only a label.
+    tags: List[str] = field(default_factory=list)
     parents: List[str] = field(default_factory=list)
     children: List[str] = field(default_factory=list)
     lineage_depth: int = 0
@@ -176,6 +197,42 @@ class Point:
                 f"delta dimensions must match embedding_orig (d={d}), got "
                 f"active={len(self.delta_active)}, latent={len(self.delta_latent)}"
             )
+        # Normalize any pre-set tags (lowercase, dedup, drop empties) and
+        # AGNOSTICALLY type the node by its kind — every fact/action/thought
+        # carries its kind tag, with zero changes at call sites.
+        norm: List[str] = []
+        for t in self.tags:
+            t = str(t).strip().lower()
+            if t and t not in norm:
+                norm.append(t)
+        kt = self.kind.value.lower()
+        if kt not in norm:
+            norm.append(kt)
+        self.tags = norm
+
+    # ------------------------------------------------------------------
+    # Evolutive tagging (multi-tag, multi-kind, open vocabulary)
+    # ------------------------------------------------------------------
+    _KIND_TAGS = ("fact", "thought", "action")
+
+    def add_tag(self, *tags: str) -> "Point":
+        """Append tag(s) (lowercased, deduped). Lets the typing EVOLVE —
+        a LLM tagger, the walk, or any pass can enrich a node over time.
+        Returns self for chaining."""
+        for t in tags:
+            t = str(t).strip().lower()
+            if t and t not in self.tags:
+                self.tags.append(t)
+        return self
+
+    def has_tag(self, tag: str) -> bool:
+        return str(tag).strip().lower() in self.tags
+
+    @property
+    def kinds(self) -> List[str]:
+        """All kind tags on this node (multi-kind). The `kind` enum is the
+        primary kind ; extra kind tags make a node count as several kinds."""
+        return [t for t in self.tags if t in self._KIND_TAGS]
 
     @property
     def confidence(self) -> float:

@@ -1,13 +1,10 @@
 """
 MetaCog-Mem — default implementations of injectable protocols.
 
-These are deliberately simple so the system runs out-of-the-box with
-ZERO external dependencies. Callers should override them with real
-implementations (sentence-transformers for the encoder, Claude/GPT
-for the LLM, real executors for ACTIONs) for production use.
-
-All defaults are DETERMINISTIC (no random state, no LLM call) so
-behavior is reproducible.
+The encoder and the ACTION executor have simple deterministic defaults
+defined here. The LLM is NOT — production uses ClaudeLLM (Haiku) from
+`metacog.llm`. There is no stub LLM in the system : every generation
+goes through Claude, no fallback.
 """
 
 from __future__ import annotations
@@ -52,68 +49,6 @@ class SimpleEncoder:
         if norm < 1e-12:
             return tuple(0.0 for _ in range(self.dim))
         return tuple(x / norm for x in acc)
-
-
-class SimpleLLM:
-    """Deterministic LLM stub. Implements all three injectable
-    protocols (ReasoningLLM + LLMExtractor) so the system runs without
-    a real model.
-
-    Override for production : plug Claude / GPT / a local model that
-    implements the same methods.
-    """
-
-    def __init__(self) -> None:
-        self._answer_history: List[str] = []
-
-    def synthesize_step(
-        self,
-        query: str,
-        previous_answer: Optional[str],
-        new_point_content: str,
-    ) -> str:
-        """Concatenate previous answer with the new content's distinctive
-        words. Stabilizes when new content adds nothing."""
-        prev_words = set((previous_answer or "").lower().split())
-        new_words = [
-            w for w in new_point_content.split()
-            if w.lower() not in prev_words
-        ]
-        if previous_answer is None:
-            return new_point_content
-        if not new_words:
-            return previous_answer
-        return f"{previous_answer} {' '.join(new_words[:5])}".strip()
-
-    def propose_action(
-        self, query: str, current_answer: str
-    ) -> Optional[str]:
-        """Default : never propose an action. Override to enable
-        automatic action generation."""
-        return None
-
-    def extract_common(self, texts) -> str:
-        """Word-set intersection, preserving the order of the first text."""
-        texts = list(texts)
-        if len(texts) < 2:
-            return ""
-        word_sets = [set(t.lower().split()) for t in texts]
-        common = word_sets[0].copy()
-        for ws in word_sets[1:]:
-            common &= ws
-        if not common:
-            return ""
-        seen: set = set()
-        out: List[str] = []
-        for w in texts[0].lower().split():
-            if w in common and w not in seen:
-                out.append(w)
-                seen.add(w)
-        return " ".join(out)
-
-    def remove_overlap(self, full: str, common: str) -> str:
-        cset = set(common.lower().split())
-        return " ".join(w for w in full.lower().split() if w not in cset)
 
 
 class NoOpExecutor:
