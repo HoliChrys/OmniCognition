@@ -180,6 +180,8 @@ def build_app(
         actions_per_stage: int = 3,
         commit: bool = False,
         observator_id: str = "",
+        user_id: str = "",
+        session_id: str = "",
     ) -> dict:
         """Run a COMPLETE meta-cognitive walk and return its result.
 
@@ -217,6 +219,11 @@ def build_app(
                                  whole walk drifted, pivot with new vocabulary
           done                 : always True (the walk ran to completion)
         """
+        # Double-query section pre-filter : when a user/session is given,
+        # the section's own points (skills/tools/turns of THIS user/session)
+        # get a retrieval rank boost, alongside the free semantic query.
+        section = {f"{k}:{v}" for k, v in
+                   (("user", user_id), ("session", session_id)) if v} or None
         walker = MetaWalker(
             query, memory,
             n_stages=max(1, n_stages),
@@ -224,6 +231,7 @@ def build_app(
             actions_per_stage=max(1, actions_per_stage),
             commit=commit,
             observator_id=observator_id or None,
+            section_filter=section,
         )
         walk_id = walkers.open(walker)
         # Loop the walk to completion : depth is the walk's own
@@ -295,6 +303,53 @@ def build_app(
         if memory.storage_path:
             memory.save()
         return result
+
+    # Per-(user, session) skill-JSON cache : the last skill folder built or
+    # ingested in a session, keyed by the caller's user token + session id.
+    _session_skills: dict = {}
+
+    @app.tool()
+    def ingest_skill(
+        tree: dict, name: str, user_id: str, session_id: str,
+        date: str = "",
+    ) -> dict:
+        """Re-index a NAMED skill — a theoretical directory tree of tools
+        (nested JSON: dir→sub-object, file→description) — as tagged points
+        the walk can retrieve like any fact. Tags every node
+        skill·tool·name:<name>·user:<id>·session:<id>·date:<…> and encodes
+        the directory topology via lineage + ref:skill:* tokens. Also caches
+        the skill JSON in this (user, session)."""
+        pts = memory.ingest_skill(
+            tree, name=name, user_id=user_id, session_id=session_id,
+            date=date or None,
+        )
+        _session_skills[(user_id, session_id)] = {"name": name, "tree": tree}
+        if memory.storage_path:
+            memory.save()
+        return {"skill": name, "points_created": len(pts),
+                "ids": [p.id for p in pts]}
+
+    @app.tool()
+    def build_skill(
+        query: str, user_id: str, session_id: str, n_stages: int = 8,
+    ) -> dict:
+        """Build a skill end-to-end (TASK mode) : a walk gathers tools
+        (gold = tool fact OR semantic fact) until enough to elaborate the
+        complete workflow, synthesises a NAMED skill folder, re-indexes it,
+        and caches it in this (user, session). Returns the skill JSON
+        {"name","tree"}."""
+        skill = memory.build_skill(
+            query, user_id=user_id, session_id=session_id, n_stages=n_stages,
+        )
+        _session_skills[(user_id, session_id)] = skill
+        if memory.storage_path:
+            memory.save()
+        return skill
+
+    @app.tool()
+    def get_session_skill(user_id: str, session_id: str) -> dict:
+        """Return the skill JSON cached for this (user, session), or {}."""
+        return _session_skills.get((user_id, session_id), {})
 
     @app.tool()
     def sleep() -> dict:

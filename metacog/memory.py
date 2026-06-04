@@ -107,6 +107,15 @@ class Memory:
     # cloud and the walk finds them recursively. Opt-in.
     _skill_ledger: Any = None
     skills_enabled: bool = False
+    # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
+    # Each entry records a solved task — (query, the walk's resolution path
+    # point-ids, the output) — so the distiller can replay it afterwards and
+    # crystallize a theoretical tool linked to the semantic facts/thoughts/
+    # actions that explicate it, so the next time the task recurs it is
+    # retrieved fast WITHOUT forced metacognition. `_distill_cursor` marks
+    # how far the distiller has consumed the ledger.
+    _resolution_ledger: List[dict] = field(default_factory=list)
+    _distill_cursor: int = 0
 
     def __post_init__(self) -> None:
         if self.storage_path:
@@ -454,6 +463,131 @@ class Memory:
 
         _walk(tree, name, root.id)
         return created
+
+    def build_skill(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        session_id: str,
+        n_stages: int = 8,
+    ) -> Dict[str, Any]:
+        """End-to-end skill construction (task mode). Runs a TASK-mode walk
+        — gold is a tool fact as readily as a semantic fact, and the walk's
+        depth gate is "have we gathered enough tools to elaborate the
+        complete workflow?" — then synthesises a NAMED skill folder from the
+        collected tools and re-indexes it via `ingest_skill`.
+
+        The query's section (this user / session) is given a retrieval rank
+        boost through the double-query `section_filter`. Returns the skill
+        JSON `{"name", "tree"}` (also persisted as points). Records the
+        resolution for the latent distiller (§ sleep)."""
+        from metacog.meta_walk import (
+            MetaWalker, synthesize_skill_json,
+        )
+        section = {f"user:{user_id}", f"session:{session_id}"}
+        walker = MetaWalker(
+            query, self, n_stages=n_stages, commit=False,
+            task_mode=True, section_filter=section,
+        )
+        for _ in range(n_stages):
+            out = walker.step()
+            if out.done:
+                break
+        tools = list(getattr(walker, "_tools_collected", []))
+        skill = synthesize_skill_json(query, tools, self.llm, name_hint=query)
+        self.ingest_skill(
+            skill.get("tree", {}), name=skill.get("name", "skill"),
+            user_id=user_id, session_id=session_id,
+        )
+        self.record_resolution(
+            query, [p.id for p in tools], skill.get("name", "skill"),
+            user_id=user_id, session_id=session_id,
+        )
+        return skill
+
+    # ------------------------------------------------------------------
+    # Latent skill distiller (replayed in sleep())
+    # ------------------------------------------------------------------
+
+    def record_resolution(
+        self,
+        query: str,
+        path_ids: Sequence[str],
+        output: str,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Record a solved task for the latent distiller. Cheap, always on
+        (the distiller itself is gated by `skills_enabled` in sleep)."""
+        self._resolution_ledger.append({
+            "query": query,
+            "path_ids": list(path_ids),
+            "output": output,
+            "user_id": user_id,
+            "session_id": session_id,
+            "t": self._now(),
+        })
+
+    def distill_skills(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """LATENT distiller : replay the resolutions recorded since the last
+        pass and crystallize, for each, a theoretical TOOL node linked to
+        the semantic facts/thoughts/actions on its resolution path. The tool
+        is a normal `ACTION` point tagged `tool`+`skill`+`distilled`, with
+        `parents` set to its path points — so the next time the same task
+        recurs the walk retrieves the tool DIRECTLY (and chains through it),
+        no forced metacognition. apply_pull co-locates it with its path.
+
+        Idempotent via `_distill_cursor`; deterministic; no LLM required."""
+        t_now = self._now(t)
+        by_id = {p.id: p for p in self.points}
+        made: List[str] = []
+        ledger = self._resolution_ledger
+        while self._distill_cursor < len(ledger):
+            r = ledger[self._distill_cursor]
+            self._distill_cursor += 1
+            path = [by_id[pid] for pid in r["path_ids"] if pid in by_id]
+            if not path:
+                continue
+            tags = ["tool", "skill", "distilled"]
+            if r.get("user_id"):
+                tags.append(f"user:{r['user_id']}")
+            if r.get("session_id"):
+                tags.append(f"session:{r['session_id']}")
+            tags.append(f"name:{r['output']}")
+            # keywords : query terms + the path points' keywords (the
+            # semantic facts/actions/thoughts that explicate the tool).
+            import re as _re
+            kws: List[str] = []
+            seen: set = set()
+            for w in _re.findall(r"[A-Za-z0-9]{3,}", r["query"]):
+                wl = w.lower()
+                if wl not in seen:
+                    seen.add(wl); kws.append(wl)
+            for p in path:
+                for k in (p.keywords or [])[:3]:
+                    if k and k not in seen:
+                        seen.add(k); kws.append(k)
+            kw_emb = position_weighted_keyword_embedding(kws[:12], self.encoder)
+            content = f"tool[{r['output']}] for: {r['query']}"
+            tool = Point(
+                id=f"skill_{uuid.uuid4().hex[:8]}",
+                content=content,
+                embedding_orig=tuple(self.encoder.encode(content)),
+                kind=PointKind.ACTION,
+                parents=[p.id for p in path],   # linked to the explicating facts
+                lineage_depth=1,
+                keywords=kws[:12],
+                keywords_embedding=kw_emb,
+                keywords_source=SourceClass.GENERATOR,
+                tags=tags,
+            )
+            self.points.append(tool)
+            made.append(tool.id)
+            for p in path:                      # co-locate with its path
+                apply_pull(tool, p, +1.0, t_now)
+        return {"distilled": len(made), "tool_ids": made}
 
     # ------------------------------------------------------------------
     # Tools : tool-tagged ACTION points + sandboxed execution.
@@ -843,6 +977,11 @@ class Memory:
         lat = self.lateral_collapse(t_now)
         out["lateral_collided_groups"] = lat["collided_groups"]
         out["lateral_aliases"] = lat["aliases"]
+        # LATENT skill distiller : replay resolutions recorded since the
+        # last sleep and crystallize theoretical tools linked to their
+        # explicating facts. Opt-in (skills_enabled), idempotent.
+        if self.skills_enabled and self._resolution_ledger:
+            out["distilled"] = self.distill_skills(t_now)["distilled"]
         return out
 
     def compress_chasles(self) -> List[Dict[str, Any]]:
