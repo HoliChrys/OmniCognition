@@ -372,9 +372,36 @@ code*, `Memory.capture_code_tool(code, context, …)` (MCP
 **feeds it into the RAG** — an executable `ACTION` node (`exec_spec`)
 tagged `tool·skill·code·name:<def-name>·user:·session:·date:`, retrieved by
 the walk like any fact and reused via `match_tool`. A snippet judged purely
-illustrative is dropped (returns `None`, chat never blocked). This closes
-the loop: code the agent writes once becomes a first-class, retrievable,
-executable capability the next time a related query arrives.
+illustrative is dropped (returns `None`, chat never blocked).
+
+**`push_code` — evaluate & route.** The richer entry point
+(`Memory.push_code`, MCP `push_code`) the client calls for *every* code
+block. The server **evaluates** it and routes:
+- **project code** → a semantic FACT **documentation** node tagged
+  `doc·project:<…>·branch:<…>·github:<user>·user:·session:·date:` that
+  teaches about the project;
+- **tool-able code** → a **metacognitive rewrite** (`_rewrite_as_tool`,
+  exposing `def run(args)`) re-indexed as an executable tool;
+- **both** → both, kept in **bidirectional `ref:` filiation**
+  (`ref:tool:<id>` on the doc, `ref:doc:<id>` on the tool, plus parents and
+  co-location) so the tool remembers the project it came from and the
+  project doc points at the derived tool.
+
+### 5.3 Episodic conversation index
+
+Every message of a session — **both** the user's and the agent's — is fed
+in **continuously**, with its **timestamp preserved**
+(`Memory.ingest_message(content, role, user_id, session_id, timestamp)`,
+MCP `ingest_message`). Each becomes a FACT anchored `[<ts>] <role>: …`,
+tagged `episode·message·role:<user|agent>·user:·session:·ts:·date:` and
+chained in order (`sequence_prev`) per `(user, session)`. The timestamp
+anchor also feeds the deterministic temporal resolution (§4.2).
+
+Indexation is **async and non-blocking**: a daemon worker drains a queue in
+the background, so feeding a message never delays a concurrent search
+(`flush_index()` / `block=True` force synchrony for tests and shutdown).
+The server's MCP `instructions` make this a standing client obligation —
+index every message, push every code block.
 
 ---
 
@@ -482,6 +509,8 @@ sleep               geometric + lateral collapse, and the latent skill distiller
 ingest_skill        re-index a named skill-JSON directory tree
 build_skill         task-mode walk → synthesise + ingest a named skill
 get_session_skill   the skill JSON cached for this (user, session)
+ingest_message      EPISODIC: index a message (user/agent), async, timestamped
+push_code           evaluate & route generated code → project doc and/or tool
 capture_code_tool   feed generated code into the RAG if it is a reusable tool
 match_tool          fast-path: does a generated tool already cover this query?
 ensure_tool         get a tool, generating it if absent ("no tool → make it")

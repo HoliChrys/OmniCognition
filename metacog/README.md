@@ -126,6 +126,8 @@ reason · sleep
 ingest_skill        re-index a named skill-JSON directory tree
 build_skill         task-mode walk → synthesise + ingest a named skill
 get_session_skill   the skill JSON cached for this (user, session)
+ingest_message      EPISODIC: index a message (user/agent), async, timestamped
+push_code           evaluate & route generated code → project doc and/or tool
 capture_code_tool   feed generated code into the RAG if it is a reusable tool
 match_tool · ensure_tool · crystallize_skills · list_tools_learned
 inspect · audit · stats
