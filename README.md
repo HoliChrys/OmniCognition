@@ -130,6 +130,21 @@ different vocabulary when a thread is exhausted — never stage-by-stage
 micro-driving. This alignment of the two control loops is what lets the
 uncertainty-governed depth actually run at inference time.
 
+### 3.1 Keepup — organic streaming
+
+Because the depth-gate (§4) already evaluates sufficiency at every stage,
+the system can answer **organically** instead of waiting for a final pass.
+In **keepup** mode (`Memory.answer_keepup`, MCP `walk_keepup`) a
+*provisional* answer is synthesised from the very first walk and
+**re-written every stage** as evidence accumulates; the live `THOUGHT` is
+streamed alongside it. The walk runs once, continuously — so the moment
+the σ / coverage gate validates (`done`), the provisional answer is
+*already* the final one: there is no separate final-generation latency. If
+the answer was correct at stage 4 and stage 5 only confirms it, the user
+saw the right answer a stage early. Generation is therefore continuous and
+asynchronous; over the SSE transport (§7.2) the client renders a single
+message that rewrites itself until validated.
+
 ---
 
 ## 4. Uncertainty-governed depth
@@ -418,6 +433,15 @@ uses. Register it:
 uv sync && uv run metacog-mcp --storage ~/.metacog/state.pkl
 ```
 
+**Transports.** stdio is the default (for Claude Code). For live-streaming
+HTTP clients — the keepup message that rewrites itself (§3.1) — run the
+server over **SSE** or streamable-http:
+
+```bash
+uv run metacog-mcp --transport sse --host 127.0.0.1 --port 8765
+#   (or --transport streamable-http ; or METACOG_TRANSPORT=sse)
+```
+
 Tools appear as `mcp__metacog__*`:
 
 ```
@@ -430,17 +454,23 @@ retrieve            top-k hybrid retrieval (RRF)
 # the walk  ── depth is decided by the walk, not the caller ──
 walk_start          run a COMPLETE uncertainty-governed walk for a query
                     (loops to its own σ-termination; returns the bounded
-                     composable evidence + reasoning chain). The agent does
-                     BREADTH pivots — re-issue walk_start with new
-                     vocabulary; it never micro-drives depth.
-walk_next           DEPRECATED — walk_start now runs to completion; this is
-                    a graceful no-op kept for backward compatibility.
+                     composable evidence + reasoning chain). user_id/
+                     session_id add the double-query section boost. The
+                     agent does BREADTH pivots — re-issue walk_start with
+                     new vocabulary; it never micro-drives depth.
+walk_keepup         KEEPUP (§3.1): the snapshot trajectory — a provisional
+                    answer re-written each stage until validated. Over SSE,
+                    a message that rewrites itself until done=True.
+walk_next           DEPRECATED — walk_start now runs to completion.
 
 # reasoning & consolidation
 reason              full reasoning trajectory until a usable answer
-sleep               geometric collision + lateral collapse pass
+sleep               geometric + lateral collapse, and the latent skill distiller
 
-# self-built tools (§5.1)
+# skills & self-built tools (§5)
+ingest_skill        re-index a named skill-JSON directory tree
+build_skill         task-mode walk → synthesise + ingest a named skill
+get_session_skill   the skill JSON cached for this (user, session)
 match_tool          fast-path: does a generated tool already cover this query?
 ensure_tool         get a tool, generating it if absent ("no tool → make it")
 crystallize_skills  fold recurring actions into persistent tool nodes
@@ -466,7 +496,7 @@ by an eager caller.
 ### 7.3 Tests & benchmark
 
 ```bash
-uv run pytest tests/ -q                                  # 311 tests
+uv run pytest tests/ -q                                  # 330 tests
 uv run python -m benchmarks.locomo.eval \
     --answerer meta --samples 5 --per-category 1 --encoder semantic
 ```
