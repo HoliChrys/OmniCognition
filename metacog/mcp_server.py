@@ -35,6 +35,13 @@ from mcp.server.fastmcp import FastMCP
 
 from metacog.memory import Memory
 
+# Hard cap on facts returned by walk_start : a deep walk can retrieve 100+
+# turns, and shipping all their content to the agent is the dominant
+# input-token cost. The composable (relevance-ranked) evidence comes first,
+# topped up to this bound — recall is unaffected (fact_ids_cumulative still
+# lists every id).
+_MAX_RETURNED_FACTS = 20
+
 
 def build_app(
     storage_path: Optional[str] = None,
@@ -237,9 +244,22 @@ def build_app(
         out = last.to_dict()
         out["walk_id"] = walk_id
         out["stages_run"] = stages_run
-        # Expose the UNION of retrieved facts across all hops (content),
-        # not just the final hop, plus the full reasoning chain.
-        out["facts"] = list(agg_facts.values())
+        # TOKEN DISCIPLINE — the agent never needs the full per-stage union
+        # (a deep walk can retrieve 100+ facts ; sending all their content
+        # is the dominant input-token sink). Expose the COMPOSABLE evidence
+        # (the bounded, relevance-ranked on-target set) as the primary
+        # `facts`, and only top up with a few extra retrieved turns. The
+        # walk's σ-cap/coverage early-returns leave the final StageOutput's
+        # relevant_collected empty, so pull it straight from the walker.
+        evidence = walker._composable_evidence()
+        ev_ids = {e["id"] for e in evidence}
+        extra = [f for f in agg_facts.values()
+                 if isinstance(f, dict) and f.get("id") not in ev_ids]
+        out["relevant_collected"] = evidence
+        out["facts"] = (
+            [agg_facts[e["id"]] for e in evidence if e["id"] in agg_facts]
+            + extra
+        )[:_MAX_RETURNED_FACTS]
         out["reasoning_chain"] = [
             t.content for t in getattr(walker, "_thought_chain", [])
         ]
