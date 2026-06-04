@@ -90,13 +90,47 @@ composable evidence (`_MAX_EVIDENCE = 15`) plus at most
 `_MAX_RETURNED_FACTS = 20` retrieved turns and the reasoning chain — full
 recall stays in `fact_ids_cumulative`.
 
+## Named skills — theoretical tool directories (`memory.py` + `meta_walk.py`)
+
+A **skill** is a named directory tree of tools, built and grown inside the
+manifold (no separate store):
+
+- `Memory.build_skill(query, user_id, session_id)` — **task-mode** walk:
+  gold is a tool fact as readily as a semantic fact; the depth gate is
+  `enough_tools_for_workflow` (LLM, per depth, fail-closed) instead of the
+  QA σ-stop. Emits a NAMED skill folder (nested JSON), ingests it, and
+  logs the resolution.
+- `Memory.ingest_skill(tree, *, name, user_id, session_id, date)` —
+  re-indexes the JSON tree as `FACT`s tagged
+  `skill·tool·name:<name>·user:<id>·session:<id>·date:<…>`; topology via
+  lineage **and** `ref:skill:<name>:path:/:parent:` tokens.
+- **Double query** — `nearest_facts_with_fallback(..., section_filter=…)`
+  RRF-merges a section-restricted retrieval (the `session:`/`user:`/`name:`
+  tags) with the free query; `walk_start(user_id, session_id, …)` wires it.
+- **Latent distiller** — `record_resolution()` logs (query, walk-path ids,
+  output); `distill_skills()` (run in `sleep()` when `skills_enabled`)
+  crystallizes a tool `ACTION` whose `parents` are the explicating
+  facts/thoughts/actions, so the next recurrence is retrieved without
+  forced metacognition. Idempotent via `_distill_cursor`.
+
 ## MCP tools (`mcp_server.py`)
 
 ```
 ingest · observe · process_turn · retrieve
-walk_start          run a COMPLETE uncertainty-governed walk (depth = σ)
+walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
+                    user_id/session_id add the double-query section boost
+walk_keepup         keepup streaming: provisional answer re-written each
+                    stage until validated (SSE → a self-rewriting message)
+scoped_answer       tag-filtered cascade: walk the discussion first, then
+                    (knowledge_base=true) the global memory seeded by it
 walk_next           deprecated — walk_start runs to completion
 reason · sleep
+ingest_skill        re-index a named skill-JSON directory tree
+build_skill         task-mode walk → synthesise + ingest a named skill
+get_session_skill   the skill JSON cached for this (user, session)
+ingest_message      EPISODIC: index a message (user/agent), async, timestamped
+push_code           evaluate & route generated code → project doc and/or tool
+capture_code_tool   feed generated code into the RAG if it is a reusable tool
 match_tool · ensure_tool · crystallize_skills · list_tools_learned
 inspect · audit · stats
 declare_observator · detect_polarized · spawn_observators · route

@@ -107,6 +107,19 @@ class Memory:
     # cloud and the walk finds them recursively. Opt-in.
     _skill_ledger: Any = None
     skills_enabled: bool = False
+    # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
+    # Each entry records a solved task — (query, the walk's resolution path
+    # point-ids, the output) — so the distiller can replay it afterwards and
+    # crystallize a theoretical tool linked to the semantic facts/thoughts/
+    # actions that explicate it, so the next time the task recurs it is
+    # retrieved fast WITHOUT forced metacognition. `_distill_cursor` marks
+    # how far the distiller has consumed the ledger.
+    _resolution_ledger: List[dict] = field(default_factory=list)
+    _distill_cursor: int = 0
+    # Episodic conversation index : the id of the last message ingested per
+    # (user, session), so successive messages chain via sequence_prev and a
+    # session reads back in order. Continuous indexation feeds this.
+    _session_msg_chain: Dict[tuple, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.storage_path:
@@ -338,6 +351,345 @@ class Memory:
         return self.ingest(description, kind="ACTION", id=id, parents=parents)
 
     # ------------------------------------------------------------------
+    # Episodic conversation index : EVERY message of a session (user AND
+    # agent), indexed continuously, with its timestamp preserved. The
+    # indexation is ASYNC and NON-BLOCKING w.r.t. search — a background
+    # worker does the (LLM-keyworded) ingest while queries read the cloud.
+    # ------------------------------------------------------------------
+
+    def _ensure_indexer(self) -> None:
+        """Lazily start the background indexing worker (daemon thread). The
+        queue/thread are plain instance attributes — never pickled (save()
+        snapshots points only)."""
+        if getattr(self, "_index_thread", None) is not None:
+            return
+        import queue as _queue
+        import threading
+        self._index_queue = _queue.Queue()
+        self._index_lock = threading.Lock()
+        t = threading.Thread(target=self._index_worker, daemon=True,
+                             name="metacog-indexer")
+        self._index_thread = t
+        t.start()
+
+    def _index_worker(self) -> None:
+        while True:
+            job = self._index_queue.get()
+            try:
+                if job is not None:
+                    self._ingest_message_sync(**job)
+            except Exception:
+                pass  # never let a bad message kill the indexer
+            finally:
+                self._index_queue.task_done()
+
+    def ingest_message(
+        self,
+        content: str,
+        *,
+        role: str,
+        user_id: str,
+        session_id: str,
+        timestamp: Optional[str] = None,
+        block: bool = False,
+    ):
+        """Index ONE conversation message (role = "user" or "agent") of a
+        session, with its timestamp. Call it for EVERY message on both
+        sides — this is the continuous episodic feed.
+
+        Async by default : the message is queued and indexed by the
+        background worker, so the call returns immediately and never blocks
+        a concurrent search. Pass `block=True` (or call `flush_index()`) to
+        index synchronously / wait — used in tests and at shutdown.
+
+        Returns the created Point when `block=True`, else a queued-ack dict."""
+        job = dict(content=content, role=role, user_id=user_id,
+                   session_id=session_id, timestamp=timestamp)
+        if block:
+            return self._ingest_message_sync(**job)
+        self._ensure_indexer()
+        self._index_queue.put(job)
+        return {"queued": True}
+
+    def _ingest_message_sync(
+        self, *, content: str, role: str, user_id: str,
+        session_id: str, timestamp: Optional[str],
+    ) -> Point:
+        role = (role or "user").lower()
+        if timestamp is None:
+            from datetime import datetime, timezone
+            timestamp = datetime.now(timezone.utc).isoformat()
+        ts = str(timestamp)
+        date = ts.split("T")[0] if "T" in ts else (ts.split()[0] if ts else "")
+        # Prefix with [timestamp] role: so temporal retrieval + the
+        # relative-date machinery have an absolute anchor (episodic system :
+        # the horodatage of each message is preserved verbatim).
+        prefixed = f"[{ts}] {role}: {content}"
+        lock = getattr(self, "_index_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            prev = self._session_msg_chain.get((user_id, session_id))
+            p = self.ingest(prefixed, kind="FACT", sequence_prev=prev)
+            p.add_tag("episode", "message", f"role:{role}",
+                      f"user:{user_id}", f"session:{session_id}",
+                      f"ts:{ts}", f"date:{date}")
+            self._session_msg_chain[(user_id, session_id)] = p.id
+        finally:
+            if lock is not None:
+                lock.release()
+        return p
+
+    def flush_index(self, timeout: Optional[float] = None) -> None:
+        """Block until the async index queue is drained (tests / shutdown)."""
+        q = getattr(self, "_index_queue", None)
+        if q is not None:
+            q.join()
+
+    # ------------------------------------------------------------------
+    # Skills : a named "theoretical directory" of tools, ingested from a
+    # nested JSON tree, re-indexed as normal tagged points.
+    # ------------------------------------------------------------------
+
+    def ingest_skill(
+        self,
+        tree: Dict[str, Any],
+        *,
+        name: str,
+        user_id: str,
+        session_id: str,
+        date: Optional[str] = None,
+        t_now: Optional[float] = None,
+    ) -> List[Point]:
+        """Ingest a NAMED skill — a theoretical directory tree of tools —
+        as ordinary tagged points, returning every created point (root
+        first).
+
+        `tree` is a nested dict : a directory maps a name to a sub-dict, a
+        file maps a name to its description string :
+            {"retrieval": {"hybrid.py": "RRF over 4 signals",
+                           "bm25.py":   "content-first BM25"},
+             "walk.py":    "uncertainty-governed depth"}
+
+        Each node becomes a `PointKind.FACT` carrying the usual format, so
+        the walk retrieves it like any other point (gold = semantic fact OR
+        tool fact). The directory **topology** is encoded two ways that
+        agree :
+          - the edge-free lineage link (`parents = [parent_point_id]`), so
+            lineage spread traverses the tree ;
+          - typed `ref:skill:*` keyword tokens — `ref:skill:<name>:path:<p>`
+            and `ref:skill:<name>:parent:<pp>` — so the topology is itself
+            retrievable / co-locating (the same trick as `ref:date:*`).
+
+        Every point is tagged so a later double-query can pre-filter the
+        SECTION (this user's this-session this-skill) before the free
+        semantic query :
+            skill · tool · name:<name> · user:<id> · session:<id>
+            · date:<indexation>
+        plus `skill_dir` / `skill_file` for the node kind.
+
+        Cor. 5 : skill content is agent/LLM-produced → keywords_source =
+        GENERATOR ; ids are prefixed `skill_` so they never collide with a
+        real evidence id.
+        """
+        if t_now is None:
+            t_now = self._now()
+        if date is None:
+            from datetime import date as _date
+            date = _date.today().isoformat()
+        base_tags = [
+            "skill", "tool", f"name:{name}",
+            f"user:{user_id}", f"session:{session_id}", f"date:{date}",
+        ]
+        created: List[Point] = []
+
+        def _tok(s: str) -> List[str]:
+            import re as _re
+            return [w.lower() for w in _re.findall(r"[A-Za-z0-9]{2,}", s or "")]
+
+        def _node(node_name: str, value: Any, path: str,
+                  parent_path: str, parent_id: Optional[str]) -> Point:
+            is_dir = isinstance(value, dict)
+            desc = "" if is_dir else str(value)
+            content = (
+                f"skill:{name} {path}" + (f" — {desc}" if desc else "")
+            )
+            kws: List[str] = []
+            seen: set = set()
+            for k in (_tok(name) + _tok(node_name)
+                      + [f"ref:skill:{name}:path:{path}"]
+                      + ([f"ref:skill:{name}:parent:{parent_path}"]
+                         if parent_path else [])
+                      + _tok(desc)[:8]):
+                if k and k not in seen:
+                    seen.add(k)
+                    kws.append(k)
+            kw_emb = position_weighted_keyword_embedding(kws, self.encoder)
+            p = Point(
+                id=f"skill_{uuid.uuid4().hex[:8]}",
+                content=content,
+                embedding_orig=tuple(self.encoder.encode(content)),
+                kind=PointKind.FACT,
+                parents=[parent_id] if parent_id else [],
+                lineage_depth=0 if parent_id is None else 1,
+                keywords=kws,
+                keywords_embedding=kw_emb,
+                keywords_source=SourceClass.GENERATOR,
+                tags=list(base_tags)
+                + ["skill_dir" if is_dir else "skill_file"],
+            )
+            self.points.append(p)
+            created.append(p)
+            # Geometric topology : pull each child onto its parent so the
+            # tree clusters in the manifold (edges-equivalent), mirroring
+            # the lineage link above.
+            if parent_id is not None:
+                parent_pt = next((q for q in self.points
+                                  if q.id == parent_id), None)
+                if parent_pt is not None:
+                    apply_pull(p, parent_pt, +1.0, t_now)
+            return p
+
+        # Root = the skill itself ; children hang under it.
+        root = _node(name, tree, name, "", None)
+
+        def _walk(subtree: Dict[str, Any], parent_path: str,
+                  parent_id: str) -> None:
+            for child_name, value in subtree.items():
+                path = f"{parent_path}/{child_name}" if parent_path else child_name
+                pt = _node(child_name, value, path, parent_path, parent_id)
+                if isinstance(value, dict):
+                    _walk(value, path, pt.id)
+
+        _walk(tree, name, root.id)
+        return created
+
+    def build_skill(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        session_id: str,
+        n_stages: int = 8,
+    ) -> Dict[str, Any]:
+        """End-to-end skill construction (task mode). Runs a TASK-mode walk
+        — gold is a tool fact as readily as a semantic fact, and the walk's
+        depth gate is "have we gathered enough tools to elaborate the
+        complete workflow?" — then synthesises a NAMED skill folder from the
+        collected tools and re-indexes it via `ingest_skill`.
+
+        The query's section (this user / session) is given a retrieval rank
+        boost through the double-query `section_filter`. Returns the skill
+        JSON `{"name", "tree"}` (also persisted as points). Records the
+        resolution for the latent distiller (§ sleep)."""
+        from metacog.meta_walk import (
+            MetaWalker, synthesize_skill_json,
+        )
+        section = {f"user:{user_id}", f"session:{session_id}"}
+        walker = MetaWalker(
+            query, self, n_stages=n_stages, commit=False,
+            task_mode=True, section_filter=section,
+        )
+        for _ in range(n_stages):
+            out = walker.step()
+            if out.done:
+                break
+        tools = list(getattr(walker, "_tools_collected", []))
+        skill = synthesize_skill_json(query, tools, self.llm, name_hint=query)
+        self.ingest_skill(
+            skill.get("tree", {}), name=skill.get("name", "skill"),
+            user_id=user_id, session_id=session_id,
+        )
+        self.record_resolution(
+            query, [p.id for p in tools], skill.get("name", "skill"),
+            user_id=user_id, session_id=session_id,
+        )
+        return skill
+
+    # ------------------------------------------------------------------
+    # Latent skill distiller (replayed in sleep())
+    # ------------------------------------------------------------------
+
+    def record_resolution(
+        self,
+        query: str,
+        path_ids: Sequence[str],
+        output: str,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Record a solved task for the latent distiller. Cheap, always on
+        (the distiller itself is gated by `skills_enabled` in sleep)."""
+        self._resolution_ledger.append({
+            "query": query,
+            "path_ids": list(path_ids),
+            "output": output,
+            "user_id": user_id,
+            "session_id": session_id,
+            "t": self._now(),
+        })
+
+    def distill_skills(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """LATENT distiller : replay the resolutions recorded since the last
+        pass and crystallize, for each, a theoretical TOOL node linked to
+        the semantic facts/thoughts/actions on its resolution path. The tool
+        is a normal `ACTION` point tagged `tool`+`skill`+`distilled`, with
+        `parents` set to its path points — so the next time the same task
+        recurs the walk retrieves the tool DIRECTLY (and chains through it),
+        no forced metacognition. apply_pull co-locates it with its path.
+
+        Idempotent via `_distill_cursor`; deterministic; no LLM required."""
+        t_now = self._now(t)
+        by_id = {p.id: p for p in self.points}
+        made: List[str] = []
+        ledger = self._resolution_ledger
+        while self._distill_cursor < len(ledger):
+            r = ledger[self._distill_cursor]
+            self._distill_cursor += 1
+            path = [by_id[pid] for pid in r["path_ids"] if pid in by_id]
+            if not path:
+                continue
+            tags = ["tool", "skill", "distilled"]
+            if r.get("user_id"):
+                tags.append(f"user:{r['user_id']}")
+            if r.get("session_id"):
+                tags.append(f"session:{r['session_id']}")
+            tags.append(f"name:{r['output']}")
+            # keywords : query terms + the path points' keywords (the
+            # semantic facts/actions/thoughts that explicate the tool).
+            import re as _re
+            kws: List[str] = []
+            seen: set = set()
+            for w in _re.findall(r"[A-Za-z0-9]{3,}", r["query"]):
+                wl = w.lower()
+                if wl not in seen:
+                    seen.add(wl); kws.append(wl)
+            for p in path:
+                for k in (p.keywords or [])[:3]:
+                    if k and k not in seen:
+                        seen.add(k); kws.append(k)
+            kw_emb = position_weighted_keyword_embedding(kws[:12], self.encoder)
+            content = f"tool[{r['output']}] for: {r['query']}"
+            tool = Point(
+                id=f"skill_{uuid.uuid4().hex[:8]}",
+                content=content,
+                embedding_orig=tuple(self.encoder.encode(content)),
+                kind=PointKind.ACTION,
+                parents=[p.id for p in path],   # linked to the explicating facts
+                lineage_depth=1,
+                keywords=kws[:12],
+                keywords_embedding=kw_emb,
+                keywords_source=SourceClass.GENERATOR,
+                tags=tags,
+            )
+            self.points.append(tool)
+            made.append(tool.id)
+            for p in path:                      # co-locate with its path
+                apply_pull(tool, p, +1.0, t_now)
+        return {"distilled": len(made), "tool_ids": made}
+
+    # ------------------------------------------------------------------
     # Tools : tool-tagged ACTION points + sandboxed execution.
     # ------------------------------------------------------------------
 
@@ -359,6 +711,262 @@ class Memory:
         p.exec_spec = {"lang": lang, "code": code}
         p.add_tag("tool")
         return p
+
+    def capture_code_tool(
+        self,
+        code: str,
+        *,
+        context: str = "",
+        lang: str = "python",
+        user_id: str = "",
+        session_id: str = "",
+        date: Optional[str] = None,
+    ) -> Optional[Point]:
+        """Chat-side hook : whenever code is GENERATED, ask whether it is a
+        reusable TOOL and, if so, FEED IT INTO THE RAG.
+
+        Self-assessment uses `assess_tool_intent` (surface markers + LLM
+        adjudication) over the code + its context. When it reads as an
+        executable capability, the code is re-indexed as a normal tool node
+        — an `ACTION` point with `exec_spec` (executable) tagged
+        `tool · skill · code · kind:<…> · name:<…> · user:<id> ·
+        session:<id> · date:<…>`. Being a normal node it is retrieved by
+        the walk like any fact (gold = tool fact OR semantic fact), reused
+        via match_tool, and persisted with the cloud.
+
+        Returns the created tool Point, or None when the code is judged not
+        a reusable tool. Fail-safe : any error → None (chat never blocked)."""
+        from metacog.skills import assess_tool_intent
+        code = (code or "").strip()
+        if not code:
+            return None
+        try:
+            intent = assess_tool_intent(f"{context}\n\n{code[:600]}", self.llm)
+        except Exception:
+            return None
+        if not intent.is_executable:
+            return None
+        if date is None:
+            from datetime import date as _date
+            date = _date.today().isoformat()
+        import re as _re
+        mname = (_re.search(r"\bdef\s+([A-Za-z_]\w*)", code)
+                 or _re.search(r"\bfunction\s+([A-Za-z_]\w*)", code))
+        name = (mname.group(1) if mname else
+                (_re.sub(r"[^a-z0-9]+", "_", (context or "tool").lower())
+                 .strip("_")[:40] or "tool"))
+        desc = context.strip() or f"tool {name} ({intent.kind})"
+        extra = []
+        if user_id:
+            extra.append(f"user:{user_id}")
+        if session_id:
+            extra.append(f"session:{session_id}")
+        extra.append(f"date:{date}")
+        return self._make_tool_node(
+            code, name=name, kind=intent.kind, desc=desc, lang=lang,
+            extra_tags=extra,
+        )
+
+    def _make_tool_node(
+        self, code: str, *, name: str, kind: str, desc: str,
+        lang: str = "python", extra_tags: Sequence[str] = (),
+    ) -> Point:
+        """Create an executable tool node (ACTION + exec_spec) tagged
+        tool·skill·code·kind:<…>·name:<…> plus any extra tags. Shared by
+        capture_code_tool and push_code."""
+        import re as _re
+        content = f"tool[{name}] {desc}"
+        kws: List[str] = []
+        seen: set = set()
+        for w in (_re.findall(r"[A-Za-z_]\w{2,}", name + " " + desc)
+                  + _re.findall(r"[A-Za-z_]\w{3,}", code)[:10]):
+            wl = w.lower()
+            if wl not in seen:
+                seen.add(wl); kws.append(wl)
+        kw_emb = position_weighted_keyword_embedding(kws[:12], self.encoder)
+        tags = (["tool", "skill", "code", f"kind:{kind}", f"name:{name}"]
+                + list(extra_tags))
+        tool = Point(
+            id=f"skill_{uuid.uuid4().hex[:8]}",
+            content=content,
+            embedding_orig=tuple(self.encoder.encode(content)),
+            kind=PointKind.ACTION,
+            keywords=kws[:12],
+            keywords_embedding=kw_emb,
+            keywords_source=SourceClass.GENERATOR,
+            tags=tags,
+        )
+        tool.exec_spec = {"lang": lang, "code": code}
+        self.points.append(tool)
+        return tool
+
+    # ------------------------------------------------------------------
+    # push_code : evaluate generated code → project-documentation FACT
+    # and/or a metacognitively-rewritten executable TOOL, linked
+    # bidirectionally via ref: tags when it is both.
+    # ------------------------------------------------------------------
+
+    def _evaluate_code(self, code: str, context: str) -> Dict[str, Any]:
+        """Classify generated code. Returns
+        {"project": bool, "tool": bool, "kind": str, "name": str}.
+        LLM-adjudicated with a deterministic fallback (markers + def-name)."""
+        import re as _re
+        mname = (_re.search(r"\bdef\s+([A-Za-z_]\w*)", code)
+                 or _re.search(r"\bfunction\s+([A-Za-z_]\w*)", code))
+        name = mname.group(1) if mname else (
+            _re.sub(r"[^a-z0-9]+", "_", (context or "tool").lower())
+            .strip("_")[:40] or "tool")
+        out = {"project": False, "tool": False, "kind": "code", "name": name}
+        # tool verdict via the shared intent assessor (markers + LLM).
+        try:
+            from metacog.skills import assess_tool_intent
+            intent = assess_tool_intent(f"{context}\n\n{code[:600]}", self.llm)
+            out["tool"] = bool(intent.is_executable)
+            out["kind"] = intent.kind if intent.is_executable else "code"
+        except Exception:
+            pass
+        # project / doc verdict (one short LLM line ; default no).
+        if hasattr(self.llm, "generate"):
+            try:
+                raw = (self.llm.generate(
+                    "Is this code part of a real software PROJECT (worth keeping "
+                    "as documentation to learn about that project)? And could it "
+                    "be a reusable TOOL? Reply one line:\n"
+                    "PROJECT: <yes|no> TOOL: <yes|no> NAME: <snake_case|->\n\n"
+                    f"CONTEXT: {context[:200]}\nCODE: {code[:500]}",
+                    max_tokens=24) or "").lower()
+                if "project: yes" in raw or "project:yes" in raw:
+                    out["project"] = True
+                if "tool: yes" in raw or "tool:yes" in raw:
+                    out["tool"] = True
+                mn = _re.search(r"name:\s*([a-z_]\w*)", raw)
+                if mn and mn.group(1) not in ("-", "none"):
+                    out["name"] = mn.group(1)
+            except Exception:
+                pass
+        return out
+
+    def _rewrite_as_tool(self, code: str, context: str) -> str:
+        """Metacognitive interpretation : rewrite code as a standalone,
+        reusable tool exposing `def run(args: dict)`. Falls back to the
+        original code on any failure (never blocks)."""
+        if not hasattr(self.llm, "generate"):
+            return code
+        try:
+            raw = (self.llm.generate(
+                "Rewrite the code as a STANDALONE reusable tool exposing "
+                "`def run(args: dict)`. Keep the behaviour, strip "
+                "project-specific coupling. Output ONLY the code, no prose.\n\n"
+                f"CONTEXT: {context[:200]}\nCODE:\n{code[:1200]}",
+                max_tokens=400) or "").strip()
+            import re as _re
+            m = _re.search(r"```(?:\w+)?\s*(.+?)```", raw, _re.DOTALL)
+            if m:
+                raw = m.group(1).strip()
+            return raw if ("def run" in raw or "function run" in raw) else code
+        except Exception:
+            return code
+
+    def _make_doc_node(self, code: str, context: str,
+                       tags: Sequence[str], *, name: str) -> Point:
+        """A semantic FACT node documenting project code — retrievable like
+        any fact, treated as documentation that teaches about the project."""
+        import re as _re
+        content = (f"[doc:{name}] " + (context.strip() + "\n" if context else "")
+                   + code.strip())[:2000]
+        kws: List[str] = []
+        seen: set = set()
+        for w in (_re.findall(r"[A-Za-z_]\w{2,}", name + " " + context)
+                  + _re.findall(r"[A-Za-z_]\w{3,}", code)[:12]
+                  + [t for t in tags if t.startswith(("project:", "branch:"))]):
+            wl = w.lower()
+            if wl not in seen:
+                seen.add(wl); kws.append(wl)
+        kw_emb = position_weighted_keyword_embedding(kws[:14], self.encoder)
+        doc = Point(
+            id=f"skill_{uuid.uuid4().hex[:8]}",
+            content=content,
+            embedding_orig=tuple(self.encoder.encode(content)),
+            kind=PointKind.FACT,
+            keywords=kws[:14],
+            keywords_embedding=kw_emb,
+            keywords_source=SourceClass.GENERATOR,
+            tags=list(tags),
+        )
+        self.points.append(doc)
+        return doc
+
+    def push_code(
+        self,
+        code: str,
+        *,
+        context: str = "",
+        project: str = "",
+        branch: str = "",
+        github_user: str = "",
+        lang: str = "python",
+        user_id: str = "",
+        session_id: str = "",
+        date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Push generated code into the RAG. The server EVALUATES it and
+        routes it :
+
+          - PROJECT code → a semantic FACT node, tagged
+            `doc·code·project:<…>·branch:<…>·github:<user>·user:·session:·
+            date:`, treated as DOCUMENTATION that teaches about the project ;
+          - TOOL-able code → a metacognitive rewrite (`_rewrite_as_tool`,
+            exposing `def run(args)`) re-indexed as an executable tool node ;
+          - BOTH → create both and keep a BIDIRECTIONAL filiation via
+            `ref:` tags (`ref:doc:<id>` on the tool, `ref:tool:<id>` on the
+            doc) plus co-location, so the tool remembers the project it came
+            from and the project doc points at the derived tool.
+
+        Fail-safe : on any error the code is still captured as a plain tool
+        if it looks executable (chat is never blocked). Returns a summary."""
+        code = (code or "").strip()
+        if not code:
+            return {"pushed": False}
+        if date is None:
+            from datetime import date as _date
+            date = _date.today().isoformat()
+        ev = self._evaluate_code(code, context)
+        is_project = ev["project"] or bool(project or branch or github_user)
+        is_tool = ev["tool"]
+        name = ev["name"]
+        meta: List[str] = ["code"]
+        for k, v in (("project", project), ("branch", branch),
+                     ("github", github_user), ("user", user_id),
+                     ("session", session_id)):
+            if v:
+                meta.append(f"{k}:{v}")
+        meta.append(f"date:{date}")
+
+        doc = tool = None
+        if is_project:
+            doc = self._make_doc_node(code, context, ["doc"] + meta, name=name)
+        if is_tool:
+            rewritten = self._rewrite_as_tool(code, context) or code
+            tool = self._make_tool_node(
+                rewritten, name=name, kind=ev["kind"],
+                desc=context or f"tool {name}", lang=lang, extra_tags=meta,
+            )
+        # Bidirectional project↔tool filiation via ref: tags.
+        if doc is not None and tool is not None:
+            tool.keywords.append(f"ref:doc:{doc.id}")
+            doc.keywords.append(f"ref:tool:{tool.id}")
+            tool.keywords_embedding = position_weighted_keyword_embedding(
+                tool.keywords[:16], self.encoder)
+            doc.keywords_embedding = position_weighted_keyword_embedding(
+                doc.keywords[:16], self.encoder)
+            tool.parents = [doc.id]
+            apply_pull(tool, doc, +1.0, self._now())
+        return {
+            "pushed": bool(doc or tool),
+            "is_project": is_project, "is_tool": is_tool, "name": name,
+            "doc_id": doc.id if doc else None,
+            "tool_id": tool.id if tool else None,
+        }
 
     def find_tools(self, query: str, k: int = 5) -> List[Point]:
         """Top-k tool-tagged ACTION points most semantically aligned
@@ -673,6 +1281,87 @@ class Memory:
     # Reasoning
     # ------------------------------------------------------------------
 
+    def answer_keepup(
+        self,
+        query: str,
+        *,
+        n_stages: int = 16,
+        user_id: str = "",
+        session_id: str = "",
+    ):
+        """KEEPUP mode — organic, continuously-rewriting answer generation.
+
+        Yields one snapshot per walk stage (see MetaWalker.keepup) : a
+        provisional answer that is re-written as evidence accumulates, the
+        live thought, and the depth-gate state. The walk runs in a single
+        uncertainty-governed pass ; because a provisional answer is emitted
+        from the first walk and refined each stage, the moment the σ /
+        coverage depth-gate validates (done=True) the answer is already
+        final — there is no separate final-generation wait. Consume it over
+        SSE to stream a message that rewrites itself until validated."""
+        from metacog.meta_walk import MetaWalker
+        section = {f"{k}:{v}" for k, v in
+                   (("user", user_id), ("session", session_id)) if v} or None
+        walker = MetaWalker(
+            query, self, n_stages=n_stages, commit=False,
+            section_filter=section,
+        )
+        yield from walker.keepup()
+
+    def scoped_answer(
+        self,
+        query: str,
+        *,
+        tags: Sequence[str],
+        knowledge_base: bool = False,
+        n_stages: int = 16,
+    ) -> Dict[str, Any]:
+        """Tag-filtered retrieval as a TWO-PHASE cascade.
+
+        Phase 1 — SCOPED. Run a full uncertainty-governed walk **hard-
+        restricted** to the points carrying ALL `tags` (e.g. a discussion /
+        `session:<id>`). This establishes *what we are talking about* inside
+        that filtered set and produces a scoped answer + its evidence.
+
+        Phase 2 — KNOWLEDGE BASE (only if `knowledge_base=True`). Seed a
+        SECOND walk over the WHOLE memory with the original query enriched by
+        Phase-1's finding, so the discussion context drives the global
+        search. When `knowledge_base=False` the answer stays strictly within
+        the filtered set.
+
+        Returns `{"scoped_answer", "scoped_evidence", "knowledge_base",
+        ["global_answer", "global_evidence"]}`."""
+        from metacog.meta_walk import MetaWalker, provisional_answer
+        tagset = {t.lower() for t in tags}
+        scoped_ids = {
+            p.id for p in self.points
+            if tagset.issubset({x.lower() for x in p.tags})
+        }
+
+        def _run(q, *, restrict):
+            w = MetaWalker(q, self, n_stages=n_stages, commit=False,
+                           restrict_ids=restrict)
+            for _ in range(n_stages):
+                if w.step().done:
+                    break
+            ev = w._composable_evidence()
+            chain = [t.content for t in w._thought_chain]
+            return provisional_answer(q, ev, chain, self.llm), ev
+
+        ans1, ev1 = _run(query, restrict=scoped_ids)
+        out: Dict[str, Any] = {
+            "scoped_answer": ans1, "scoped_evidence": ev1,
+            "knowledge_base": bool(knowledge_base),
+        }
+        if not knowledge_base:
+            return out
+        # Phase-1's finding seeds the global search.
+        seed = (f"{query} {ans1}").strip() if ans1 else query
+        ans2, ev2 = _run(seed, restrict=None)
+        out["global_answer"] = ans2
+        out["global_evidence"] = ev2
+        return out
+
     def reason(
         self,
         query: str,
@@ -725,6 +1414,11 @@ class Memory:
         lat = self.lateral_collapse(t_now)
         out["lateral_collided_groups"] = lat["collided_groups"]
         out["lateral_aliases"] = lat["aliases"]
+        # LATENT skill distiller : replay resolutions recorded since the
+        # last sleep and crystallize theoretical tools linked to their
+        # explicating facts. Opt-in (skills_enabled), idempotent.
+        if self.skills_enabled and self._resolution_ledger:
+            out["distilled"] = self.distill_skills(t_now)["distilled"]
         return out
 
     def compress_chasles(self) -> List[Dict[str, Any]]:

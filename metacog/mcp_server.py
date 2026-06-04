@@ -55,7 +55,24 @@ def build_app(
     """
     from metacog.meta_walk import MetaWalker, WalkerRegistry
 
-    app = FastMCP("metacog")
+    app = FastMCP(
+        "metacog",
+        instructions=(
+            "Continuously feed this memory. TWO standing obligations for the "
+            "client:\n"
+            "1. INDEX EVERY MESSAGE. For each turn of the conversation — BOTH "
+            "the user's and your own — call `ingest_message(content, role, "
+            "user_id, session_id, timestamp)` with the message's timestamp. "
+            "Indexing is async and never blocks your searches.\n"
+            "2. PUSH EVERY CODE BLOCK. Whenever you produce code, call "
+            "`push_code(code, context, project, branch, github_user, user_id, "
+            "session_id)`. The server decides whether it is project "
+            "documentation, a reusable tool, or both, and files it "
+            "accordingly. If the code belongs to a project, pass the project / "
+            "branch / github_user so the doc node is tagged and the derived "
+            "tool keeps a bidirectional link back to it."
+        ),
+    )
     if memory is None:
         memory = Memory(storage_path=storage_path)
 
@@ -180,6 +197,8 @@ def build_app(
         actions_per_stage: int = 3,
         commit: bool = False,
         observator_id: str = "",
+        user_id: str = "",
+        session_id: str = "",
     ) -> dict:
         """Run a COMPLETE meta-cognitive walk and return its result.
 
@@ -217,6 +236,11 @@ def build_app(
                                  whole walk drifted, pivot with new vocabulary
           done                 : always True (the walk ran to completion)
         """
+        # Double-query section pre-filter : when a user/session is given,
+        # the section's own points (skills/tools/turns of THIS user/session)
+        # get a retrieval rank boost, alongside the free semantic query.
+        section = {f"{k}:{v}" for k, v in
+                   (("user", user_id), ("session", session_id)) if v} or None
         walker = MetaWalker(
             query, memory,
             n_stages=max(1, n_stages),
@@ -224,6 +248,7 @@ def build_app(
             actions_per_stage=max(1, actions_per_stage),
             commit=commit,
             observator_id=observator_id or None,
+            section_filter=section,
         )
         walk_id = walkers.open(walker)
         # Loop the walk to completion : depth is the walk's own
@@ -289,12 +314,163 @@ def build_app(
         return out
 
     @app.tool()
+    def walk_keepup(
+        query: str, n_stages: int = 16,
+        user_id: str = "", session_id: str = "",
+    ) -> dict:
+        """KEEPUP mode — organic streaming answer. Runs the uncertainty-
+        governed walk and returns the full SNAPSHOT TRAJECTORY: one entry
+        per stage, each a PROVISIONAL answer (re-written as evidence
+        accumulates) plus the live thought and depth-gate state. The LAST
+        snapshot is the validated final answer — generation is continuous,
+        so there is no separate final pass to wait for.
+
+        Over the SSE transport a client renders these as a message that
+        rewrites itself until `done=True`. Returns
+        {"snapshots": [...], "final": <last answer>, "stages": n}.
+        """
+        snaps = list(memory.answer_keepup(
+            query, n_stages=max(1, n_stages),
+            user_id=user_id, session_id=session_id,
+        ))
+        final = next((s["answer"] for s in reversed(snaps) if s.get("answer")), "")
+        return {"snapshots": snaps, "final": final, "stages": len(snaps)}
+
+    @app.tool()
+    def scoped_answer(
+        query: str, tags: list, knowledge_base: bool = False,
+        n_stages: int = 16,
+    ) -> dict:
+        """Tag-filtered retrieval as a TWO-PHASE cascade. Phase 1 runs the
+        walk HARD-restricted to points carrying ALL `tags` (e.g.
+        ["session:s1"] — a discussion) to find what is being talked about
+        there. If knowledge_base=True, Phase 2 then searches the WHOLE
+        memory seeded by Phase-1's finding (discussion context → global KB);
+        otherwise the answer stays strictly within the filtered set.
+        Returns the scoped answer/evidence (+ global ones when enabled)."""
+        return memory.scoped_answer(
+            query, tags=list(tags or []),
+            knowledge_base=bool(knowledge_base), n_stages=max(1, n_stages),
+        )
+
+    @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
         """Run a full reasoning trajectory until output convenable."""
         result = memory.reason(query, with_executor=with_executor, apply_compression=apply_compression)
         if memory.storage_path:
             memory.save()
         return result
+
+    # Per-(user, session) skill-JSON cache : the last skill folder built or
+    # ingested in a session, keyed by the caller's user token + session id.
+    _session_skills: dict = {}
+
+    @app.tool()
+    def ingest_skill(
+        tree: dict, name: str, user_id: str, session_id: str,
+        date: str = "",
+    ) -> dict:
+        """Re-index a NAMED skill — a theoretical directory tree of tools
+        (nested JSON: dir→sub-object, file→description) — as tagged points
+        the walk can retrieve like any fact. Tags every node
+        skill·tool·name:<name>·user:<id>·session:<id>·date:<…> and encodes
+        the directory topology via lineage + ref:skill:* tokens. Also caches
+        the skill JSON in this (user, session)."""
+        pts = memory.ingest_skill(
+            tree, name=name, user_id=user_id, session_id=session_id,
+            date=date or None,
+        )
+        _session_skills[(user_id, session_id)] = {"name": name, "tree": tree}
+        if memory.storage_path:
+            memory.save()
+        return {"skill": name, "points_created": len(pts),
+                "ids": [p.id for p in pts]}
+
+    @app.tool()
+    def build_skill(
+        query: str, user_id: str, session_id: str, n_stages: int = 8,
+    ) -> dict:
+        """Build a skill end-to-end (TASK mode) : a walk gathers tools
+        (gold = tool fact OR semantic fact) until enough to elaborate the
+        complete workflow, synthesises a NAMED skill folder, re-indexes it,
+        and caches it in this (user, session). Returns the skill JSON
+        {"name","tree"}."""
+        skill = memory.build_skill(
+            query, user_id=user_id, session_id=session_id, n_stages=n_stages,
+        )
+        _session_skills[(user_id, session_id)] = skill
+        if memory.storage_path:
+            memory.save()
+        return skill
+
+    @app.tool()
+    def get_session_skill(user_id: str, session_id: str) -> dict:
+        """Return the skill JSON cached for this (user, session), or {}."""
+        return _session_skills.get((user_id, session_id), {})
+
+    @app.tool()
+    def capture_code_tool(
+        code: str, context: str = "", lang: str = "python",
+        user_id: str = "", session_id: str = "",
+    ) -> dict:
+        """Chat-side hook : after generating code, ask whether it is a
+        REUSABLE TOOL and, if so, FEED IT INTO THE RAG. Self-assesses via
+        tool-intent ; on yes, re-indexes the code as an executable tool node
+        (tagged tool·skill·code·name:·user:·session:·date:) the walk can
+        retrieve like any fact and reuse next time. Returns
+        {"captured": bool, "id", "name", "kind"}."""
+        p = memory.capture_code_tool(
+            code, context=context, lang=lang,
+            user_id=user_id, session_id=session_id,
+        )
+        if memory.storage_path and p is not None:
+            memory.save()
+        if p is None:
+            return {"captured": False}
+        name = next((t.split(":", 1)[1] for t in p.tags
+                     if t.startswith("name:")), "")
+        kind = next((t.split(":", 1)[1] for t in p.tags
+                     if t.startswith("kind:")), "")
+        return {"captured": True, "id": p.id, "name": name, "kind": kind}
+
+    @app.tool()
+    def ingest_message(
+        content: str, role: str, user_id: str, session_id: str,
+        timestamp: str = "",
+    ) -> dict:
+        """EPISODIC FEED — index ONE conversation message (role = "user" or
+        "agent") of a session, preserving its timestamp. Call this for EVERY
+        turn on BOTH sides. Indexing is ASYNC and NON-BLOCKING : the message
+        is queued and indexed in the background, so it never delays your
+        searches. Messages chain in order (sequence_prev) and are tagged
+        episode·message·role:·user:·session:·ts:·date:."""
+        memory.ingest_message(
+            content, role=role, user_id=user_id, session_id=session_id,
+            timestamp=timestamp or None, block=False,
+        )
+        return {"queued": True}
+
+    @app.tool()
+    def push_code(
+        code: str, context: str = "", project: str = "", branch: str = "",
+        github_user: str = "", lang: str = "python",
+        user_id: str = "", session_id: str = "",
+    ) -> dict:
+        """PUSH generated code into the RAG. The server EVALUATES it and
+        routes it : PROJECT code → a semantic FACT documentation node tagged
+        project·branch·github ; TOOL-able code → a metacognitive rewrite
+        re-indexed as an executable tool ; BOTH → both, with a bidirectional
+        ref: filiation so the tool remembers its project and the project doc
+        points at the derived tool. Pass project/branch/github_user when the
+        code belongs to a project. Returns the routing summary."""
+        r = memory.push_code(
+            code, context=context, project=project, branch=branch,
+            github_user=github_user, lang=lang,
+            user_id=user_id, session_id=session_id,
+        )
+        if memory.storage_path and r.get("pushed"):
+            memory.save()
+        return r
 
     @app.tool()
     def sleep() -> dict:
@@ -440,13 +616,30 @@ def main():
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio"],
-        default="stdio",
-        help="MCP transport. Default stdio (standard for Claude Code).",
+        choices=["stdio", "sse", "streamable-http"],
+        default=os.environ.get("METACOG_TRANSPORT", "stdio"),
+        help="MCP transport. stdio (default, for Claude Code) ; sse or "
+             "streamable-http for live-streaming HTTP clients (keepup).",
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("METACOG_HOST", "127.0.0.1"),
+        help="Bind host for the sse / streamable-http transports.",
+    )
+    parser.add_argument(
+        "--port", type=int,
+        default=int(os.environ.get("METACOG_PORT", "8765")),
+        help="Bind port for the sse / streamable-http transports.",
     )
     args = parser.parse_args()
 
     app = build_app(storage_path=args.storage)
+    if args.transport in ("sse", "streamable-http"):
+        # Configure the HTTP bind for the streaming transports.
+        try:
+            app.settings.host = args.host
+            app.settings.port = args.port
+        except Exception:
+            pass
     app.run(transport=args.transport)
 
 

@@ -130,6 +130,37 @@ different vocabulary when a thread is exhausted — never stage-by-stage
 micro-driving. This alignment of the two control loops is what lets the
 uncertainty-governed depth actually run at inference time.
 
+### 3.1 Keepup — organic streaming
+
+Because the depth-gate (§4) already evaluates sufficiency at every stage,
+the system can answer **organically** instead of waiting for a final pass.
+In **keepup** mode (`Memory.answer_keepup`, MCP `walk_keepup`) a
+*provisional* answer is synthesised from the very first walk and
+**re-written every stage** as evidence accumulates; the live `THOUGHT` is
+streamed alongside it. The walk runs once, continuously — so the moment
+the σ / coverage gate validates (`done`), the provisional answer is
+*already* the final one: there is no separate final-generation latency. If
+the answer was correct at stage 4 and stage 5 only confirms it, the user
+saw the right answer a stage early. Generation is therefore continuous and
+asynchronous; over the SSE transport (§7.2) the client renders a single
+message that rewrites itself until validated.
+
+### 3.2 Scoped retrieval — discussion first, then the knowledge base
+
+Tag-filtered retrieval is a **two-phase cascade**
+(`Memory.scoped_answer(query, tags, knowledge_base=…)`, MCP
+`scoped_answer`). **Phase 1** runs a full uncertainty-governed walk
+**hard-restricted** (`MetaWalker(restrict_ids=…)`) to the points carrying
+*all* the given tags — e.g. `["session:s1"]`, a single discussion — to
+establish *what is being talked about there*. **Phase 2** then, only when
+`knowledge_base=True`, seeds a **second** walk over the *whole* memory with
+the original query enriched by Phase-1's finding, so the discussion context
+drives the global search. With `knowledge_base=False` the answer stays
+strictly inside the filtered set. This is the difference between the soft
+`section_filter` (an in-walk RRF rank boost, §5) and a hard scope: scoped
+retrieval *first* resolves the reference inside the discussion, *then*
+optionally reaches the global knowledge base seeded by what it found.
+
 ---
 
 ## 4. Uncertainty-governed depth
@@ -172,6 +203,20 @@ govern termination:
   the walk holds turns bearing on each facet of the question and stops.
   Vocabulary-gap questions never reach full coverage, so σ governs those —
   they are never cut short.
+
+Put as a single termination predicate, the walk halts at stage *k* iff
+
+```
+   k ≥ _MIN_STAGES   AND   ( σ_path(k) > cutoff   OR   covers(query, evidence) )
+```
+
+with `cutoff = median(d₀) + std(d₀)` over the stage-0 pairwise distances.
+**Uncertainty is the primary stop**: the walk continues precisely as long
+as its evidence chain stays inside the manifold's own resolution, and
+terminates the moment the accumulated σ says the chain can no longer be
+trusted — no fixed maximum, no learned controller, no caller override
+(§7.2). The floor guarantees a minimum exploration; coverage is an early
+exit for questions whose vocabulary the evidence already spans.
 
 **Why this matters empirically.** A naive depth measure — the
 stage-to-stage drift of the re-anchored seed — is ≈ 0 (the seed is
@@ -257,16 +302,122 @@ event that repeats a seen direction adds ≈ 0; only distant directions
 accumulate), and each is **gated** so it stays inert on small clouds where
 "redundant" is undefined.
 
-### 5.1 Memory skills — self-built tools
+### 5.1 Memory skills — self-built (automated) tools
 
 A capability the system keeps re-deriving crystallizes into a **tool**: a
-*normal node* (kind `ACTION`, tagged `tool` + a genre tag + grounding
-tags), scoped by its keywords. Being a normal node it lives in the same
-cloud — persisted, found by the walk recursively, subject to lateral
-collision and Chasles like anything else. It is reached either by
-*recurrence* (`crystallize_skills`) or *eagerly* (`ensure_tool`: "no tool
-→ generate it → proceed"), and reused via a keyword-cosine fast path
-(`match_tool`).
+*normal node* (kind `ACTION`, tagged `tool` + a genre tag
+`tool_code`/`tool_command`/`tool_api` + grounding-context tags), scoped by
+its keywords. Being a normal node it lives in the same cloud — persisted on
+save, found by the walk **recursively**, and subject to lateral collision
+and Chasles compression like anything else. The tool set is therefore
+self-built, self-pruning, and self-retrieving; nothing about it is a
+special case.
+
+Three mechanisms govern automation (`skills.py`):
+
+- **Two triggers.**
+  *Recurrence* (`crystallize_skills`) — an action re-derived across enough
+  **diverse** queries (the same Poisson floor `λ + √λ`, diversity-weighted)
+  earns a persistent tool over time.
+  *Eager* (`ensure_tool`) — the "no tool → generate it → proceed" step:
+  on first need, with no recurrence wait. Generation is unconstrained, so
+  it never blocks; it only ever *grows* the self-built set.
+- **Tool-intent metacognition** (`assess_tool_intent`) — reads a `THOUGHT`
+  or a generated response and judges whether it implies running code or a
+  command underneath, i.e. whether there is a tool to generate at all.
+- **Fast-path reuse** (`match_tool`) — an in-scope query returns its
+  covering tool via keyword-cosine (threshold `cos`-based, not tuned), so
+  the agent reuses the cached capability and **skips a think phase**.
+
+```python
+m.skills_enabled = True
+m.ensure_tool("search scientific articles about X",
+              how="query the article index by topic, rank by relevance")
+# 1st call → generates tool_search_articles (ACTION, tag=tool,tool_api…)
+# next time a query falls in its keyword scope → match_tool returns it,
+#   the think phase is skipped, and the capability is reused verbatim.
+```
+
+Because a tool is just an `ACTION` node, the walk (§3) can *chain through*
+it like any other point: a self-built capability becomes available to
+multi-hop reasoning the moment it crystallizes, and a `tool_workflow`
+(a Chasles-compressed chain of actions, §5) is reused as a single optimised
+step.
+
+### 5.2 Named skills — theoretical directories of tools
+
+A **skill** is a *named theoretical directory* of tools that solves a
+complex task. It is built, retrieved, and grown entirely inside the
+manifold — no special store.
+
+**Construction (task mode).** `Memory.build_skill(query, user_id,
+session_id)` runs a walk in **task mode**: gold is a *tool fact* as
+readily as a *semantic fact* (tools ride the same retrieval), and the
+depth gate is no longer the QA σ-stop but *"have we gathered enough tools
+to elaborate the complete workflow?"* (`enough_tools_for_workflow`, an LLM
+check per depth, fail-closed). The output is a **skill folder** as nested
+JSON — keys are theoretical file names — with a generated `name`.
+
+**Ingestion (`Memory.ingest_skill`).** The skill JSON is re-indexed as
+ordinary points: each dir/file becomes a `FACT` tagged
+`skill · tool · name:<name> · user:<id> · session:<id> · date:<…>`
+(`skill_dir`/`skill_file`). The directory **topology** is encoded twice in
+agreement — edge-free lineage (`parents` + `apply_pull` clustering) and
+typed `ref:skill:<name>:path:` / `:parent:` tokens (the same device as
+`ref:date:*`) — so the structure is itself retrievable.
+
+**Scoped retrieval (double query).** Recall pre-filters the **section**
+(`session:`/`user:`/`name:` tags) and RRF-merges it with the free semantic
+query (`section_filter`): a user's own this-session skills get a rank boost
+without excluding the global cloud. The MCP layer caches the live skill
+JSON per `(user, session)`.
+
+**Latent distiller (in `sleep()`).** Every solved task is logged with its
+**resolution path** (`record_resolution`: query, the walked point-ids, the
+output). The next `sleep()` replays the ledger (`distill_skills`) and
+crystallizes, per resolution, a tool `ACTION` node whose `parents` are the
+semantic facts/thoughts/actions that **explicate** it, co-located by
+`apply_pull`. The next time the task recurs the walk retrieves the tool
+**directly** and chains through it — no forced metacognition. Deterministic
+and idempotent (a consumed-cursor over the ledger).
+
+**Capture-on-generation (chat side).** Whenever the assistant *generates
+code*, `Memory.capture_code_tool(code, context, …)` (MCP
+`capture_code_tool`) asks whether it is a **reusable tool**
+(`assess_tool_intent`: surface markers + LLM adjudication) and, on a yes,
+**feeds it into the RAG** — an executable `ACTION` node (`exec_spec`)
+tagged `tool·skill·code·name:<def-name>·user:·session:·date:`, retrieved by
+the walk like any fact and reused via `match_tool`. A snippet judged purely
+illustrative is dropped (returns `None`, chat never blocked).
+
+**`push_code` — evaluate & route.** The richer entry point
+(`Memory.push_code`, MCP `push_code`) the client calls for *every* code
+block. The server **evaluates** it and routes:
+- **project code** → a semantic FACT **documentation** node tagged
+  `doc·project:<…>·branch:<…>·github:<user>·user:·session:·date:` that
+  teaches about the project;
+- **tool-able code** → a **metacognitive rewrite** (`_rewrite_as_tool`,
+  exposing `def run(args)`) re-indexed as an executable tool;
+- **both** → both, kept in **bidirectional `ref:` filiation**
+  (`ref:tool:<id>` on the doc, `ref:doc:<id>` on the tool, plus parents and
+  co-location) so the tool remembers the project it came from and the
+  project doc points at the derived tool.
+
+### 5.3 Episodic conversation index
+
+Every message of a session — **both** the user's and the agent's — is fed
+in **continuously**, with its **timestamp preserved**
+(`Memory.ingest_message(content, role, user_id, session_id, timestamp)`,
+MCP `ingest_message`). Each becomes a FACT anchored `[<ts>] <role>: …`,
+tagged `episode·message·role:<user|agent>·user:·session:·ts:·date:` and
+chained in order (`sequence_prev`) per `(user, session)`. The timestamp
+anchor also feeds the deterministic temporal resolution (§4.2).
+
+Indexation is **async and non-blocking**: a daemon worker drains a queue in
+the background, so feeding a message never delays a concurrent search
+(`flush_index()` / `block=True` force synchrony for tests and shutdown).
+The server's MCP `instructions` make this a standing client obligation —
+index every message, push every code block.
 
 ---
 
@@ -323,27 +474,89 @@ m.sleep()                                 # geometric + lateral collision pass
 
 ### 7.2 MCP service
 
-The same operations are exposed as an MCP service. `walk_start` runs a
-**complete** uncertainty-governed walk; `walk_next` is deprecated (the walk
-no longer advances one stage per call). Register it in Claude Code:
+Every operation is exposed as an MCP service (`metacog/mcp_server.py`), so
+an external agent (e.g. Claude Code) drives the same memory the library
+uses. Register it:
 
 ```json
 { "mcpServers": { "metacog": {
     "command": "metacog-mcp",
     "args": ["--storage", "~/.metacog/state.pkl"] } } }
 ```
-
 ```bash
 uv sync && uv run metacog-mcp --storage ~/.metacog/state.pkl
 ```
 
-Tools appear as `mcp__metacog__*`. A full tool list is in
-[`metacog/README.md`](metacog/README.md).
+**Transports.** stdio is the default (for Claude Code). For live-streaming
+HTTP clients — the keepup message that rewrites itself (§3.1) — run the
+server over **SSE** or streamable-http:
+
+```bash
+uv run metacog-mcp --transport sse --host 127.0.0.1 --port 8765
+#   (or --transport streamable-http ; or METACOG_TRANSPORT=sse)
+```
+
+Tools appear as `mcp__metacog__*`:
+
+```
+# memory I/O
+ingest              add a FACT / THOUGHT / ACTION
+observe             apply an Observation on existing point(s)
+process_turn        record a conversation turn (detectors fire)
+retrieve            top-k hybrid retrieval (RRF)
+
+# the walk  ── depth is decided by the walk, not the caller ──
+walk_start          run a COMPLETE uncertainty-governed walk for a query
+                    (loops to its own σ-termination; returns the bounded
+                     composable evidence + reasoning chain). user_id/
+                     session_id add the double-query section boost. The
+                     agent does BREADTH pivots — re-issue walk_start with
+                     new vocabulary; it never micro-drives depth.
+walk_keepup         KEEPUP (§3.1): the snapshot trajectory — a provisional
+                    answer re-written each stage until validated. Over SSE,
+                    a message that rewrites itself until done=True.
+scoped_answer       SCOPED (§3.2): tag-filtered cascade — walk the
+                    discussion first, then (knowledge_base=true) the global
+                    memory seeded by what it found.
+walk_next           DEPRECATED — walk_start now runs to completion.
+
+# reasoning & consolidation
+reason              full reasoning trajectory until a usable answer
+sleep               geometric + lateral collapse, and the latent skill distiller
+
+# skills & self-built tools (§5)
+ingest_skill        re-index a named skill-JSON directory tree
+build_skill         task-mode walk → synthesise + ingest a named skill
+get_session_skill   the skill JSON cached for this (user, session)
+ingest_message      EPISODIC: index a message (user/agent), async, timestamped
+push_code           evaluate & route generated code → project doc and/or tool
+capture_code_tool   feed generated code into the RAG if it is a reusable tool
+match_tool          fast-path: does a generated tool already cover this query?
+ensure_tool         get a tool, generating it if absent ("no tool → make it")
+crystallize_skills  fold recurring actions into persistent tool nodes
+list_tools_learned  list the self-built tool set
+
+# introspection & perspective
+inspect             dump a point's full state (keywords, tags, σ, spike count)
+audit               verify no laundering (Corollary 5)
+stats               system overview
+declare_observator · detect_polarized · spawn_observators · route
+list_communities    Level-1 community / observator detection
+save                persist to disk
+```
+
+The crucial semantic difference from a conventional retrieval tool:
+**`walk_start` owns the depth decision.** A caller cannot ask for "one more
+hop"; the walk runs until its own uncertainty propagation says stop (§4).
+The agent's only lever is *breadth* — start another walk aimed at a
+different facet. This is what keeps the σ-termination, the floor, and the
+coverage-stop authoritative at inference time instead of being overridden
+by an eager caller.
 
 ### 7.3 Tests & benchmark
 
 ```bash
-uv run pytest tests/ -q                                  # 311 tests
+uv run pytest tests/ -q                                  # 346 tests
 uv run python -m benchmarks.locomo.eval \
     --answerer meta --samples 5 --per-category 1 --encoder semantic
 ```

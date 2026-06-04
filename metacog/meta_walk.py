@@ -44,6 +44,7 @@ THOUGHT/ACTION Points (which were appended to the memory).
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -346,6 +347,7 @@ def nearest_facts_with_fallback(
     extractor: Any = None,
     anchor_query: Optional[str] = None,
     hyde_passage_text: Optional[str] = None,
+    section_filter: Optional[set] = None,
 ) -> List[Point]:
     """FACT retrieval — delegates to the FULL hybrid pipeline.
 
@@ -424,12 +426,37 @@ def nearest_facts_with_fallback(
         rrf_k = 60
         has_anchor = bool(anchor_query and anchor_query != query_text)
         has_hyde = bool(hyde_passage_text)
-        if has_anchor or has_hyde:
+        # DOUBLE QUERY (skill sections) : when a section_filter is given
+        # (e.g. {"session:s7", "user:u42"} or a skill name tag), run a
+        # SECOND retrieval restricted to the points carrying ALL those tags
+        # — the "section" — and RRF-merge it with the free query. This is
+        # the pre-filtered-on-the-session ⊕ free-semantic-query the skill
+        # system uses : the section's own tools/files get a rank boost
+        # without excluding anything from the free channel.
+        has_section = bool(section_filter)
+        if has_anchor or has_hyde or has_section:
             rrf_scores: dict = {}
             pid_map: dict = {}
             for rank, (_, p) in enumerate(results):
                 rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
                 pid_map.setdefault(p.id, p)
+            if has_section:
+                # Tags are normalised to lower-case on the Point, so the
+                # filter must match case-insensitively (a user/session id
+                # with capitals would otherwise silently match nothing).
+                sect_lc = {s.lower() for s in section_filter}
+                sect = [p for p in search_points
+                        if sect_lc.issubset({t.lower() for t in p.tags})]
+                if sect:
+                    sect_pool = retrieve_hybrid(
+                        query_text, sect, overfetch, t_now,
+                        encoder=encoder, extractor=extractor,
+                        use_lineage=True, use_spreading=True, use_fuzzy=True,
+                        restrict_kind=PointKind.FACT,
+                    )
+                    for rank, (_, p) in enumerate(sect_pool):
+                        rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+                        pid_map.setdefault(p.id, p)
             if has_anchor:
                 anchor_pool = bm25_score(
                     anchor_query,
@@ -1061,6 +1088,36 @@ def synthesize_answer_from_walk(
         return ""
 
 
+def provisional_answer(query: str, evidence: Sequence[dict],
+                       chain: Sequence[str], llm: Any,
+                       *, max_tokens: int = 80) -> str:
+    """A best-effort answer from the evidence gathered SO FAR — the unit
+    the keepup stream re-writes each stage. Same bare-value style as the
+    final synthesis ; cheap (one short LLM call). Empty on failure (the
+    stream simply keeps the previous snapshot)."""
+    if not hasattr(llm, "generate") or not evidence:
+        return ""
+    ev = "\n".join(f"  - {e.get('content','')}" for e in list(evidence)[:15])
+    chain_block = ""
+    if chain:
+        chain_block = ("REASONING SO FAR :\n"
+                       + "\n".join(f"  - {c}" for c in list(chain)[-4:]) + "\n\n")
+    prompt = (
+        "Answer the QUERY from the evidence gathered so far. This is a "
+        "PROVISIONAL answer that may be refined as more evidence arrives. "
+        "Reply with the bare value in the gold style (date / place / short "
+        "noun phrase / 'Likely yes|no, <clause>' / 'Not mentioned'). No "
+        "preamble, no prose.\n\n"
+        f"QUERY : {query}\n\n"
+        f"{chain_block}"
+        f"EVIDENCE :\n{ev}"
+    )
+    try:
+        return (llm.generate(prompt, max_tokens=max_tokens) or "").strip()
+    except Exception:
+        return ""
+
+
 def meta_walk(
     query: str,
     memory: Any,
@@ -1223,6 +1280,88 @@ def meta_walk(
 
 
 # ---------------------------------------------------------------------------
+# Skill / task mode : tools-in-the-walk depth gate + skill-JSON synthesis
+# ---------------------------------------------------------------------------
+
+def is_tool_point(p: Point) -> bool:
+    """A point that represents a tool / skill ingredient — tagged `tool`
+    or `skill`, or a crystallized tool ACTION."""
+    t = set(getattr(p, "tags", []) or [])
+    return bool(t & {"tool", "skill", "tool_workflow"})
+
+
+def enough_tools_for_workflow(query: str, tools: Sequence[Point],
+                              llm: Any) -> bool:
+    """Task-mode DEPTH gate : do the gathered TOOL nodes suffice to
+    elaborate the COMPLETE workflow that solves `query`? Returns True to
+    stop the walk, False to keep collecting.
+
+    Fails CLOSED (False) on any error / empty tool set, so a transient LLM
+    hiccup only makes the walk gather MORE tools, never stop short. No
+    tools yet → trivially not enough.
+    """
+    if not tools or not hasattr(llm, "generate"):
+        return False
+    listing = "\n".join(f"- {p.content}" for p in list(tools)[-20:])
+    prompt = (
+        "We are assembling a COMPLETE workflow to solve a TASK from the "
+        "tools gathered so far. Answer with exactly YES if the tools are "
+        "sufficient to build the whole workflow end-to-end, or NO if a "
+        "step is still missing.\n\n"
+        f"TASK : {query}\n"
+        f"TOOLS GATHERED :\n{listing}"
+    )
+    try:
+        raw = (llm.generate(prompt, max_tokens=8) or "").strip().lower()
+    except Exception:
+        return False
+    return raw.startswith("yes")
+
+
+def synthesize_skill_json(query: str, tools: Sequence[Point],
+                          llm: Any, *, name_hint: str = "") -> Dict[str, Any]:
+    """Produce the NAMED skill folder — `{"name": str, "tree": {...}}` —
+    from the gathered tools. `tree` is the nested theoretical directory the
+    skill ingestion (Memory.ingest_skill) consumes. Deterministic fallback
+    on any failure : a flat tree of the tool contents under a slugged name,
+    so a skill is ALWAYS produced and ingestable.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", (name_hint or query).lower()).strip("_")[:40]
+    slug = slug or "skill"
+    fallback = {
+        "name": slug,
+        "tree": {f"step_{i+1}.txt": (p.content or "")[:160]
+                 for i, p in enumerate(list(tools)[:12])},
+    }
+    if not hasattr(llm, "generate"):
+        return fallback
+    listing = "\n".join(f"- {p.content}" for p in list(tools)[:20])
+    prompt = (
+        "Turn the gathered tools into a SKILL FOLDER that solves the task. "
+        "Output STRICT JSON: an object with \"name\" (a short snake_case "
+        "skill name) and \"tree\" (a nested directory: a folder maps a name "
+        "to a sub-object, a file maps a name to a one-line description). "
+        "No prose, JSON only.\n\n"
+        f"TASK : {query}\n"
+        f"TOOLS :\n{listing}"
+    )
+    try:
+        raw = (llm.generate(prompt, max_tokens=400) or "").strip()
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return fallback
+        obj = json.loads(m.group(0))
+        if not isinstance(obj, dict) or not isinstance(obj.get("tree"), dict):
+            return fallback
+        obj.setdefault("name", slug)
+        if not isinstance(obj["name"], str) or not obj["name"].strip():
+            obj["name"] = slug
+        return obj
+    except Exception:
+        return fallback
+
+
+# ---------------------------------------------------------------------------
 # Stateful walker for MCP-driven step-by-step traversal
 # ---------------------------------------------------------------------------
 
@@ -1258,6 +1397,9 @@ class MetaWalker:
         commit: bool = True,
         use_chain_of_note: bool = True,
         observator_id: Optional[str] = None,
+        task_mode: bool = False,
+        section_filter: Optional[set] = None,
+        restrict_ids: Optional[set] = None,
     ) -> None:
         """`commit` controls whether the walk MUTATES the shared memory.
 
@@ -1288,6 +1430,21 @@ class MetaWalker:
         # Optional Level-1 community activation : restricts FACT retrieval
         # to this observator's members (see _all_points).
         self.observator_id = observator_id
+        # SKILL / TASK mode. When task_mode is on, the walk is assembling a
+        # workflow from TOOL nodes (skill/tool-tagged FACTs retrieved
+        # alongside semantic facts) rather than answering a question : its
+        # depth gate becomes "have we collected enough tools to elaborate
+        # the complete workflow?" (an LLM check per depth). `section_filter`
+        # is the double-query pre-filter — a set of tags (session:/user:/
+        # name:) whose section gets a retrieval rank boost.
+        self.task_mode = task_mode
+        self.section_filter = section_filter
+        # HARD search-pool restriction (scoped walk) : set of point ids the
+        # walk may retrieve FACTs from. None = the whole memory.
+        self.restrict_ids = restrict_ids
+        # Tools gathered across the walk (skill/tool-tagged), the workflow
+        # ingredients in task mode.
+        self._tools_collected: List[Point] = []
         # Per-walk scratch for generated points when commit=False.
         self._local_points: List[Point] = []
         self.t_now = (
@@ -1388,6 +1545,16 @@ class MetaWalker:
         scaffolding is community-agnostic."""
         base = (list(self.memory.points) + self._local_points
                 if self._local_points else list(self.memory.points))
+        # HARD restriction (scoped walk) : only points in `restrict_ids`
+        # (plus this walk's own generated scaffolding) are searchable. Used
+        # by the scoped→knowledge-base cascade : the first walk runs over a
+        # filtered set (a discussion / session) before any global search.
+        rids = getattr(self, "restrict_ids", None)
+        if rids:
+            gen = set(self._generated_ids)
+            base = [p for p in base
+                    if p.id in rids or p.id in gen
+                    or p.kind != PointKind.FACT or p.id.startswith("entity_")]
         oid = getattr(self, "observator_id", None)
         if not oid:
             return base
@@ -1613,6 +1780,25 @@ class MetaWalker:
                 sigma_path=self._sigma_path,
             )
 
+        # TASK-MODE depth gate : once past the floor, stop as soon as the
+        # tools gathered suffice to elaborate the complete workflow (LLM
+        # check per depth). Fails closed (keep collecting) on any error.
+        if (self.task_mode
+                and self._stage_idx >= _MIN_STAGES
+                and self._tools_collected
+                and enough_tools_for_workflow(
+                    self.query, self._tools_collected, self._llm)):
+            self._done = True
+            return StageOutput(
+                stage=self._stage_idx,
+                facts=[], actions=[],
+                chosen_fact=None, chosen_action=None, thought=None,
+                generated_action=False, generated_thought=False,
+                fact_ids_cumulative=list(self._fact_ids_cum),
+                done=True,
+                sigma_path=self._sigma_path,
+            )
+
         pts = self._all_points()
         facts = nearest_facts_with_fallback(
             seed_emb, seed_query, pts,
@@ -1621,6 +1807,7 @@ class MetaWalker:
             encoder=self._enc, extractor=self._extr,
             anchor_query=self.query if seed_query != self.query else None,
             hyde_passage_text=self._hyde_passage or None,
+            section_filter=self.section_filter,
         )
 
         # Feed the LATERAL co-retrieval ledger : this ranked result, under
@@ -1711,6 +1898,15 @@ class MetaWalker:
                 self._relevant_cum.append(f)
                 self._relevant_ids.add(f.id)
                 self._relevant_label[f.id] = relevance[i]
+
+        # TASK MODE : collect the tool/skill nodes surfaced this stage —
+        # the workflow ingredients. Gold in task mode is a tool fact as
+        # readily as a semantic fact, so they ride the same retrieval.
+        if self.task_mode:
+            have = {p.id for p in self._tools_collected}
+            for f in facts:
+                if f.id not in have and is_tool_point(f):
+                    self._tools_collected.append(f)
 
         # The subset the reasoning trusts : everything except clearly
         # off-target turns. "contradicts" is kept (the THOUGHT must see
@@ -1919,10 +2115,60 @@ class MetaWalker:
         self._stage_idx = next_idx
         return out
 
+    # ----------------------------------------------------------------
+    # Keepup : organic streaming. Emit a provisional answer from the very
+    # first walk and re-write it every stage until the depth-stop validates
+    # it — the last snapshot IS the final answer (no separate final pass).
+    # ----------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# In-process walker registry (per-MCP-server) for tool-call continuity
-# ---------------------------------------------------------------------------
+    def keepup(self):
+        """Generator yielding one snapshot per stage :
+
+            {"stage", "thought", "answer", "evidence_count", "done",
+             "sigma_path"}
+
+        The `answer` is a PROVISIONAL answer synthesised from the evidence
+        gathered up to this stage ; a consumer re-writes the displayed
+        message with each yield. Generation is therefore CONTINUOUS — by
+        the time the walk's σ / coverage depth-gate fires (done=True) the
+        provisional answer has already converged, so there is nothing extra
+        to compute : the depth-validation and the answer are produced
+        together. If walk k+1 only confirms walk k, the answer was already
+        right and the user saw it k stages early.
+
+        Cheap-by-design : a provisional answer is only (re)synthesised once
+        the floor is reached and the evidence set actually grew, so easy
+        questions emit one or two snapshots, not n.
+        """
+        last_answer = ""
+        last_ev_count = -1
+        while not self._done:
+            out = self.step()
+            ev = self._composable_evidence()
+            chain = [t.content for t in self._thought_chain]
+            # (Re)synthesise past the floor when evidence changed, AND
+            # always on the terminal stage if we have evidence but no
+            # answer yet (a walk that stops before the floor must still
+            # emit a final answer — keepup must never end empty-handed).
+            need = (out.stage + 1 >= _MIN_STAGES and len(ev) != last_ev_count)
+            if not need and out.done and ev and not last_answer:
+                need = True
+            if ev and need:
+                ans = provisional_answer(self.query, ev, chain, self._llm)
+                if ans:
+                    last_answer = ans
+                last_ev_count = len(ev)
+            yield {
+                "stage": out.stage,
+                "thought": (out.thought or {}).get("content")
+                if isinstance(out.thought, dict) else None,
+                "answer": last_answer,
+                "evidence_count": len(ev),
+                "done": bool(out.done),
+                "sigma_path": round(out.sigma_path, 4),
+            }
+            if out.done:
+                break
 
 
 class WalkerRegistry:
