@@ -297,6 +297,29 @@ def build_app(
         return out
 
     @app.tool()
+    def walk_keepup(
+        query: str, n_stages: int = 16,
+        user_id: str = "", session_id: str = "",
+    ) -> dict:
+        """KEEPUP mode — organic streaming answer. Runs the uncertainty-
+        governed walk and returns the full SNAPSHOT TRAJECTORY: one entry
+        per stage, each a PROVISIONAL answer (re-written as evidence
+        accumulates) plus the live thought and depth-gate state. The LAST
+        snapshot is the validated final answer — generation is continuous,
+        so there is no separate final pass to wait for.
+
+        Over the SSE transport a client renders these as a message that
+        rewrites itself until `done=True`. Returns
+        {"snapshots": [...], "final": <last answer>, "stages": n}.
+        """
+        snaps = list(memory.answer_keepup(
+            query, n_stages=max(1, n_stages),
+            user_id=user_id, session_id=session_id,
+        ))
+        final = next((s["answer"] for s in reversed(snaps) if s.get("answer")), "")
+        return {"snapshots": snaps, "final": final, "stages": len(snaps)}
+
+    @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
         """Run a full reasoning trajectory until output convenable."""
         result = memory.reason(query, with_executor=with_executor, apply_compression=apply_compression)
@@ -495,13 +518,30 @@ def main():
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio"],
-        default="stdio",
-        help="MCP transport. Default stdio (standard for Claude Code).",
+        choices=["stdio", "sse", "streamable-http"],
+        default=os.environ.get("METACOG_TRANSPORT", "stdio"),
+        help="MCP transport. stdio (default, for Claude Code) ; sse or "
+             "streamable-http for live-streaming HTTP clients (keepup).",
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("METACOG_HOST", "127.0.0.1"),
+        help="Bind host for the sse / streamable-http transports.",
+    )
+    parser.add_argument(
+        "--port", type=int,
+        default=int(os.environ.get("METACOG_PORT", "8765")),
+        help="Bind port for the sse / streamable-http transports.",
     )
     args = parser.parse_args()
 
     app = build_app(storage_path=args.storage)
+    if args.transport in ("sse", "streamable-http"):
+        # Configure the HTTP bind for the streaming transports.
+        try:
+            app.settings.host = args.host
+            app.settings.port = args.port
+        except Exception:
+            pass
     app.run(transport=args.transport)
 
 

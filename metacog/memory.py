@@ -925,6 +925,33 @@ class Memory:
     # Reasoning
     # ------------------------------------------------------------------
 
+    def answer_keepup(
+        self,
+        query: str,
+        *,
+        n_stages: int = 16,
+        user_id: str = "",
+        session_id: str = "",
+    ):
+        """KEEPUP mode — organic, continuously-rewriting answer generation.
+
+        Yields one snapshot per walk stage (see MetaWalker.keepup) : a
+        provisional answer that is re-written as evidence accumulates, the
+        live thought, and the depth-gate state. The walk runs in a single
+        uncertainty-governed pass ; because a provisional answer is emitted
+        from the first walk and refined each stage, the moment the σ /
+        coverage depth-gate validates (done=True) the answer is already
+        final — there is no separate final-generation wait. Consume it over
+        SSE to stream a message that rewrites itself until validated."""
+        from metacog.meta_walk import MetaWalker
+        section = {f"{k}:{v}" for k, v in
+                   (("user", user_id), ("session", session_id)) if v} or None
+        walker = MetaWalker(
+            query, self, n_stages=n_stages, commit=False,
+            section_filter=section,
+        )
+        yield from walker.keepup()
+
     def reason(
         self,
         query: str,

@@ -1088,6 +1088,36 @@ def synthesize_answer_from_walk(
         return ""
 
 
+def provisional_answer(query: str, evidence: Sequence[dict],
+                       chain: Sequence[str], llm: Any,
+                       *, max_tokens: int = 80) -> str:
+    """A best-effort answer from the evidence gathered SO FAR — the unit
+    the keepup stream re-writes each stage. Same bare-value style as the
+    final synthesis ; cheap (one short LLM call). Empty on failure (the
+    stream simply keeps the previous snapshot)."""
+    if not hasattr(llm, "generate") or not evidence:
+        return ""
+    ev = "\n".join(f"  - {e.get('content','')}" for e in list(evidence)[:15])
+    chain_block = ""
+    if chain:
+        chain_block = ("REASONING SO FAR :\n"
+                       + "\n".join(f"  - {c}" for c in list(chain)[-4:]) + "\n\n")
+    prompt = (
+        "Answer the QUERY from the evidence gathered so far. This is a "
+        "PROVISIONAL answer that may be refined as more evidence arrives. "
+        "Reply with the bare value in the gold style (date / place / short "
+        "noun phrase / 'Likely yes|no, <clause>' / 'Not mentioned'). No "
+        "preamble, no prose.\n\n"
+        f"QUERY : {query}\n\n"
+        f"{chain_block}"
+        f"EVIDENCE :\n{ev}"
+    )
+    try:
+        return (llm.generate(prompt, max_tokens=max_tokens) or "").strip()
+    except Exception:
+        return ""
+
+
 def meta_walk(
     query: str,
     memory: Any,
@@ -2071,10 +2101,60 @@ class MetaWalker:
         self._stage_idx = next_idx
         return out
 
+    # ----------------------------------------------------------------
+    # Keepup : organic streaming. Emit a provisional answer from the very
+    # first walk and re-write it every stage until the depth-stop validates
+    # it — the last snapshot IS the final answer (no separate final pass).
+    # ----------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# In-process walker registry (per-MCP-server) for tool-call continuity
-# ---------------------------------------------------------------------------
+    def keepup(self):
+        """Generator yielding one snapshot per stage :
+
+            {"stage", "thought", "answer", "evidence_count", "done",
+             "sigma_path"}
+
+        The `answer` is a PROVISIONAL answer synthesised from the evidence
+        gathered up to this stage ; a consumer re-writes the displayed
+        message with each yield. Generation is therefore CONTINUOUS — by
+        the time the walk's σ / coverage depth-gate fires (done=True) the
+        provisional answer has already converged, so there is nothing extra
+        to compute : the depth-validation and the answer are produced
+        together. If walk k+1 only confirms walk k, the answer was already
+        right and the user saw it k stages early.
+
+        Cheap-by-design : a provisional answer is only (re)synthesised once
+        the floor is reached and the evidence set actually grew, so easy
+        questions emit one or two snapshots, not n.
+        """
+        last_answer = ""
+        last_ev_count = -1
+        while not self._done:
+            out = self.step()
+            ev = self._composable_evidence()
+            chain = [t.content for t in self._thought_chain]
+            # (Re)synthesise past the floor when evidence changed, AND
+            # always on the terminal stage if we have evidence but no
+            # answer yet (a walk that stops before the floor must still
+            # emit a final answer — keepup must never end empty-handed).
+            need = (out.stage + 1 >= _MIN_STAGES and len(ev) != last_ev_count)
+            if not need and out.done and ev and not last_answer:
+                need = True
+            if ev and need:
+                ans = provisional_answer(self.query, ev, chain, self._llm)
+                if ans:
+                    last_answer = ans
+                last_ev_count = len(ev)
+            yield {
+                "stage": out.stage,
+                "thought": (out.thought or {}).get("content")
+                if isinstance(out.thought, dict) else None,
+                "answer": last_answer,
+                "evidence_count": len(ev),
+                "done": bool(out.done),
+                "sigma_path": round(out.sigma_path, 4),
+            }
+            if out.done:
+                break
 
 
 class WalkerRegistry:
