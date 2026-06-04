@@ -126,6 +126,7 @@ reason · sleep
 ingest_skill        re-index a named skill-JSON directory tree
 build_skill         task-mode walk → synthesise + ingest a named skill
 get_session_skill   the skill JSON cached for this (user, session)
+capture_code_tool   feed generated code into the RAG if it is a reusable tool
 match_tool · ensure_tool · crystallize_skills · list_tools_learned
 inspect · audit · stats
 declare_observator · detect_polarized · spawn_observators · route

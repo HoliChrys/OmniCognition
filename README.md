@@ -365,6 +365,17 @@ semantic facts/thoughts/actions that **explicate** it, co-located by
 **directly** and chains through it — no forced metacognition. Deterministic
 and idempotent (a consumed-cursor over the ledger).
 
+**Capture-on-generation (chat side).** Whenever the assistant *generates
+code*, `Memory.capture_code_tool(code, context, …)` (MCP
+`capture_code_tool`) asks whether it is a **reusable tool**
+(`assess_tool_intent`: surface markers + LLM adjudication) and, on a yes,
+**feeds it into the RAG** — an executable `ACTION` node (`exec_spec`)
+tagged `tool·skill·code·name:<def-name>·user:·session:·date:`, retrieved by
+the walk like any fact and reused via `match_tool`. A snippet judged purely
+illustrative is dropped (returns `None`, chat never blocked). This closes
+the loop: code the agent writes once becomes a first-class, retrievable,
+executable capability the next time a related query arrives.
+
 ---
 
 ## 6. Evaluation
@@ -471,6 +482,7 @@ sleep               geometric + lateral collapse, and the latent skill distiller
 ingest_skill        re-index a named skill-JSON directory tree
 build_skill         task-mode walk → synthesise + ingest a named skill
 get_session_skill   the skill JSON cached for this (user, session)
+capture_code_tool   feed generated code into the RAG if it is a reusable tool
 match_tool          fast-path: does a generated tool already cover this query?
 ensure_tool         get a tool, generating it if absent ("no tool → make it")
 crystallize_skills  fold recurring actions into persistent tool nodes
