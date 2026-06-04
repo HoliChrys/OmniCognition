@@ -55,7 +55,24 @@ def build_app(
     """
     from metacog.meta_walk import MetaWalker, WalkerRegistry
 
-    app = FastMCP("metacog")
+    app = FastMCP(
+        "metacog",
+        instructions=(
+            "Continuously feed this memory. TWO standing obligations for the "
+            "client:\n"
+            "1. INDEX EVERY MESSAGE. For each turn of the conversation — BOTH "
+            "the user's and your own — call `ingest_message(content, role, "
+            "user_id, session_id, timestamp)` with the message's timestamp. "
+            "Indexing is async and never blocks your searches.\n"
+            "2. PUSH EVERY CODE BLOCK. Whenever you produce code, call "
+            "`push_code(code, context, project, branch, github_user, user_id, "
+            "session_id)`. The server decides whether it is project "
+            "documentation, a reusable tool, or both, and files it "
+            "accordingly. If the code belongs to a project, pass the project / "
+            "branch / github_user so the doc node is tagged and the derived "
+            "tool keeps a bidirectional link back to it."
+        ),
+    )
     if memory is None:
         memory = Memory(storage_path=storage_path)
 
@@ -398,6 +415,45 @@ def build_app(
         kind = next((t.split(":", 1)[1] for t in p.tags
                      if t.startswith("kind:")), "")
         return {"captured": True, "id": p.id, "name": name, "kind": kind}
+
+    @app.tool()
+    def ingest_message(
+        content: str, role: str, user_id: str, session_id: str,
+        timestamp: str = "",
+    ) -> dict:
+        """EPISODIC FEED — index ONE conversation message (role = "user" or
+        "agent") of a session, preserving its timestamp. Call this for EVERY
+        turn on BOTH sides. Indexing is ASYNC and NON-BLOCKING : the message
+        is queued and indexed in the background, so it never delays your
+        searches. Messages chain in order (sequence_prev) and are tagged
+        episode·message·role:·user:·session:·ts:·date:."""
+        memory.ingest_message(
+            content, role=role, user_id=user_id, session_id=session_id,
+            timestamp=timestamp or None, block=False,
+        )
+        return {"queued": True}
+
+    @app.tool()
+    def push_code(
+        code: str, context: str = "", project: str = "", branch: str = "",
+        github_user: str = "", lang: str = "python",
+        user_id: str = "", session_id: str = "",
+    ) -> dict:
+        """PUSH generated code into the RAG. The server EVALUATES it and
+        routes it : PROJECT code → a semantic FACT documentation node tagged
+        project·branch·github ; TOOL-able code → a metacognitive rewrite
+        re-indexed as an executable tool ; BOTH → both, with a bidirectional
+        ref: filiation so the tool remembers its project and the project doc
+        points at the derived tool. Pass project/branch/github_user when the
+        code belongs to a project. Returns the routing summary."""
+        r = memory.push_code(
+            code, context=context, project=project, branch=branch,
+            github_user=github_user, lang=lang,
+            user_id=user_id, session_id=session_id,
+        )
+        if memory.storage_path and r.get("pushed"):
+            memory.save()
+        return r
 
     @app.tool()
     def sleep() -> dict:

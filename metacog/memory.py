@@ -116,6 +116,10 @@ class Memory:
     # how far the distiller has consumed the ledger.
     _resolution_ledger: List[dict] = field(default_factory=list)
     _distill_cursor: int = 0
+    # Episodic conversation index : the id of the last message ingested per
+    # (user, session), so successive messages chain via sequence_prev and a
+    # session reads back in order. Continuous indexation feeds this.
+    _session_msg_chain: Dict[tuple, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.storage_path:
@@ -345,6 +349,102 @@ class Memory:
     ) -> Point:
         """Convenience : ingest an ACTION point."""
         return self.ingest(description, kind="ACTION", id=id, parents=parents)
+
+    # ------------------------------------------------------------------
+    # Episodic conversation index : EVERY message of a session (user AND
+    # agent), indexed continuously, with its timestamp preserved. The
+    # indexation is ASYNC and NON-BLOCKING w.r.t. search — a background
+    # worker does the (LLM-keyworded) ingest while queries read the cloud.
+    # ------------------------------------------------------------------
+
+    def _ensure_indexer(self) -> None:
+        """Lazily start the background indexing worker (daemon thread). The
+        queue/thread are plain instance attributes — never pickled (save()
+        snapshots points only)."""
+        if getattr(self, "_index_thread", None) is not None:
+            return
+        import queue as _queue
+        import threading
+        self._index_queue = _queue.Queue()
+        self._index_lock = threading.Lock()
+        t = threading.Thread(target=self._index_worker, daemon=True,
+                             name="metacog-indexer")
+        self._index_thread = t
+        t.start()
+
+    def _index_worker(self) -> None:
+        while True:
+            job = self._index_queue.get()
+            try:
+                if job is not None:
+                    self._ingest_message_sync(**job)
+            except Exception:
+                pass  # never let a bad message kill the indexer
+            finally:
+                self._index_queue.task_done()
+
+    def ingest_message(
+        self,
+        content: str,
+        *,
+        role: str,
+        user_id: str,
+        session_id: str,
+        timestamp: Optional[str] = None,
+        block: bool = False,
+    ):
+        """Index ONE conversation message (role = "user" or "agent") of a
+        session, with its timestamp. Call it for EVERY message on both
+        sides — this is the continuous episodic feed.
+
+        Async by default : the message is queued and indexed by the
+        background worker, so the call returns immediately and never blocks
+        a concurrent search. Pass `block=True` (or call `flush_index()`) to
+        index synchronously / wait — used in tests and at shutdown.
+
+        Returns the created Point when `block=True`, else a queued-ack dict."""
+        job = dict(content=content, role=role, user_id=user_id,
+                   session_id=session_id, timestamp=timestamp)
+        if block:
+            return self._ingest_message_sync(**job)
+        self._ensure_indexer()
+        self._index_queue.put(job)
+        return {"queued": True}
+
+    def _ingest_message_sync(
+        self, *, content: str, role: str, user_id: str,
+        session_id: str, timestamp: Optional[str],
+    ) -> Point:
+        role = (role or "user").lower()
+        if timestamp is None:
+            from datetime import datetime, timezone
+            timestamp = datetime.now(timezone.utc).isoformat()
+        ts = str(timestamp)
+        date = ts.split("T")[0] if "T" in ts else (ts.split()[0] if ts else "")
+        # Prefix with [timestamp] role: so temporal retrieval + the
+        # relative-date machinery have an absolute anchor (episodic system :
+        # the horodatage of each message is preserved verbatim).
+        prefixed = f"[{ts}] {role}: {content}"
+        lock = getattr(self, "_index_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            prev = self._session_msg_chain.get((user_id, session_id))
+            p = self.ingest(prefixed, kind="FACT", sequence_prev=prev)
+            p.add_tag("episode", "message", f"role:{role}",
+                      f"user:{user_id}", f"session:{session_id}",
+                      f"ts:{ts}", f"date:{date}")
+            self._session_msg_chain[(user_id, session_id)] = p.id
+        finally:
+            if lock is not None:
+                lock.release()
+        return p
+
+    def flush_index(self, timeout: Optional[float] = None) -> None:
+        """Block until the async index queue is drained (tests / shutdown)."""
+        q = getattr(self, "_index_queue", None)
+        if q is not None:
+            q.join()
 
     # ------------------------------------------------------------------
     # Skills : a named "theoretical directory" of tools, ingested from a
@@ -656,6 +756,25 @@ class Memory:
                 (_re.sub(r"[^a-z0-9]+", "_", (context or "tool").lower())
                  .strip("_")[:40] or "tool"))
         desc = context.strip() or f"tool {name} ({intent.kind})"
+        extra = []
+        if user_id:
+            extra.append(f"user:{user_id}")
+        if session_id:
+            extra.append(f"session:{session_id}")
+        extra.append(f"date:{date}")
+        return self._make_tool_node(
+            code, name=name, kind=intent.kind, desc=desc, lang=lang,
+            extra_tags=extra,
+        )
+
+    def _make_tool_node(
+        self, code: str, *, name: str, kind: str, desc: str,
+        lang: str = "python", extra_tags: Sequence[str] = (),
+    ) -> Point:
+        """Create an executable tool node (ACTION + exec_spec) tagged
+        tool·skill·code·kind:<…>·name:<…> plus any extra tags. Shared by
+        capture_code_tool and push_code."""
+        import re as _re
         content = f"tool[{name}] {desc}"
         kws: List[str] = []
         seen: set = set()
@@ -665,12 +784,8 @@ class Memory:
             if wl not in seen:
                 seen.add(wl); kws.append(wl)
         kw_emb = position_weighted_keyword_embedding(kws[:12], self.encoder)
-        tags = ["tool", "skill", "code", f"kind:{intent.kind}", f"name:{name}"]
-        if user_id:
-            tags.append(f"user:{user_id}")
-        if session_id:
-            tags.append(f"session:{session_id}")
-        tags.append(f"date:{date}")
+        tags = (["tool", "skill", "code", f"kind:{kind}", f"name:{name}"]
+                + list(extra_tags))
         tool = Point(
             id=f"skill_{uuid.uuid4().hex[:8]}",
             content=content,
@@ -684,6 +799,174 @@ class Memory:
         tool.exec_spec = {"lang": lang, "code": code}
         self.points.append(tool)
         return tool
+
+    # ------------------------------------------------------------------
+    # push_code : evaluate generated code → project-documentation FACT
+    # and/or a metacognitively-rewritten executable TOOL, linked
+    # bidirectionally via ref: tags when it is both.
+    # ------------------------------------------------------------------
+
+    def _evaluate_code(self, code: str, context: str) -> Dict[str, Any]:
+        """Classify generated code. Returns
+        {"project": bool, "tool": bool, "kind": str, "name": str}.
+        LLM-adjudicated with a deterministic fallback (markers + def-name)."""
+        import re as _re
+        mname = (_re.search(r"\bdef\s+([A-Za-z_]\w*)", code)
+                 or _re.search(r"\bfunction\s+([A-Za-z_]\w*)", code))
+        name = mname.group(1) if mname else (
+            _re.sub(r"[^a-z0-9]+", "_", (context or "tool").lower())
+            .strip("_")[:40] or "tool")
+        out = {"project": False, "tool": False, "kind": "code", "name": name}
+        # tool verdict via the shared intent assessor (markers + LLM).
+        try:
+            from metacog.skills import assess_tool_intent
+            intent = assess_tool_intent(f"{context}\n\n{code[:600]}", self.llm)
+            out["tool"] = bool(intent.is_executable)
+            out["kind"] = intent.kind if intent.is_executable else "code"
+        except Exception:
+            pass
+        # project / doc verdict (one short LLM line ; default no).
+        if hasattr(self.llm, "generate"):
+            try:
+                raw = (self.llm.generate(
+                    "Is this code part of a real software PROJECT (worth keeping "
+                    "as documentation to learn about that project)? And could it "
+                    "be a reusable TOOL? Reply one line:\n"
+                    "PROJECT: <yes|no> TOOL: <yes|no> NAME: <snake_case|->\n\n"
+                    f"CONTEXT: {context[:200]}\nCODE: {code[:500]}",
+                    max_tokens=24) or "").lower()
+                if "project: yes" in raw or "project:yes" in raw:
+                    out["project"] = True
+                if "tool: yes" in raw or "tool:yes" in raw:
+                    out["tool"] = True
+                mn = _re.search(r"name:\s*([a-z_]\w*)", raw)
+                if mn and mn.group(1) not in ("-", "none"):
+                    out["name"] = mn.group(1)
+            except Exception:
+                pass
+        return out
+
+    def _rewrite_as_tool(self, code: str, context: str) -> str:
+        """Metacognitive interpretation : rewrite code as a standalone,
+        reusable tool exposing `def run(args: dict)`. Falls back to the
+        original code on any failure (never blocks)."""
+        if not hasattr(self.llm, "generate"):
+            return code
+        try:
+            raw = (self.llm.generate(
+                "Rewrite the code as a STANDALONE reusable tool exposing "
+                "`def run(args: dict)`. Keep the behaviour, strip "
+                "project-specific coupling. Output ONLY the code, no prose.\n\n"
+                f"CONTEXT: {context[:200]}\nCODE:\n{code[:1200]}",
+                max_tokens=400) or "").strip()
+            import re as _re
+            m = _re.search(r"```(?:\w+)?\s*(.+?)```", raw, _re.DOTALL)
+            if m:
+                raw = m.group(1).strip()
+            return raw if ("def run" in raw or "function run" in raw) else code
+        except Exception:
+            return code
+
+    def _make_doc_node(self, code: str, context: str,
+                       tags: Sequence[str], *, name: str) -> Point:
+        """A semantic FACT node documenting project code — retrievable like
+        any fact, treated as documentation that teaches about the project."""
+        import re as _re
+        content = (f"[doc:{name}] " + (context.strip() + "\n" if context else "")
+                   + code.strip())[:2000]
+        kws: List[str] = []
+        seen: set = set()
+        for w in (_re.findall(r"[A-Za-z_]\w{2,}", name + " " + context)
+                  + _re.findall(r"[A-Za-z_]\w{3,}", code)[:12]
+                  + [t for t in tags if t.startswith(("project:", "branch:"))]):
+            wl = w.lower()
+            if wl not in seen:
+                seen.add(wl); kws.append(wl)
+        kw_emb = position_weighted_keyword_embedding(kws[:14], self.encoder)
+        doc = Point(
+            id=f"skill_{uuid.uuid4().hex[:8]}",
+            content=content,
+            embedding_orig=tuple(self.encoder.encode(content)),
+            kind=PointKind.FACT,
+            keywords=kws[:14],
+            keywords_embedding=kw_emb,
+            keywords_source=SourceClass.GENERATOR,
+            tags=list(tags),
+        )
+        self.points.append(doc)
+        return doc
+
+    def push_code(
+        self,
+        code: str,
+        *,
+        context: str = "",
+        project: str = "",
+        branch: str = "",
+        github_user: str = "",
+        lang: str = "python",
+        user_id: str = "",
+        session_id: str = "",
+        date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Push generated code into the RAG. The server EVALUATES it and
+        routes it :
+
+          - PROJECT code → a semantic FACT node, tagged
+            `doc·code·project:<…>·branch:<…>·github:<user>·user:·session:·
+            date:`, treated as DOCUMENTATION that teaches about the project ;
+          - TOOL-able code → a metacognitive rewrite (`_rewrite_as_tool`,
+            exposing `def run(args)`) re-indexed as an executable tool node ;
+          - BOTH → create both and keep a BIDIRECTIONAL filiation via
+            `ref:` tags (`ref:doc:<id>` on the tool, `ref:tool:<id>` on the
+            doc) plus co-location, so the tool remembers the project it came
+            from and the project doc points at the derived tool.
+
+        Fail-safe : on any error the code is still captured as a plain tool
+        if it looks executable (chat is never blocked). Returns a summary."""
+        code = (code or "").strip()
+        if not code:
+            return {"pushed": False}
+        if date is None:
+            from datetime import date as _date
+            date = _date.today().isoformat()
+        ev = self._evaluate_code(code, context)
+        is_project = ev["project"] or bool(project or branch or github_user)
+        is_tool = ev["tool"]
+        name = ev["name"]
+        meta: List[str] = ["code"]
+        for k, v in (("project", project), ("branch", branch),
+                     ("github", github_user), ("user", user_id),
+                     ("session", session_id)):
+            if v:
+                meta.append(f"{k}:{v}")
+        meta.append(f"date:{date}")
+
+        doc = tool = None
+        if is_project:
+            doc = self._make_doc_node(code, context, ["doc"] + meta, name=name)
+        if is_tool:
+            rewritten = self._rewrite_as_tool(code, context) or code
+            tool = self._make_tool_node(
+                rewritten, name=name, kind=ev["kind"],
+                desc=context or f"tool {name}", lang=lang, extra_tags=meta,
+            )
+        # Bidirectional project↔tool filiation via ref: tags.
+        if doc is not None and tool is not None:
+            tool.keywords.append(f"ref:doc:{doc.id}")
+            doc.keywords.append(f"ref:tool:{tool.id}")
+            tool.keywords_embedding = position_weighted_keyword_embedding(
+                tool.keywords[:16], self.encoder)
+            doc.keywords_embedding = position_weighted_keyword_embedding(
+                doc.keywords[:16], self.encoder)
+            tool.parents = [doc.id]
+            apply_pull(tool, doc, +1.0, self._now())
+        return {
+            "pushed": bool(doc or tool),
+            "is_project": is_project, "is_tool": is_tool, "name": name,
+            "doc_id": doc.id if doc else None,
+            "tool_id": tool.id if tool else None,
+        }
 
     def find_tools(self, query: str, k: int = 5) -> List[Point]:
         """Top-k tool-tagged ACTION points most semantically aligned
