@@ -441,8 +441,12 @@ def nearest_facts_with_fallback(
                 rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
                 pid_map.setdefault(p.id, p)
             if has_section:
+                # Tags are normalised to lower-case on the Point, so the
+                # filter must match case-insensitively (a user/session id
+                # with capitals would otherwise silently match nothing).
+                sect_lc = {s.lower() for s in section_filter}
                 sect = [p for p in search_points
-                        if section_filter.issubset(set(p.tags))]
+                        if sect_lc.issubset({t.lower() for t in p.tags})]
                 if sect:
                     sect_pool = retrieve_hybrid(
                         query_text, sect, overfetch, t_now,
