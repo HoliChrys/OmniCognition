@@ -145,6 +145,22 @@ saw the right answer a stage early. Generation is therefore continuous and
 asynchronous; over the SSE transport (§7.2) the client renders a single
 message that rewrites itself until validated.
 
+### 3.2 Scoped retrieval — discussion first, then the knowledge base
+
+Tag-filtered retrieval is a **two-phase cascade**
+(`Memory.scoped_answer(query, tags, knowledge_base=…)`, MCP
+`scoped_answer`). **Phase 1** runs a full uncertainty-governed walk
+**hard-restricted** (`MetaWalker(restrict_ids=…)`) to the points carrying
+*all* the given tags — e.g. `["session:s1"]`, a single discussion — to
+establish *what is being talked about there*. **Phase 2** then, only when
+`knowledge_base=True`, seeds a **second** walk over the *whole* memory with
+the original query enriched by Phase-1's finding, so the discussion context
+drives the global search. With `knowledge_base=False` the answer stays
+strictly inside the filtered set. This is the difference between the soft
+`section_filter` (an in-walk RRF rank boost, §5) and a hard scope: scoped
+retrieval *first* resolves the reference inside the discussion, *then*
+optionally reaches the global knowledge base seeded by what it found.
+
 ---
 
 ## 4. Uncertainty-governed depth

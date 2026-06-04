@@ -121,6 +121,8 @@ walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
                     user_id/session_id add the double-query section boost
 walk_keepup         keepup streaming: provisional answer re-written each
                     stage until validated (SSE → a self-rewriting message)
+scoped_answer       tag-filtered cascade: walk the discussion first, then
+                    (knowledge_base=true) the global memory seeded by it
 walk_next           deprecated — walk_start runs to completion
 reason · sleep
 ingest_skill        re-index a named skill-JSON directory tree
