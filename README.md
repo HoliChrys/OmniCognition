@@ -173,6 +173,20 @@ govern termination:
   Vocabulary-gap questions never reach full coverage, so σ governs those —
   they are never cut short.
 
+Put as a single termination predicate, the walk halts at stage *k* iff
+
+```
+   k ≥ _MIN_STAGES   AND   ( σ_path(k) > cutoff   OR   covers(query, evidence) )
+```
+
+with `cutoff = median(d₀) + std(d₀)` over the stage-0 pairwise distances.
+**Uncertainty is the primary stop**: the walk continues precisely as long
+as its evidence chain stays inside the manifold's own resolution, and
+terminates the moment the accumulated σ says the chain can no longer be
+trusted — no fixed maximum, no learned controller, no caller override
+(§7.2). The floor guarantees a minimum exploration; coverage is an early
+exit for questions whose vocabulary the evidence already spans.
+
 **Why this matters empirically.** A naive depth measure — the
 stage-to-stage drift of the re-anchored seed — is ≈ 0 (the seed is
 re-anchored on the query each hop) and never trips; a fact★-to-fact★ drift
@@ -257,16 +271,47 @@ event that repeats a seen direction adds ≈ 0; only distant directions
 accumulate), and each is **gated** so it stays inert on small clouds where
 "redundant" is undefined.
 
-### 5.1 Memory skills — self-built tools
+### 5.1 Memory skills — self-built (automated) tools
 
 A capability the system keeps re-deriving crystallizes into a **tool**: a
-*normal node* (kind `ACTION`, tagged `tool` + a genre tag + grounding
-tags), scoped by its keywords. Being a normal node it lives in the same
-cloud — persisted, found by the walk recursively, subject to lateral
-collision and Chasles like anything else. It is reached either by
-*recurrence* (`crystallize_skills`) or *eagerly* (`ensure_tool`: "no tool
-→ generate it → proceed"), and reused via a keyword-cosine fast path
-(`match_tool`).
+*normal node* (kind `ACTION`, tagged `tool` + a genre tag
+`tool_code`/`tool_command`/`tool_api` + grounding-context tags), scoped by
+its keywords. Being a normal node it lives in the same cloud — persisted on
+save, found by the walk **recursively**, and subject to lateral collision
+and Chasles compression like anything else. The tool set is therefore
+self-built, self-pruning, and self-retrieving; nothing about it is a
+special case.
+
+Three mechanisms govern automation (`skills.py`):
+
+- **Two triggers.**
+  *Recurrence* (`crystallize_skills`) — an action re-derived across enough
+  **diverse** queries (the same Poisson floor `λ + √λ`, diversity-weighted)
+  earns a persistent tool over time.
+  *Eager* (`ensure_tool`) — the "no tool → generate it → proceed" step:
+  on first need, with no recurrence wait. Generation is unconstrained, so
+  it never blocks; it only ever *grows* the self-built set.
+- **Tool-intent metacognition** (`assess_tool_intent`) — reads a `THOUGHT`
+  or a generated response and judges whether it implies running code or a
+  command underneath, i.e. whether there is a tool to generate at all.
+- **Fast-path reuse** (`match_tool`) — an in-scope query returns its
+  covering tool via keyword-cosine (threshold `cos`-based, not tuned), so
+  the agent reuses the cached capability and **skips a think phase**.
+
+```python
+m.skills_enabled = True
+m.ensure_tool("search scientific articles about X",
+              how="query the article index by topic, rank by relevance")
+# 1st call → generates tool_search_articles (ACTION, tag=tool,tool_api…)
+# next time a query falls in its keyword scope → match_tool returns it,
+#   the think phase is skipped, and the capability is reused verbatim.
+```
+
+Because a tool is just an `ACTION` node, the walk (§3) can *chain through*
+it like any other point: a self-built capability becomes available to
+multi-hop reasoning the moment it crystallizes, and a `tool_workflow`
+(a Chasles-compressed chain of actions, §5) is reused as a single optimised
+step.
 
 ---
 
@@ -323,22 +368,63 @@ m.sleep()                                 # geometric + lateral collision pass
 
 ### 7.2 MCP service
 
-The same operations are exposed as an MCP service. `walk_start` runs a
-**complete** uncertainty-governed walk; `walk_next` is deprecated (the walk
-no longer advances one stage per call). Register it in Claude Code:
+Every operation is exposed as an MCP service (`metacog/mcp_server.py`), so
+an external agent (e.g. Claude Code) drives the same memory the library
+uses. Register it:
 
 ```json
 { "mcpServers": { "metacog": {
     "command": "metacog-mcp",
     "args": ["--storage", "~/.metacog/state.pkl"] } } }
 ```
-
 ```bash
 uv sync && uv run metacog-mcp --storage ~/.metacog/state.pkl
 ```
 
-Tools appear as `mcp__metacog__*`. A full tool list is in
-[`metacog/README.md`](metacog/README.md).
+Tools appear as `mcp__metacog__*`:
+
+```
+# memory I/O
+ingest              add a FACT / THOUGHT / ACTION
+observe             apply an Observation on existing point(s)
+process_turn        record a conversation turn (detectors fire)
+retrieve            top-k hybrid retrieval (RRF)
+
+# the walk  ── depth is decided by the walk, not the caller ──
+walk_start          run a COMPLETE uncertainty-governed walk for a query
+                    (loops to its own σ-termination; returns the bounded
+                     composable evidence + reasoning chain). The agent does
+                     BREADTH pivots — re-issue walk_start with new
+                     vocabulary; it never micro-drives depth.
+walk_next           DEPRECATED — walk_start now runs to completion; this is
+                    a graceful no-op kept for backward compatibility.
+
+# reasoning & consolidation
+reason              full reasoning trajectory until a usable answer
+sleep               geometric collision + lateral collapse pass
+
+# self-built tools (§5.1)
+match_tool          fast-path: does a generated tool already cover this query?
+ensure_tool         get a tool, generating it if absent ("no tool → make it")
+crystallize_skills  fold recurring actions into persistent tool nodes
+list_tools_learned  list the self-built tool set
+
+# introspection & perspective
+inspect             dump a point's full state (keywords, tags, σ, spike count)
+audit               verify no laundering (Corollary 5)
+stats               system overview
+declare_observator · detect_polarized · spawn_observators · route
+list_communities    Level-1 community / observator detection
+save                persist to disk
+```
+
+The crucial semantic difference from a conventional retrieval tool:
+**`walk_start` owns the depth decision.** A caller cannot ask for "one more
+hop"; the walk runs until its own uncertainty propagation says stop (§4).
+The agent's only lever is *breadth* — start another walk aimed at a
+different facet. This is what keeps the σ-termination, the floor, and the
+coverage-stop authoritative at inference time instead of being overridden
+by an eager caller.
 
 ### 7.3 Tests & benchmark
 
