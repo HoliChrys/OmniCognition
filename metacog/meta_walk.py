@@ -1399,6 +1399,7 @@ class MetaWalker:
         observator_id: Optional[str] = None,
         task_mode: bool = False,
         section_filter: Optional[set] = None,
+        restrict_ids: Optional[set] = None,
     ) -> None:
         """`commit` controls whether the walk MUTATES the shared memory.
 
@@ -1438,6 +1439,9 @@ class MetaWalker:
         # name:) whose section gets a retrieval rank boost.
         self.task_mode = task_mode
         self.section_filter = section_filter
+        # HARD search-pool restriction (scoped walk) : set of point ids the
+        # walk may retrieve FACTs from. None = the whole memory.
+        self.restrict_ids = restrict_ids
         # Tools gathered across the walk (skill/tool-tagged), the workflow
         # ingredients in task mode.
         self._tools_collected: List[Point] = []
@@ -1541,6 +1545,16 @@ class MetaWalker:
         scaffolding is community-agnostic."""
         base = (list(self.memory.points) + self._local_points
                 if self._local_points else list(self.memory.points))
+        # HARD restriction (scoped walk) : only points in `restrict_ids`
+        # (plus this walk's own generated scaffolding) are searchable. Used
+        # by the scoped→knowledge-base cascade : the first walk runs over a
+        # filtered set (a discussion / session) before any global search.
+        rids = getattr(self, "restrict_ids", None)
+        if rids:
+            gen = set(self._generated_ids)
+            base = [p for p in base
+                    if p.id in rids or p.id in gen
+                    or p.kind != PointKind.FACT or p.id.startswith("entity_")]
         oid = getattr(self, "observator_id", None)
         if not oid:
             return base

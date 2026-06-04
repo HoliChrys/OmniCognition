@@ -337,6 +337,23 @@ def build_app(
         return {"snapshots": snaps, "final": final, "stages": len(snaps)}
 
     @app.tool()
+    def scoped_answer(
+        query: str, tags: list, knowledge_base: bool = False,
+        n_stages: int = 16,
+    ) -> dict:
+        """Tag-filtered retrieval as a TWO-PHASE cascade. Phase 1 runs the
+        walk HARD-restricted to points carrying ALL `tags` (e.g.
+        ["session:s1"] — a discussion) to find what is being talked about
+        there. If knowledge_base=True, Phase 2 then searches the WHOLE
+        memory seeded by Phase-1's finding (discussion context → global KB);
+        otherwise the answer stays strictly within the filtered set.
+        Returns the scoped answer/evidence (+ global ones when enabled)."""
+        return memory.scoped_answer(
+            query, tags=list(tags or []),
+            knowledge_base=bool(knowledge_base), n_stages=max(1, n_stages),
+        )
+
+    @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
         """Run a full reasoning trajectory until output convenable."""
         result = memory.reason(query, with_executor=with_executor, apply_compression=apply_compression)

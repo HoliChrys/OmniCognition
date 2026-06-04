@@ -1308,6 +1308,60 @@ class Memory:
         )
         yield from walker.keepup()
 
+    def scoped_answer(
+        self,
+        query: str,
+        *,
+        tags: Sequence[str],
+        knowledge_base: bool = False,
+        n_stages: int = 16,
+    ) -> Dict[str, Any]:
+        """Tag-filtered retrieval as a TWO-PHASE cascade.
+
+        Phase 1 — SCOPED. Run a full uncertainty-governed walk **hard-
+        restricted** to the points carrying ALL `tags` (e.g. a discussion /
+        `session:<id>`). This establishes *what we are talking about* inside
+        that filtered set and produces a scoped answer + its evidence.
+
+        Phase 2 — KNOWLEDGE BASE (only if `knowledge_base=True`). Seed a
+        SECOND walk over the WHOLE memory with the original query enriched by
+        Phase-1's finding, so the discussion context drives the global
+        search. When `knowledge_base=False` the answer stays strictly within
+        the filtered set.
+
+        Returns `{"scoped_answer", "scoped_evidence", "knowledge_base",
+        ["global_answer", "global_evidence"]}`."""
+        from metacog.meta_walk import MetaWalker, provisional_answer
+        tagset = {t.lower() for t in tags}
+        scoped_ids = {
+            p.id for p in self.points
+            if tagset.issubset({x.lower() for x in p.tags})
+        }
+
+        def _run(q, *, restrict):
+            w = MetaWalker(q, self, n_stages=n_stages, commit=False,
+                           restrict_ids=restrict)
+            for _ in range(n_stages):
+                if w.step().done:
+                    break
+            ev = w._composable_evidence()
+            chain = [t.content for t in w._thought_chain]
+            return provisional_answer(q, ev, chain, self.llm), ev
+
+        ans1, ev1 = _run(query, restrict=scoped_ids)
+        out: Dict[str, Any] = {
+            "scoped_answer": ans1, "scoped_evidence": ev1,
+            "knowledge_base": bool(knowledge_base),
+        }
+        if not knowledge_base:
+            return out
+        # Phase-1's finding seeds the global search.
+        seed = (f"{query} {ans1}").strip() if ans1 else query
+        ans2, ev2 = _run(seed, restrict=None)
+        out["global_answer"] = ans2
+        out["global_evidence"] = ev2
+        return out
+
     def reason(
         self,
         query: str,
