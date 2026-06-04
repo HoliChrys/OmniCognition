@@ -338,6 +338,124 @@ class Memory:
         return self.ingest(description, kind="ACTION", id=id, parents=parents)
 
     # ------------------------------------------------------------------
+    # Skills : a named "theoretical directory" of tools, ingested from a
+    # nested JSON tree, re-indexed as normal tagged points.
+    # ------------------------------------------------------------------
+
+    def ingest_skill(
+        self,
+        tree: Dict[str, Any],
+        *,
+        name: str,
+        user_id: str,
+        session_id: str,
+        date: Optional[str] = None,
+        t_now: Optional[float] = None,
+    ) -> List[Point]:
+        """Ingest a NAMED skill — a theoretical directory tree of tools —
+        as ordinary tagged points, returning every created point (root
+        first).
+
+        `tree` is a nested dict : a directory maps a name to a sub-dict, a
+        file maps a name to its description string :
+            {"retrieval": {"hybrid.py": "RRF over 4 signals",
+                           "bm25.py":   "content-first BM25"},
+             "walk.py":    "uncertainty-governed depth"}
+
+        Each node becomes a `PointKind.FACT` carrying the usual format, so
+        the walk retrieves it like any other point (gold = semantic fact OR
+        tool fact). The directory **topology** is encoded two ways that
+        agree :
+          - the edge-free lineage link (`parents = [parent_point_id]`), so
+            lineage spread traverses the tree ;
+          - typed `ref:skill:*` keyword tokens — `ref:skill:<name>:path:<p>`
+            and `ref:skill:<name>:parent:<pp>` — so the topology is itself
+            retrievable / co-locating (the same trick as `ref:date:*`).
+
+        Every point is tagged so a later double-query can pre-filter the
+        SECTION (this user's this-session this-skill) before the free
+        semantic query :
+            skill · tool · name:<name> · user:<id> · session:<id>
+            · date:<indexation>
+        plus `skill_dir` / `skill_file` for the node kind.
+
+        Cor. 5 : skill content is agent/LLM-produced → keywords_source =
+        GENERATOR ; ids are prefixed `skill_` so they never collide with a
+        real evidence id.
+        """
+        if t_now is None:
+            t_now = self._now()
+        if date is None:
+            from datetime import date as _date
+            date = _date.today().isoformat()
+        base_tags = [
+            "skill", "tool", f"name:{name}",
+            f"user:{user_id}", f"session:{session_id}", f"date:{date}",
+        ]
+        created: List[Point] = []
+
+        def _tok(s: str) -> List[str]:
+            import re as _re
+            return [w.lower() for w in _re.findall(r"[A-Za-z0-9]{2,}", s or "")]
+
+        def _node(node_name: str, value: Any, path: str,
+                  parent_path: str, parent_id: Optional[str]) -> Point:
+            is_dir = isinstance(value, dict)
+            desc = "" if is_dir else str(value)
+            content = (
+                f"skill:{name} {path}" + (f" — {desc}" if desc else "")
+            )
+            kws: List[str] = []
+            seen: set = set()
+            for k in (_tok(name) + _tok(node_name)
+                      + [f"ref:skill:{name}:path:{path}"]
+                      + ([f"ref:skill:{name}:parent:{parent_path}"]
+                         if parent_path else [])
+                      + _tok(desc)[:8]):
+                if k and k not in seen:
+                    seen.add(k)
+                    kws.append(k)
+            kw_emb = position_weighted_keyword_embedding(kws, self.encoder)
+            p = Point(
+                id=f"skill_{uuid.uuid4().hex[:8]}",
+                content=content,
+                embedding_orig=tuple(self.encoder.encode(content)),
+                kind=PointKind.FACT,
+                parents=[parent_id] if parent_id else [],
+                lineage_depth=0 if parent_id is None else 1,
+                keywords=kws,
+                keywords_embedding=kw_emb,
+                keywords_source=SourceClass.GENERATOR,
+                tags=list(base_tags)
+                + ["skill_dir" if is_dir else "skill_file"],
+            )
+            self.points.append(p)
+            created.append(p)
+            # Geometric topology : pull each child onto its parent so the
+            # tree clusters in the manifold (edges-equivalent), mirroring
+            # the lineage link above.
+            if parent_id is not None:
+                parent_pt = next((q for q in self.points
+                                  if q.id == parent_id), None)
+                if parent_pt is not None:
+                    apply_pull(p, parent_pt, +1.0, t_now)
+            return p
+
+        # Root = the skill itself ; children hang under it.
+        root = _node(name, tree, name, "", None)
+
+        def _walk(subtree: Dict[str, Any], parent_path: str,
+                  parent_id: str) -> None:
+            for child_name, value in subtree.items():
+                path = f"{parent_path}/{child_name}" if parent_path else child_name
+                pt = _node(child_name, value, path, parent_path, parent_id)
+                if isinstance(value, dict):
+                    _walk(value, path, pt.id)
+
+        _walk(tree, name, root.id)
+        return created
+
+    # ------------------------------------------------------------------
     # Tools : tool-tagged ACTION points + sandboxed execution.
     # ------------------------------------------------------------------
 
