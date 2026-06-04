@@ -26,7 +26,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 try:
     import anthropic as _ant_mod
@@ -577,6 +577,54 @@ _DATE_RES = [
 ]
 
 
+_RELATIVE_DATE_RE = re.compile(
+    r"\b(last\s+year|last\s+month|last\s+week|yesterday|"
+    r"\d+\s+years?\s+ago|\d+\s+months?\s+ago|a\s+few\s+(?:weeks?|days?)\s+ago|"
+    r"recently|around\s+\d{4})\b",
+    re.IGNORECASE,
+)
+_ABS_DATE_CLAUSE_RE = re.compile(r"\(absolute date:\s*([^)]+)\)", re.IGNORECASE)
+
+
+def _resolve_relative_date_answer(
+    answer: str, contents: Sequence[str]
+) -> str:
+    """If `answer` is (or contains) a RELATIVE date phrase, replace it with
+    the absolute date computed at ingestion. Each dated turn carries a
+    plain "(absolute date: 2022)" clause next to the relative phrase it
+    resolves. We find the evidence turn that contains BOTH the SAME
+    relative phrase the answer used AND an absolute-date clause, and return
+    that absolute date — precise, deterministic, no LLM. Falls back to the
+    only absolute-date clause seen if the phrase match is ambiguous.
+
+    This closes the temporal 0-clue gap : "When did X paint a sunrise?" →
+    the generator echoes "last year", which we deterministically rewrite to
+    "2022" using the turn's own resolved date."""
+    if not answer:
+        return answer
+    m = _RELATIVE_DATE_RE.search(answer)
+    if not m:
+        return answer
+    phrase = m.group(1).lower().strip()
+    # 1. Prefer the turn whose text contains the same relative phrase AND a
+    #    resolved absolute-date clause.
+    candidates: List[str] = []
+    for c in contents:
+        cl = c.lower()
+        abs_m = _ABS_DATE_CLAUSE_RE.search(c)
+        if not abs_m:
+            continue
+        val = abs_m.group(1).strip()
+        candidates.append(val)
+        if phrase in cl:
+            return val
+    # 2. Otherwise, if exactly one distinct absolute date was seen, use it.
+    distinct = list(dict.fromkeys(candidates))
+    if len(distinct) == 1:
+        return distinct[0]
+    return answer
+
+
 def _extract_date(text: str) -> Optional[str]:
     """Pull the first absolute date out of a verbose 'when' answer.
 
@@ -904,6 +952,9 @@ class McpMetaAgent:
         total_out = 0
         trace: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
+        # All retrieved-fact contents seen across walks — used by the
+        # deterministic relative→absolute date resolver at answer time.
+        seen_contents: List[str] = []
 
         async with create_connected_server_and_client_session(app) as session:
             await session.initialize()
@@ -1133,6 +1184,18 @@ class McpMetaAgent:
                                            else None)
                                     if _id:
                                         relevant_ids_seen.add(_id)
+                            # Capture ALL retrieved-fact contents (not just the
+                            # CoN-relevant set) so the deterministic
+                            # relative→absolute date resolver can find the
+                            # "(absolute date: …)" clause even on the 0-clue
+                            # path where relevant_collected is empty.
+                            for _src in (obj.get("facts"), rc):
+                                if isinstance(_src, list):
+                                    for _e in _src:
+                                        if isinstance(_e, dict):
+                                            _c = _e.get("content")
+                                            if _c:
+                                                seen_contents.append(_c)
                         except Exception:
                             pass
                         if tu.name == "walk_start":
@@ -1285,6 +1348,11 @@ class McpMetaAgent:
                         answer_text = et
                 except Exception:
                     pass
+
+        # Deterministic temporal resolution : rewrite any relative-date
+        # answer ("last year") to the absolute date the evidence resolved
+        # ("2022"), using the turns' own "(absolute date: …)" clauses.
+        answer_text = _resolve_relative_date_answer(answer_text, seen_contents)
 
         return {
             "answer": terse(answer_text, question),
