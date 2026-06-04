@@ -126,6 +126,57 @@ Aggregated per category (1 multi-hop · 2 temporal · 3 inference ·
 per-QA trace (question, gold, prediction, retrieved ids, react trace) for
 inspection.
 
+## Temporal handling — how dates are resolved
+
+LoCoMo gold answers are **absolute** ("2022", "May 2023", "16 March
+2022"); conversation turns are **relative** ("last year", "yesterday",
+"for 3 years"). Resolution is **two deterministic stages, no LLM**:
+
+### Stage 1 — ingestion (`eval.py`)
+- `_clean_session_date` normalises each session's timestamp
+  (`"1:56 pm on 8 May, 2023"` → `"8 May 2023"`); the turn content is
+  prefixed with it (`[8 May 2023] Melanie: …`).
+- `_expand_relative_dates(text, session_date)` parses the anchor and, for
+  every relative expression, **appends two additive forms**:
+  - a **typed retrieval token** — `ref:date:day:N` / `ref:date:month:name`
+    / `ref:date:year:N` — so the keyword extractor and BM25 match a typed
+    `month:march` instead of a bare `march` that the every-turn date prefix
+    would dilute (IDF);
+  - a **plain readable clause** — `(absolute date: 2022)` /
+    `(absolute date: 16 March 2022)` / `(absolute date: around 2020)` — so
+    the answer generator emits the resolved value directly.
+
+  | turn says | session | appended |
+  |---|---|---|
+  | "… last year" | 8 May 2023 | `[ref:date:year:2022] (absolute date: 2022)` |
+  | "yesterday …" | 17 March 2022 | `[ref:date:day:16 ref:date:month:march ref:date:year:2022] (absolute date: 16 March 2022)` |
+  | "for 3 years" | 27 March 2023 | `[ref:date:year:~2020] (absolute date: around 2020)` |
+  | "last month" | 10 June 2023 | `[ref:date:month:may ref:date:year:2023] (absolute date: May 2023)` |
+  | "last week" | 17 March 2022 | `[ref:date:day:10 ref:date:month:march ref:date:year:2022] (absolute date: 10 March 2022)` |
+  | "recently" / "a few weeks ago" | 8 May 2023 | `[ref:date:month:may ref:date:year:2023] (absolute date: May 2023)` |
+
+  Month/year roll-over is handled (e.g. "yesterday" on the 1st → last day of
+  the previous month). The original wording is never modified — expansion is
+  purely additive, so retrieval on the literal phrase still works.
+
+### Stage 2 — answer time (`mcp_meta_agent.py`)
+- `_resolve_relative_date_answer(answer, seen_contents)` runs on the final
+  answer. If it **is / contains** a relative phrase (`last year/month/week`,
+  `yesterday`, `N years/months ago`, `recently`, `around YYYY`), it scans
+  every retrieved turn the agent saw for one carrying the **same** phrase
+  *and* an `(absolute date: X)` clause, and rewrites the answer to `X`.
+  Falls back to the unique absolute date seen if the phrase match is
+  ambiguous; otherwise leaves the answer untouched.
+- This is the guard that closes the temporal **0-clue** case: gold turn
+  `D1:12` ("look at this", an attached image, no retrievable date), the
+  walk answers from the dated neighbour, the generator says "last year",
+  and Stage 2 deterministically rewrites it to **"2022"** (token-F1 = 1.0).
+
+Both stages are pure string + arithmetic operations: identical across runs,
+no token cost, no model dependence. Set `--answerer meta` (dates resolve
+automatically); the older "two-rule date system" in the prompt is now a
+fallback, not the primary mechanism.
+
 ## MetaCog-Mem results (balanced per-category sampling)
 
 All runs use `--answerer meta --encoder semantic --per-category 1`

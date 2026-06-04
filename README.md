@@ -201,15 +201,40 @@ input from **118k to 19k tokens (−84 %)** with an unchanged answer.
 
 ### 4.2 Deterministic temporal resolution
 
-Temporal questions need absolute dates the gold answers use. At ingestion,
-every relative expression ("last year", "yesterday", "3 years ago") is
-expanded against the turn's session date into both typed retrieval tokens
-(`ref:date:year:2022`) and a plain readable clause
-(`(absolute date: 2022)`). At answer time, a deterministic post-processor
-rewrites any residual relative-date answer to the absolute date carried by
-the matching evidence turn. The two stages together resolve the temporal
-"0-clue" case — *"When did Melanie paint a sunrise?" → "2022"* — even when
-the relevance set is empty.
+Temporal questions need the **absolute** dates the gold answers use, but
+conversation turns speak in **relative** terms ("last year", "yesterday",
+"3 years ago"). MetaCog-Mem resolves this in **two deterministic stages**,
+no LLM in the resolution path:
+
+**Stage 1 — at ingestion** (`benchmarks/locomo/eval.py`,
+`_expand_relative_dates`). Each turn carries its session date as a content
+prefix (`[8 May 2023] Melanie: …`). Every relative expression in the turn
+is computed against that anchor and the turn is augmented with **two**
+forms — a typed token for retrieval and a plain clause for generation:
+
+| expression (turn) | session date | appended to content |
+|---|---|---|
+| "… last year" | 8 May 2023 | `[ref:date:year:2022] (absolute date: 2022)` |
+| "yesterday …" | 17 March 2022 | `[ref:date:day:16 ref:date:month:march ref:date:year:2022] (absolute date: 16 March 2022)` |
+| "for 3 years" | 27 March 2023 | `[ref:date:year:~2020] (absolute date: around 2020)` |
+| "last month" | 10 June 2023 | `[ref:date:month:may ref:date:year:2023] (absolute date: May 2023)` |
+
+The `ref:date:*` compounds are *typed* tokens (so the keyword extractor and
+BM25 match `month:march`, not a bare `march` diluted by every dated
+prefix); the `(absolute date: …)` clause is what the generator reads. The
+original wording is never altered — the expansion is additive.
+
+**Stage 2 — at answer time** (`benchmarks/locomo/mcp_meta_agent.py`,
+`_resolve_relative_date_answer`). If the generated answer still *is* or
+*contains* a relative phrase, a post-processor finds the evidence turn that
+carries the **same** phrase plus an `(absolute date: X)` clause and
+rewrites the answer to `X` (falling back to the unique absolute date seen
+if the phrase match is ambiguous). This closes the temporal **0-clue**
+case — *"When did Melanie paint a sunrise?"* where the gold turn is an
+image with no retrievable text: the walk answers from the dated neighbour,
+the generator echoes "last year", and Stage 2 rewrites it to **"2022"**
+(token-F1 = 1.0). Both stages are pure string/arithmetic operations and
+deterministic across runs.
 
 ---
 
