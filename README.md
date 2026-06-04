@@ -515,6 +515,9 @@ walk_start          run a COMPLETE uncertainty-governed walk for a query
 walk_keepup         KEEPUP (§3.1): the snapshot trajectory — a provisional
                     answer re-written each stage until validated. Over SSE,
                     a message that rewrites itself until done=True.
+scoped_answer       SCOPED (§3.2): tag-filtered cascade — walk the
+                    discussion first, then (knowledge_base=true) the global
+                    memory seeded by what it found.
 walk_next           DEPRECATED — walk_start now runs to completion.
 
 # reasoning & consolidation
@@ -553,7 +556,7 @@ by an eager caller.
 ### 7.3 Tests & benchmark
 
 ```bash
-uv run pytest tests/ -q                                  # 330 tests
+uv run pytest tests/ -q                                  # 346 tests
 uv run python -m benchmarks.locomo.eval \
     --answerer meta --samples 5 --per-category 1 --encoder semantic
 ```
