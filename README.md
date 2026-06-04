@@ -313,6 +313,43 @@ multi-hop reasoning the moment it crystallizes, and a `tool_workflow`
 (a Chasles-compressed chain of actions, §5) is reused as a single optimised
 step.
 
+### 5.2 Named skills — theoretical directories of tools
+
+A **skill** is a *named theoretical directory* of tools that solves a
+complex task. It is built, retrieved, and grown entirely inside the
+manifold — no special store.
+
+**Construction (task mode).** `Memory.build_skill(query, user_id,
+session_id)` runs a walk in **task mode**: gold is a *tool fact* as
+readily as a *semantic fact* (tools ride the same retrieval), and the
+depth gate is no longer the QA σ-stop but *"have we gathered enough tools
+to elaborate the complete workflow?"* (`enough_tools_for_workflow`, an LLM
+check per depth, fail-closed). The output is a **skill folder** as nested
+JSON — keys are theoretical file names — with a generated `name`.
+
+**Ingestion (`Memory.ingest_skill`).** The skill JSON is re-indexed as
+ordinary points: each dir/file becomes a `FACT` tagged
+`skill · tool · name:<name> · user:<id> · session:<id> · date:<…>`
+(`skill_dir`/`skill_file`). The directory **topology** is encoded twice in
+agreement — edge-free lineage (`parents` + `apply_pull` clustering) and
+typed `ref:skill:<name>:path:` / `:parent:` tokens (the same device as
+`ref:date:*`) — so the structure is itself retrievable.
+
+**Scoped retrieval (double query).** Recall pre-filters the **section**
+(`session:`/`user:`/`name:` tags) and RRF-merges it with the free semantic
+query (`section_filter`): a user's own this-session skills get a rank boost
+without excluding the global cloud. The MCP layer caches the live skill
+JSON per `(user, session)`.
+
+**Latent distiller (in `sleep()`).** Every solved task is logged with its
+**resolution path** (`record_resolution`: query, the walked point-ids, the
+output). The next `sleep()` replays the ledger (`distill_skills`) and
+crystallizes, per resolution, a tool `ACTION` node whose `parents` are the
+semantic facts/thoughts/actions that **explicate** it, co-located by
+`apply_pull`. The next time the task recurs the walk retrieves the tool
+**directly** and chains through it — no forced metacognition. Deterministic
+and idempotent (a consumed-cursor over the ledger).
+
 ---
 
 ## 6. Evaluation
