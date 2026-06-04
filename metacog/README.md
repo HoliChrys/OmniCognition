@@ -23,6 +23,24 @@ Everything is a `Point` (`epistemic.py`). A point of any kind — `FACT`,
 - lineage (`parents`, `sequence_prev/next`) and the pulled offsets
   (`delta_active`, `delta_latent`) that *are* the edge-free relations.
 
+A point's epistemic state machine — note **zero deletion**: invalid points
+are exiled geometrically and *resurrect* on fresh corroboration.
+
+```mermaid
+stateDiagram-v2
+  [*] --> CONJECTURE: ingest (GENERATOR/COMPUTATION)
+  CONJECTURE --> CORROBORATED: n_corrob ↑
+  CORROBORATED --> INVALID: n_contra ↑ (contradicted)
+  CONJECTURE --> INVALID: n_contra ↑
+  INVALID --> CORROBORATED: re-corroborated (resurrection)
+  CORROBORATED --> DEPRECATED: superseded
+  DEPRECATED --> CORROBORATED: re-corroborated
+  note right of INVALID
+    not removed — exiled
+    geometrically (apply_exile)
+  end note
+```
+
 ## Two invariants, enforced
 
 1. **Anti-laundering (Corollary 5).** `Observation`s carry a `SourceClass`;
