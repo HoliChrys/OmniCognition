@@ -125,22 +125,32 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
     """Append computed absolute dates for relative references in turn text.
 
     "yesterday I went bowling" + session "17 March 2022"
-    → "... [ref:date:day:16 ref:date:month:march ref:date:year:2022]"
+    → "... [ref:date:day:16 ref:date:month:march ref:date:year:2022]
+         (absolute date: 16 March 2022)"
 
     "I've had them for 3 years" + session "27 March 2023"
-    → "... [ref:date:year:~2020]"
+    → "... [ref:date:year:~2020] (absolute date: around 2020)"
 
-    Structured ref:date:* compounds let the keyword extractor emit typed
-    tokens (ref:date:month:march) rather than bare 'march', preventing
-    IDF dilution from session-date prefixes that mention the same month
-    in every turn. Components stay grouped under ref:date:* so month:
-    and year: are always co-typed and cross-date collisions are minimal.
-    Non-destructive — original content is unchanged."""
+    Two complementary additions :
+      - structured ref:date:* compounds → typed tokens for the keyword
+        extractor / BM25 (retrieval), avoiding IDF dilution from the
+        session-date prefix that mentions the same month in every turn ;
+      - a PLAIN-LANGUAGE "(absolute date: …)" clause → so the answer
+        synthesiser emits the resolved absolute date ("2022") instead of
+        copying the relative phrase ("last year") verbatim. The ref tags
+        alone are not reliably parsed by the generator ; the readable
+        clause closes that gap for temporal questions, especially the
+        0-clue path where the answer is composed straight from raw turns.
+    Non-destructive — the original wording is unchanged."""
     parsed = _parse_session_date(session_date_str)
     if not parsed:
         return text
     s_day, s_mon, s_yr = parsed
-    annotations = []
+    annotations: List[str] = []
+    readable: List[str] = []
+
+    def _cap(mon: int) -> str:
+        return _MONTHS[mon - 1].capitalize()
 
     # "yesterday"
     if re.search(r'\byesterday\b', text, re.IGNORECASE):
@@ -153,12 +163,14 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
                             31, 31, 30, 31, 30, 31][m - 1]
             d = days_in_prev
         annotations.append(_fmt_date_ref(d, m, y))
+        readable.append(f"{d} {_cap(m)} {y}")
 
     # "N years ago" or "for N years" (possession duration)
     m_ya = re.search(r'\b(\d+)\s+years?\b', text, re.IGNORECASE)
     if m_ya:
         n = int(m_ya.group(1))
         annotations.append(f"ref:date:year:~{s_yr - n}")
+        readable.append(f"around {s_yr - n}")
 
     # "N months ago" / "for N months"
     m_ma = re.search(r'\b(\d+)\s+months?\b', text, re.IGNORECASE)
@@ -166,15 +178,18 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
         n = int(m_ma.group(1))
         _, rm, ry = _add_month(s_day, s_mon, s_yr, -n)
         annotations.append(_fmt_month_year_ref(rm, ry))
+        readable.append(f"{_cap(rm)} {ry}")
 
     # "last month"
     if re.search(r'\blast\s+month\b', text, re.IGNORECASE):
         _, rm, ry = _add_month(s_day, s_mon, s_yr, -1)
         annotations.append(_fmt_month_year_ref(rm, ry))
+        readable.append(f"{_cap(rm)} {ry}")
 
     # "last year"
     if re.search(r'\blast\s+year\b', text, re.IGNORECASE):
         annotations.append(f"ref:date:year:{s_yr - 1}")
+        readable.append(f"{s_yr - 1}")
 
     # "last week"
     if re.search(r'\blast\s+week\b', text, re.IGNORECASE):
@@ -187,16 +202,22 @@ def _expand_relative_dates(text: str, session_date_str: str) -> str:
                             31, 31, 30, 31, 30, 31][m - 1]
             d += days_in_prev
         annotations.append(_fmt_date_ref(d, m, y))
+        readable.append(f"{d} {_cap(m)} {y}")
 
     # "recently" / "a few weeks ago" / "a couple of months ago"
     if re.search(r'\ba few weeks? ago\b|\brecently\b|\ba couple of\b',
                  text, re.IGNORECASE):
         annotations.append(_fmt_month_year_ref(s_mon, s_yr))
+        readable.append(f"{_cap(s_mon)} {s_yr}")
 
     if not annotations:
         return text
     deduped = list(dict.fromkeys(annotations))
-    return text + " [" + " | ".join(deduped) + "]"
+    out = text + " [" + " | ".join(deduped) + "]"
+    read_deduped = list(dict.fromkeys(readable))
+    if read_deduped:
+        out += " (absolute date: " + "; ".join(read_deduped) + ")"
+    return out
 
 
 def _clean_session_date(raw: str) -> str:
