@@ -1250,7 +1250,16 @@ class McpMetaAgent:
                                     "following the format rules (absolute "
                                     "calendar date for 'when'; shortest label; "
                                     + (
-                                        "THIS IS A PLURAL QUESTION — list "
+                                        # inference-plural → a FEW best labels,
+                                        # not an exhaustive list (the gold is a
+                                        # small canonical estimate).
+                                        "THIS IS AN OPEN-ESTIMATE QUESTION — "
+                                        "give the 1-3 MOST LIKELY canonical "
+                                        "labels, comma-separated, NOT an "
+                                        "exhaustive list. "
+                                        if (_ENUM_Q_RE.search(question or "")
+                                            and _is_inference_q(question))
+                                        else "THIS IS A PLURAL QUESTION — list "
                                         "ALL items found, comma-separated. "
                                         "Do NOT collapse to one item. "
                                         if _ENUM_Q_RE.search(question or "")
@@ -1675,7 +1684,15 @@ class McpMetaAgent:
             # question, run a dedicated aggregation pass over relevant_
             # collected that lists every distinct item — exploiting the
             # MAP-REDUCE we already build instead of trusting free-form.
+            # NOT for inference questions : their gold is a small canonical
+            # ESTIMATE (e.g. "Psychology, counseling certification"), not an
+            # exhaustive enumeration. The "list EVERY item / prefer MORE
+            # commas" pass over-generates there ("Counseling, Mental health,
+            # LGBTQ+ counseling, Therapeutic work with trans people, Art")
+            # and token-F1 precision collapses. A factual plural ("what
+            # events did X attend") still enumerates fully.
             if (_ENUM_Q_RE.search(question or "")
+                    and not _is_inference_q(question)
                     and len(last_relevant_collected) >= 1):
                 ev = "\n".join(
                     f"- {e.get('content', '')}"
