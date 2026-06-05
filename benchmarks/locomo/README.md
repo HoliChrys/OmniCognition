@@ -61,11 +61,20 @@ DEBUG_NSESS=0 DEBUG_PROBE=caroline python -m benchmarks.locomo.debug_walk all
 
 # Measure lateral-collision effect on kNN redundancy (before/after sleep)
 DEBUG_NSESS=0 python -m benchmarks.locomo.debug_lateral
+
+# Step-by-step QA REPL: drive presearch / clue_search / walk_start /
+# final_answer one tool at a time, with `step` to let the algo pick the
+# next call and `checkpoint`/`restore` to branch & replay (memory cached
+# to /tmp after the first build, so iteration is instant).
+python -m benchmarks.locomo.debug_qa --probe john           # interactive
+python -m benchmarks.locomo.debug_qa --probe caroline \
+    --script "gold; presearch caroline counseling; clues; recall"
 ```
 
 `DEBUG_NSESS` = number of sessions to index (0 = whole conversation) ;
 `DEBUG_PROBE` = `caroline` | `john` ; `METACOG_HYDE=1` toggles the HyDE
-retrieval channel.
+retrieval channel. A worked walkthrough of `john` (the hardest cat3) is
+in [`docs/john_walkthrough.md`](../../docs/john_walkthrough.md).
 
 Or via the Makefile :
 
