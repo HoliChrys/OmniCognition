@@ -612,12 +612,15 @@ def nearest_facts_with_fallback(
                 from metacog.query_anchor import alignment_score
                 fact_pts = [p for p in search_points
                             if p.kind == PointKind.FACT]
-                # O(1) per fact : one cosine of the once-encoded input anchor
-                # against the fact's stored embedding + cheap lexical match.
-                # No per-token / per-stage re-encoding.
+                # LEXICAL-ONLY here (set ops, zero encoding) : the precise
+                # exact-match-on-salient signal is the drift-resistant anchor
+                # the walk needs. Adding the input-embedding cosine re-injects
+                # the dominant-topic bias (cosine(question, fact) favours the
+                # co-present topic), diluting the gold's exact-match lead — so
+                # the semantic side stays in clue_search, not the walk.
                 scored_al = [
                     (alignment_score(query_anchor, p.content,
-                                     p.embedding_orig), p)
+                                     lexical_only=True), p)
                     for p in fact_pts
                 ]
                 scored_al.sort(key=lambda x: -x[0])
