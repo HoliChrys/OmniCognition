@@ -1121,13 +1121,27 @@ class McpMetaAgent:
                 # Round 0 is FORCED to presearch : recon the question's
                 # phrasings before paying any walk (the answer's words differ
                 # from the question's on inference items, so a literal first
-                # walk misses the gold turn). After that, the agent is free.
+                # walk misses the gold turn).
+                _tool_names = {t["name"] for t in tools}
                 _force_presearch = (
-                    round_idx == 0 and "presearch" in
-                    {t["name"] for t in tools}
+                    round_idx == 0 and "presearch" in _tool_names
                 )
-                _tc = ({"type": "tool", "name": "presearch"}
-                       if _force_presearch else None)
+                # Round 1 FORCES clue_search on vocab-gap questions — BEFORE
+                # the agent can walk a co-present topic. Forcing it only via
+                # the floor (after a stray walk) is too late: the wrong
+                # topic's content already dominates the compose set and the
+                # agent answers from it (Caroline "research" → her counseling
+                # career instead of the adoption she actually researched).
+                _force_clue = (
+                    round_idx == 1 and _vocab_gap and clue_search_count < 1
+                    and "clue_search" in _tool_names
+                )
+                if _force_presearch:
+                    _tc = {"type": "tool", "name": "presearch"}
+                elif _force_clue:
+                    _tc = {"type": "tool", "name": "clue_search"}
+                else:
+                    _tc = None
                 _kw = {"tool_choice": _tc} if _tc is not None else {}
                 resp = _create_with_retry(self.client,
                     model=self.model,
