@@ -1767,27 +1767,55 @@ class McpMetaAgent:
                 grouped = _grouped_evidence_text(last_relevant_collected, memory)
                 if grouped:
                     try:
+                        # Re-use the input's typed extraction (action verb +
+                        # named entities, Slice A) so the generation FOLLOWS
+                        # THE INPUT, and have the model take a RETROSPECTIVE
+                        # thought over the groups w.r.t. that anchor before
+                        # concluding the best answer.
+                        from metacog.query_anchor import build_query_anchor
+                        qa = build_query_anchor(
+                            question,
+                            entity_extractor=getattr(memory, "entity_extractor", None),
+                            keyword_extractor=getattr(memory, "extractor", None),
+                            encoder=getattr(memory, "encoder", None))
+                        anchor_terms = ", ".join(
+                            (qa.salient or [])[:6]) or question
                         er = _create_with_retry(self.client,
-                            model=self.model, max_tokens=64, temperature=0,
+                            model=self.model, max_tokens=200, temperature=0,
                             system=(
-                                "Infer the answer from the evidence, which is "
-                                "GROUPED BY ASSOCIATION. Items in DIFFERENT "
-                                "groups are unrelated — do NOT let one group "
-                                "reinforce another, and do NOT merge them. Use "
-                                "the group(s) that actually answer the "
-                                "question. Output the 1-3 most likely canonical "
-                                "labels, comma-separated, no prose, no "
-                                "exhaustive list."),
+                                "You answer by reflecting on association-"
+                                "grouped evidence THROUGH THE LENS OF THE "
+                                "QUESTION'S OWN TERMS. [Group 1] is the "
+                                "STRONGEST (most mutually-reinforcing) "
+                                "association; items in different groups are "
+                                "unrelated — never merge them.\n"
+                                "1) In ONE sentence, reflect RETROSPECTIVELY: "
+                                "which group(s) match the question's action + "
+                                "named entities — default to [Group 1] ALONE "
+                                "unless another is clearly required.\n"
+                                "2) On a final line 'ANSWER: ...' give 1-3 "
+                                "canonical labels in the EVIDENCE'S OWN WORDS "
+                                "— do NOT re-abstract into academic / "
+                                "field-name categories (keep 'counseling', "
+                                "not 'Psychology'/'LGBTQ Studies'). "
+                                "Comma-separated, no prose."),
                             messages=[{"role": "user", "content":
-                                       f"Question: {question}\n\n{grouped}"}],
+                                       f"Question: {question}\n"
+                                       f"Question's key terms (action + named "
+                                       f"entities): {anchor_terms}\n\n"
+                                       f"{grouped}"}],
                         )
                         if hasattr(er, "usage"):
                             total_in += getattr(er.usage, "input_tokens", 0) or 0
                             total_out += getattr(er.usage, "output_tokens", 0) or 0
                         et = " ".join(b.text for b in er.content
                                       if b.type == "text").strip()
-                        if et:
-                            answer_text = et
+                        # take the labels after the retrospective thought
+                        m = re.search(r"answer\s*:\s*(.+)", et, re.I)
+                        val = (m.group(1) if m else et).strip()
+                        val = val.splitlines()[0].strip() if val else ""
+                        if val:
+                            answer_text = val
                     except Exception:
                         pass
 
