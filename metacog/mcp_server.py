@@ -53,7 +53,7 @@ def build_app(
     benchmark conversation pre-ingested in-process) instead of creating
     an empty one. When omitted, a fresh Memory(storage_path=…) is used.
     """
-    from metacog.meta_walk import MetaWalker, WalkerRegistry
+    from metacog.meta_walk import MetaWalker, WalkerRegistry, _NEIGHBOUR_GATE
 
     app = FastMCP(
         "metacog",
@@ -285,22 +285,26 @@ def build_app(
             [agg_facts[e["id"]] for e in evidence if e["id"] in agg_facts]
             + extra
         )[:_MAX_RETURNED_FACTS]
-        # MULTIPLE POSSIBILITIES — when the walk's grounding is THIN (the
-        # gold is likely just out of the seed's reach), offer the sequence-
-        # adjacent turns of everything retrieved : the answer turn often
-        # carries none of the question's words but sits one hop away on the
-        # conversation chain from a turn the walk did surface. Appended to
-        # `facts` (and `relevant_collected`), tagged relevance="neighbor",
-        # so the agent can compose over them. Bounded, deterministic.
-        if walker.grounding_is_thin():
-            already = {f.get("id") for f in out["facts"]
-                       if isinstance(f, dict)}
-            neighbors = [n for n in walker.neighbor_possibilities()
-                         if n["id"] not in already]
-            if neighbors:
-                out["neighbor_possibilities"] = neighbors
+        # MULTIPLE POSSIBILITIES — the answer turn on a vocabulary-gap case
+        # often carries none of the question's words (so the seed never ranks
+        # it) but sits one hop away on the conversation chain from a turn the
+        # walk DID surface. So ALWAYS offer the sequence-adjacent turns of
+        # everything retrieved, tagged relevance="neighbor" : they go into
+        # `neighbor_possibilities` and the `facts` union the agent reads.
+        # (Gating on a raw "thin grounding" count was wrong — a walk can
+        # collect several relevant-LOOKING facts yet still miss the gold, so
+        # it never looked thin and the neighbours were never offered.)
+        # They are promoted into the COMPOSE set (`relevant_collected`) only
+        # when the real on-target evidence is itself thin, so strong cases
+        # are not diluted while 0-clue cat3 paths still get them to compose.
+        already = {f.get("id") for f in out["facts"] if isinstance(f, dict)}
+        neighbors = [n for n in walker.neighbor_possibilities()
+                     if n["id"] not in already]
+        if neighbors:
+            out["neighbor_possibilities"] = neighbors
+            out["facts"] = (out["facts"] + neighbors)[:_MAX_RETURNED_FACTS]
+            if len(evidence) < _NEIGHBOUR_GATE:
                 out["relevant_collected"] = evidence + neighbors
-                out["facts"] = (out["facts"] + neighbors)[:_MAX_RETURNED_FACTS]
         out["reasoning_chain"] = [
             t.content for t in getattr(walker, "_thought_chain", [])
         ]
