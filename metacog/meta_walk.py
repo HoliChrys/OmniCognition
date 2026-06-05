@@ -612,9 +612,11 @@ def nearest_facts_with_fallback(
                 from metacog.query_anchor import alignment_score
                 fact_pts = [p for p in search_points
                             if p.kind == PointKind.FACT]
+                # lexical_only : exact-match anchor over every fact every
+                # stage must be cheap (no per-token transformer encoding).
                 scored_al = [
                     (alignment_score(query_anchor, p.content,
-                                     p.embedding_orig), p)
+                                     lexical_only=True), p)
                     for p in fact_pts
                 ]
                 scored_al.sort(key=lambda x: -x[0])

@@ -221,6 +221,8 @@ def alignment_score(
     anchor: QueryAnchor,
     turn_text: str,
     turn_embedding: Optional[Sequence[float]] = None,
+    *,
+    lexical_only: bool = False,
 ) -> float:
     """ColBERT-style typed alignment of `anchor` against one turn, in [0, 1].
 
@@ -228,21 +230,36 @@ def alignment_score(
     interaction) — exact stem match short-circuits to 1.0 for the high-IDF
     salient terms, soft terms contribute their best token cosine. Weighted
     by `_W_SALIENT` / `_W_SOFT`, normalised by total weight so the result is
-    comparable across turns and questions."""
+    comparable across turns and questions.
+
+    `lexical_only` : skip the semantic token-MaxSim (no per-token encoding) —
+    only EXACT stem matches contribute. O(tokens) set ops, no embedding work.
+    Used by the walk's per-stage anchor (Slice C), where scoring every fact
+    every stage with full MaxSim would mean thousands of transformer forward
+    passes ; the exact-match-on-salient signal is what that channel needs (the
+    semantic side is already covered by the embedding/HyDE RRF channels)."""
     if anchor.is_empty():
         return 0.0
     turn_tokens = _tokens(turn_text)
     turn_stems = {_stem(w) for w in turn_tokens}
+
+    def _term(term: str) -> float:
+        t_stems = {_stem(w) for w in _tokens(term)}
+        if t_stems and t_stems <= turn_stems:
+            return 1.0
+        if lexical_only:
+            return 0.0
+        return _maxsim(term, anchor._emb.get(term), turn_tokens,
+                       turn_stems, anchor, turn_embedding)
+
     score = 0.0
     wsum = 0.0
     for s in anchor.salient:
         w = _W_SALIENT * anchor.idf(s)               # IDF-weighted (high-IDF)
         wsum += w
-        score += w * _maxsim(s, anchor._emb.get(s), turn_tokens,
-                             turn_stems, anchor, turn_embedding)
+        score += w * _term(s)
     for t in anchor.soft:
         w = _W_SOFT * anchor.idf(t)
         wsum += w
-        score += w * _maxsim(t, anchor._emb.get(t), turn_tokens,
-                             turn_stems, anchor, turn_embedding)
+        score += w * _term(t)
     return score / wsum if wsum else 0.0
