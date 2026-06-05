@@ -69,13 +69,15 @@ _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "256"))
 # forced-final synthesis while keeping the agentic loop cheap.
 _MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
 
-# Only the walk tools — the agent should NOT bypass the walk by
-# calling raw retrieve. This is enforced server-side AND client-side.
-# `walk_start` now runs the COMPLETE uncertainty-governed walk in one
-# call (depth = σ-propagation, not caller-driven), so `walk_next` is no
-# longer exposed : the agent does breadth pivots (new walk_start), never
-# stage-by-stage micro-driving.
-_ALLOWED_TOOLS = {"walk_start", "list_communities"}
+# FULL CAPABILITY. The agent gets the ENTIRE MCP tool surface — every
+# retrieval / reasoning tool (walk_start, presearch, scoped_answer,
+# list_tags, retrieve, reason, inspect, …) AND every state-mutating tool
+# (ingest, observe, sleep, build_skill, crystallize_skills, …). Nothing
+# is hidden from it. This is safe for the concurrent harness because each
+# QA runs against its OWN `memory.snapshot()` (see `_answer_async`), so a
+# mutating tool can never race another worker on a shared cloud.
+# `_ALLOWED_TOOLS = None` means "expose all server tools".
+_ALLOWED_TOOLS = None
 
 # Constrained final-answer tool (literature : constrained decoding +
 # strict tool-use tames the verbose tail that costs token-F1). The agent
@@ -110,7 +112,33 @@ _FINAL_ANSWER_TOOL = {
 AGENT_SYSTEM = """You answer questions about a long conversation by
 driving a meta-cognitive walk through tools.
 
+You have the FULL tool surface. The ones that matter for answering :
+  • walk_start(query=…)     — the COMPLETE uncertainty-governed walk (core).
+  • presearch(queries=[…], k_per_query=3, tags=…, match=…)
+                            — CHEAP batch reconnaissance: top-k nearest
+                              hits per query, NO walk. Use it to VALIDATE a
+                              query is probative BEFORE paying a walk, and
+                              to pick which phrasing actually lands near the
+                              evidence. A query whose presearch is empty is
+                              the WRONG phrasing — reformulate, don't walk it.
+  • scoped_answer(query, tags=[…], knowledge_base=true, match=…)
+                            — tag-restricted walk that then escalates to the
+                              whole memory. Use when the question targets a
+                              specific session / date / namespace.
+  • list_tags()             — the glossary of available tag NAMESPACES
+                              (e.g. ref:date, session, person) to aim
+                              presearch / scoped_answer.
+  • match=exact|fuzzy|regex on the tag filters (exact also matches a parent
+    namespace, e.g. ref:date matches ref:date:2022).
+Other tools exist (retrieve, reason, inspect, sleep, …) and are available
+if useful — but the walk is the backbone; do not answer from raw retrieve.
+
 Workflow :
+0. RECON GATE (recommended for indirect / inference questions). Fire one
+   `presearch` with 2-4 candidate phrasings of the question (literal terms,
+   answer-domain synonyms, behavioural clues). Read the top-3 per query;
+   keep the phrasing whose hits are clearly on-topic and walk THAT. If all
+   are empty, reformulate before spending any walk.
 1. Call `walk_start(query=…)` to begin. This runs a COMPLETE walk : its
    DEPTH is decided automatically by uncertainty propagation (a floor of
    at least 3 hops, then it keeps going as long as it surfaces new
@@ -404,7 +432,7 @@ def _resolve_client(api_key: Optional[str]):
 def _mcp_tools_to_anthropic(mcp_tools) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for t in mcp_tools:
-        if t.name not in _ALLOWED_TOOLS:
+        if _ALLOWED_TOOLS is not None and t.name not in _ALLOWED_TOOLS:
             continue
         out.append({
             "name": t.name,
@@ -947,6 +975,13 @@ class McpMetaAgent:
         from mcp.shared.memory import create_connected_server_and_client_session
         from metacog.mcp_server import build_app
 
+        # PER-QA ISOLATION. The agent now has the FULL tool surface,
+        # including state-mutating tools (ingest / observe / sleep /
+        # build_skill / …). The harness runs many QAs concurrently against
+        # one conversation memory, so give THIS QA its own deep copy : any
+        # mutation stays local and cannot race another worker. Read-only
+        # tools are unaffected ; the cost is one snapshot per QA.
+        memory = memory.snapshot()
         app = build_app(memory=memory)
         total_in = 0
         total_out = 0
@@ -1161,9 +1196,8 @@ class McpMetaAgent:
                 messages.append({"role": "assistant", "content": resp.content})
                 tool_results: List[Dict[str, Any]] = []
                 for tu in tool_uses:
-                    if tu.name not in _ALLOWED_TOOLS:
-                        result_text = (f"Tool {tu.name} not permitted — only "
-                                       "walk_start and walk_next are allowed.")
+                    if _ALLOWED_TOOLS is not None and tu.name not in _ALLOWED_TOOLS:
+                        result_text = (f"Tool {tu.name} not permitted.")
                     elif tu.name == "walk_next" and walk_start_count == 0:
                         # Guard : walk_next without any walk_start.
                         result_text = ("Call walk_start first.")
