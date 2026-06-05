@@ -42,6 +42,14 @@ from metacog.memory import Memory
 # lists every id).
 _MAX_RETURNED_FACTS = 20
 
+# Weight of the original-question alignment anchor when re-ranking the
+# clue_search merge (Slice B) and the walk's per-stage facts (Slice C).
+# Additive: final = (1-α)·relative + α·alignment. Kept moderately high —
+# the PRF / Rocchio literature warns that under-weighting the original
+# query lets feedback (here: noisy clues / co-present topics) drift the
+# ranking. The relative signal is never discarded (α < 1).
+_ANCHOR_ALPHA = 0.5
+
 
 def build_app(
     storage_path: Optional[str] = None,
@@ -539,6 +547,42 @@ def build_app(
             for n in nbrs:
                 n["tags"] = tag_by_id.get(n["id"], [])
             merged_list = merged_list + nbrs
+        # SLICE B — Rocchio / ReformIR anchor to the ORIGINAL question.
+        # The per-clue / bridge scores are RELATIVE (to a brainstormed clue),
+        # so a noisy clue ("ordered books on gardening") or a co-present topic
+        # drifts the ranking. Re-rank ADDITIVELY against the original
+        # question's typed alignment (ColBERT MaxSim) so the on-question turn
+        # ("Researching adoption agencies" for "what did X research?") rises
+        # and off-question noise sinks — without discarding the clue signal.
+        try:
+            from metacog.query_anchor import (
+                build_query_anchor, alignment_score)
+            anchor = build_query_anchor(
+                question,
+                entity_extractor=getattr(memory, "entity_extractor", None),
+                keyword_extractor=getattr(memory, "extractor", None),
+                encoder=getattr(memory, "encoder", None),
+            )
+            if not anchor.is_empty() and merged_list:
+                pt = {p.id: p for p in memory.points}
+                scs = [h["score"] for h in merged_list
+                       if isinstance(h.get("score"), (int, float))]
+                lo, hi = (min(scs), max(scs)) if scs else (0.0, 1.0)
+                rng = (hi - lo) or 1.0
+                for h in merged_list:
+                    s = h.get("score")
+                    rel = ((s - lo) / rng
+                           if isinstance(s, (int, float)) else 0.0)
+                    p = pt.get(h["id"])
+                    al = alignment_score(
+                        anchor, h.get("content", ""),
+                        getattr(p, "embedding_orig", None) if p else None)
+                    h["align"] = round(al, 4)
+                    h["rank_score"] = round(
+                        (1.0 - _ANCHOR_ALPHA) * rel + _ANCHOR_ALPHA * al, 4)
+                merged_list.sort(key=lambda h: -h.get("rank_score", 0.0))
+        except Exception:
+            pass
         # Expose fact_ids_cumulative so recall / id-extraction credit the
         # clue hits + lineage bridge (same field walk_start uses), otherwise
         # a clue_search that DID surface the gold scores recall 0.
