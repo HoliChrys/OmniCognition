@@ -71,13 +71,16 @@ def _cos(a, b) -> float:
 
 @dataclass
 class QueryAnchor:
-    """Typed alignment target built once per question."""
+    """Typed alignment target built once per question.
+
+    Holds the original input ENCODED ONCE (`anchor_emb`) plus the typed
+    salient/soft terms for the cheap lexical exact-match. Scoring a fact is
+    then O(1): one cosine against the fact's already-stored embedding +
+    set-membership on stems — no per-stage, per-token re-encoding."""
     salient: List[str] = field(default_factory=list)   # exact-match terms
     soft: List[str] = field(default_factory=list)       # semantic terms
-    _emb: Dict[str, tuple] = field(default_factory=dict)
+    anchor_emb: Optional[tuple] = None                   # input encoded ONCE
     _idf: Dict[str, float] = field(default_factory=dict)  # rarity weight ∈ (0,1]
-    _encoder: Any = None                                 # for turn-token MaxSim
-    _tok_emb: Dict[str, tuple] = field(default_factory=dict)  # token emb cache
     question: str = ""
 
     def is_empty(self) -> bool:
@@ -87,19 +90,6 @@ class QueryAnchor:
         """Rarity weight for `term` in (0, 1]. 1.0 when no corpus stats
         (everything counts) ; ubiquitous terms (the speaker's name) → ~0."""
         return self._idf.get(term, 1.0)
-
-    def _token_embedding(self, token: str):
-        """Cached embedding of a single TURN token (for ColBERT MaxSim)."""
-        if self._encoder is None:
-            return None
-        e = self._tok_emb.get(token)
-        if e is None and token not in self._tok_emb:
-            try:
-                e = tuple(self._encoder.encode(token))
-            except Exception:
-                e = None
-            self._tok_emb[token] = e
-        return e
 
 
 def build_query_anchor(
@@ -158,20 +148,22 @@ def build_query_anchor(
     salient = list(dict.fromkeys(salient))
     soft = [s for s in dict.fromkeys(soft) if s not in set(salient)]
 
-    emb: Dict[str, tuple] = {}
-    if encoder is not None:
-        for term in set(salient) | set(soft):
-            try:
-                emb[term] = tuple(encoder.encode(term))
-            except Exception:
-                pass
+    # The ORIGINAL input is encoded ONCE, as-is — NOT synthesised from the
+    # extracted terms. This is the fixed anchor vector; scoring a fact is
+    # then a single cosine against the fact's already-stored embedding (no
+    # per-stage / per-token re-encoding). The typed terms are kept SEPARATE,
+    # used only for the cheap lexical exact-match.
+    anchor_emb: Optional[tuple] = None
+    if encoder is not None and q.strip():
+        try:
+            anchor_emb = tuple(encoder.encode(q))
+        except Exception:
+            anchor_emb = None
 
-    # IDF rarity weights — the heart of ColBERT's high-IDF preference.
-    # A term in nearly every turn (the conversation's speaker name, common
-    # words) carries no discriminative signal and must not inflate the
-    # alignment of off-topic turns; a rare term (the question's verb / a
-    # specific object) should dominate. weight = log(N/df) / log(N), in
-    # (0, 1]. No corpus → all weights 1.0 (degrades to un-weighted MaxSim).
+    # IDF rarity weights — ColBERT's high-IDF preference, parameter-free.
+    # A term in nearly every turn (the speaker name, common words) carries
+    # no discriminative signal; a rare term (the question's verb / a
+    # specific object) should dominate. weight = log(N/df)/log(N) ∈ (0,1].
     idf: Dict[str, float] = {}
     if corpus_texts:
         docs = [{_stem(w) for w in _tokens(t)} for t in corpus_texts]
@@ -183,38 +175,16 @@ def build_query_anchor(
                 continue
             df = sum(1 for d in docs if ts <= d)
             idf[term] = max(0.0, math.log((n + 1) / (df + 1)) / log_n)
-    return QueryAnchor(salient=salient, soft=soft, _emb=emb, _idf=idf,
-                       _encoder=encoder, question=q)
+    return QueryAnchor(salient=salient, soft=soft, anchor_emb=anchor_emb,
+                       _idf=idf, question=q)
 
 
-def _maxsim(term: str, term_emb, turn_tokens: List[str],
-            turn_stems: set, anchor: QueryAnchor,
-            turn_embedding) -> float:
-    """ColBERT MaxSim for one query `term` over a turn's tokens.
-
-    The score is `max` over the turn's token embeddings of the cosine to the
-    term — the late-interaction operator — with an EXACT (stem) lexical hit
-    short-circuiting to 1.0 (ColBERT's high-IDF exact-match preference).
-    Falls back to a turn-level cosine when per-token encoding is unavailable
-    (so the operator degrades gracefully, never raises)."""
-    t_stems = {_stem(w) for w in _tokens(term)}
-    if t_stems and t_stems <= turn_stems:            # exact lexical MaxSim = 1
-        return 1.0
-    if term_emb is None:
-        return 0.0
-    best = 0.0
-    saw_token = False
-    for w in turn_tokens:                            # MaxSim over turn tokens
-        te = anchor._token_embedding(w)
-        if te is None:
-            continue
-        saw_token = True
-        c = _cos(term_emb, te)
-        if c > best:
-            best = c
-    if not saw_token:                                # no per-token emb → turn-level
-        return max(0.0, _cos(term_emb, turn_embedding))
-    return max(0.0, best)
+# Weight of the lexical exact-match vs the semantic input-anchor cosine in
+# the combined alignment. Lexical (IDF-weighted exact stem hit on a salient
+# term — ColBERT's high-IDF exact-match) is the precise signal ; the cosine
+# of the original-input embedding against the fact is the softer support.
+_W_LEX = 0.7
+_W_SEM = 0.3
 
 
 def alignment_score(
@@ -224,42 +194,37 @@ def alignment_score(
     *,
     lexical_only: bool = False,
 ) -> float:
-    """ColBERT-style typed alignment of `anchor` against one turn, in [0, 1].
+    """Typed alignment of `anchor` against one fact, in [0, 1] — O(1).
 
-    For every query term, take the MaxSim over the turn's TOKENS (late
-    interaction) — exact stem match short-circuits to 1.0 for the high-IDF
-    salient terms, soft terms contribute their best token cosine. Weighted
-    by `_W_SALIENT` / `_W_SOFT`, normalised by total weight so the result is
-    comparable across turns and questions.
+    Two ADDED signals, each cheap and needing no re-encoding:
+      • LEXICAL (precise) — IDF-weighted fraction of the salient/soft terms
+        whose stem appears in the fact (ColBERT's high-IDF exact-match, set
+        ops only). The ubiquitous speaker name is IDF-driven to ~0.
+      • SEMANTIC (support) — a single cosine of the ORIGINAL-input embedding
+        (encoded once) against the fact's already-stored embedding.
 
-    `lexical_only` : skip the semantic token-MaxSim (no per-token encoding) —
-    only EXACT stem matches contribute. O(tokens) set ops, no embedding work.
-    Used by the walk's per-stage anchor (Slice C), where scoring every fact
-    every stage with full MaxSim would mean thousands of transformer forward
-    passes ; the exact-match-on-salient signal is what that channel needs (the
-    semantic side is already covered by the embedding/HyDE RRF channels)."""
+    `lexical_only` drops the semantic cosine (used where no fact embedding is
+    handy). The input vector is kept SEPARATE from the per-stage relative
+    signal: callers blend `(1−α)·relative + α·alignment` — additive."""
     if anchor.is_empty():
         return 0.0
-    turn_tokens = _tokens(turn_text)
-    turn_stems = {_stem(w) for w in turn_tokens}
+    turn_stems = {_stem(w) for w in _tokens(turn_text)}
 
-    def _term(term: str) -> float:
-        t_stems = {_stem(w) for w in _tokens(term)}
-        if t_stems and t_stems <= turn_stems:
-            return 1.0
-        if lexical_only:
-            return 0.0
-        return _maxsim(term, anchor._emb.get(term), turn_tokens,
-                       turn_stems, anchor, turn_embedding)
-
-    score = 0.0
+    # Lexical : IDF-weighted exact-stem hit fraction.
+    lex = 0.0
     wsum = 0.0
-    for s in anchor.salient:
-        w = _W_SALIENT * anchor.idf(s)               # IDF-weighted (high-IDF)
+    for term, base in (
+        [(s, _W_SALIENT) for s in anchor.salient]
+        + [(t, _W_SOFT) for t in anchor.soft]
+    ):
+        w = base * anchor.idf(term)
         wsum += w
-        score += w * _term(s)
-    for t in anchor.soft:
-        w = _W_SOFT * anchor.idf(t)
-        wsum += w
-        score += w * _term(t)
-    return score / wsum if wsum else 0.0
+        t_stems = {_stem(x) for x in _tokens(term)}
+        if t_stems and t_stems <= turn_stems:
+            lex += w
+    lex = lex / wsum if wsum else 0.0
+
+    if lexical_only or anchor.anchor_emb is None or turn_embedding is None:
+        return lex
+    sem = max(0.0, _cos(anchor.anchor_emb, turn_embedding))
+    return _W_LEX * lex + _W_SEM * sem
