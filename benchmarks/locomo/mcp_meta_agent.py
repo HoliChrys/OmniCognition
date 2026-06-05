@@ -592,6 +592,20 @@ _MAX_PIVOT_REDIRECTS = 3
 # walk's own relevant_collected output, never the question wording.
 _MIN_GROUNDING_FACTS = 2
 
+# HARD PROCESS FLOOR (cat3 fix). Wiring presearch is useless if the agent
+# never calls it : on inference questions the answer's words differ from the
+# question's, so the FIRST literal walk lands off the gold turn (measured:
+# "John financial status…" misses D5:5, but "John kids have so much" ranks it
+# 3rd). So we MANDATE the reconnaissance + breadth protocol, regardless of how
+# confident the model feels:
+#   • round 0 is FORCED to presearch (tool_choice) — recon before any walk;
+#   • final_answer is REFUSED until the agent has run >= _MIN_DISTINCT_WALKS
+#     walk_start calls with DIFFERENT vocabulary AND >= 1 presearch.
+# Bounded by _MAX_FLOOR_REDIRECTS so genuinely-absent evidence still
+# terminates (the end-of-budget forced-final always passes through).
+_MIN_DISTINCT_WALKS = 2
+_MAX_FLOOR_REDIRECTS = 3
+
 # Absolute-date patterns for "when" question extraction, most specific first :
 #   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
 _MONTHS = (r"(?:January|February|March|April|May|June|July|August|"
@@ -1006,15 +1020,31 @@ class McpMetaAgent:
             pivot_redirects = 0        # premature-answer redirects issued
             relevant_ids_seen: set = set()  # distinct on-target fact ids (grounding)
             last_relevant_collected: List[dict] = []  # for forced-final evidence
+            # HARD PROCESS FLOOR state (cat3): force recon + breadth.
+            presearch_count = 0
+            walk_vocab: set = set()    # distinct walk_start query phrasings
+            floor_redirects = 0
 
             for round_idx in range(self.max_rounds):
-                resp = _create_with_retry(self.client, 
+                # Round 0 is FORCED to presearch : recon the question's
+                # phrasings before paying any walk (the answer's words differ
+                # from the question's on inference items, so a literal first
+                # walk misses the gold turn). After that, the agent is free.
+                _force_presearch = (
+                    round_idx == 0 and "presearch" in
+                    {t["name"] for t in tools}
+                )
+                _tc = ({"type": "tool", "name": "presearch"}
+                       if _force_presearch else None)
+                _kw = {"tool_choice": _tc} if _tc is not None else {}
+                resp = _create_with_retry(self.client,
                     model=self.model,
                     max_tokens=self.max_tokens,
                     temperature=0,
                     system=AGENT_SYSTEM,
                     tools=tools,
                     messages=messages,
+                    **_kw,
                 )
                 if hasattr(resp, "usage"):
                     total_in += getattr(resp.usage, "input_tokens", 0) or 0
@@ -1026,6 +1056,44 @@ class McpMetaAgent:
                 # Natural exit : no tool calls → answer
                 if not tool_uses:
                     raw = " ".join(text_blocks).strip()
+                    # HARD PROCESS FLOOR also guards the text-only exit, so the
+                    # agent can't bypass the recon/breadth protocol by simply
+                    # narrating an answer instead of calling final_answer.
+                    # EXCEPTION : an abstention ("not mentioned" / "no info")
+                    # is allowed through — that is the adversarial escape hatch,
+                    # and the prompt already requires two walks before it.
+                    _raw_low = raw.lower()
+                    _is_abstain = any(s in _raw_low for s in (
+                        "not mentioned", "no information", "isn't mentioned",
+                        "not mention", "no mention", "doesn't mention",
+                        "not available", "not stated", "can't find",
+                        "cannot find", "no record", "not provided",
+                    ))
+                    _floor_unmet = (presearch_count < 1
+                                    or len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                    if (_floor_unmet and not _is_abstain
+                            and floor_redirects < _MAX_FLOOR_REDIRECTS
+                            and round_idx < self.max_rounds - 1):
+                        floor_redirects += 1
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user", "content": (
+                            "Do not answer yet. The answer's words usually "
+                            "differ from the question's, so one literal pass "
+                            "misses the evidence. You still need : "
+                            + ("a presearch over candidate phrasings; "
+                               if presearch_count < 1 else "")
+                            + (f">= {_MIN_DISTINCT_WALKS} walk_start calls with "
+                               "different vocabulary (you have "
+                               f"{len(walk_vocab)}); "
+                               if len(walk_vocab) < _MIN_DISTINCT_WALKS else "")
+                            + "do the missing step now (call the tool)."
+                        )})
+                        trace.append({"round": round_idx,
+                                      "action": "floor_redirect_text",
+                                      "presearch_count": presearch_count,
+                                      "distinct_walks": len(walk_vocab)})
+                        continue
                     # If the agent NARRATED instead of giving a bare value
                     # ("I now have clear evidence…", "Looking at the facts…"),
                     # convert it via a forced final_answer turn — otherwise
@@ -1089,6 +1157,56 @@ class McpMetaAgent:
                 final_tu = next(
                     (b for b in tool_uses if b.name == "final_answer"), None)
                 if final_tu is not None:
+                    # HARD PROCESS FLOOR (cat3). Refuse to answer until the
+                    # recon + breadth protocol has actually run : >= 1
+                    # presearch AND >= _MIN_DISTINCT_WALKS walks with DIFFERENT
+                    # vocabulary. This is process-driven, not grounding-driven
+                    # (the grounding pivot below is a separate, weaker gate) —
+                    # it forces the agent to use the tools we wired even when
+                    # it feels confident after one literal walk. Bounded by
+                    # _MAX_FLOOR_REDIRECTS and the round budget, so abstention
+                    # questions still terminate at the forced-final.
+                    _floor_unmet = (presearch_count < 1
+                                    or len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                    if (_floor_unmet
+                            and floor_redirects < _MAX_FLOOR_REDIRECTS
+                            and round_idx < self.max_rounds - 1):
+                        floor_redirects += 1
+                        _need = []
+                        if presearch_count < 1:
+                            _need.append(
+                                "run presearch with 3-4 candidate phrasings "
+                                "(literal terms, answer-domain synonyms, "
+                                "behavioural clues) and walk the one whose "
+                                "hits are on-topic")
+                        if len(walk_vocab) < _MIN_DISTINCT_WALKS:
+                            _need.append(
+                                f"run at least {_MIN_DISTINCT_WALKS} walk_start "
+                                "calls with DIFFERENT vocabulary (you have "
+                                f"{len(walk_vocab)} distinct so far)")
+                        floor_msg = (
+                            "Do not answer yet — the answer's words usually "
+                            "differ from the question's, so a single literal "
+                            "walk lands off the evidence. You must still : "
+                            + "; ".join(_need) + ". Do the missing step now."
+                        )
+                        floor_results: List[Dict[str, Any]] = [{
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": (floor_msg if tu.id == final_tu.id
+                                        else "Skipped — recon/breadth floor "
+                                             "not met yet."),
+                        } for tu in tool_uses]
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user",
+                                         "content": floor_results})
+                        trace.append({"round": round_idx,
+                                      "action": "floor_redirect",
+                                      "presearch_count": presearch_count,
+                                      "distinct_walks": len(walk_vocab),
+                                      "floor_redirects": floor_redirects})
+                        continue  # back to top — satisfy the floor first
                     # SIGNAL-DRIVEN pivot (not question-type-driven). The
                     # meta-walk fires when single-hop retrieval is INCONCLUSIVE,
                     # measured by GROUNDING : how many DISTINCT on-target facts
@@ -1232,8 +1350,17 @@ class McpMetaAgent:
                                                 seen_contents.append(_c)
                         except Exception:
                             pass
+                        if tu.name == "presearch":
+                            presearch_count += 1
                         if tu.name == "walk_start":
                             walk_start_count += 1
+                            # Track DISTINCT walk vocabulary for the breadth
+                            # floor : two walks with the same phrasing are not
+                            # a breadth pivot. Normalise to a sorted token set.
+                            _q = str((tu.input or {}).get("query", "")).lower()
+                            _vocab = frozenset(re.findall(r"[a-z0-9]+", _q))
+                            if _vocab:
+                                walk_vocab.add(_vocab)
                             done_seen = False  # reset — new walk, new chance
                         # Detect done + drift flags for trace / pivot signal.
                         try:
