@@ -472,6 +472,7 @@ def nearest_facts_with_fallback(
     anchor_query: Optional[str] = None,
     hyde_passage_text: Optional[str] = None,
     section_filter: Optional[set] = None,
+    query_anchor: Any = None,
 ) -> List[Point]:
     """FACT retrieval — delegates to the FULL hybrid pipeline.
 
@@ -558,7 +559,14 @@ def nearest_facts_with_fallback(
         # system uses : the section's own tools/files get a rank boost
         # without excluding anything from the free channel.
         has_section = bool(section_filter)
-        if has_anchor or has_hyde or has_section:
+        # SLICE C — typed query-alignment anchor (ColBERT MaxSim + IDF),
+        # fired at EVERY stage (a fixed-fraction anchor per the multi-hop
+        # drift literature), not only on drift like the BM25 channel. RRF-
+        # merged, so it can only PROMOTE on-question facts, never drop any
+        # (recall preserved) — additive, not substitutive.
+        has_align = bool(
+            query_anchor is not None and not query_anchor.is_empty())
+        if has_anchor or has_hyde or has_section or has_align:
             rrf_scores: dict = {}
             pid_map: dict = {}
             for rank, (_, p) in enumerate(results):
@@ -598,6 +606,21 @@ def nearest_facts_with_fallback(
                     restrict_kind=PointKind.FACT,
                 )
                 for rank, (_, p) in enumerate(hyde_pool):
+                    rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+                    pid_map.setdefault(p.id, p)
+            if has_align:
+                from metacog.query_anchor import alignment_score
+                fact_pts = [p for p in search_points
+                            if p.kind == PointKind.FACT]
+                scored_al = [
+                    (alignment_score(query_anchor, p.content,
+                                     p.embedding_orig), p)
+                    for p in fact_pts
+                ]
+                scored_al.sort(key=lambda x: -x[0])
+                for rank, (al, p) in enumerate(scored_al[:overfetch]):
+                    if al <= 0.0:
+                        break
                     rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
                     pid_map.setdefault(p.id, p)
             merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
@@ -1590,6 +1613,24 @@ class MetaWalker:
             except Exception:
                 self._hyde_passage = ""
 
+        # SLICE C — typed query-alignment anchor, built ONCE per walk and
+        # fed to every stage's retrieval (no per-stage cost beyond scoring).
+        # Uses the keyword extractor + any entity extractor + IDF over the
+        # corpus ; entity extraction is skipped when no extractor is wired
+        # (then it degrades to keyword/raw-token alignment, no extra LLM).
+        self._query_anchor = None
+        try:
+            from metacog.query_anchor import build_query_anchor
+            self._query_anchor = build_query_anchor(
+                self.query,
+                entity_extractor=getattr(self.memory, "entity_extractor", None),
+                keyword_extractor=self._extr,
+                encoder=self._enc,
+                corpus_texts=[p.content for p in self.memory.points],
+            )
+        except Exception:
+            self._query_anchor = None
+
         # Stage-0 seed embedding from the query keywords. Position-
         # weighted (1/(i+1) decay) so the top keyword drives the vector.
         q_kws = self._extr.extract(query, n=8) if self._extr else []
@@ -1999,6 +2040,7 @@ class MetaWalker:
             anchor_query=self.query if seed_query != self.query else None,
             hyde_passage_text=self._hyde_passage or None,
             section_filter=self.section_filter,
+            query_anchor=self._query_anchor,
         )
 
         # Feed the LATERAL co-retrieval ledger : this ranked result, under
