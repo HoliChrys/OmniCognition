@@ -1778,8 +1778,11 @@ class McpMetaAgent:
                             entity_extractor=getattr(memory, "entity_extractor", None),
                             keyword_extractor=getattr(memory, "extractor", None),
                             encoder=getattr(memory, "encoder", None))
+                        # action verb + named entities if an extractor is
+                        # wired ; else fall back to the question's content
+                        # tokens so the key-terms line is never empty.
                         anchor_terms = ", ".join(
-                            (qa.salient or [])[:6]) or question
+                            (qa.salient or qa.soft or [])[:8]) or question
                         er = _create_with_retry(self.client,
                             model=self.model, max_tokens=220, temperature=0,
                             system=(
@@ -1814,10 +1817,13 @@ class McpMetaAgent:
                             total_out += getattr(er.usage, "output_tokens", 0) or 0
                         et = " ".join(b.text for b in er.content
                                       if b.type == "text").strip()
-                        # take the labels after the retrospective thought
+                        # take the labels after the retrospective thought,
+                        # stripping any leading markdown/punctuation the model
+                        # emits ("**ANSWER:** ..." → "...").
                         m = re.search(r"answer\s*:\s*(.+)", et, re.I)
                         val = (m.group(1) if m else et).strip()
                         val = val.splitlines()[0].strip() if val else ""
+                        val = re.sub(r"^[\s*_#>:•\-]+", "", val).strip()
                         if val:
                             answer_text = val
                     except Exception:
