@@ -374,7 +374,11 @@ class QADebugger:
         from benchmarks.locomo.eval import official_score
         print("\n  running the full autonomous agent ...")
         agent = McpMetaAgent()
-        res = agent.answer(self.memory, self.question)
+        # agent.answer() calls asyncio.run() internally; run it in a worker
+        # thread so it gets its own event loop (we're already inside one).
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None, agent.answer, self.memory, self.question)
         pred = res.get("answer", "")
         for t in res.get("trace") or []:
             act = t.get("action")

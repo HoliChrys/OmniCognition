@@ -125,6 +125,15 @@ You have the FULL tool surface. The ones that matter for answering :
                             — tag-restricted walk that then escalates to the
                               whole memory. Use when the question targets a
                               specific session / date / namespace.
+  • clue_search(question=…)  — INFERENCE expander. For a question whose
+                              answer is never stated (status / leaning /
+                              "what might X be?"), the evidence is a casual
+                              aside with NONE of the question's words. This
+                              brainstorms concrete chat lines that would each
+                              imply a DIFFERENT answer, retrieves over them,
+                              and bridges to the in-between turn. Use it the
+                              moment a walk on the question's own words
+                              drifts or returns only generic on-topic turns.
   • list_tags()             — the glossary of available tag NAMESPACES
                               (e.g. ref:date, session, person) to aim
                               presearch / scoped_answer.
@@ -139,6 +148,12 @@ Workflow :
    answer-domain synonyms, behavioural clues). Read the top-3 per query;
    keep the phrasing whose hits are clearly on-topic and walk THAT. If all
    are empty, reformulate before spending any walk.
+   INFERENCE questions ("what might X's <status/leaning> be?", "is it
+   likely that…") — where the answer is never stated and the evidence is a
+   casual aside in different words — call `clue_search(question=…)` instead
+   of guessing phrasings: it brainstorms the evidence-register lines for
+   you and bridges to the in-between turn. Compose the answer from whichever
+   clue hits are real.
 1. Call `walk_start(query=…)` to begin. This runs a COMPLETE walk : its
    DEPTH is decided automatically by uncertainty propagation (a floor of
    at least 3 hops, then it keeps going as long as it surfaces new
