@@ -285,6 +285,22 @@ def build_app(
             [agg_facts[e["id"]] for e in evidence if e["id"] in agg_facts]
             + extra
         )[:_MAX_RETURNED_FACTS]
+        # MULTIPLE POSSIBILITIES — when the walk's grounding is THIN (the
+        # gold is likely just out of the seed's reach), offer the sequence-
+        # adjacent turns of everything retrieved : the answer turn often
+        # carries none of the question's words but sits one hop away on the
+        # conversation chain from a turn the walk did surface. Appended to
+        # `facts` (and `relevant_collected`), tagged relevance="neighbor",
+        # so the agent can compose over them. Bounded, deterministic.
+        if walker.grounding_is_thin():
+            already = {f.get("id") for f in out["facts"]
+                       if isinstance(f, dict)}
+            neighbors = [n for n in walker.neighbor_possibilities()
+                         if n["id"] not in already]
+            if neighbors:
+                out["neighbor_possibilities"] = neighbors
+                out["relevant_collected"] = evidence + neighbors
+                out["facts"] = (out["facts"] + neighbors)[:_MAX_RETURNED_FACTS]
         out["reasoning_chain"] = [
             t.content for t in getattr(walker, "_thought_chain", [])
         ]

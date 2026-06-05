@@ -91,6 +91,19 @@ _DEFAULT_STAGES = 16
 # bridged to is kept, not the raw query terms.
 _MAX_EVIDENCE = 15
 
+# LINEAGE NEIGHBOUR EXPANSION (the "offer multiple possibilities" rule).
+# When a walk's on-target grounding is THIN — the proxy for "the gold is
+# probably outside the top-k the seed could reach" — the answer turn is
+# often sitting one or two turns away from a turn the walk DID retrieve
+# (measured on LoCoMo cat3 : the literal seed lands on D5:2/3/6/8 but the
+# wealth-implying gold D5:5 stays just out of reach). Rather than commit to
+# the single best chain, the walk then OFFERS the sequence-adjacent turns
+# (±_NEIGHBOUR_WINDOW along the conversation chain) of everything it
+# retrieved, as extra candidate evidence. Deterministic, no LLM, bounded.
+_NEIGHBOUR_WINDOW = 2          # how many turns out, each direction
+_MAX_NEIGHBOURS = 10          # hard cap on offered possibilities
+_NEIGHBOUR_GATE = 3           # expand only when relevant_cum has fewer than this
+
 
 # ----------------------------------------------------------------------
 # HyDE — Hypothetical Document Embeddings (Gao et al., 2022), as an
@@ -1644,6 +1657,83 @@ class MetaWalker:
              "relevance": self._relevant_label.get(p.id, "relevant")}
             for p in ranked
         ]
+
+    def neighbor_possibilities(
+        self,
+        *,
+        window: int = _NEIGHBOUR_WINDOW,
+        cap: int = _MAX_NEIGHBOURS,
+    ) -> List[dict]:
+        """Sequence-adjacent turns of everything the walk retrieved — the
+        "multiple possibilities" offered when the gold is likely just out of
+        the seed's reach.
+
+        For every FACT id the walk saw (`_fact_ids_cum`), collect up to
+        `window` turns BACKWARD (`sequence_prev`) and `window` turns FORWARD
+        (derived reverse index, since ingestion only sets `sequence_prev`)
+        along the conversation chain. Return the ones the walk did NOT
+        already surface, as `{id, content, relevance:"neighbor"}`, nearest
+        first, capped at `cap`. Deterministic, no LLM.
+
+        This bridges the last step on vocabulary-gap cases : the answer turn
+        ("my kids have so much") carries none of the question's words, so the
+        seed never ranks it — but its neighbours DO retrieve, and the gold
+        sits one hop away on the turn chain.
+        """
+        seen = set(self._fact_ids_cum)
+        if not seen:
+            return []
+        points = list(self.memory.points)
+        by_id = {p.id: p for p in points}
+        # Reverse index : ingestion sets only sequence_prev, so derive the
+        # forward link (the turn whose prev is X is X's next).
+        nxt: dict = {}
+        for p in points:
+            if p.sequence_prev:
+                nxt.setdefault(p.sequence_prev, p.id)
+
+        ordered: List[str] = []          # neighbour ids, nearest-first
+        seen_out: set = set()
+
+        def _add(nid: Optional[str]) -> None:
+            if nid and nid not in seen and nid not in seen_out:
+                seen_out.add(nid)
+                ordered.append(nid)
+
+        # Interleave by distance so the closest neighbours of every seed win
+        # the cap before any seed's far neighbours.
+        for dist in range(1, window + 1):
+            for fid in list(seen):
+                cur = fid                      # backward `dist` steps
+                for _ in range(dist):
+                    p = by_id.get(cur)
+                    cur = p.sequence_prev if p else None
+                    if cur is None:
+                        break
+                _add(cur)
+                cur = fid                      # forward `dist` steps
+                for _ in range(dist):
+                    cur = nxt.get(cur)
+                    if cur is None:
+                        break
+                _add(cur)
+
+        out: List[dict] = []
+        for nid in ordered:
+            p = by_id.get(nid)
+            if p is not None and p.kind == PointKind.FACT \
+                    and not p.id.startswith(("entity_", "atom_")):
+                out.append({"id": p.id, "content": p.content,
+                            "relevance": "neighbor"})
+            if len(out) >= cap:
+                break
+        return out
+
+    def grounding_is_thin(self) -> bool:
+        """True when the walk collected fewer than `_NEIGHBOUR_GATE` on-target
+        facts — the proxy for "the gold is likely out of the seed's reach",
+        used to decide whether to offer the lineage neighbours."""
+        return len(self._relevant_cum) < _NEIGHBOUR_GATE
 
     def _query_covered(self) -> bool:
         """True when every query keyword appears in the gathered evidence's
