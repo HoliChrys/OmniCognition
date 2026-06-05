@@ -339,7 +339,7 @@ def build_app(
     @app.tool()
     def scoped_answer(
         query: str, tags: list, knowledge_base: bool = False,
-        n_stages: int = 16,
+        n_stages: int = 16, match: str = "exact",
     ) -> dict:
         """Tag-filtered retrieval as a TWO-PHASE cascade. Phase 1 runs the
         walk HARD-restricted to points carrying ALL `tags` (e.g.
@@ -347,11 +347,109 @@ def build_app(
         there. If knowledge_base=True, Phase 2 then searches the WHOLE
         memory seeded by Phase-1's finding (discussion context → global KB);
         otherwise the answer stays strictly within the filtered set.
+
+        `match` controls how each tag in `tags` is resolved:
+          - "exact"  : equality OR hierarchical ancestry (filtering on
+                       `ref:date` matches a point carrying `ref:date:2022`).
+          - "fuzzy"  : segment-wise Levenshtein (typos on tag names).
+          - "regex"  : `re.search` on each tag, e.g. `r"^session:s\\d+$"`.
+
         Returns the scoped answer/evidence (+ global ones when enabled)."""
         return memory.scoped_answer(
             query, tags=list(tags or []),
             knowledge_base=bool(knowledge_base), n_stages=max(1, n_stages),
+            match=str(match or "exact"),
         )
+
+    @app.tool()
+    def list_tags() -> dict:
+        """Return the GLOSSARY of tag NAMESPACES across the whole memory.
+
+        Hierarchical tags use `:` as the separator (`ref:date:2022`,
+        `session:s1`). The glossary keeps every PARENT PREFIX (the
+        namespace keys) and drops the leaf (the concrete value): `ref`,
+        `ref:date`, `session`, … Flat tags (no `:`) are included verbatim.
+
+        The catalogue is ordered by hierarchy depth first (shallowest
+        namespaces first), then alphabetically — top-level namespaces
+        appear before their children. Use this to discover which tag
+        filters are available for `scoped_answer` / `presearch` /
+        `walk_start`."""
+        from metacog.tags import tag_glossary
+        return {"namespaces": tag_glossary(memory.points)}
+
+    @app.tool()
+    def presearch(
+        queries: list, k_per_query: int = 3, tags: list = None,
+        match: str = "exact", observator_id: str = "",
+    ) -> dict:
+        """BATCH RECONNAISSANCE — return the top-`k_per_query` nearest hits
+        for EACH query, WITHOUT triggering a walk. The agent's gate before
+        spending a full uncertainty-governed walk on a query: a query whose
+        pre-search is empty/weak is reformulated and re-batched until the
+        results look probative; ONLY THEN the agent calls `walk_start` on
+        the validated query.
+
+        Without this gate a weak query still cascades through the walk and
+        the knowledge graph for nothing — the gate keeps that cost behind a
+        cheap kNN check.
+
+        Parameters
+        ----------
+        queries        : list[str]  — the batch of candidate queries.
+        k_per_query    : int        — top-N kept per query (default 3, the
+                                      smallest informative aperture).
+        tags           : list[str]  — optional pre-filter; only points
+                                      satisfying ALL these tags under `match`
+                                      are searched. Same tri-modal semantics
+                                      as `scoped_answer`.
+        match          : str        — "exact" | "fuzzy" | "regex".
+        observator_id  : str        — optional Level-1 community lens.
+
+        Returns `{"results": [{"query", "hits": [{"id","content","score",
+        "kind","tags"}], "n_hits": int}], "n_queries": int}`.
+        """
+        from metacog.tags import filter_points
+        qs = [str(q) for q in (queries or []) if q]
+        tagset = list(tags or [])
+        if tagset:
+            allowed = filter_points(memory.points, tagset, mode=match)
+            scope = [p for p in memory.points if p.id in allowed]
+        else:
+            scope = None  # full memory, retrieve handles it
+        # Stash + restore points to honour the tag pre-filter without
+        # adding a new code path through retrieve().
+        out_results = []
+        original = memory.points
+        try:
+            if scope is not None:
+                memory.points = scope
+            k = max(1, int(k_per_query))
+            for q in qs:
+                hits = memory.retrieve(
+                    q, k=k, observator_id=observator_id or None,
+                )
+                trimmed = [
+                    {
+                        "id": h["id"],
+                        "content": h["content"],
+                        "score": h["score"],
+                        "kind": h["kind"],
+                        "tags": [
+                            t for t in (next(
+                                (p.tags for p in original if p.id == h["id"]),
+                                [],
+                            ))
+                        ],
+                    }
+                    for h in hits
+                ]
+                out_results.append(
+                    {"query": q, "hits": trimmed, "n_hits": len(trimmed)}
+                )
+        finally:
+            memory.points = original
+        return {"results": out_results, "n_queries": len(qs)}
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
