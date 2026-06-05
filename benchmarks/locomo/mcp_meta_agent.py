@@ -1110,6 +1110,12 @@ class McpMetaAgent:
             clue_search_count = 0      # clue_search is the inference recon op
             walk_vocab: set = set()    # distinct walk_start query phrasings
             floor_redirects = 0
+            # Vocab-gap questions (inference + abstract-verb factual) get
+            # clue_search FORCED, not merely offered : it reliably surfaces
+            # the answer-register evidence and anchors the agent on the
+            # question's actual topic instead of drifting to a co-present one
+            # (Caroline "research" → adoption, not her counseling career).
+            _vocab_gap = _is_vocab_gap_q(question)
 
             for round_idx in range(self.max_rounds):
                 # Round 0 is FORCED to presearch : recon the question's
@@ -1162,6 +1168,7 @@ class McpMetaAgent:
                     # inference items.
                     _floor_unmet = (
                         presearch_count < 1
+                        or (_vocab_gap and clue_search_count < 1)
                         or (clue_search_count < 1
                             and len(walk_vocab) < _MIN_DISTINCT_WALKS))
                     if (_floor_unmet and not _is_abstain
@@ -1176,13 +1183,17 @@ class McpMetaAgent:
                             "misses the evidence. You still need : "
                             + ("a presearch over candidate phrasings; "
                                if presearch_count < 1 else "")
-                            + ("EITHER clue_search(question=…) OR "
-                               f">= {_MIN_DISTINCT_WALKS} walk_start calls with "
-                               "different vocabulary (you have "
-                               f"{len(walk_vocab)}); "
-                               if (clue_search_count < 1
-                                   and len(walk_vocab) < _MIN_DISTINCT_WALKS)
-                               else "")
+                            + ("call clue_search(question=…) NOW — this is an "
+                               "inference / abstract-verb question and "
+                               "clue_search anchors on its actual topic; "
+                               if (_vocab_gap and clue_search_count < 1)
+                               else ("EITHER clue_search(question=…) OR "
+                                     f">= {_MIN_DISTINCT_WALKS} walk_start "
+                                     "calls with different vocabulary (you "
+                                     f"have {len(walk_vocab)}); "
+                                     if (clue_search_count < 1
+                                         and len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                                     else ""))
                             + "do the missing step now (call the tool)."
                         )})
                         trace.append({"round": round_idx,
@@ -1270,6 +1281,7 @@ class McpMetaAgent:
                     # inference items.
                     _floor_unmet = (
                         presearch_count < 1
+                        or (_vocab_gap and clue_search_count < 1)
                         or (clue_search_count < 1
                             and len(walk_vocab) < _MIN_DISTINCT_WALKS))
                     if (_floor_unmet
@@ -1283,7 +1295,15 @@ class McpMetaAgent:
                                 "(literal terms, answer-domain synonyms, "
                                 "behavioural clues) and walk the one whose "
                                 "hits are on-topic")
-                        if (clue_search_count < 1
+                        if _vocab_gap and clue_search_count < 1:
+                            _need.append(
+                                "call clue_search(question=…) NOW — this is an "
+                                "inference / abstract-verb question; "
+                                "clue_search brainstorms the evidence-register "
+                                "lines and anchors on the question's actual "
+                                "topic (do NOT answer from a different topic "
+                                "you happened to retrieve)")
+                        elif (clue_search_count < 1
                                 and len(walk_vocab) < _MIN_DISTINCT_WALKS):
                             _need.append(
                                 "EITHER call clue_search(question=…) (for an "
