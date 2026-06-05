@@ -301,6 +301,39 @@ A worked example of the full cascade on the hardest cat3 instance
 [§6.1](#61-worked-example--johns-financial-status) and in
 [`docs/john_walkthrough.md`](docs/john_walkthrough.md).
 
+### 3.5 Query-alignment anchor — drift resistance
+
+Every signal that drives the walk and `clue_search` is RELATIVE — a fact is
+scored against the latest reflection, the σ-neighbourhood, or a brainstormed
+clue. That relativity lets the walk go deep, but it also lets it DRIFT off
+the original question (classic pseudo-relevance-feedback *query drift*): a
+noisy clue ("books on gardening") or a co-present topic (Caroline's
+counselling persona on a "what did she research?" question about adoption)
+hijacks the ranking. The literature's answer is an explicit ANCHOR to the
+original query, kept **additively** (Rocchio's α·q_original term; ReformIR's
+"always score relevance w.r.t. the original query"; multi-hop RAG's
+fixed-fraction-per-hop blend). `metacog/query_anchor.py` implements it as a
+typed, parameter-free alignment in three composable slices:
+
+- **(A) the primitive.** `build_query_anchor(question)` extracts SALIENT
+  terms (named entities + content keywords — high-IDF, **exact-match
+  preferred** à la ColBERT) and SOFT terms (implied topics — semantic), and
+  encodes the input ONCE into a fixed anchor vector. `alignment_score(anchor,
+  fact)` is then O(1): an IDF-weighted exact-stem match on the salient terms
+  (the ubiquitous speaker name is IDF-driven to ~0) plus a single cosine of
+  the once-encoded input against the fact's already-stored embedding. No
+  per-token, per-stage re-encoding.
+- **(B) `clue_search` re-rank (Rocchio / ReformIR).** The merged clue hits
+  are re-ranked `(1−α)·clue_relative + α·alignment`, so the on-question turn
+  rises and off-question noise sinks without discarding the clue signal.
+- **(C) per-stage walk anchor (multi-hop).** The typed alignment is a fourth
+  RRF channel in every walk stage (lexical-only there — exact-match is the
+  drift-resistant signal, and it costs no encoding), so a walk seeded with
+  the wrong vocabulary ("research project study") still pulls the gold
+  ("Researching adoption agencies") into its relevant set.
+
+All three are ADDITIVE — the relative per-stage signal is never replaced.
+
 ---
 
 ## 4. Uncertainty-governed depth
@@ -837,6 +870,42 @@ residual; on `neighbor_bridge`-class cat3 (≈ 25 % of the category, e.g.
 the *Caroline / counseling career* probe) the same pipeline produces a
 clean recall 1.0 *and* a clean F1.
 
+### 6.2 Inference synthesis over association-grouped evidence
+
+A flat list of retrieved facts lets unrelated evidence reinforce each other
+in the final composition: for *"what fields would Caroline pursue?"* the
+gathered evidence holds a tight counselling / mental-health group AND an
+unrelated *art* turn, and a linear synthesis lists them all
+(*"...Art"*), collapsing token-F1 precision. `metacog/answer_cluster.py`
+SEGMENTS the evidence into association groups so reinforcement is computed
+WITHIN a group, never across unrelated ones — it does NOT pick a single
+dominant cluster (a complex question may draw on several groups; that is
+the LLM's call), it only supplies the structure.
+
+The clusterer is **HDBSCAN-style** (chosen over link-communities after an
+empirical comparison on real LoCoMo evidence — link-communities degenerates
+on the small/sparse evidence graph): core-distance **mutual-reachability**
+similarity defeats single-linkage *chaining* and isolates outliers natively,
+with a parameter-free **natural-break** cut and link-community-style soft
+overlap (a two-topic fact may join both groups). The inference final answer
+is then a small synthesis that, conditioned on the query anchor (§3.5 — the
+input's action verb + named entities):
+
+1. takes a **retrospective thought** over the groups — which one(s) match the
+   question's action+entities, defaulting to the strongest group alone;
+2. **abstracts that group to the level the question asks** (the gold answer
+   is usually an abstraction the evidence only implies — *"counseling,
+   mental health"* → *"psychology, counseling"* for a "what fields"
+   question), guided by the anchor and the verbatim query, staying WITHIN
+   the chosen group;
+3. emits 1-3 canonical labels.
+
+On the *Caroline / fields* probe this lifts token-F1 from 0.14 (flat
+over-enumeration) to 0.80. The clue_search lineage bridge that feeds it is
+made deterministic (§3.4) by padding the gap-fill by ±window and requiring
+the clue generator to cover the indirect lifestyle register where status
+evidence actually lives.
+
 ---
 
 ## 7. Usage
@@ -969,3 +1038,37 @@ uv run python -m benchmarks.locomo.eval \
 6. BIPM. *Guide to the Expression of Uncertainty in Measurement* (GUM),
    1995.
 7. Cormack et al. *Reciprocal Rank Fusion*, 2009.
+
+### Drift resistance — query anchoring (§3.5)
+
+8. Rocchio, J.J. *Relevance Feedback in Information Retrieval*, in Salton
+   (ed.), The SMART Retrieval System, 1971. (The α·q_original anchor term.)
+9. *When More Reformulations Hurt: Avoiding Drift using Ranker Feedback*
+   (ReformIR). arXiv:2605.00560. (Score relevance w.r.t. the ORIGINAL query;
+   reformulations as down-weightable features.)
+10. Khattab & Zaharia. *ColBERT: Efficient and Effective Passage Search via
+    Contextualized Late Interaction over BERT*, SIGIR 2020. (MaxSim;
+    high-IDF terms prefer exact lexical match.)
+11. Wang et al. *Pseudo Relevance Feedback with Deep Language Models and
+    Dense Retrievers.* ACM TOIS, 2023. (Rocchio interpolation in dense
+    embedding space; keep α high to resist drift.)
+12. *When Iterative RAG Beats Ideal Evidence: A Diagnostic Study in
+    Scientific Multi-hop QA.* arXiv:2601.19827. ·  *PAR²-RAG.*
+    arXiv:2603.29085. (Fixed-fraction original-query anchoring per hop.)
+
+### Evidence segmentation — association clustering (§6.2)
+
+13. Wang et al. *Evidence Aggregation for Answer Re-Ranking in Open-Domain
+    Question Answering.* arXiv:1711.05116. (Strength- and coverage-based:
+    an answer supported by more mutually-reinforcing passages wins.)
+14. *TopClustRAG* (SIGIR 2025 LiveRAG). arXiv:2506.15246. (Cluster
+    passages, answer per cluster, marginalise outlier clusters.)
+15. Ahn, Bagrow & Lehmann. *Link communities reveal multiscale complexity
+    in networks.* Nature, 2010. (Edge clustering → native overlap.)
+16. Campello, Moulavi & Sander. *Density-Based Clustering Based on
+    Hierarchical Density Estimates* (HDBSCAN), 2013. (Mutual-reachability
+    distance defeats single-linkage chaining; native outlier labelling.)
+17. Xie & Szymanski. *SLPA: Speaker-Listener Label Propagation* — overlapping
+    community detection.
+18. *EviMem: Evidence-Gap-Driven Iterative Retrieval for Long-Term
+    Conversational Memory.* arXiv:2604.27695.
