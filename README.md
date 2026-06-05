@@ -63,6 +63,31 @@ LoCoMo evaluation. Module-level documentation lives in
 full per-version results table live in
 [`benchmarks/locomo/README.md`](benchmarks/locomo/README.md).
 
+### 1.1 Architecture at a glance
+
+```mermaid
+flowchart TB
+  subgraph IN["Continuous ingestion"]
+    MSG["messages user+agent<br/>async · timestamped"]
+    CODE["generated code<br/>push_code / capture"]
+    SK["skill JSON<br/>ingest_skill"]
+  end
+  subgraph MAN["Memory manifold — typed Points, no edges"]
+    FACT["FACT"]
+    TH["THOUGHT"]
+    ACT["ACTION / tool"]
+  end
+  IN --> MAN
+  MAN -->|hybrid RRF + HyDE| WALK["meta-cognitive WALK<br/>uncertainty-governed depth"]
+  WALK -->|keepup stream / answer| OUT["answer + reasoning chain"]
+  WALK -->|record_resolution| SLEEP["sleep(): collisions +<br/>latent skill distiller"]
+  SLEEP --> MAN
+```
+
+The manifold holds one kind of object — a typed `Point`. Everything else
+is a process over it: ingestion feeds it, the walk reads it, sleep
+consolidates it. There are no edges; relations are geometric proximity.
+
 ---
 
 ## 2. The epistemic substrate
@@ -134,6 +159,17 @@ different vocabulary when a thread is exhausted — never stage-by-stage
 micro-driving. This alignment of the two control loops is what lets the
 uncertainty-governed depth actually run at inference time.
 
+```mermaid
+flowchart LR
+  SEED["seed = query keywords<br/>(+ last THOUGHT)"] --> RET["retrieve FACTs/ACTIONs<br/>hybrid RRF + HyDE"]
+  RET --> CON["Chain-of-Note<br/>relevance labels"]
+  CON --> RED["REDUCE → _relevant_cum<br/>(bridging facts kept)"]
+  RED --> THG["synthesize THOUGHT<br/>keywords from walked points only"]
+  THG --> GATE{"depth gate<br/>(§4)"}
+  GATE -->|continue| SEED
+  GATE -->|done| ANS["compose answer over<br/>evidence + reasoning chain"]
+```
+
 ### 3.1 Keepup — organic streaming
 
 Because the depth-gate (§4) already evaluates sufficiency at every stage,
@@ -148,6 +184,19 @@ the answer was correct at stage 4 and stage 5 only confirms it, the user
 saw the right answer a stage early. Generation is therefore continuous and
 asynchronous; over the SSE transport (§7.2) the client renders a single
 message that rewrites itself until validated.
+
+```mermaid
+sequenceDiagram
+  participant C as Client (SSE)
+  participant W as Walk
+  C->>W: walk_keepup(query)
+  loop each stage (k ≥ 3)
+    W->>W: step() — gather evidence
+    W-->>C: snapshot {THOUGHT, provisional answer}
+    Note over C: displayed message rewrites itself
+  end
+  W-->>C: done=true — last snapshot IS the final answer
+```
 
 ### 3.2 Scoped retrieval — discussion first, then the knowledge base
 
@@ -176,6 +225,16 @@ namespaces are discoverable via **`list_tags`**, which returns the
 glossary of **parent prefixes** of every hierarchical tag (the leaf —
 the concrete value — is dropped), ordered by hierarchy depth.
 
+```mermaid
+flowchart LR
+  Q["query + tags<br/>e.g. session:s1"] --> P1["Phase 1 — WALK<br/>HARD-restricted to the tagged set"]
+  P1 --> A1["scoped answer<br/>(what the discussion is about)"]
+  A1 --> KB{"knowledge_base?"}
+  KB -->|false| OUT1["return scoped answer<br/>(stays in the discussion)"]
+  KB -->|true| P2["Phase 2 — WALK global<br/>seeded by: query + scoped answer"]
+  P2 --> OUT2["global answer<br/>(discussion context → KB)"]
+```
+
 ### 3.3 Pre-search gate — validate a query before spending a walk
 
 A single `walk_start` runs the *whole* σ-governed walk **and** (under
@@ -189,6 +248,15 @@ the empty ones, and only then calls `walk_start` on a validated query. An
 optional `tags` pre-filter (same `exact|fuzzy|regex` semantics) orients
 the gate to a date / session / namespace, so reconnaissance can itself be
 scoped before any walk is paid for.
+
+```mermaid
+flowchart LR
+  QS["batch of candidate<br/>queries q1..qN"] --> PS["presearch<br/>top-k kNN per query · NO walk"]
+  PS --> J{"any query<br/>probative?"}
+  J -->|no| RF["reformulate<br/>empty queries"]
+  RF --> PS
+  J -->|yes| WS["walk_start on the<br/>validated query (full σ-walk)"]
+```
 
 ---
 
@@ -246,6 +314,20 @@ terminates the moment the accumulated σ says the chain can no longer be
 trusted — no fixed maximum, no learned controller, no caller override
 (§7.2). The floor guarantees a minimum exploration; coverage is an early
 exit for questions whose vocabulary the evidence already spans.
+
+```mermaid
+flowchart TB
+  S["stage k done<br/>σ_path = √(Σ min-hop²)"] --> FL{"k ≥ MIN_STAGES (3)?"}
+  FL -->|no| C1["continue"]
+  FL -->|yes| CV{"query keywords covered<br/>by gathered evidence?"}
+  CV -->|yes| ST1["STOP · coverage<br/>(cheap, keyword-only)"]
+  CV -->|no| SG{"σ_path > cutoff<br/>(median+std of stage-0)?"}
+  SG -->|yes| ST2["STOP · σ-cap<br/>(chain left the neighbourhood)"]
+  SG -->|no| C1
+```
+
+A coherent gold trail keeps the per-stage min-hop small, so σ grows slowly
+and the walk goes deep; wandering adds a large hop and σ trips fast.
 
 **Why this matters empirically.** A naive depth measure — the
 stage-to-stage drift of the re-anchored seed — is ≈ 0 (the seed is
@@ -432,7 +514,18 @@ block. The server **evaluates** it and routes:
   co-location) so the tool remembers the project it came from and the
   project doc points at the derived tool.
 
-### 5.3 Episodic conversation index
+```mermaid
+flowchart TB
+  GEN["chat generates code"] --> PUSH["push_code: EVALUATE"]
+  PUSH -->|project| DOC["FACT doc node<br/>project · branch · github tags"]
+  PUSH -->|tool-able| REW["metacognitive rewrite<br/>def run(args)"]
+  REW --> TOOL["executable tool node<br/>(ACTION + exec_spec)"]
+  DOC <-->|ref: bidirectional| TOOL
+  TOOL --> RET["retrieved by the WALK<br/>gold = semantic fact OR tool fact"]
+  RET --> RES["solved task → record_resolution"]
+  RES --> DIST["sleep(): distill_skills →<br/>new tool linked to its explicating facts"]
+  DIST --> RET
+```
 
 Every message of a session — **both** the user's and the agent's — is fed
 in **continuously**, with its **timestamp preserved**
