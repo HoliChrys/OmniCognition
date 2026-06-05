@@ -303,6 +303,15 @@ def build_app(
         if neighbors:
             out["neighbor_possibilities"] = neighbors
             out["facts"] = (out["facts"] + neighbors)[:_MAX_RETURNED_FACTS]
+            # Neighbours are part of the effective retrieval set : add them to
+            # `fact_ids_cumulative` so recall / the answerer's id-extraction
+            # credit them (otherwise the lineage bridge is invisible to both
+            # the metric and the deterministic date resolver).
+            nb_ids = [n["id"] for n in neighbors]
+            cum = list(out.get("fact_ids_cumulative") or [])
+            out["fact_ids_cumulative"] = cum + [
+                i for i in nb_ids if i not in set(cum)
+            ]
             if len(evidence) < _NEIGHBOUR_GATE:
                 out["relevant_collected"] = evidence + neighbors
         out["reasoning_chain"] = [
