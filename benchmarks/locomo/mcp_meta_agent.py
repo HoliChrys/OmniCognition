@@ -1037,6 +1037,7 @@ class McpMetaAgent:
             last_relevant_collected: List[dict] = []  # for forced-final evidence
             # HARD PROCESS FLOOR state (cat3): force recon + breadth.
             presearch_count = 0
+            clue_search_count = 0      # clue_search is the inference recon op
             walk_vocab: set = set()    # distinct walk_start query phrasings
             floor_redirects = 0
 
@@ -1084,8 +1085,15 @@ class McpMetaAgent:
                         "not available", "not stated", "can't find",
                         "cannot find", "no record", "not provided",
                     ))
-                    _floor_unmet = (presearch_count < 1
-                                    or len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                    # Recon floor : a presearch, then EITHER a clue_search
+                    # (the inference recon op — ~10x cheaper than a walk and
+                    # the right tool for indirect questions) OR two distinct
+                    # walks. clue_search thus replaces the 2nd forced walk on
+                    # inference items.
+                    _floor_unmet = (
+                        presearch_count < 1
+                        or (clue_search_count < 1
+                            and len(walk_vocab) < _MIN_DISTINCT_WALKS))
                     if (_floor_unmet and not _is_abstain
                             and floor_redirects < _MAX_FLOOR_REDIRECTS
                             and round_idx < self.max_rounds - 1):
@@ -1098,10 +1106,13 @@ class McpMetaAgent:
                             "misses the evidence. You still need : "
                             + ("a presearch over candidate phrasings; "
                                if presearch_count < 1 else "")
-                            + (f">= {_MIN_DISTINCT_WALKS} walk_start calls with "
+                            + ("EITHER clue_search(question=…) OR "
+                               f">= {_MIN_DISTINCT_WALKS} walk_start calls with "
                                "different vocabulary (you have "
                                f"{len(walk_vocab)}); "
-                               if len(walk_vocab) < _MIN_DISTINCT_WALKS else "")
+                               if (clue_search_count < 1
+                                   and len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                               else "")
                             + "do the missing step now (call the tool)."
                         )})
                         trace.append({"round": round_idx,
@@ -1181,8 +1192,15 @@ class McpMetaAgent:
                     # it feels confident after one literal walk. Bounded by
                     # _MAX_FLOOR_REDIRECTS and the round budget, so abstention
                     # questions still terminate at the forced-final.
-                    _floor_unmet = (presearch_count < 1
-                                    or len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                    # Recon floor : a presearch, then EITHER a clue_search
+                    # (the inference recon op — ~10x cheaper than a walk and
+                    # the right tool for indirect questions) OR two distinct
+                    # walks. clue_search thus replaces the 2nd forced walk on
+                    # inference items.
+                    _floor_unmet = (
+                        presearch_count < 1
+                        or (clue_search_count < 1
+                            and len(walk_vocab) < _MIN_DISTINCT_WALKS))
                     if (_floor_unmet
                             and floor_redirects < _MAX_FLOOR_REDIRECTS
                             and round_idx < self.max_rounds - 1):
@@ -1194,10 +1212,14 @@ class McpMetaAgent:
                                 "(literal terms, answer-domain synonyms, "
                                 "behavioural clues) and walk the one whose "
                                 "hits are on-topic")
-                        if len(walk_vocab) < _MIN_DISTINCT_WALKS:
+                        if (clue_search_count < 1
+                                and len(walk_vocab) < _MIN_DISTINCT_WALKS):
                             _need.append(
-                                f"run at least {_MIN_DISTINCT_WALKS} walk_start "
-                                "calls with DIFFERENT vocabulary (you have "
+                                "EITHER call clue_search(question=…) (for an "
+                                "inference question — it brainstorms the "
+                                "evidence-register lines) OR run at least "
+                                f"{_MIN_DISTINCT_WALKS} walk_start calls with "
+                                "DIFFERENT vocabulary (you have "
                                 f"{len(walk_vocab)} distinct so far)")
                         floor_msg = (
                             "Do not answer yet — the answer's words usually "
@@ -1367,6 +1389,8 @@ class McpMetaAgent:
                             pass
                         if tu.name == "presearch":
                             presearch_count += 1
+                        if tu.name == "clue_search":
+                            clue_search_count += 1
                         if tu.name == "walk_start":
                             walk_start_count += 1
                             # Track DISTINCT walk vocabulary for the breadth
