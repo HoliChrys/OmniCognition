@@ -23,7 +23,11 @@ propagation of uncertainty** (GUM 1995) over the retrieved evidence chain:
 a hard floor of three hops, an emergent σ-cap derived from the manifold's
 own local resolution, and a deterministic keyword-coverage stop — no
 fixed maximum and no learned controller. A single invocation runs the
-walk to completion; an agent above it performs only *breadth pivots*. On
+walk to completion; an agent above it performs only *breadth pivots* —
+optionally **scoped** to a discussion before escalating to the global
+knowledge base, **gated** by a cheap batch pre-search so a non-probative
+query never pays for a full walk, and **targeted** by tri-modal
+(exact / fuzzy / regex) matching over the hierarchical tag namespace. On
 the LoCoMo long-conversation benchmark the walk raises evidence
 **agent-recall from a static 0.31 (Recall@7) to ≈ 0.85**, while a
 keyword-oriented token-discipline pass cuts the worst-case per-query input
