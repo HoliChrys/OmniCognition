@@ -652,6 +652,41 @@ def _is_temporal_q(question: Optional[str]) -> bool:
     return bool(_TEMPORAL_Q_RE.search(question or ""))
 
 
+def _grouped_evidence_text(evidence, memory) -> Optional[str]:
+    """Segment the evidence into ASSOCIATION groups (metacog.answer_cluster,
+    HDBSCAN-style) and format them as labelled groups, so the answerer sees
+    which facts mutually reinforce and which are unrelated. Used for
+    inference synthesis : it does NOT pick a dominant group (the LLM decides
+    which group(s) answer) — it only prevents unrelated facts (counselling
+    vs. art) from reinforcing each other. Returns None when there is too
+    little evidence or no embeddings to cluster on."""
+    items = [e for e in (evidence or [])
+             if isinstance(e, dict) and e.get("content")]
+    if len(items) < 3:
+        return None
+    by = {p.id: p for p in getattr(memory, "points", [])}
+    keep, embs = [], []
+    for e in items:
+        p = by.get(e.get("id"))
+        emb = getattr(p, "embedding_orig", None) if p else None
+        if emb is not None:
+            keep.append(e)
+            embs.append(list(emb))
+    if len(keep) < 3:
+        return None
+    try:
+        from metacog.answer_cluster import group_evidence
+        groups = group_evidence(keep, embs)
+    except Exception:
+        return None
+    lines: List[str] = []
+    for gi, g in enumerate(groups, 1):
+        lines.append(f"[Group {gi}]")
+        for e in g:
+            lines.append(f"  - {e.get('content', '')}")
+    return "\n".join(lines)
+
+
 def _final_answer_hint(question: Optional[str]) -> str:
     """The verbatim-vs-inference instruction injected at the final step."""
     if _is_inference_q(question):
@@ -1720,6 +1755,41 @@ class McpMetaAgent:
                         answer_text = et
                 except Exception:
                     pass
+
+            # INFERENCE synthesis over ASSOCIATION-GROUPED evidence. The gold
+            # is a small canonical estimate ; a flat list lets unrelated facts
+            # reinforce each other ("...Art"). Present the evidence grouped by
+            # association and let the LLM pick the group(s) that answer —
+            # WITHOUT merging unrelated groups. Not a dominant-cluster vote ;
+            # the model decides, the grouping just blocks false reinforcement.
+            elif (_is_inference_q(question)
+                    and len(last_relevant_collected) >= 3):
+                grouped = _grouped_evidence_text(last_relevant_collected, memory)
+                if grouped:
+                    try:
+                        er = _create_with_retry(self.client,
+                            model=self.model, max_tokens=64, temperature=0,
+                            system=(
+                                "Infer the answer from the evidence, which is "
+                                "GROUPED BY ASSOCIATION. Items in DIFFERENT "
+                                "groups are unrelated — do NOT let one group "
+                                "reinforce another, and do NOT merge them. Use "
+                                "the group(s) that actually answer the "
+                                "question. Output the 1-3 most likely canonical "
+                                "labels, comma-separated, no prose, no "
+                                "exhaustive list."),
+                            messages=[{"role": "user", "content":
+                                       f"Question: {question}\n\n{grouped}"}],
+                        )
+                        if hasattr(er, "usage"):
+                            total_in += getattr(er.usage, "input_tokens", 0) or 0
+                            total_out += getattr(er.usage, "output_tokens", 0) or 0
+                        et = " ".join(b.text for b in er.content
+                                      if b.type == "text").strip()
+                        if et:
+                            answer_text = et
+                    except Exception:
+                        pass
 
         # Deterministic temporal resolution : rewrite any relative-date
         # answer ("last year") to the absolute date the evidence resolved
