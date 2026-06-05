@@ -42,6 +42,14 @@ from metacog.memory import Memory
 # lists every id).
 _MAX_RETURNED_FACTS = 20
 
+# Weight of the original-question alignment anchor when re-ranking the
+# clue_search merge (Slice B) and the walk's per-stage facts (Slice C).
+# Additive: final = (1-α)·relative + α·alignment. Kept moderately high —
+# the PRF / Rocchio literature warns that under-weighting the original
+# query lets feedback (here: noisy clues / co-present topics) drift the
+# ranking. The relative signal is never discarded (α < 1).
+_ANCHOR_ALPHA = 0.5
+
 
 def build_app(
     storage_path: Optional[str] = None,
@@ -53,7 +61,7 @@ def build_app(
     benchmark conversation pre-ingested in-process) instead of creating
     an empty one. When omitted, a fresh Memory(storage_path=…) is used.
     """
-    from metacog.meta_walk import MetaWalker, WalkerRegistry
+    from metacog.meta_walk import MetaWalker, WalkerRegistry, _NEIGHBOUR_GATE
 
     app = FastMCP(
         "metacog",
@@ -285,6 +293,35 @@ def build_app(
             [agg_facts[e["id"]] for e in evidence if e["id"] in agg_facts]
             + extra
         )[:_MAX_RETURNED_FACTS]
+        # MULTIPLE POSSIBILITIES — the answer turn on a vocabulary-gap case
+        # often carries none of the question's words (so the seed never ranks
+        # it) but sits one hop away on the conversation chain from a turn the
+        # walk DID surface. So ALWAYS offer the sequence-adjacent turns of
+        # everything retrieved, tagged relevance="neighbor" : they go into
+        # `neighbor_possibilities` and the `facts` union the agent reads.
+        # (Gating on a raw "thin grounding" count was wrong — a walk can
+        # collect several relevant-LOOKING facts yet still miss the gold, so
+        # it never looked thin and the neighbours were never offered.)
+        # They are promoted into the COMPOSE set (`relevant_collected`) only
+        # when the real on-target evidence is itself thin, so strong cases
+        # are not diluted while 0-clue cat3 paths still get them to compose.
+        already = {f.get("id") for f in out["facts"] if isinstance(f, dict)}
+        neighbors = [n for n in walker.neighbor_possibilities()
+                     if n["id"] not in already]
+        if neighbors:
+            out["neighbor_possibilities"] = neighbors
+            out["facts"] = (out["facts"] + neighbors)[:_MAX_RETURNED_FACTS]
+            # Neighbours are part of the effective retrieval set : add them to
+            # `fact_ids_cumulative` so recall / the answerer's id-extraction
+            # credit them (otherwise the lineage bridge is invisible to both
+            # the metric and the deterministic date resolver).
+            nb_ids = [n["id"] for n in neighbors]
+            cum = list(out.get("fact_ids_cumulative") or [])
+            out["fact_ids_cumulative"] = cum + [
+                i for i in nb_ids if i not in set(cum)
+            ]
+            if len(evidence) < _NEIGHBOUR_GATE:
+                out["relevant_collected"] = evidence + neighbors
         out["reasoning_chain"] = [
             t.content for t in getattr(walker, "_thought_chain", [])
         ]
@@ -450,6 +487,117 @@ def build_app(
         finally:
             memory.points = original
         return {"results": out_results, "n_queries": len(qs)}
+
+    @app.tool()
+    def clue_search(
+        question: str, k_per_clue: int = 3, n_clues: int = 6,
+        observator_id: str = "",
+    ) -> dict:
+        """INFERENCE-question expander. For a question whose answer is never
+        stated directly ("What might John's financial status be?"), the
+        evidence is a casual aside in a vocabulary that shares NOTHING with
+        the question ("my kids have so much" ⇒ well-off). Querying in the
+        question's words retrieves the wrong turns; HyDE on a hypothetical
+        ANSWER ("John is wealthy") also misses — it stays in the money
+        register, not the evidence register.
+
+        `clue_search` instead has the server BRAINSTORM concrete first-person
+        chat lines that would each be EVIDENCE for a DIFFERENT plausible
+        answer (spanning the answer space — well-off AND struggling), then
+        retrieves over those clue lines. Whichever clue matches a real turn
+        surfaces the actual aside, and you infer the answer from what stuck.
+
+        Use this when a plain `presearch`/`walk_start` on the question
+        drifts or returns only generic on-topic turns. Returns
+        `{"clues":[...], "results":[{clue,hits}], "merged":[top unique hits]}`.
+        """
+        from metacog.clues import clue_utterances
+        clues = clue_utterances(question, memory.llm, n=max(1, int(n_clues)))
+        if not clues:
+            return {"clues": [], "results": [], "merged": [],
+                    "note": "no clues generated (no usable LLM?)"}
+        k = max(1, int(k_per_clue))
+        tag_by_id = {p.id: list(p.tags) for p in memory.points}
+        per_clue = []
+        merged: dict = {}              # id -> best hit (highest score)
+        for c in clues:
+            hits = memory.retrieve(c, k=k, observator_id=observator_id or None)
+            trimmed = [
+                {"id": h["id"], "content": h["content"], "score": h["score"],
+                 "kind": h["kind"], "tags": tag_by_id.get(h["id"], [])}
+                for h in hits
+            ]
+            per_clue.append({"clue": c, "hits": trimmed, "n_hits": len(trimmed)})
+            for h in trimmed:
+                cur = merged.get(h["id"])
+                if cur is None or h["score"] > cur["score"]:
+                    merged[h["id"]] = h
+        merged_list = sorted(merged.values(), key=lambda h: -h["score"])
+        # LINEAGE BRIDGE — the clues often land on the SPACED neighbours of
+        # the real aside (kids/family clues hit D5:3 and D5:6, the gold D5:5
+        # sits between them). Gap-fill the conversation chain between the
+        # merged hits so the in-between answer turn surfaces too.
+        from metacog.meta_walk import lineage_neighbors
+        # Generous bridge for clue recon : many clue hits act as seeds, so a
+        # wider window + larger cap is needed for a dist-2 in-between turn
+        # (the gold one step past a clue hit) to survive the cap race.
+        nbrs = lineage_neighbors([h["id"] for h in merged_list], memory.points,
+                                 window=3, cap=40)
+        if nbrs:
+            for n in nbrs:
+                n["tags"] = tag_by_id.get(n["id"], [])
+            merged_list = merged_list + nbrs
+        # SLICE B — Rocchio / ReformIR anchor to the ORIGINAL question.
+        # The per-clue / bridge scores are RELATIVE (to a brainstormed clue),
+        # so a noisy clue ("ordered books on gardening") or a co-present topic
+        # drifts the ranking. Re-rank ADDITIVELY against the original
+        # question's typed alignment (ColBERT MaxSim) so the on-question turn
+        # ("Researching adoption agencies" for "what did X research?") rises
+        # and off-question noise sinks — without discarding the clue signal.
+        try:
+            from metacog.query_anchor import (
+                build_query_anchor, alignment_score)
+            anchor = build_query_anchor(
+                question,
+                entity_extractor=getattr(memory, "entity_extractor", None),
+                keyword_extractor=getattr(memory, "extractor", None),
+                encoder=getattr(memory, "encoder", None),
+                corpus_texts=[p.content for p in memory.points],
+            )
+            if not anchor.is_empty() and merged_list:
+                pt = {p.id: p for p in memory.points}
+                scs = [h["score"] for h in merged_list
+                       if isinstance(h.get("score"), (int, float))]
+                lo, hi = (min(scs), max(scs)) if scs else (0.0, 1.0)
+                rng = (hi - lo) or 1.0
+                for h in merged_list:
+                    s = h.get("score")
+                    # Bridge neighbours carry no clue score : give them a
+                    # NEUTRAL relative baseline (0.5) so a strong alignment
+                    # can still surface them, instead of zeroing them out.
+                    rel = ((s - lo) / rng
+                           if isinstance(s, (int, float)) else 0.5)
+                    p = pt.get(h["id"])
+                    al = alignment_score(
+                        anchor, h.get("content", ""),
+                        getattr(p, "embedding_orig", None) if p else None)
+                    h["align"] = round(al, 4)
+                    h["rank_score"] = round(
+                        (1.0 - _ANCHOR_ALPHA) * rel + _ANCHOR_ALPHA * al, 4)
+                merged_list.sort(key=lambda h: -h.get("rank_score", 0.0))
+        except Exception:
+            pass
+        # Expose fact_ids_cumulative so recall / id-extraction credit the
+        # clue hits + lineage bridge (same field walk_start uses), otherwise
+        # a clue_search that DID surface the gold scores recall 0.
+        cum_ids: list = []
+        seen_c: set = set()
+        for h in merged_list:
+            if h["id"] not in seen_c:
+                seen_c.add(h["id"])
+                cum_ids.append(h["id"])
+        return {"clues": clues, "results": per_clue, "merged": merged_list,
+                "neighbor_possibilities": nbrs, "fact_ids_cumulative": cum_ids}
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:

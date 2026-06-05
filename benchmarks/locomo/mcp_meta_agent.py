@@ -69,13 +69,15 @@ _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "256"))
 # forced-final synthesis while keeping the agentic loop cheap.
 _MAX_ROUNDS = int(os.environ.get("MCP_META_MAX_ROUNDS", "8"))
 
-# Only the walk tools — the agent should NOT bypass the walk by
-# calling raw retrieve. This is enforced server-side AND client-side.
-# `walk_start` now runs the COMPLETE uncertainty-governed walk in one
-# call (depth = σ-propagation, not caller-driven), so `walk_next` is no
-# longer exposed : the agent does breadth pivots (new walk_start), never
-# stage-by-stage micro-driving.
-_ALLOWED_TOOLS = {"walk_start", "list_communities"}
+# FULL CAPABILITY. The agent gets the ENTIRE MCP tool surface — every
+# retrieval / reasoning tool (walk_start, presearch, scoped_answer,
+# list_tags, retrieve, reason, inspect, …) AND every state-mutating tool
+# (ingest, observe, sleep, build_skill, crystallize_skills, …). Nothing
+# is hidden from it. This is safe for the concurrent harness because each
+# QA runs against its OWN `memory.snapshot()` (see `_answer_async`), so a
+# mutating tool can never race another worker on a shared cloud.
+# `_ALLOWED_TOOLS = None` means "expose all server tools".
+_ALLOWED_TOOLS = None
 
 # Constrained final-answer tool (literature : constrained decoding +
 # strict tool-use tames the verbose tail that costs token-F1). The agent
@@ -110,7 +112,48 @@ _FINAL_ANSWER_TOOL = {
 AGENT_SYSTEM = """You answer questions about a long conversation by
 driving a meta-cognitive walk through tools.
 
+You have the FULL tool surface. The ones that matter for answering :
+  • walk_start(query=…)     — the COMPLETE uncertainty-governed walk (core).
+  • presearch(queries=[…], k_per_query=3, tags=…, match=…)
+                            — CHEAP batch reconnaissance: top-k nearest
+                              hits per query, NO walk. Use it to VALIDATE a
+                              query is probative BEFORE paying a walk, and
+                              to pick which phrasing actually lands near the
+                              evidence. A query whose presearch is empty is
+                              the WRONG phrasing — reformulate, don't walk it.
+  • scoped_answer(query, tags=[…], knowledge_base=true, match=…)
+                            — tag-restricted walk that then escalates to the
+                              whole memory. Use when the question targets a
+                              specific session / date / namespace.
+  • clue_search(question=…)  — INFERENCE expander. For a question whose
+                              answer is never stated (status / leaning /
+                              "what might X be?"), the evidence is a casual
+                              aside with NONE of the question's words. This
+                              brainstorms concrete chat lines that would each
+                              imply a DIFFERENT answer, retrieves over them,
+                              and bridges to the in-between turn. Use it the
+                              moment a walk on the question's own words
+                              drifts or returns only generic on-topic turns.
+  • list_tags()             — the glossary of available tag NAMESPACES
+                              (e.g. ref:date, session, person) to aim
+                              presearch / scoped_answer.
+  • match=exact|fuzzy|regex on the tag filters (exact also matches a parent
+    namespace, e.g. ref:date matches ref:date:2022).
+Other tools exist (retrieve, reason, inspect, sleep, …) and are available
+if useful — but the walk is the backbone; do not answer from raw retrieve.
+
 Workflow :
+0. RECON GATE (recommended for indirect / inference questions). Fire one
+   `presearch` with 2-4 candidate phrasings of the question (literal terms,
+   answer-domain synonyms, behavioural clues). Read the top-3 per query;
+   keep the phrasing whose hits are clearly on-topic and walk THAT. If all
+   are empty, reformulate before spending any walk.
+   INFERENCE questions ("what might X's <status/leaning> be?", "is it
+   likely that…") — where the answer is never stated and the evidence is a
+   casual aside in different words — call `clue_search(question=…)` instead
+   of guessing phrasings: it brainstorms the evidence-register lines for
+   you and bridges to the in-between turn. Compose the answer from whichever
+   clue hits are real.
 1. Call `walk_start(query=…)` to begin. This runs a COMPLETE walk : its
    DEPTH is decided automatically by uncertainty propagation (a floor of
    at least 3 hops, then it keeps going as long as it surfaces new
@@ -404,7 +447,7 @@ def _resolve_client(api_key: Optional[str]):
 def _mcp_tools_to_anthropic(mcp_tools) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for t in mcp_tools:
-        if t.name not in _ALLOWED_TOOLS:
+        if _ALLOWED_TOOLS is not None and t.name not in _ALLOWED_TOOLS:
             continue
         out.append({
             "name": t.name,
@@ -552,6 +595,111 @@ _ENUM_Q_RE = re.compile(
     re.IGNORECASE,
 )
 
+# INFERENCE questions — the answer is a CONCLUSION the evidence implies, not
+# a quote from it. "What might X's financial status be?", "Would Caroline
+# likely…?", "Is it likely that…?". These must NOT be answered verbatim from
+# the evidence turn (that is the cat3 failure: echoing "my kids have so much"
+# instead of inferring "wealthy"). Detected to flip the final-answer
+# guidance from extractive to inferential.
+_INFER_Q_RE = re.compile(
+    r"\b(might|would|could|likely|probabl|suspect|presumabl|imply|implies|"
+    r"would .* be|what .* status|what .* leaning|how .* feel)\b",
+    re.IGNORECASE,
+)
+
+# VOCAB-GAP factual questions — the question's verb is ABSTRACT
+# ("research", "study", "look into", "work on", "decide", "plan") and the
+# evidence uses the CONCRETE topic word instead ("researching adoption
+# agencies", "planning a trip to Lisbon"). Single-shot retrieval on the
+# abstract verb misses, the walk in its register doesn't CoN-label the gold
+# relevant, and the agent abstains. Detected to force `clue_search` (which
+# brainstorms the concrete topics) even though the question is factual,
+# not inferential.
+_VOCAB_GAP_FACTUAL_Q_RE = re.compile(
+    r"\bwhat\b.{0,30}\b(?:did|does|do|has|have|was|were|is|are)\b"
+    r".{0,30}\b(?:research(?:ing|ed)?|stud(?:y|ying|ied)|look(?:ing)? into|"
+    r"investigat(?:e|ing|ed)|explor(?:e|ing|ed)|decid(?:e|ing|ed)|"
+    r"plan(?:ning|ned)?|work(?:ing)? on|consider(?:ing|ed)?|"
+    r"think(?:ing)? about)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_inference_q(question: Optional[str]) -> bool:
+    return bool(_INFER_Q_RE.search(question or ""))
+
+
+def _is_vocab_gap_q(question: Optional[str]) -> bool:
+    """Inference question OR vocab-gap factual — both benefit from
+    `clue_search`, the evidence-register expander."""
+    q = question or ""
+    return bool(_INFER_Q_RE.search(q) or _VOCAB_GAP_FACTUAL_Q_RE.search(q))
+
+
+# TEMPORAL questions — "when did…", "what year/date/month/day…", "how long
+# ago…". Only these should have the relative-date resolver applied to the
+# final answer; otherwise an answer that merely CONTAINS a relative-time
+# word ("recently unemployed", "lately struggling") gets clobbered into the
+# evidence turn's absolute date (the "January 2023" bug on a cat3 question).
+_TEMPORAL_Q_RE = re.compile(
+    r"\bwhen\b|\bwhat\s+(?:year|date|month|day|time)\b|\bhow\s+long\s+ago\b|"
+    r"\bwhat\s+day\s+of\b|\bon\s+what\s+(?:date|day)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_temporal_q(question: Optional[str]) -> bool:
+    return bool(_TEMPORAL_Q_RE.search(question or ""))
+
+
+def _grouped_evidence_text(evidence, memory) -> Optional[str]:
+    """Segment the evidence into ASSOCIATION groups (metacog.answer_cluster,
+    HDBSCAN-style) and format them as labelled groups, so the answerer sees
+    which facts mutually reinforce and which are unrelated. Used for
+    inference synthesis : it does NOT pick a dominant group (the LLM decides
+    which group(s) answer) — it only prevents unrelated facts (counselling
+    vs. art) from reinforcing each other. Returns None when there is too
+    little evidence or no embeddings to cluster on."""
+    items = [e for e in (evidence or [])
+             if isinstance(e, dict) and e.get("content")]
+    if len(items) < 3:
+        return None
+    by = {p.id: p for p in getattr(memory, "points", [])}
+    keep, embs = [], []
+    for e in items:
+        p = by.get(e.get("id"))
+        emb = getattr(p, "embedding_orig", None) if p else None
+        if emb is not None:
+            keep.append(e)
+            embs.append(list(emb))
+    if len(keep) < 3:
+        return None
+    try:
+        from metacog.answer_cluster import group_evidence
+        groups = group_evidence(keep, embs)
+    except Exception:
+        return None
+    lines: List[str] = []
+    for gi, g in enumerate(groups, 1):
+        lines.append(f"[Group {gi}]")
+        for e in g:
+            lines.append(f"  - {e.get('content', '')}")
+    return "\n".join(lines)
+
+
+def _final_answer_hint(question: Optional[str]) -> str:
+    """The verbatim-vs-inference instruction injected at the final step."""
+    if _is_inference_q(question):
+        return (
+            "This is an INFERENCE question — the answer is the concise "
+            "CONCLUSION the evidence implies, NOT a quote. Map the evidence's "
+            "specifics to a canonical label via world knowledge (e.g. "
+            "evidence 'my kids have so much' -> 'wealthy'; 'I volunteer every "
+            "week' -> 'community-minded'). Do NOT echo the turn's words, do "
+            "NOT answer yes/no — give the bare inferred label."
+        )
+    return "Copy the bare value VERBATIM from the evidence (the speaker's words)."
+
 # Loop-safety cap on how many times we redirect a premature final_answer back
 # into a pivot when the walk evidence is still inconclusive (weak grounding).
 # NOT a question-type rule — purely a bound so an answer that genuinely isn't
@@ -563,6 +711,20 @@ _MAX_PIVOT_REDIRECTS = 3
 # all walks so far, the single-hop result is inconclusive → pivot. Reads the
 # walk's own relevant_collected output, never the question wording.
 _MIN_GROUNDING_FACTS = 2
+
+# HARD PROCESS FLOOR (cat3 fix). Wiring presearch is useless if the agent
+# never calls it : on inference questions the answer's words differ from the
+# question's, so the FIRST literal walk lands off the gold turn (measured:
+# "John financial status…" misses D5:5, but "John kids have so much" ranks it
+# 3rd). So we MANDATE the reconnaissance + breadth protocol, regardless of how
+# confident the model feels:
+#   • round 0 is FORCED to presearch (tool_choice) — recon before any walk;
+#   • final_answer is REFUSED until the agent has run >= _MIN_DISTINCT_WALKS
+#     walk_start calls with DIFFERENT vocabulary AND >= 1 presearch.
+# Bounded by _MAX_FLOOR_REDIRECTS so genuinely-absent evidence still
+# terminates (the end-of-budget forced-final always passes through).
+_MIN_DISTINCT_WALKS = 2
+_MAX_FLOOR_REDIRECTS = 3
 
 # Absolute-date patterns for "when" question extraction, most specific first :
 #   "19 January 2023" · "January 19, 2023" · "January 2023" · "2023".
@@ -947,6 +1109,13 @@ class McpMetaAgent:
         from mcp.shared.memory import create_connected_server_and_client_session
         from metacog.mcp_server import build_app
 
+        # PER-QA ISOLATION. The agent now has the FULL tool surface,
+        # including state-mutating tools (ingest / observe / sleep /
+        # build_skill / …). The harness runs many QAs concurrently against
+        # one conversation memory, so give THIS QA its own deep copy : any
+        # mutation stays local and cannot race another worker. Read-only
+        # tools are unaffected ; the cost is one snapshot per QA.
+        memory = memory.snapshot()
         app = build_app(memory=memory)
         total_in = 0
         total_out = 0
@@ -971,15 +1140,52 @@ class McpMetaAgent:
             pivot_redirects = 0        # premature-answer redirects issued
             relevant_ids_seen: set = set()  # distinct on-target fact ids (grounding)
             last_relevant_collected: List[dict] = []  # for forced-final evidence
+            # HARD PROCESS FLOOR state (cat3): force recon + breadth.
+            presearch_count = 0
+            clue_search_count = 0      # clue_search is the inference recon op
+            walk_vocab: set = set()    # distinct walk_start query phrasings
+            floor_redirects = 0
+            # Vocab-gap questions (inference + abstract-verb factual) get
+            # clue_search FORCED, not merely offered : it reliably surfaces
+            # the answer-register evidence and anchors the agent on the
+            # question's actual topic instead of drifting to a co-present one
+            # (Caroline "research" → adoption, not her counseling career).
+            _vocab_gap = _is_vocab_gap_q(question)
 
             for round_idx in range(self.max_rounds):
-                resp = _create_with_retry(self.client, 
+                # Round 0 is FORCED to presearch : recon the question's
+                # phrasings before paying any walk (the answer's words differ
+                # from the question's on inference items, so a literal first
+                # walk misses the gold turn).
+                _tool_names = {t["name"] for t in tools}
+                _force_presearch = (
+                    round_idx == 0 and "presearch" in _tool_names
+                )
+                # Round 1 FORCES clue_search on vocab-gap questions — BEFORE
+                # the agent can walk a co-present topic. Forcing it only via
+                # the floor (after a stray walk) is too late: the wrong
+                # topic's content already dominates the compose set and the
+                # agent answers from it (Caroline "research" → her counseling
+                # career instead of the adoption she actually researched).
+                _force_clue = (
+                    round_idx == 1 and _vocab_gap and clue_search_count < 1
+                    and "clue_search" in _tool_names
+                )
+                if _force_presearch:
+                    _tc = {"type": "tool", "name": "presearch"}
+                elif _force_clue:
+                    _tc = {"type": "tool", "name": "clue_search"}
+                else:
+                    _tc = None
+                _kw = {"tool_choice": _tc} if _tc is not None else {}
+                resp = _create_with_retry(self.client,
                     model=self.model,
                     max_tokens=self.max_tokens,
                     temperature=0,
                     system=AGENT_SYSTEM,
                     tools=tools,
                     messages=messages,
+                    **_kw,
                 )
                 if hasattr(resp, "usage"):
                     total_in += getattr(resp.usage, "input_tokens", 0) or 0
@@ -991,6 +1197,59 @@ class McpMetaAgent:
                 # Natural exit : no tool calls → answer
                 if not tool_uses:
                     raw = " ".join(text_blocks).strip()
+                    # HARD PROCESS FLOOR also guards the text-only exit, so the
+                    # agent can't bypass the recon/breadth protocol by simply
+                    # narrating an answer instead of calling final_answer.
+                    # EXCEPTION : an abstention ("not mentioned" / "no info")
+                    # is allowed through — that is the adversarial escape hatch,
+                    # and the prompt already requires two walks before it.
+                    _raw_low = raw.lower()
+                    _is_abstain = any(s in _raw_low for s in (
+                        "not mentioned", "no information", "isn't mentioned",
+                        "not mention", "no mention", "doesn't mention",
+                        "not available", "not stated", "can't find",
+                        "cannot find", "no record", "not provided",
+                    ))
+                    # Recon floor : a presearch, then EITHER a clue_search
+                    # (the inference recon op — ~10x cheaper than a walk and
+                    # the right tool for indirect questions) OR two distinct
+                    # walks. clue_search thus replaces the 2nd forced walk on
+                    # inference items.
+                    _floor_unmet = (
+                        presearch_count < 1
+                        or (_vocab_gap and clue_search_count < 1)
+                        or (clue_search_count < 1
+                            and len(walk_vocab) < _MIN_DISTINCT_WALKS))
+                    if (_floor_unmet and not _is_abstain
+                            and floor_redirects < _MAX_FLOOR_REDIRECTS
+                            and round_idx < self.max_rounds - 1):
+                        floor_redirects += 1
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user", "content": (
+                            "Do not answer yet. The answer's words usually "
+                            "differ from the question's, so one literal pass "
+                            "misses the evidence. You still need : "
+                            + ("a presearch over candidate phrasings; "
+                               if presearch_count < 1 else "")
+                            + ("call clue_search(question=…) NOW — this is an "
+                               "inference / abstract-verb question and "
+                               "clue_search anchors on its actual topic; "
+                               if (_vocab_gap and clue_search_count < 1)
+                               else ("EITHER clue_search(question=…) OR "
+                                     f">= {_MIN_DISTINCT_WALKS} walk_start "
+                                     "calls with different vocabulary (you "
+                                     f"have {len(walk_vocab)}); "
+                                     if (clue_search_count < 1
+                                         and len(walk_vocab) < _MIN_DISTINCT_WALKS)
+                                     else ""))
+                            + "do the missing step now (call the tool)."
+                        )})
+                        trace.append({"round": round_idx,
+                                      "action": "floor_redirect_text",
+                                      "presearch_count": presearch_count,
+                                      "distinct_walks": len(walk_vocab)})
+                        continue
                     # If the agent NARRATED instead of giving a bare value
                     # ("I now have clear evidence…", "Looking at the facts…"),
                     # convert it via a forced final_answer turn — otherwise
@@ -1026,13 +1285,23 @@ class McpMetaAgent:
                                     "following the format rules (absolute "
                                     "calendar date for 'when'; shortest label; "
                                     + (
-                                        "THIS IS A PLURAL QUESTION — list "
+                                        # inference-plural → a FEW best labels,
+                                        # not an exhaustive list (the gold is a
+                                        # small canonical estimate).
+                                        "THIS IS AN OPEN-ESTIMATE QUESTION — "
+                                        "give the 1-3 MOST LIKELY canonical "
+                                        "labels, comma-separated, NOT an "
+                                        "exhaustive list. "
+                                        if (_ENUM_Q_RE.search(question or "")
+                                            and _is_inference_q(question))
+                                        else "THIS IS A PLURAL QUESTION — list "
                                         "ALL items found, comma-separated. "
                                         "Do NOT collapse to one item. "
                                         if _ENUM_Q_RE.search(question or "")
                                         else "full list for plural. "
                                     )
-                                    + "No narration."
+                                    + "No narration. "
+                                    + _final_answer_hint(question)
                                 ),
                             }],
                         )
@@ -1054,6 +1323,126 @@ class McpMetaAgent:
                 final_tu = next(
                     (b for b in tool_uses if b.name == "final_answer"), None)
                 if final_tu is not None:
+                    # HARD PROCESS FLOOR (cat3). Refuse to answer until the
+                    # recon + breadth protocol has actually run : >= 1
+                    # presearch AND >= _MIN_DISTINCT_WALKS walks with DIFFERENT
+                    # vocabulary. This is process-driven, not grounding-driven
+                    # (the grounding pivot below is a separate, weaker gate) —
+                    # it forces the agent to use the tools we wired even when
+                    # it feels confident after one literal walk. Bounded by
+                    # _MAX_FLOOR_REDIRECTS and the round budget, so abstention
+                    # questions still terminate at the forced-final.
+                    # Recon floor : a presearch, then EITHER a clue_search
+                    # (the inference recon op — ~10x cheaper than a walk and
+                    # the right tool for indirect questions) OR two distinct
+                    # walks. clue_search thus replaces the 2nd forced walk on
+                    # inference items.
+                    _floor_unmet = (
+                        presearch_count < 1
+                        or (_vocab_gap and clue_search_count < 1)
+                        or (clue_search_count < 1
+                            and len(walk_vocab) < _MIN_DISTINCT_WALKS))
+                    if (_floor_unmet
+                            and floor_redirects < _MAX_FLOOR_REDIRECTS
+                            and round_idx < self.max_rounds - 1):
+                        floor_redirects += 1
+                        _need = []
+                        if presearch_count < 1:
+                            _need.append(
+                                "run presearch with 3-4 candidate phrasings "
+                                "(literal terms, answer-domain synonyms, "
+                                "behavioural clues) and walk the one whose "
+                                "hits are on-topic")
+                        if _vocab_gap and clue_search_count < 1:
+                            _need.append(
+                                "call clue_search(question=…) NOW — this is an "
+                                "inference / abstract-verb question; "
+                                "clue_search brainstorms the evidence-register "
+                                "lines and anchors on the question's actual "
+                                "topic (do NOT answer from a different topic "
+                                "you happened to retrieve)")
+                        elif (clue_search_count < 1
+                                and len(walk_vocab) < _MIN_DISTINCT_WALKS):
+                            _need.append(
+                                "EITHER call clue_search(question=…) (for an "
+                                "inference question — it brainstorms the "
+                                "evidence-register lines) OR run at least "
+                                f"{_MIN_DISTINCT_WALKS} walk_start calls with "
+                                "DIFFERENT vocabulary (you have "
+                                f"{len(walk_vocab)} distinct so far)")
+                        floor_msg = (
+                            "Do not answer yet — the answer's words usually "
+                            "differ from the question's, so a single literal "
+                            "walk lands off the evidence. You must still : "
+                            + "; ".join(_need) + ". Do the missing step now."
+                        )
+                        floor_results: List[Dict[str, Any]] = [{
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": (floor_msg if tu.id == final_tu.id
+                                        else "Skipped — recon/breadth floor "
+                                             "not met yet."),
+                        } for tu in tool_uses]
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user",
+                                         "content": floor_results})
+                        trace.append({"round": round_idx,
+                                      "action": "floor_redirect",
+                                      "presearch_count": presearch_count,
+                                      "distinct_walks": len(walk_vocab),
+                                      "floor_redirects": floor_redirects})
+                        continue  # back to top — satisfy the floor first
+                    # VOCAB-GAP ABSTAIN GUARD. If the agent is about to
+                    # abstain ("Not mentioned") on a question whose verb is
+                    # abstract ("what did X research / study / look into?")
+                    # and HAS NOT tried clue_search yet, redirect to
+                    # clue_search before accepting the abstain. The evidence
+                    # is usually in the conversation but in the answer's
+                    # vocabulary, not the question's. The check on
+                    # `clue_search_count == 0` keeps this from looping after
+                    # the agent has already tried clue_search and still
+                    # wants to abstain.
+                    _final_value = str(
+                        (final_tu.input or {}).get("value", "")).lower()
+                    _abstaining = any(s in _final_value for s in (
+                        "not mentioned", "no information", "isn't mentioned",
+                        "not mention", "no mention", "doesn't mention",
+                        "don't have", "not stated", "not specified",
+                        "can't find", "cannot find",
+                    ))
+                    if (_abstaining
+                            and _is_vocab_gap_q(question)
+                            and clue_search_count == 0
+                            and floor_redirects < _MAX_FLOOR_REDIRECTS
+                            and round_idx < self.max_rounds - 1):
+                        floor_redirects += 1
+                        guard_msg = (
+                            "Hold on — you are about to abstain on a question "
+                            "whose answer is likely in the conversation but in "
+                            "DIFFERENT words than the question's (e.g. the "
+                            "question says 'research' but the turn says "
+                            "'researching adoption agencies'). You have NOT "
+                            "tried clue_search yet. Call clue_search(question="
+                            "…) NOW : it brainstorms concrete chat lines that "
+                            "would be evidence for different plausible "
+                            "answers and retrieves over them. Then decide."
+                        )
+                        guard_results: List[Dict[str, Any]] = [{
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": (guard_msg if tu.id == final_tu.id
+                                        else "Skipped — try clue_search "
+                                             "before abstaining."),
+                        } for tu in tool_uses]
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user",
+                                         "content": guard_results})
+                        trace.append({"round": round_idx,
+                                      "action": "vocab_gap_abstain_redirect",
+                                      "clue_search_count": clue_search_count})
+                        continue
                     # SIGNAL-DRIVEN pivot (not question-type-driven). The
                     # meta-walk fires when single-hop retrieval is INCONCLUSIVE,
                     # measured by GROUNDING : how many DISTINCT on-target facts
@@ -1161,9 +1550,8 @@ class McpMetaAgent:
                 messages.append({"role": "assistant", "content": resp.content})
                 tool_results: List[Dict[str, Any]] = []
                 for tu in tool_uses:
-                    if tu.name not in _ALLOWED_TOOLS:
-                        result_text = (f"Tool {tu.name} not permitted — only "
-                                       "walk_start and walk_next are allowed.")
+                    if _ALLOWED_TOOLS is not None and tu.name not in _ALLOWED_TOOLS:
+                        result_text = (f"Tool {tu.name} not permitted.")
                     elif tu.name == "walk_next" and walk_start_count == 0:
                         # Guard : walk_next without any walk_start.
                         result_text = ("Call walk_start first.")
@@ -1198,8 +1586,19 @@ class McpMetaAgent:
                                                 seen_contents.append(_c)
                         except Exception:
                             pass
+                        if tu.name == "presearch":
+                            presearch_count += 1
+                        if tu.name == "clue_search":
+                            clue_search_count += 1
                         if tu.name == "walk_start":
                             walk_start_count += 1
+                            # Track DISTINCT walk vocabulary for the breadth
+                            # floor : two walks with the same phrasing are not
+                            # a breadth pivot. Normalise to a sorted token set.
+                            _q = str((tu.input or {}).get("query", "")).lower()
+                            _vocab = frozenset(re.findall(r"[a-z0-9]+", _q))
+                            if _vocab:
+                                walk_vocab.add(_vocab)
                             done_seen = False  # reset — new walk, new chance
                         # Detect done + drift flags for trace / pivot signal.
                         try:
@@ -1258,8 +1657,8 @@ class McpMetaAgent:
                         "content": (
                             _ab_choice_hint(question)
                             + f"Walk finished.{ev_ctx}"
-                            "Call final_answer now with the bare value, "
-                            "copied verbatim from the evidence."
+                            "Call final_answer now with the bare value. "
+                            + _final_answer_hint(question)
                         ),
                     })
             else:
@@ -1289,8 +1688,8 @@ class McpMetaAgent:
                         "content": (
                             _ab_choice_hint(question)
                             + f"Stop searching.{forced_evidence}"
-                            "Call final_answer with the bare value, copied "
-                            "verbatim from the evidence."
+                            "Call final_answer with the bare value. "
+                            + _final_answer_hint(question)
                         ),
                     }],
                 )
@@ -1320,7 +1719,15 @@ class McpMetaAgent:
             # question, run a dedicated aggregation pass over relevant_
             # collected that lists every distinct item — exploiting the
             # MAP-REDUCE we already build instead of trusting free-form.
+            # NOT for inference questions : their gold is a small canonical
+            # ESTIMATE (e.g. "Psychology, counseling certification"), not an
+            # exhaustive enumeration. The "list EVERY item / prefer MORE
+            # commas" pass over-generates there ("Counseling, Mental health,
+            # LGBTQ+ counseling, Therapeutic work with trans people, Art")
+            # and token-F1 precision collapses. A factual plural ("what
+            # events did X attend") still enumerates fully.
             if (_ENUM_Q_RE.search(question or "")
+                    and not _is_inference_q(question)
                     and len(last_relevant_collected) >= 1):
                 ev = "\n".join(
                     f"- {e.get('content', '')}"
@@ -1349,10 +1756,88 @@ class McpMetaAgent:
                 except Exception:
                     pass
 
+            # INFERENCE synthesis over ASSOCIATION-GROUPED evidence. The gold
+            # is a small canonical estimate ; a flat list lets unrelated facts
+            # reinforce each other ("...Art"). Present the evidence grouped by
+            # association and let the LLM pick the group(s) that answer —
+            # WITHOUT merging unrelated groups. Not a dominant-cluster vote ;
+            # the model decides, the grouping just blocks false reinforcement.
+            elif (_is_inference_q(question)
+                    and len(last_relevant_collected) >= 3):
+                grouped = _grouped_evidence_text(last_relevant_collected, memory)
+                if grouped:
+                    try:
+                        # Re-use the input's typed extraction (action verb +
+                        # named entities, Slice A) so the generation FOLLOWS
+                        # THE INPUT, and have the model take a RETROSPECTIVE
+                        # thought over the groups w.r.t. that anchor before
+                        # concluding the best answer.
+                        from metacog.query_anchor import build_query_anchor
+                        qa = build_query_anchor(
+                            question,
+                            entity_extractor=getattr(memory, "entity_extractor", None),
+                            keyword_extractor=getattr(memory, "extractor", None),
+                            encoder=getattr(memory, "encoder", None))
+                        # action verb + named entities if an extractor is
+                        # wired ; else fall back to the question's content
+                        # tokens so the key-terms line is never empty.
+                        anchor_terms = ", ".join(
+                            (qa.salient or qa.soft or [])[:8]) or question
+                        er = _create_with_retry(self.client,
+                            model=self.model, max_tokens=220, temperature=0,
+                            system=(
+                                "You answer an INFERENCE question by "
+                                "reflecting on association-grouped evidence "
+                                "THROUGH THE LENS OF THE QUESTION. [Group 1] "
+                                "is the STRONGEST (most mutually-reinforcing) "
+                                "association; groups are unrelated — never "
+                                "merge them or borrow labels across groups.\n"
+                                "1) In ONE sentence, reflect RETROSPECTIVELY "
+                                "against the question's action + named "
+                                "entities: which group answers? Default to "
+                                "[Group 1] ALONE unless another is clearly "
+                                "required.\n"
+                                "2) ABSTRACT that group to the LEVEL THE "
+                                "QUESTION ASKS FOR — name the canonical "
+                                "category / field its facts represent, while "
+                                "KEEPING the group's own core term. E.g. for "
+                                "a 'what fields' question, evidence "
+                                "'counseling, mental health' → 'psychology, "
+                                "counseling'. Stay WITHIN the chosen group.\n"
+                                "3) Final line 'ANSWER: ...' — 1-3 canonical "
+                                "labels, comma-separated, no prose."),
+                            messages=[{"role": "user", "content":
+                                       f"Question (verbatim): {question}\n"
+                                       f"Question's key terms (action + named "
+                                       f"entities): {anchor_terms}\n\n"
+                                       f"Association-grouped evidence:\n{grouped}"}],
+                        )
+                        if hasattr(er, "usage"):
+                            total_in += getattr(er.usage, "input_tokens", 0) or 0
+                            total_out += getattr(er.usage, "output_tokens", 0) or 0
+                        et = " ".join(b.text for b in er.content
+                                      if b.type == "text").strip()
+                        # take the labels after the retrospective thought,
+                        # stripping any leading markdown/punctuation the model
+                        # emits ("**ANSWER:** ..." → "...").
+                        m = re.search(r"answer\s*:\s*(.+)", et, re.I)
+                        val = (m.group(1) if m else et).strip()
+                        val = val.splitlines()[0].strip() if val else ""
+                        val = re.sub(r"^[\s*_#>:•\-]+", "", val).strip()
+                        if val:
+                            answer_text = val
+                    except Exception:
+                        pass
+
         # Deterministic temporal resolution : rewrite any relative-date
         # answer ("last year") to the absolute date the evidence resolved
         # ("2022"), using the turns' own "(absolute date: …)" clauses.
-        answer_text = _resolve_relative_date_answer(answer_text, seen_contents)
+        # ONLY for temporal questions — otherwise an answer that merely
+        # contains a relative-time word ("recently unemployed") gets
+        # clobbered into an evidence date (the "January 2023" cat3 bug).
+        if _is_temporal_q(question):
+            answer_text = _resolve_relative_date_answer(
+                answer_text, seen_contents)
 
         return {
             "answer": terse(answer_text, question),

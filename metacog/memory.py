@@ -129,6 +129,42 @@ class Memory:
                 pass  # first run
 
     # ------------------------------------------------------------------
+    # Isolation
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> "Memory":
+        """Return an ISOLATED copy of this memory for mutation-safe use.
+
+        The heavy, stateless resources — `encoder`, `llm`, `executor`,
+        `extractor`, `entity_extractor`, `atomic_extractor` — are SHARED
+        by reference (they hold no per-memory state and are expensive to
+        rebuild). Everything mutable — `points` (each `Point`), the
+        observators, the conversation log, every ledger and counter — is
+        DEEP-COPIED, so anything the caller does to the snapshot (ingest,
+        observe, sleep, crystallize, save) cannot touch the original.
+
+        This is what lets a read-only concurrent harness hand each worker
+        the FULL tool surface (including the state-mutating tools) without
+        the workers racing on one shared point cloud: give each its own
+        `memory.snapshot()`.
+
+        `storage_path` is cleared on the clone so a `save()` on a snapshot
+        can never overwrite the original's on-disk store.
+        """
+        import copy
+        # Seed the deepcopy memo with the shared resources keyed by id, so
+        # deepcopy returns them as-is (shared) instead of cloning them.
+        memo: Dict[int, Any] = {}
+        for name in ("encoder", "llm", "executor", "extractor",
+                     "entity_extractor", "atomic_extractor"):
+            obj = getattr(self, name, None)
+            if obj is not None:
+                memo[id(obj)] = obj
+        clone = copy.deepcopy(self, memo)
+        clone.storage_path = None
+        return clone
+
+    # ------------------------------------------------------------------
     # Time
     # ------------------------------------------------------------------
 

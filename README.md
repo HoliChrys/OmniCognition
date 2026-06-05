@@ -258,6 +258,112 @@ flowchart LR
   J -->|yes| WS["walk_start on the<br/>validated query (full σ-walk)"]
 ```
 
+### 3.4 Evidence-register expansion — when the answer's words are not in the question
+
+A subset of inference questions (`cat3` on LoCoMo — *"what might X's
+financial status be?"*) shares **no content words** with their gold
+evidence: the evidence is a casual aside in a different register
+(*"my kids have so much and others don't"* ⇒ *wealthy*), and a literal
+retrieval cannot reach it. HyDE on a hypothetical answer (*"X is
+wealthy"*) also misses — that stays in the answer's register
+(*money / wealth*), not the evidence's.
+
+**`clue_search(question)`** inverts HyDE. A single LLM call brainstorms
+*N* concrete first-person chat lines, each one a hypothetical **piece of
+evidence for a DIFFERENT plausible answer** — spanning the answer space
+(*well-off ↔ struggling*, *direct purchase ↔ indirect family aside*) in
+the register a person actually types. Each clue then drives a small
+top-k retrieval. The clues whose words match real turns surface the
+casual asides that exist in the conversation, and the agent infers the
+answer from what stuck.
+
+**`lineage_neighbors`** — the deterministic lineage bridge — closes the
+last gap. Clue retrieval typically lands on the **neighbours** of the
+gold turn (its previous/next utterances along `sequence_prev`), but not
+on the gold itself. For every conversation chain the clues touched, the
+bridge **gap-fills the contiguous turns between the lowest and highest
+position** the chain saw (bounded so a sparse far-apart pair does not
+drag a whole session in), plus ±k turns of edge expansion. No LLM,
+deterministic. The same routine is reused by `walk_start` as
+`neighbor_possibilities()` to bridge a walk that retrieved only the ends
+of a stretch.
+
+```mermaid
+flowchart LR
+  Q2["question with no<br/>content-word overlap<br/>with the evidence"] --> CS["clue_search<br/>generate N evidence-register<br/>chat lines (1 LLM call)"]
+  CS --> RT["top-k retrieve per clue<br/>(deterministic kNN)"]
+  RT --> LB["lineage_neighbors<br/>gap-fill ±k along sequence_prev"]
+  LB --> CC["merged hits + bridge ids → fact_ids_cumulative<br/>(credited by recall, fed to the answerer)"]
+```
+
+A worked example of the full cascade on the hardest cat3 instance
+(`What might John's financial status be?`) is in
+[§6.1](#61-worked-example--johns-financial-status) and in
+[`docs/john_walkthrough.md`](docs/john_walkthrough.md).
+
+### 3.5 Query-alignment anchor — drift resistance
+
+Every signal that drives the walk and `clue_search` is RELATIVE — a fact is
+scored against the latest reflection, the σ-neighbourhood, or a brainstormed
+clue. That relativity lets the walk go deep, but it also lets it DRIFT off
+the original question (classic pseudo-relevance-feedback *query drift*): a
+noisy clue ("books on gardening") or a co-present topic (Caroline's
+counselling persona on a "what did she research?" question about adoption)
+hijacks the ranking. The literature's answer is an explicit ANCHOR to the
+original query, kept **additively** (Rocchio's α·q_original term; ReformIR's
+"always score relevance w.r.t. the original query"; multi-hop RAG's
+fixed-fraction-per-hop blend). `metacog/query_anchor.py` implements it as a
+typed, parameter-free alignment in three composable slices:
+
+- **(A) the primitive.** `build_query_anchor(question)` extracts SALIENT
+  terms (named entities + content keywords — high-IDF, **exact-match
+  preferred** à la ColBERT) and SOFT terms (implied topics — semantic), and
+  encodes the input ONCE into a fixed anchor vector. `alignment_score(anchor,
+  fact)` is then O(1): an IDF-weighted exact-stem match on the salient terms
+  (the ubiquitous speaker name is IDF-driven to ~0) plus a single cosine of
+  the once-encoded input against the fact's already-stored embedding. No
+  per-token, per-stage re-encoding.
+- **(B) `clue_search` re-rank (Rocchio / ReformIR).** The merged clue hits
+  are re-ranked `(1−α)·clue_relative + α·alignment`, so the on-question turn
+  rises and off-question noise sinks without discarding the clue signal.
+- **(C) per-stage walk anchor (multi-hop).** The typed alignment is a fourth
+  RRF channel in every walk stage (lexical-only there — exact-match is the
+  drift-resistant signal, and it costs no encoding), so a walk seeded with
+  the wrong vocabulary ("research project study") still pulls the gold
+  ("Researching adoption agencies") into its relevant set.
+
+All three are ADDITIVE — the relative per-stage signal is never replaced.
+
+**The alignment score, concretely.** For a fact *f* with stored embedding
+`e_f` and an anchor built from the question *q*,
+
+```
+   alignment(anchor, f)  =  w_lex · LEX(anchor, f)  +  w_sem · max(0, cos(e_q, e_f))
+
+   LEX(anchor, f)  =  ( Σ_{t ∈ salient∪soft}  w_t · idf(t) · 1[ stem(t) ⊆ stems(f) ] )
+                      / ( Σ_t  w_t · idf(t) )
+
+   idf(t)  =  log(N / df(t)) / log(N)            # ∈ (0,1], parameter-free
+```
+
+`e_q` is the input **encoded once** (not synthesised from the extracted
+terms); `e_f` already exists from ingestion — so scoring a fact is **one
+cosine + a set-membership test**, not a per-token re-encoding (an earlier
+ColBERT-faithful MaxSim re-encoded every turn token at every stage and the
+walk crawled). The IDF weight is the crux: the conversation's ubiquitous
+speaker name ("caroline", in every turn via the `Speaker:` prefix) is driven
+to ~0, while the question's rare verb/objects ("research", "adoption")
+dominate — ColBERT's high-IDF exact-match preference, made parameter-free.
+The caller blends `(1−α)·relative + α·alignment` with **α = 0.5** (Rocchio /
+PRF: keep the original-query weight high or feedback drifts the ranking).
+
+**One lesson worth recording.** Slice C (the walk channel) uses the
+**lexical part only** — adding the `cos(e_q, e_f)` term there *re-introduced*
+the dominant-topic bias (`cos(question, fact)` favours the co-present topic),
+diluting the gold's exact-match lead and dropping it back out of the relevant
+set. The semantic cosine belongs in `clue_search` (Slice B), where it is a
+soft re-rank; in the walk, the precise IDF exact-match is what resists drift.
+
 ---
 
 ## 4. Uncertainty-governed depth
@@ -572,6 +678,305 @@ keyword extractor that cached an empty result after one transient API
 error, dropping every subsequent query to a mismatched embedding space.
 Retry-and-never-cache-empty discipline now covers every LLM call.
 
+### 6.1 Worked example — John's financial status
+
+A real cat3 instance from LoCoMo `conv-41` driven live in
+[`benchmarks/locomo/debug_qa.py`](benchmarks/locomo/debug_qa.py) on the
+full 663-turn memory. The full step-by-step trace is in
+[`docs/john_walkthrough.md`](docs/john_walkthrough.md); the diagram below
+is the paper-style résumé of the agent's four rounds.
+
+| | |
+| --- | --- |
+| Question | *"What might John's financial status be?"* |
+| Gold answer | *Middle-class or wealthy* |
+| Gold evidence | `D5:5` — *"My kids have so much and others don't…"* (28 Jan 2023) |
+
+The three vertical lanes mirror the three logical tracks at every round:
+the **indexed substrate** the walk composes over (left — `FACT` green,
+`ACTION` ochre, `THOUGHT` blue, `★` gold turn), the **tool calls and
+decisions** (centre), and the **new content generated this round** that
+did not exist in the manifold before (right — clue utterances, bridge
+neighbours, chain-of-note thoughts, the final inferred label). The
+horizontal dashed boxes are agent rounds. Three dots between edges mean
+*plus N more of the same kind* — this is a résumé, not a 1:1 audit log.
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#FAF7F0",
+    "primaryColor": "#FAF7F0",
+    "primaryBorderColor": "#5B5B5B",
+    "primaryTextColor": "#1F1F1F",
+    "lineColor": "#7A7A7A",
+    "fontFamily": "ui-serif, Georgia, serif",
+    "fontSize": "13px"
+  },
+  "flowchart": { "htmlLabels": true, "curve": "linear", "padding": 10 }
+}}%%
+flowchart TB
+
+Q["<span style='font-size:28px;'><b>Q</b> &nbsp; &quot;What might John's financial status be?&quot;</span><br/><br/><span style='font-size:18px;'><i>gold answer: Middle-class or wealthy &nbsp; · &nbsp; gold evidence: D5:5</i></span>"]:::question
+Q --> R0
+
+subgraph TOPROW[" "]
+  direction LR
+
+  subgraph LEGEND["legend"]
+    direction TB
+    L1["&nbsp;<b>FACT</b>&nbsp;&nbsp;·&nbsp;evidence point&nbsp;"]:::fact
+    L2["&nbsp;<b>ACTION</b>&nbsp;&nbsp;·&nbsp;traversal step&nbsp;"]:::action
+    L3["&nbsp;<b>THOUGHT</b>&nbsp;&nbsp;·&nbsp;reflection&nbsp;"]:::thought
+    L4["&nbsp;<b>TOOL CALL</b>&nbsp;"]:::tool
+    L5["&nbsp;<b>GENERATED</b>&nbsp;·&nbsp;new content&nbsp;"]:::gen
+    L6["&nbsp;<b>★ gold turn</b>&nbsp;"]:::gold
+    L7["&nbsp;…&nbsp;&nbsp;N more of the same kind&nbsp;"]:::dots
+    L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6 ~~~ L7
+  end
+
+  subgraph R0["<b>round 0 — presearch</b>     literal-vocabulary recon · 0 LLM calls · cheap embedding retrieval"]
+    direction LR
+    subgraph R0L["indexed substrate (left)"]
+      direction TB
+      R0L1["D6:6 · D6:14 · D29:4<br/><i>charity / community turns</i>"]:::fact
+      R0L2["D6:9 · D2:6 · D29:4<br/><i>same caritative cluster</i>"]:::fact
+      R0L3["D3:5 · D22:11 · D22:9<br/><i>family / lifestyle turns</i>"]:::fact
+      R0LDOTS(("…")):::dots
+      R0L1 -.- R0L2 -.- R0L3 -.- R0LDOTS
+    end
+    subgraph R0M["tools / decisions (centre)"]
+      direction TB
+      R0T["presearch (3 phrasings)<br/>· John financial status money income<br/>· John wealthy rich poor struggling<br/>· John spending habits possessions lifestyle"]:::tool
+      R0N["<b>diagnosis</b>: every literal-vocabulary path<br/>lands on the caritative persona<br/>→ switch register"]:::decision
+      R0T --> R0N
+    end
+    subgraph R0R["generation (right)"]
+      direction TB
+      R0G["<i>no new content</i><br/>recall = 0.000"]:::genempty
+    end
+  end
+
+end
+R0L -.->|"top-5 each"| R0T
+R0T -.->|"reads hits"| R0R
+R0 --> R1
+
+subgraph R1["<b>round 1 — clue_search</b>     evidence-register expansion · 1 LLM call (~5 s) · then deterministic retrieve + lineage bridge"]
+  direction LR
+  subgraph R1L["indexed substrate (left)"]
+    direction TB
+    R1L1["D11:1<br/><i>'rough patch' near gold chain</i>"]:::fact
+    R1L2["D5:6<br/><i>next turn after gold</i>"]:::fact
+    R1L3["D14:17 · D19:7-12<br/><i>life-event clusters</i>"]:::fact
+    R1LDOTS(("…")):::dots
+    R1LSEP["⇣ lineage_neighbors — gap-fill ±3 along sequence_prev ⇣"]:::sep
+    R1LBG["<b>★ D5:5</b><br/><i>surfaced as bridge neighbour</i><br/>(between D5:4 and D5:6)"]:::gold
+    R1LB2["D11:2 · D5:7 · D8:6 · D8:8<br/>D13:17 · D13:19 · D19:9-11"]:::fact
+    R1LBD(("…")):::dots
+    R1L1 -.- R1L2 -.- R1L3 -.- R1LDOTS -.- R1LSEP -.- R1LBG -.- R1LB2 -.- R1LBD
+  end
+  subgraph R1M["tools / decisions (centre)"]
+    direction TB
+    R1T["clue_search(question)<br/><i>brainstorm N short first-person<br/>chat lines, each evidence for<br/>a DIFFERENT plausible answer</i>"]:::tool
+    R1MX["retrieve top-3 per clue<br/>+ lineage bridge (±window gap-fill)"]:::tool
+    R1MA["<b>anchor re-rank (§3.5, Rocchio/ColBERT)</b><br/>(1−α)·clue_relative + α·alignment<br/>IDF exact-match on the query terms<br/>→ on-question turns rise, noise sinks"]:::decision
+    R1T --> R1MX --> R1MA
+  end
+  subgraph R1R["generation (right) — clue utterances"]
+    direction TB
+    R1G1["'Took the kids to Disney last month…'"]:::gen
+    R1G2["'My car's been in the shop for two weeks<br/>and I can't afford to pick it up.'"]:::gen
+    R1G3["'Lake house down payment.'"]:::gen
+    R1G4["'Eating ramen, rent went up again.'"]:::gen
+    R1G5["'Parents asking about their mortgage.'"]:::gen
+    R1G6["'Got promoted, stock options sweet.'"]:::gen
+    R1GD(("…")):::dots
+    R1G1 -.- R1G2 -.- R1G3 -.- R1G4 -.- R1G5 -.- R1G6 -.- R1GD
+  end
+end
+R1R -.->|"each clue → top-3 retrieve"| R1L
+R1L -.->|"merged + fact_ids_cumulative"| R1M
+R1 -->|"recall 0.000 → <b>1.000</b>"| R2
+
+subgraph R2["<b>round 2 — walk_start</b>     multi-stage Chain-of-Note · σ-governed depth · ~9 stages × ~2 LLM calls"]
+  direction LR
+  subgraph R2L["indexed substrate (left)"]
+    direction TB
+    R2L1["stage 0 — top-7:<br/>D5:4 · <b>★D5:5</b> · D17:9<br/>D10:13 · D10:15 · D6:9 · …"]:::fact
+    R2LA0["ACTION₀ — pivot keyword<br/>'kids · abundance · provide'"]:::action
+    R2L2["stage 1 — D5:6 · D29:14 · D24:16<br/>D22:7 · D3:5 · …"]:::fact
+    R2LA1["ACTION₁ — scan giving / community<br/>sub-thread around the gold turn"]:::action
+    R2L3["stage 2-8 — D20:4 · D15:16<br/>D31:9 · D32:17 · …"]:::fact
+    R2LA2["ACTION₂ — descend into shared-values<br/>cluster (cross-session)"]:::action
+    R2LD(("…")):::dots
+    R2L1 -.- R2LA0 -.- R2L2 -.- R2LA1 -.- R2L3 -.- R2LA2 -.- R2LD
+  end
+  subgraph R2M["tools / decisions (centre)"]
+    direction TB
+    R2T["walk_start<br/>(query = 'John kids have so much<br/>possessions resources family wealth')"]:::tool
+    R2MX["per stage:<br/>1. rank top-k under σ<br/><b>+ anchor RRF channel (§3.5 Slice C)</b><br/>2. Chain-of-Note label<br/>3. THOUGHT generation<br/>4. propagate σ"]:::tool
+    R2MS["stop: σ-cap + keyword coverage<br/>drifted = False · σ_path = 0.63"]:::decision
+    R2T --> R2MX --> R2MS
+  end
+  subgraph R2R["generation (right) — per-stage thoughts"]
+    direction TB
+    R2G0["THOUGHT₀ — 'John speaks of his kids<br/>having a lot, comparison with others'"]:::thought
+    R2G1["THOUGHT₁ — 'abundance vs. need,<br/>framing of giving'"]:::thought
+    R2G2["THOUGHT₂ — 'comfort + civic engagement,<br/>consistent across sessions'"]:::thought
+    R2GD(("…")):::dots
+    R2G0 -.- R2G1 -.- R2G2 -.- R2GD
+    R2GR["<b>relevant_collected</b> (15)<br/>incl. <b>★ D5:5 labelled 'relevant'</b><br/>→ enters the COMPOSE set"]:::gen
+    R2G2 -.- R2GR
+  end
+end
+R2L -.->|"facts → CoN"| R2M
+R2M -.->|"THOUGHT joins the manifold"| R2R
+R2R -.->|"σ feeds back"| R2L
+R2 --> R3
+
+subgraph R3["<b>round 3 — inference synthesis</b>     §6.2 · association-grouped evidence · anchor-conditioned · 1 LLM call"]
+  direction LR
+  subgraph R3L["indexed substrate (left) — HDBSCAN grouping"]
+    direction TB
+    R3LH["<b>mutual-reachability clustering</b><br/>s_mr = min(core_i, core_j, cos)<br/>natural-break cut · soft overlap"]:::decision
+    R3LG1["<b>[Group 1]</b> ★D5:5 · D5:3 · D5:4 · D5:6<br/>D6:6 · D6:14 · D29:4 · D16:3<br/><i>one coherent theme: kids /<br/>inequality / charity</i>"]:::fact
+    R3LN["<i>(on Caroline this stage SPLITS<br/>counselling vs art — here john's<br/>evidence is a single theme)</i>"]:::dots
+    R3LH -.- R3LG1 -.- R3LN
+  end
+  subgraph R3M["tools / decisions (centre)"]
+    direction TB
+    R3D["<b>_is_inference_q</b> matches<br/>'might / status' → inference path"]:::decision
+    R3T["synthesis conditioned on the<br/>ANCHOR (action + entities + verbatim Q)<br/>+ groups; default [Group 1] alone"]:::tool
+    R3D --> R3T
+  end
+  subgraph R3R["generation (right)"]
+    direction TB
+    R3TH["<b>retrospective THOUGHT</b><br/>'which group answers the<br/>question's action+entities?'"]:::thought
+    R3AB["<b>anchor-guided abstraction</b><br/>group → the level the Q asks<br/>(stay within the group)"]:::gen
+    R3G["inferred label<br/>john → 'middle-income' (near-ceiling)<br/>Caroline → 'psychology, counseling' (0.80)"]:::gen
+    R3TH -.- R3AB -.- R3G
+  end
+end
+R3L -.->|"grouped structure"| R3M
+R3M -.->|"reflect, then abstract"| R3R
+
+classDef fact         fill:#EEF3EC,stroke:#5B7C56,color:#1F1F1F,stroke-width:1px;
+classDef action       fill:#F4ECDF,stroke:#A07B3A,color:#1F1F1F,stroke-width:1px;
+classDef thought      fill:#E9EEF6,stroke:#4B6E96,color:#1F1F1F,stroke-width:1px;
+classDef tool         fill:#FFFFFF,stroke:#1F1F1F,color:#1F1F1F,stroke-width:1.4px;
+classDef decision     fill:#FFFFFF,stroke:#7A7A7A,color:#1F1F1F,stroke-dasharray:3 3;
+classDef gen          fill:#F7E7D8,stroke:#B5663A,color:#1F1F1F,stroke-width:1px;
+classDef genempty     fill:#F5F1EA,stroke:#9A9A9A,color:#6B6B6B,stroke-dasharray:2 2;
+classDef gold         fill:#FFF2B0,stroke:#A07A00,color:#1F1F1F,stroke-width:2px,font-weight:bold;
+classDef question     fill:#FFFFFF,stroke:#1F1F1F,color:#1F1F1F,stroke-width:2.6px,font-size:22px;
+classDef dots         fill:#FAF7F0,stroke:#7A7A7A,color:#7A7A7A,stroke-dasharray:1 3;
+classDef sep          fill:#FAF7F0,stroke:#C8C8C8,color:#7A7A7A,stroke-dasharray:4 3,font-style:italic;
+class R0,R1,R2,R3 round;
+classDef round fill:#FAF7F0,stroke:#9A9A9A,color:#1F1F1F,stroke-width:1px,stroke-dasharray:6 4;
+class R0L,R0M,R0R,R1L,R1M,R1R,R1LB,R2L,R2M,R2R,R3L,R3M,R3R lane;
+classDef lane fill:#FAF7F0,stroke:#C8C8C8,color:#4B4B4B,stroke-width:1px;
+class LEGEND legend;
+classDef legend fill:#FFFFFF,stroke:#1F1F1F,color:#1F1F1F,stroke-width:1px;
+```
+
+**What the four rounds do, in one line each.**
+
+- **Round 0** — `presearch` confirms the literal-vocabulary failure: every
+  candidate phrasing lands on John's caritative persona, `D5:5` never
+  appears. Recall stays at 0.
+- **Round 1** — `clue_search` brainstorms six evidence-register chat
+  lines (the *Disney with the kids* clue, the *car in the shop* clue, …).
+  Each retrieves three real turns; the lineage bridge fills the gaps
+  between them, **surfacing `D5:5` as a bridge neighbour** of the *Disney*
+  clue's hit `D5:6`. Recall → 1.0 in a single round.
+- **Round 2** — `walk_start` runs a ~9-stage Chain-of-Note that **picks
+  up the clue vocabulary** (the agent seeds the walk with *"kids have so
+  much"*, not the literal *"financial status"*). `D5:5` is now labelled
+  `relevant` and enters the compose set.
+- **Round 3** — `final_answer`. The detector `_is_inference_q` matches
+  *"might / status"* and the agent receives the **inferential** hint
+  (canonical label from the evidence, **not** a quote), so the answer is
+  a status label and not an echo of *"my kids have so much"*.
+
+This `conv-41` instance is the **`no_bridge ∩ ambiguous` tail of cat3**
+(John speaks at length about unemployment in his community, so even with
+`D5:5` in the compose set the canonical label can flip between *wealthy*
+and *modest* across runs). The composition step is the documented
+residual; on `neighbor_bridge`-class cat3 (≈ 25 % of the category, e.g.
+the *Caroline / counseling career* probe) the same pipeline produces a
+clean recall 1.0 *and* a clean F1.
+
+### 6.2 Inference synthesis over association-grouped evidence
+
+A flat list of retrieved facts lets unrelated evidence reinforce each other
+in the final composition: for *"what fields would Caroline pursue?"* the
+gathered evidence holds a tight counselling / mental-health group AND an
+unrelated *art* turn, and a linear synthesis lists them all
+(*"...Art"*), collapsing token-F1 precision. `metacog/answer_cluster.py`
+SEGMENTS the evidence into association groups so reinforcement is computed
+WITHIN a group, never across unrelated ones — it does NOT pick a single
+dominant cluster (a complex question may draw on several groups; that is
+the LLM's call), it only supplies the structure.
+
+**Why HDBSCAN-style, not plain clustering.** The natural first reflex —
+single-linkage connected components on the cosine graph — *chains*: "a
+single noise point in the wrong place acts as a bridge between islands", so
+the lone *art* turn, linked through a transitional fact, glues itself to the
+counselling cluster. The fix is HDBSCAN's **mutual-reachability** similarity
+(Campello et al. 2013). With a node's *core* similarity `core_i` = its k-th
+highest cosine (k = `min_cluster_size`),
+
+```
+   s_mr(i, j)  =  min( core_i, core_j, cos(i, j) )
+```
+
+a semantically isolated fact (few close neighbours → low core) is pulled
+*down* from everything — it can no longer bridge, and it falls out as its own
+group: native outlier handling, no chaining. The edge cut is a parameter-free
+**natural break** — the largest gap in the sorted `s_mr` values (Jenks-style)
+— which is robust to the *bimodal* "tight cluster + outliers" shape that a
+median+σ cut breaks on (σ then lifts the threshold *above* the cluster's own
+internal similarities and nothing connects). **Soft overlap** is
+link-community-style (Ahn, Bagrow & Lehmann, Nature 2010): a fact also joins
+a second group when its mean similarity to that group clears the threshold —
+a turn about two related things genuinely belongs to both.
+
+The choice was made empirically, not by taste: on the real Caroline cat3
+evidence (MiniLM embeddings) the two methods give
+
+| | counselling | *art* | outliers (adoption, books) | small/sparse set |
+| --- | --- | --- | --- | --- |
+| **mutual-reachability** | grouped | grouped, separate | singletons | robust |
+| link-communities (Ahn) | grouped | left edgeless | "no community" | degenerates (3 edges) |
+
+Both remain selectable via `method=` in `associate_clusters`.
+
+**The synthesis** is a small final pass, conditioned on the query anchor
+(§3.5 — the input's action verb + named entities, plus the verbatim query):
+
+1. a **retrospective thought** over the groups — which one(s) match the
+   question's action+entities, defaulting to the strongest `[Group 1]` alone
+   unless another is clearly required (never merging or borrowing across
+   groups);
+2. **anchor-guided abstraction** of the chosen group to the level the
+   question asks. The gold answer is usually an abstraction the evidence only
+   *implies* — for *"what **fields**"*, evidence *"counseling, mental health"*
+   → **"psychology, counseling"** (the field it represents), keeping the
+   group's own term and staying within the group (the earlier "Fine Arts /
+   LGBTQ Studies" leak came from crossing groups, not from abstracting);
+3. emit 1–3 canonical labels.
+
+On the *Caroline / fields* probe this lifts token-F1 from **0.14** (flat
+over-enumeration) to **0.80**. On *john* the evidence is one thematically
+coherent group (charity / inequality / `D5:5` all together), so the same
+pass reads it — defensibly — as *"middle-income, community-minded"*: the
+documented near-ceiling, faithfully reflected by the single-group structure.
+The lineage bridge that feeds the synthesis is made **deterministic** (§3.4)
+by padding the gap-fill ±window and forcing the clue generator to cover the
+indirect lifestyle register where status evidence actually lives (john bridge
+recall 60 % → 83 %).
+
 ---
 
 ## 7. Usage
@@ -704,3 +1109,37 @@ uv run python -m benchmarks.locomo.eval \
 6. BIPM. *Guide to the Expression of Uncertainty in Measurement* (GUM),
    1995.
 7. Cormack et al. *Reciprocal Rank Fusion*, 2009.
+
+### Drift resistance — query anchoring (§3.5)
+
+8. Rocchio, J.J. *Relevance Feedback in Information Retrieval*, in Salton
+   (ed.), The SMART Retrieval System, 1971. (The α·q_original anchor term.)
+9. *When More Reformulations Hurt: Avoiding Drift using Ranker Feedback*
+   (ReformIR). arXiv:2605.00560. (Score relevance w.r.t. the ORIGINAL query;
+   reformulations as down-weightable features.)
+10. Khattab & Zaharia. *ColBERT: Efficient and Effective Passage Search via
+    Contextualized Late Interaction over BERT*, SIGIR 2020. (MaxSim;
+    high-IDF terms prefer exact lexical match.)
+11. Wang et al. *Pseudo Relevance Feedback with Deep Language Models and
+    Dense Retrievers.* ACM TOIS, 2023. (Rocchio interpolation in dense
+    embedding space; keep α high to resist drift.)
+12. *When Iterative RAG Beats Ideal Evidence: A Diagnostic Study in
+    Scientific Multi-hop QA.* arXiv:2601.19827. ·  *PAR²-RAG.*
+    arXiv:2603.29085. (Fixed-fraction original-query anchoring per hop.)
+
+### Evidence segmentation — association clustering (§6.2)
+
+13. Wang et al. *Evidence Aggregation for Answer Re-Ranking in Open-Domain
+    Question Answering.* arXiv:1711.05116. (Strength- and coverage-based:
+    an answer supported by more mutually-reinforcing passages wins.)
+14. *TopClustRAG* (SIGIR 2025 LiveRAG). arXiv:2506.15246. (Cluster
+    passages, answer per cluster, marginalise outlier clusters.)
+15. Ahn, Bagrow & Lehmann. *Link communities reveal multiscale complexity
+    in networks.* Nature, 2010. (Edge clustering → native overlap.)
+16. Campello, Moulavi & Sander. *Density-Based Clustering Based on
+    Hierarchical Density Estimates* (HDBSCAN), 2013. (Mutual-reachability
+    distance defeats single-linkage chaining; native outlier labelling.)
+17. Xie & Szymanski. *SLPA: Speaker-Listener Label Propagation* — overlapping
+    community detection.
+18. *EviMem: Evidence-Gap-Driven Iterative Retrieval for Long-Term
+    Conversational Memory.* arXiv:2604.27695.

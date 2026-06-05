@@ -91,6 +91,31 @@ _DEFAULT_STAGES = 16
 # bridged to is kept, not the raw query terms.
 _MAX_EVIDENCE = 15
 
+# LINEAGE NEIGHBOUR EXPANSION (the "offer multiple possibilities" rule).
+# When a walk's on-target grounding is THIN — the proxy for "the gold is
+# probably outside the top-k the seed could reach" — the answer turn is
+# often sitting one or two turns away from a turn the walk DID retrieve
+# (measured on LoCoMo cat3 : the literal seed lands on D5:2/3/6/8 but the
+# wealth-implying gold D5:5 stays just out of reach). Rather than commit to
+# the single best chain, the walk then OFFERS the sequence-adjacent turns
+# (±_NEIGHBOUR_WINDOW along the conversation chain) of everything it
+# retrieved, as extra candidate evidence. Deterministic, no LLM, bounded.
+_NEIGHBOUR_WINDOW = 2          # how many turns out, each direction (edge)
+_MAX_NEIGHBOURS = 12          # hard cap on offered possibilities
+_MAX_FILL_SPAN = 12           # max contiguous turns to fill between two hits
+_NEIGHBOUR_GATE = 3           # promote into compose set when relevant_cum < this
+
+# COMPOSE-SET FALLBACK — when the Chain-of-Note labelled almost nothing
+# `relevant` (a vocab-gap walk : the seed register and the evidence register
+# do not share content words), the agent would otherwise see an empty
+# compose set and abstain. Retrieval has often touched the gold across the
+# stages (it sits in `_fact_ids_cum`, just unlabelled). We then re-rank the
+# unlabelled candidates by cosine similarity to the query embedding and
+# promote the top `_FALLBACK_K` with label "retrieved" — a weaker confidence
+# than "relevant", so the prompt knows.
+_FALLBACK_RELEVANT_GATE = 2
+_FALLBACK_K = 5
+
 
 # ----------------------------------------------------------------------
 # HyDE — Hypothetical Document Embeddings (Gao et al., 2022), as an
@@ -186,6 +211,112 @@ def hyde_passage(query: str, llm: Any) -> str:
     if passage:
         _HYDE_CACHE[q] = passage
     return passage
+def lineage_neighbors(
+    seed_ids: Sequence[str],
+    points: Sequence["Point"],            # noqa: F821
+    *,
+    window: int = _NEIGHBOUR_WINDOW,
+    cap: int = _MAX_NEIGHBOURS,
+) -> List[dict]:
+    """The "multiple possibilities" offered when the gold is likely just out
+    of a query's reach : the sequence-adjacent turns of everything retrieved.
+
+    Two mechanisms, both deterministic / no LLM :
+      (a) GAP FILL — when retrieval landed on the spaced ENDS of a stretch
+          (e.g. D5:2 and D5:8) the answer often sits in the MIDDLE (D5:5),
+          out of any fixed ±window. So for each conversation chain the seeds
+          touched, fill the contiguous turns between the lowest and highest
+          retrieved position (bounded by `_MAX_FILL_SPAN`).
+      (b) EDGE WINDOW — also offer ±`window` turns beyond every seed.
+
+    Ingestion sets only `sequence_prev`, so the forward link is derived
+    (the turn whose prev is X is X's next). Returns the turns NOT already in
+    `seed_ids`, as `{id, content, relevance:"neighbor"}`, nearest-first,
+    capped at `cap`. Used by the walk (over its retrieved set) and by
+    `clue_search` (over its merged clue hits)."""
+    seen = {s for s in (seed_ids or []) if isinstance(s, str)}
+    if not seen:
+        return []
+    by_id = {p.id: p for p in points}
+    nxt: dict = {}
+    for p in points:
+        if p.sequence_prev:
+            nxt.setdefault(p.sequence_prev, p.id)
+
+    ordered: List[str] = []
+    seen_out: set = set()
+
+    def _add(nid: Optional[str]) -> None:
+        if nid and nid not in seen and nid not in seen_out:
+            seen_out.add(nid)
+            ordered.append(nid)
+
+    # (a) gap fill per conversation chain
+    chains: dict = {}
+    for fid in list(seen):
+        path = []
+        cur = fid
+        guard = 0
+        while cur is not None and guard < 2000:
+            path.append(cur)
+            p = by_id.get(cur)
+            cur = p.sequence_prev if p else None
+            guard += 1
+        root = path[-1] if path else fid
+        chains.setdefault(root, {})[len(path) - 1] = fid
+    for root, pos_map in chains.items():
+        if len(pos_map) < 2:
+            continue
+        lo0, hi0 = min(pos_map), max(pos_map)
+        if hi0 - lo0 > _MAX_FILL_SPAN:
+            continue
+        # PAD the fill by ±window : the gold is often just BEYOND the span the
+        # clues hit (they land on D5:2/D5:3, the answer is D5:5). Filling only
+        # BETWEEN the hits misses it, and the edge-window then loses the cap
+        # race against dist-1 of many seeds. Padding the contiguous fill makes
+        # the gold deterministically surface whenever a hit is within `window`
+        # of it, and (being added before the edge-window) it survives the cap.
+        lo, hi = max(0, lo0 - window), hi0 + window
+        seq: List[str] = []
+        cur = root
+        guard = 0
+        while cur is not None and guard < (hi + 2):
+            seq.append(cur)
+            cur = nxt.get(cur)
+            guard += 1
+        for pos in range(lo, hi + 1):
+            if pos < len(seq):
+                _add(seq[pos])
+
+    # (b) edge window
+    for dist in range(1, window + 1):
+        for fid in list(seen):
+            cur = fid
+            for _ in range(dist):
+                p = by_id.get(cur)
+                cur = p.sequence_prev if p else None
+                if cur is None:
+                    break
+            _add(cur)
+            cur = fid
+            for _ in range(dist):
+                cur = nxt.get(cur)
+                if cur is None:
+                    break
+            _add(cur)
+
+    out: List[dict] = []
+    for nid in ordered:
+        p = by_id.get(nid)
+        if p is not None and p.kind == PointKind.FACT \
+                and not p.id.startswith(("entity_", "atom_")):
+            out.append({"id": p.id, "content": p.content,
+                        "relevance": "neighbor"})
+        if len(out) >= cap:
+            break
+    return out
+
+
 # Match the system retrieval budget (k=7) so a walk's stage-0 facts are
 # the same top-k a single-shot retrieve would return — the walk can then
 # only ADD evidence across later stages, never lose what single-shot found.
@@ -348,6 +479,7 @@ def nearest_facts_with_fallback(
     anchor_query: Optional[str] = None,
     hyde_passage_text: Optional[str] = None,
     section_filter: Optional[set] = None,
+    query_anchor: Any = None,
 ) -> List[Point]:
     """FACT retrieval — delegates to the FULL hybrid pipeline.
 
@@ -434,7 +566,14 @@ def nearest_facts_with_fallback(
         # system uses : the section's own tools/files get a rank boost
         # without excluding anything from the free channel.
         has_section = bool(section_filter)
-        if has_anchor or has_hyde or has_section:
+        # SLICE C — typed query-alignment anchor (ColBERT MaxSim + IDF),
+        # fired at EVERY stage (a fixed-fraction anchor per the multi-hop
+        # drift literature), not only on drift like the BM25 channel. RRF-
+        # merged, so it can only PROMOTE on-question facts, never drop any
+        # (recall preserved) — additive, not substitutive.
+        has_align = bool(
+            query_anchor is not None and not query_anchor.is_empty())
+        if has_anchor or has_hyde or has_section or has_align:
             rrf_scores: dict = {}
             pid_map: dict = {}
             for rank, (_, p) in enumerate(results):
@@ -474,6 +613,27 @@ def nearest_facts_with_fallback(
                     restrict_kind=PointKind.FACT,
                 )
                 for rank, (_, p) in enumerate(hyde_pool):
+                    rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
+                    pid_map.setdefault(p.id, p)
+            if has_align:
+                from metacog.query_anchor import alignment_score
+                fact_pts = [p for p in search_points
+                            if p.kind == PointKind.FACT]
+                # LEXICAL-ONLY here (set ops, zero encoding) : the precise
+                # exact-match-on-salient signal is the drift-resistant anchor
+                # the walk needs. Adding the input-embedding cosine re-injects
+                # the dominant-topic bias (cosine(question, fact) favours the
+                # co-present topic), diluting the gold's exact-match lead — so
+                # the semantic side stays in clue_search, not the walk.
+                scored_al = [
+                    (alignment_score(query_anchor, p.content,
+                                     lexical_only=True), p)
+                    for p in fact_pts
+                ]
+                scored_al.sort(key=lambda x: -x[0])
+                for rank, (al, p) in enumerate(scored_al[:overfetch]):
+                    if al <= 0.0:
+                        break
                     rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + rank)
                     pid_map.setdefault(p.id, p)
             merged = sorted(rrf_scores.items(), key=lambda x: -x[1])
@@ -1466,6 +1626,24 @@ class MetaWalker:
             except Exception:
                 self._hyde_passage = ""
 
+        # SLICE C — typed query-alignment anchor, built ONCE per walk and
+        # fed to every stage's retrieval (no per-stage cost beyond scoring).
+        # Uses the keyword extractor + any entity extractor + IDF over the
+        # corpus ; entity extraction is skipped when no extractor is wired
+        # (then it degrades to keyword/raw-token alignment, no extra LLM).
+        self._query_anchor = None
+        try:
+            from metacog.query_anchor import build_query_anchor
+            self._query_anchor = build_query_anchor(
+                self.query,
+                entity_extractor=getattr(self.memory, "entity_extractor", None),
+                keyword_extractor=self._extr,
+                encoder=self._enc,
+                corpus_texts=[p.content for p in self.memory.points],
+            )
+        except Exception:
+            self._query_anchor = None
+
         # Stage-0 seed embedding from the query keywords. Position-
         # weighted (1/(i+1) decay) so the top keyword drives the vector.
         q_kws = self._extr.extract(query, n=8) if self._extr else []
@@ -1618,7 +1796,53 @@ class MetaWalker:
         Full recall is unaffected : `fact_ids_cumulative` still lists every
         fact seen ; this only bounds what is COMPOSED over.
         """
-        cum = self._relevant_cum
+        cum = list(self._relevant_cum)
+
+        # Vocab-gap fallback : when the CoN labelled almost nothing relevant,
+        # promote the top-`_FALLBACK_K` unlabelled retrieved facts (re-ranked
+        # by cosine similarity to the query embedding) as `retrieved`, so the
+        # answerer sees something on-topic when the seed was off-register
+        # (cat1 "What did X research?" with evidence "Researching adoption
+        # agencies" — the gold sits in fact_ids_cumulative but the academic-
+        # register walk never CoN-labelled it relevant).
+        seen_ids = {p.id for p in cum}
+        if (len(cum) < _FALLBACK_RELEVANT_GATE
+                and len(self._fact_ids_cum) > _FALLBACK_K
+                and getattr(self.memory, "encoder", None) is not None
+                and (self.query or "").strip()):
+            by_id = {p.id: p for p in self.memory.points}
+            candidates: List[Point] = []
+            for fid in self._fact_ids_cum:
+                if fid in seen_ids or fid not in by_id:
+                    continue
+                p = by_id[fid]
+                if p.kind != PointKind.FACT \
+                        or p.id.startswith(("entity_", "atom_")):
+                    continue
+                candidates.append(p)
+            if candidates:
+                try:
+                    import numpy as np
+                    q_emb = np.asarray(
+                        self.memory.encoder.encode(self.query), dtype=float)
+                    q_norm = float(np.linalg.norm(q_emb)) + 1e-12
+                    ranked: List[Tuple[float, Point]] = []
+                    for p in candidates:
+                        e = p.embedding_orig
+                        if e is None:
+                            continue
+                        pe = np.asarray(e, dtype=float)
+                        denom = q_norm * (float(np.linalg.norm(pe)) + 1e-12)
+                        sim = float(np.dot(q_emb, pe) / denom)
+                        ranked.append((sim, p))
+                    ranked.sort(reverse=True, key=lambda x: x[0])
+                    for _, p in ranked[:_FALLBACK_K]:
+                        self._relevant_label.setdefault(p.id, "retrieved")
+                        cum.append(p)
+                        seen_ids.add(p.id)
+                except Exception:
+                    pass
+
         if len(cum) <= _MAX_EVIDENCE:
             return [
                 {"id": p.id, "content": p.content,
@@ -1644,6 +1868,27 @@ class MetaWalker:
              "relevance": self._relevant_label.get(p.id, "relevant")}
             for p in ranked
         ]
+
+    def neighbor_possibilities(
+        self,
+        *,
+        window: int = _NEIGHBOUR_WINDOW,
+        cap: int = _MAX_NEIGHBOURS,
+    ) -> List[dict]:
+        """Sequence-adjacent turns of everything the walk retrieved — the
+        "multiple possibilities" offered when the gold is likely just out of
+        the seed's reach. Delegates to the module-level `lineage_neighbors`
+        over the walk's own retrieved set (`_fact_ids_cum`)."""
+        return lineage_neighbors(
+            self._fact_ids_cum, self.memory.points,
+            window=window, cap=cap,
+        )
+
+    def grounding_is_thin(self) -> bool:
+        """True when the walk collected fewer than `_NEIGHBOUR_GATE` on-target
+        facts — the proxy for "the gold is likely out of the seed's reach",
+        used to decide whether to offer the lineage neighbours."""
+        return len(self._relevant_cum) < _NEIGHBOUR_GATE
 
     def _query_covered(self) -> bool:
         """True when every query keyword appears in the gathered evidence's
@@ -1808,6 +2053,7 @@ class MetaWalker:
             anchor_query=self.query if seed_query != self.query else None,
             hyde_passage_text=self._hyde_passage or None,
             section_filter=self.section_filter,
+            query_anchor=self._query_anchor,
         )
 
         # Feed the LATERAL co-retrieval ledger : this ranked result, under
