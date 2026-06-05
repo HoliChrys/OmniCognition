@@ -607,9 +607,49 @@ _INFER_Q_RE = re.compile(
     re.IGNORECASE,
 )
 
+# VOCAB-GAP factual questions — the question's verb is ABSTRACT
+# ("research", "study", "look into", "work on", "decide", "plan") and the
+# evidence uses the CONCRETE topic word instead ("researching adoption
+# agencies", "planning a trip to Lisbon"). Single-shot retrieval on the
+# abstract verb misses, the walk in its register doesn't CoN-label the gold
+# relevant, and the agent abstains. Detected to force `clue_search` (which
+# brainstorms the concrete topics) even though the question is factual,
+# not inferential.
+_VOCAB_GAP_FACTUAL_Q_RE = re.compile(
+    r"\bwhat\b.{0,30}\b(?:did|does|do|has|have|was|were|is|are)\b"
+    r".{0,30}\b(?:research(?:ing|ed)?|stud(?:y|ying|ied)|look(?:ing)? into|"
+    r"investigat(?:e|ing|ed)|explor(?:e|ing|ed)|decid(?:e|ing|ed)|"
+    r"plan(?:ning|ned)?|work(?:ing)? on|consider(?:ing|ed)?|"
+    r"think(?:ing)? about)\b",
+    re.IGNORECASE,
+)
+
 
 def _is_inference_q(question: Optional[str]) -> bool:
     return bool(_INFER_Q_RE.search(question or ""))
+
+
+def _is_vocab_gap_q(question: Optional[str]) -> bool:
+    """Inference question OR vocab-gap factual — both benefit from
+    `clue_search`, the evidence-register expander."""
+    q = question or ""
+    return bool(_INFER_Q_RE.search(q) or _VOCAB_GAP_FACTUAL_Q_RE.search(q))
+
+
+# TEMPORAL questions — "when did…", "what year/date/month/day…", "how long
+# ago…". Only these should have the relative-date resolver applied to the
+# final answer; otherwise an answer that merely CONTAINS a relative-time
+# word ("recently unemployed", "lately struggling") gets clobbered into the
+# evidence turn's absolute date (the "January 2023" bug on a cat3 question).
+_TEMPORAL_Q_RE = re.compile(
+    r"\bwhen\b|\bwhat\s+(?:year|date|month|day|time)\b|\bhow\s+long\s+ago\b|"
+    r"\bwhat\s+day\s+of\b|\bon\s+what\s+(?:date|day)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_temporal_q(question: Optional[str]) -> bool:
+    return bool(_TEMPORAL_Q_RE.search(question or ""))
 
 
 def _final_answer_hint(question: Optional[str]) -> str:
@@ -1275,6 +1315,56 @@ class McpMetaAgent:
                                       "distinct_walks": len(walk_vocab),
                                       "floor_redirects": floor_redirects})
                         continue  # back to top — satisfy the floor first
+                    # VOCAB-GAP ABSTAIN GUARD. If the agent is about to
+                    # abstain ("Not mentioned") on a question whose verb is
+                    # abstract ("what did X research / study / look into?")
+                    # and HAS NOT tried clue_search yet, redirect to
+                    # clue_search before accepting the abstain. The evidence
+                    # is usually in the conversation but in the answer's
+                    # vocabulary, not the question's. The check on
+                    # `clue_search_count == 0` keeps this from looping after
+                    # the agent has already tried clue_search and still
+                    # wants to abstain.
+                    _final_value = str(
+                        (final_tu.input or {}).get("value", "")).lower()
+                    _abstaining = any(s in _final_value for s in (
+                        "not mentioned", "no information", "isn't mentioned",
+                        "not mention", "no mention", "doesn't mention",
+                        "don't have", "not stated", "not specified",
+                        "can't find", "cannot find",
+                    ))
+                    if (_abstaining
+                            and _is_vocab_gap_q(question)
+                            and clue_search_count == 0
+                            and floor_redirects < _MAX_FLOOR_REDIRECTS
+                            and round_idx < self.max_rounds - 1):
+                        floor_redirects += 1
+                        guard_msg = (
+                            "Hold on — you are about to abstain on a question "
+                            "whose answer is likely in the conversation but in "
+                            "DIFFERENT words than the question's (e.g. the "
+                            "question says 'research' but the turn says "
+                            "'researching adoption agencies'). You have NOT "
+                            "tried clue_search yet. Call clue_search(question="
+                            "…) NOW : it brainstorms concrete chat lines that "
+                            "would be evidence for different plausible "
+                            "answers and retrieves over them. Then decide."
+                        )
+                        guard_results: List[Dict[str, Any]] = [{
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": (guard_msg if tu.id == final_tu.id
+                                        else "Skipped — try clue_search "
+                                             "before abstaining."),
+                        } for tu in tool_uses]
+                        messages.append(
+                            {"role": "assistant", "content": resp.content})
+                        messages.append({"role": "user",
+                                         "content": guard_results})
+                        trace.append({"round": round_idx,
+                                      "action": "vocab_gap_abstain_redirect",
+                                      "clue_search_count": clue_search_count})
+                        continue
                     # SIGNAL-DRIVEN pivot (not question-type-driven). The
                     # meta-walk fires when single-hop retrieval is INCONCLUSIVE,
                     # measured by GROUNDING : how many DISTINCT on-target facts
@@ -1583,7 +1673,12 @@ class McpMetaAgent:
         # Deterministic temporal resolution : rewrite any relative-date
         # answer ("last year") to the absolute date the evidence resolved
         # ("2022"), using the turns' own "(absolute date: …)" clauses.
-        answer_text = _resolve_relative_date_answer(answer_text, seen_contents)
+        # ONLY for temporal questions — otherwise an answer that merely
+        # contains a relative-time word ("recently unemployed") gets
+        # clobbered into an evidence date (the "January 2023" cat3 bug).
+        if _is_temporal_q(question):
+            answer_text = _resolve_relative_date_answer(
+                answer_text, seen_contents)
 
         return {
             "answer": terse(answer_text, question),

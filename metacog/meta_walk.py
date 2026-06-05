@@ -105,6 +105,17 @@ _MAX_NEIGHBOURS = 12          # hard cap on offered possibilities
 _MAX_FILL_SPAN = 12           # max contiguous turns to fill between two hits
 _NEIGHBOUR_GATE = 3           # promote into compose set when relevant_cum < this
 
+# COMPOSE-SET FALLBACK — when the Chain-of-Note labelled almost nothing
+# `relevant` (a vocab-gap walk : the seed register and the evidence register
+# do not share content words), the agent would otherwise see an empty
+# compose set and abstain. Retrieval has often touched the gold across the
+# stages (it sits in `_fact_ids_cum`, just unlabelled). We then re-rank the
+# unlabelled candidates by cosine similarity to the query embedding and
+# promote the top `_FALLBACK_K` with label "retrieved" — a weaker confidence
+# than "relevant", so the prompt knows.
+_FALLBACK_RELEVANT_GATE = 2
+_FALLBACK_K = 5
+
 
 # ----------------------------------------------------------------------
 # HyDE — Hypothetical Document Embeddings (Gao et al., 2022), as an
@@ -1731,7 +1742,53 @@ class MetaWalker:
         Full recall is unaffected : `fact_ids_cumulative` still lists every
         fact seen ; this only bounds what is COMPOSED over.
         """
-        cum = self._relevant_cum
+        cum = list(self._relevant_cum)
+
+        # Vocab-gap fallback : when the CoN labelled almost nothing relevant,
+        # promote the top-`_FALLBACK_K` unlabelled retrieved facts (re-ranked
+        # by cosine similarity to the query embedding) as `retrieved`, so the
+        # answerer sees something on-topic when the seed was off-register
+        # (cat1 "What did X research?" with evidence "Researching adoption
+        # agencies" — the gold sits in fact_ids_cumulative but the academic-
+        # register walk never CoN-labelled it relevant).
+        seen_ids = {p.id for p in cum}
+        if (len(cum) < _FALLBACK_RELEVANT_GATE
+                and len(self._fact_ids_cum) > _FALLBACK_K
+                and getattr(self.memory, "encoder", None) is not None
+                and (self.query or "").strip()):
+            by_id = {p.id: p for p in self.memory.points}
+            candidates: List[Point] = []
+            for fid in self._fact_ids_cum:
+                if fid in seen_ids or fid not in by_id:
+                    continue
+                p = by_id[fid]
+                if p.kind != PointKind.FACT \
+                        or p.id.startswith(("entity_", "atom_")):
+                    continue
+                candidates.append(p)
+            if candidates:
+                try:
+                    import numpy as np
+                    q_emb = np.asarray(
+                        self.memory.encoder.encode(self.query), dtype=float)
+                    q_norm = float(np.linalg.norm(q_emb)) + 1e-12
+                    ranked: List[Tuple[float, Point]] = []
+                    for p in candidates:
+                        e = p.embedding_orig
+                        if e is None:
+                            continue
+                        pe = np.asarray(e, dtype=float)
+                        denom = q_norm * (float(np.linalg.norm(pe)) + 1e-12)
+                        sim = float(np.dot(q_emb, pe) / denom)
+                        ranked.append((sim, p))
+                    ranked.sort(reverse=True, key=lambda x: x[0])
+                    for _, p in ranked[:_FALLBACK_K]:
+                        self._relevant_label.setdefault(p.id, "retrieved")
+                        cum.append(p)
+                        seen_ids.add(p.id)
+                except Exception:
+                    pass
+
         if len(cum) <= _MAX_EVIDENCE:
             return [
                 {"id": p.id, "content": p.content,

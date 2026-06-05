@@ -58,11 +58,15 @@ def clue_utterances(question: str, llm: Any, n: int = 6) -> List[str]:
         "bill) AND INDIRECT ones — offhand remarks about their FAMILY, KIDS, "
         "HOME, daily life, what they have or give, comparisons to others — "
         "since the real evidence is usually an indirect aside, not a "
-        "declaration. Use the concrete everyday wording a real person "
-        "actually types — specific nouns, plain facts, no abstract category "
-        "words from the question itself. Do NOT restate or reference the "
-        "question, do NOT hedge, do NOT explain or label. Output exactly one "
-        "line per clue, no numbering, no bullets."
+        "declaration. If the question uses an abstract verb (research, study, "
+        "look into, work on, plan, decide), interpret it BROADLY — the real "
+        "evidence may be a LIFE topic ('researching adoption agencies', "
+        "'planning a trip to Lisbon', 'looking into a counseling certificate') "
+        "rather than an academic one. Use the concrete everyday wording a "
+        "real person actually types — specific nouns, plain facts, no "
+        "abstract category words from the question itself. Do NOT restate or "
+        "reference the question, do NOT hedge, do NOT explain or label. "
+        "Output exactly one line per clue, no numbering, no bullets."
     )
     lines: List[str] = []
     try:
