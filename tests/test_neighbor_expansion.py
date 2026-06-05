@@ -37,6 +37,32 @@ def test_gold_between_two_retrieved_neighbors_is_surfaced():
     assert "D5:4" in nb
 
 
+def test_gap_fill_catches_gold_between_spaced_hits():
+    """The real cat3 failure : the walk retrieved only the spaced ENDS of a
+    stretch (D5:2 and D5:8), and the gold D5:5 sits in the middle — out of
+    reach of any fixed ±window. Gap-fill must include the whole span."""
+    m = _chain(10)
+    w = MetaWalker("x", m, commit=False)
+    w._fact_ids_cum = ["D5:2", "D5:8"]
+    w._relevant_cum = []
+    ids = {n["id"] for n in w.neighbor_possibilities()}
+    for mid in ("D5:3", "D5:4", "D5:5", "D5:6", "D5:7"):
+        assert mid in ids, f"{mid} not filled between D5:2 and D5:8"
+
+
+def test_gap_fill_bounded_by_max_span():
+    """A sparse pair of hits across a huge stretch must NOT pull everything
+    in — the fill is bounded by _MAX_FILL_SPAN."""
+    from metacog.meta_walk import _MAX_FILL_SPAN
+    m = _chain(_MAX_FILL_SPAN + 6)
+    w = MetaWalker("x", m, commit=False)
+    w._fact_ids_cum = ["D5:1", f"D5:{_MAX_FILL_SPAN + 5}"]  # span > limit
+    w._relevant_cum = []
+    ids = {n["id"] for n in w.neighbor_possibilities(window=1)}
+    # Far-apart pair: the middle is NOT bulk-filled (only ±window edges).
+    assert f"D5:{_MAX_FILL_SPAN // 2}" not in ids
+
+
 def test_neighbors_exclude_already_seen():
     m = _chain()
     w = MetaWalker("x", m, commit=False)

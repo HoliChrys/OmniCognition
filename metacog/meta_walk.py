@@ -100,9 +100,10 @@ _MAX_EVIDENCE = 15
 # the single best chain, the walk then OFFERS the sequence-adjacent turns
 # (±_NEIGHBOUR_WINDOW along the conversation chain) of everything it
 # retrieved, as extra candidate evidence. Deterministic, no LLM, bounded.
-_NEIGHBOUR_WINDOW = 2          # how many turns out, each direction
-_MAX_NEIGHBOURS = 10          # hard cap on offered possibilities
-_NEIGHBOUR_GATE = 3           # expand only when relevant_cum has fewer than this
+_NEIGHBOUR_WINDOW = 2          # how many turns out, each direction (edge)
+_MAX_NEIGHBOURS = 12          # hard cap on offered possibilities
+_MAX_FILL_SPAN = 12           # max contiguous turns to fill between two hits
+_NEIGHBOUR_GATE = 3           # promote into compose set when relevant_cum < this
 
 
 # ----------------------------------------------------------------------
@@ -1700,8 +1701,48 @@ class MetaWalker:
                 seen_out.add(nid)
                 ordered.append(nid)
 
-        # Interleave by distance so the closest neighbours of every seed win
-        # the cap before any seed's far neighbours.
+        # (a) GAP FILL — the answer turn is often in the MIDDLE of a stretch
+        # the walk retrieved only the ENDS of (e.g. it surfaced D5:2 and D5:8
+        # but the gold D5:5 sits between them). A fixed ±window from each end
+        # never reaches the centre, so for every conversation chain the walk
+        # touched, FILL the contiguous turns between its lowest and highest
+        # retrieved position. Bounded by `_MAX_FILL_SPAN` so a sparse pair of
+        # hits across a whole session doesn't pull the entire session in.
+        chains: dict = {}    # head id (chain root) -> {pos: id} for seen turns
+        # Walk each seen turn back to its chain root to group co-chain turns,
+        # recording each turn's integer position along the chain.
+        for fid in list(seen):
+            path = []
+            cur = fid
+            guard = 0
+            while cur is not None and guard < 2000:
+                path.append(cur)
+                p = by_id.get(cur)
+                cur = p.sequence_prev if p else None
+                guard += 1
+            root = path[-1] if path else fid
+            pos = len(path) - 1            # distance from root
+            chains.setdefault(root, {})[pos] = fid
+        for root, pos_map in chains.items():
+            if len(pos_map) < 2:
+                continue
+            lo, hi = min(pos_map), max(pos_map)
+            if hi - lo > _MAX_FILL_SPAN:
+                continue
+            # Re-walk from root collecting id-by-position, then fill [lo, hi].
+            seq: List[str] = []
+            cur = root
+            guard = 0
+            while cur is not None and guard < (hi + 2):
+                seq.append(cur)
+                cur = nxt.get(cur)
+                guard += 1
+            for pos in range(lo, hi + 1):
+                if pos < len(seq):
+                    _add(seq[pos])
+
+        # (b) EDGE WINDOW — also offer ±`window` turns beyond every retrieved
+        # turn, nearest-first, so the possibilities extend just past the hits.
         for dist in range(1, window + 1):
             for fid in list(seen):
                 cur = fid                      # backward `dist` steps
