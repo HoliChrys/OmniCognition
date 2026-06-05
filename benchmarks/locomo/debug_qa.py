@@ -335,6 +335,31 @@ class QADebugger:
                 self._track([e.get("id")])
         self.cmd_recall()
 
+    async def cmd_clues(self, session, arg: str):
+        q = arg.strip() or self.question
+        out = await self._call(session, "clue_search", question=q,
+                               k_per_clue=3, n_clues=6)
+        self._record("clue_search", {"question": q}, out)
+        print(f"\n  clue_search({q!r})")
+        print("  generated clues (evidence-register, spanning answers):")
+        for c in out.get("clues", []):
+            print(f"    · {c}")
+        print("  per-clue hits:")
+        for r in out.get("results", []):
+            for h in r.get("hits", []):
+                print(f"      [{self._mark(h['id'])}] from clue {r['clue'][:40]!r}: "
+                      f"{h['content'][:56]}")
+            self._track(h["id"] for h in r.get("hits", []))
+        merged = out.get("merged", [])
+        self._track(h["id"] for h in merged)        # incl. lineage-bridge nbrs
+        nb = out.get("neighbor_possibilities") or []
+        if nb:
+            print(f"  lineage-bridge neighbours ({len(nb)}): "
+                  + ", ".join(self._mark(n['id']) for n in nb[:12]))
+        gold_in = [g for g in self.gold if g in {h['id'] for h in merged}]
+        print(f"  merged unique hits: {len(merged)}  gold∈merged={gold_in or '∅'}")
+        self.cmd_recall()
+
     async def cmd_retrieve(self, session, arg: str):
         out = await self._call(session, "retrieve", query=arg.strip(), k=7)
         self._record("retrieve", {"query": arg.strip(), "k": 7}, out)
@@ -491,7 +516,7 @@ class QADebugger:
             "tools": self.cmd_tools, "presearch": self.cmd_presearch,
             "walk": self.cmd_walk, "scoped": self.cmd_scoped,
             "retrieve": self.cmd_retrieve, "auto": self.cmd_auto,
-            "step": self.cmd_step,
+            "step": self.cmd_step, "clues": self.cmd_clues,
         }
         try:
             if cmd in sync:

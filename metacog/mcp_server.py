@@ -481,6 +481,68 @@ def build_app(
         return {"results": out_results, "n_queries": len(qs)}
 
     @app.tool()
+    def clue_search(
+        question: str, k_per_clue: int = 3, n_clues: int = 6,
+        observator_id: str = "",
+    ) -> dict:
+        """INFERENCE-question expander. For a question whose answer is never
+        stated directly ("What might John's financial status be?"), the
+        evidence is a casual aside in a vocabulary that shares NOTHING with
+        the question ("my kids have so much" ⇒ well-off). Querying in the
+        question's words retrieves the wrong turns; HyDE on a hypothetical
+        ANSWER ("John is wealthy") also misses — it stays in the money
+        register, not the evidence register.
+
+        `clue_search` instead has the server BRAINSTORM concrete first-person
+        chat lines that would each be EVIDENCE for a DIFFERENT plausible
+        answer (spanning the answer space — well-off AND struggling), then
+        retrieves over those clue lines. Whichever clue matches a real turn
+        surfaces the actual aside, and you infer the answer from what stuck.
+
+        Use this when a plain `presearch`/`walk_start` on the question
+        drifts or returns only generic on-topic turns. Returns
+        `{"clues":[...], "results":[{clue,hits}], "merged":[top unique hits]}`.
+        """
+        from metacog.clues import clue_utterances
+        clues = clue_utterances(question, memory.llm, n=max(1, int(n_clues)))
+        if not clues:
+            return {"clues": [], "results": [], "merged": [],
+                    "note": "no clues generated (no usable LLM?)"}
+        k = max(1, int(k_per_clue))
+        tag_by_id = {p.id: list(p.tags) for p in memory.points}
+        per_clue = []
+        merged: dict = {}              # id -> best hit (highest score)
+        for c in clues:
+            hits = memory.retrieve(c, k=k, observator_id=observator_id or None)
+            trimmed = [
+                {"id": h["id"], "content": h["content"], "score": h["score"],
+                 "kind": h["kind"], "tags": tag_by_id.get(h["id"], [])}
+                for h in hits
+            ]
+            per_clue.append({"clue": c, "hits": trimmed, "n_hits": len(trimmed)})
+            for h in trimmed:
+                cur = merged.get(h["id"])
+                if cur is None or h["score"] > cur["score"]:
+                    merged[h["id"]] = h
+        merged_list = sorted(merged.values(), key=lambda h: -h["score"])
+        # LINEAGE BRIDGE — the clues often land on the SPACED neighbours of
+        # the real aside (kids/family clues hit D5:3 and D5:6, the gold D5:5
+        # sits between them). Gap-fill the conversation chain between the
+        # merged hits so the in-between answer turn surfaces too.
+        from metacog.meta_walk import lineage_neighbors
+        # Generous bridge for clue recon : many clue hits act as seeds, so a
+        # wider window + larger cap is needed for a dist-2 in-between turn
+        # (the gold one step past a clue hit) to survive the cap race.
+        nbrs = lineage_neighbors([h["id"] for h in merged_list], memory.points,
+                                 window=3, cap=40)
+        if nbrs:
+            for n in nbrs:
+                n["tags"] = tag_by_id.get(n["id"], [])
+            merged_list = merged_list + nbrs
+        return {"clues": clues, "results": per_clue, "merged": merged_list,
+                "neighbor_possibilities": nbrs}
+
+    @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
         """Run a full reasoning trajectory until output convenable."""
         result = memory.reason(query, with_executor=with_executor, apply_compression=apply_compression)

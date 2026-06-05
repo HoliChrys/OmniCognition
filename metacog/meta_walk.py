@@ -200,6 +200,105 @@ def hyde_passage(query: str, llm: Any) -> str:
     if passage:
         _HYDE_CACHE[q] = passage
     return passage
+def lineage_neighbors(
+    seed_ids: Sequence[str],
+    points: Sequence["Point"],            # noqa: F821
+    *,
+    window: int = _NEIGHBOUR_WINDOW,
+    cap: int = _MAX_NEIGHBOURS,
+) -> List[dict]:
+    """The "multiple possibilities" offered when the gold is likely just out
+    of a query's reach : the sequence-adjacent turns of everything retrieved.
+
+    Two mechanisms, both deterministic / no LLM :
+      (a) GAP FILL — when retrieval landed on the spaced ENDS of a stretch
+          (e.g. D5:2 and D5:8) the answer often sits in the MIDDLE (D5:5),
+          out of any fixed ±window. So for each conversation chain the seeds
+          touched, fill the contiguous turns between the lowest and highest
+          retrieved position (bounded by `_MAX_FILL_SPAN`).
+      (b) EDGE WINDOW — also offer ±`window` turns beyond every seed.
+
+    Ingestion sets only `sequence_prev`, so the forward link is derived
+    (the turn whose prev is X is X's next). Returns the turns NOT already in
+    `seed_ids`, as `{id, content, relevance:"neighbor"}`, nearest-first,
+    capped at `cap`. Used by the walk (over its retrieved set) and by
+    `clue_search` (over its merged clue hits)."""
+    seen = {s for s in (seed_ids or []) if isinstance(s, str)}
+    if not seen:
+        return []
+    by_id = {p.id: p for p in points}
+    nxt: dict = {}
+    for p in points:
+        if p.sequence_prev:
+            nxt.setdefault(p.sequence_prev, p.id)
+
+    ordered: List[str] = []
+    seen_out: set = set()
+
+    def _add(nid: Optional[str]) -> None:
+        if nid and nid not in seen and nid not in seen_out:
+            seen_out.add(nid)
+            ordered.append(nid)
+
+    # (a) gap fill per conversation chain
+    chains: dict = {}
+    for fid in list(seen):
+        path = []
+        cur = fid
+        guard = 0
+        while cur is not None and guard < 2000:
+            path.append(cur)
+            p = by_id.get(cur)
+            cur = p.sequence_prev if p else None
+            guard += 1
+        root = path[-1] if path else fid
+        chains.setdefault(root, {})[len(path) - 1] = fid
+    for root, pos_map in chains.items():
+        if len(pos_map) < 2:
+            continue
+        lo, hi = min(pos_map), max(pos_map)
+        if hi - lo > _MAX_FILL_SPAN:
+            continue
+        seq: List[str] = []
+        cur = root
+        guard = 0
+        while cur is not None and guard < (hi + 2):
+            seq.append(cur)
+            cur = nxt.get(cur)
+            guard += 1
+        for pos in range(lo, hi + 1):
+            if pos < len(seq):
+                _add(seq[pos])
+
+    # (b) edge window
+    for dist in range(1, window + 1):
+        for fid in list(seen):
+            cur = fid
+            for _ in range(dist):
+                p = by_id.get(cur)
+                cur = p.sequence_prev if p else None
+                if cur is None:
+                    break
+            _add(cur)
+            cur = fid
+            for _ in range(dist):
+                cur = nxt.get(cur)
+                if cur is None:
+                    break
+            _add(cur)
+
+    out: List[dict] = []
+    for nid in ordered:
+        p = by_id.get(nid)
+        if p is not None and p.kind == PointKind.FACT \
+                and not p.id.startswith(("entity_", "atom_")):
+            out.append({"id": p.id, "content": p.content,
+                        "relevance": "neighbor"})
+        if len(out) >= cap:
+            break
+    return out
+
+
 # Match the system retrieval budget (k=7) so a walk's stage-0 facts are
 # the same top-k a single-shot retrieve would return — the walk can then
 # only ADD evidence across later stages, never lose what single-shot found.
@@ -1667,108 +1766,12 @@ class MetaWalker:
     ) -> List[dict]:
         """Sequence-adjacent turns of everything the walk retrieved — the
         "multiple possibilities" offered when the gold is likely just out of
-        the seed's reach.
-
-        For every FACT id the walk saw (`_fact_ids_cum`), collect up to
-        `window` turns BACKWARD (`sequence_prev`) and `window` turns FORWARD
-        (derived reverse index, since ingestion only sets `sequence_prev`)
-        along the conversation chain. Return the ones the walk did NOT
-        already surface, as `{id, content, relevance:"neighbor"}`, nearest
-        first, capped at `cap`. Deterministic, no LLM.
-
-        This bridges the last step on vocabulary-gap cases : the answer turn
-        ("my kids have so much") carries none of the question's words, so the
-        seed never ranks it — but its neighbours DO retrieve, and the gold
-        sits one hop away on the turn chain.
-        """
-        seen = set(self._fact_ids_cum)
-        if not seen:
-            return []
-        points = list(self.memory.points)
-        by_id = {p.id: p for p in points}
-        # Reverse index : ingestion sets only sequence_prev, so derive the
-        # forward link (the turn whose prev is X is X's next).
-        nxt: dict = {}
-        for p in points:
-            if p.sequence_prev:
-                nxt.setdefault(p.sequence_prev, p.id)
-
-        ordered: List[str] = []          # neighbour ids, nearest-first
-        seen_out: set = set()
-
-        def _add(nid: Optional[str]) -> None:
-            if nid and nid not in seen and nid not in seen_out:
-                seen_out.add(nid)
-                ordered.append(nid)
-
-        # (a) GAP FILL — the answer turn is often in the MIDDLE of a stretch
-        # the walk retrieved only the ENDS of (e.g. it surfaced D5:2 and D5:8
-        # but the gold D5:5 sits between them). A fixed ±window from each end
-        # never reaches the centre, so for every conversation chain the walk
-        # touched, FILL the contiguous turns between its lowest and highest
-        # retrieved position. Bounded by `_MAX_FILL_SPAN` so a sparse pair of
-        # hits across a whole session doesn't pull the entire session in.
-        chains: dict = {}    # head id (chain root) -> {pos: id} for seen turns
-        # Walk each seen turn back to its chain root to group co-chain turns,
-        # recording each turn's integer position along the chain.
-        for fid in list(seen):
-            path = []
-            cur = fid
-            guard = 0
-            while cur is not None and guard < 2000:
-                path.append(cur)
-                p = by_id.get(cur)
-                cur = p.sequence_prev if p else None
-                guard += 1
-            root = path[-1] if path else fid
-            pos = len(path) - 1            # distance from root
-            chains.setdefault(root, {})[pos] = fid
-        for root, pos_map in chains.items():
-            if len(pos_map) < 2:
-                continue
-            lo, hi = min(pos_map), max(pos_map)
-            if hi - lo > _MAX_FILL_SPAN:
-                continue
-            # Re-walk from root collecting id-by-position, then fill [lo, hi].
-            seq: List[str] = []
-            cur = root
-            guard = 0
-            while cur is not None and guard < (hi + 2):
-                seq.append(cur)
-                cur = nxt.get(cur)
-                guard += 1
-            for pos in range(lo, hi + 1):
-                if pos < len(seq):
-                    _add(seq[pos])
-
-        # (b) EDGE WINDOW — also offer ±`window` turns beyond every retrieved
-        # turn, nearest-first, so the possibilities extend just past the hits.
-        for dist in range(1, window + 1):
-            for fid in list(seen):
-                cur = fid                      # backward `dist` steps
-                for _ in range(dist):
-                    p = by_id.get(cur)
-                    cur = p.sequence_prev if p else None
-                    if cur is None:
-                        break
-                _add(cur)
-                cur = fid                      # forward `dist` steps
-                for _ in range(dist):
-                    cur = nxt.get(cur)
-                    if cur is None:
-                        break
-                _add(cur)
-
-        out: List[dict] = []
-        for nid in ordered:
-            p = by_id.get(nid)
-            if p is not None and p.kind == PointKind.FACT \
-                    and not p.id.startswith(("entity_", "atom_")):
-                out.append({"id": p.id, "content": p.content,
-                            "relevance": "neighbor"})
-            if len(out) >= cap:
-                break
-        return out
+        the seed's reach. Delegates to the module-level `lineage_neighbors`
+        over the walk's own retrieved set (`_fact_ids_cum`)."""
+        return lineage_neighbors(
+            self._fact_ids_cum, self.memory.points,
+            window=window, cap=cap,
+        )
 
     def grounding_is_thin(self) -> bool:
         """True when the walk collected fewer than `_NEIGHBOUR_GATE` on-target
