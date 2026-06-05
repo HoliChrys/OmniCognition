@@ -707,15 +707,11 @@ subgraph R1["<b>round 1 — clue_search</b>     evidence-register expansion · 1
     R1L2["D5:6<br/><i>next turn after gold</i>"]:::fact
     R1L3["D14:17 · D19:7-12<br/><i>life-event clusters</i>"]:::fact
     R1LDOTS(("…")):::dots
-    R1L1 -.- R1L2 -.- R1L3 -.- R1LDOTS
-    subgraph R1LB["lineage bridge — gap-fill ±3 along sequence_prev"]
-      direction TB
-      R1LBG["<b>★ D5:5</b><br/><i>surfaced as bridge neighbour</i><br/>(between D5:4 and D5:6)"]:::gold
-      R1LB2["D11:2 · D5:7 · D8:6 · D8:8<br/>D13:17 · D13:19 · D19:9-11"]:::fact
-      R1LBD(("…")):::dots
-      R1LBG -.- R1LB2 -.- R1LBD
-    end
-    R1L3 -.->|"its neighbours along the chain"| R1LB
+    R1LSEP["⇣ lineage_neighbors — gap-fill ±3 along sequence_prev ⇣"]:::sep
+    R1LBG["<b>★ D5:5</b><br/><i>surfaced as bridge neighbour</i><br/>(between D5:4 and D5:6)"]:::gold
+    R1LB2["D11:2 · D5:7 · D8:6 · D8:8<br/>D13:17 · D13:19 · D19:9-11"]:::fact
+    R1LBD(("…")):::dots
+    R1L1 -.- R1L2 -.- R1L3 -.- R1LDOTS -.- R1LSEP -.- R1LBG -.- R1LB2 -.- R1LBD
   end
   subgraph R1M["tools / decisions (centre)"]
     direction TB
@@ -732,13 +728,11 @@ subgraph R1["<b>round 1 — clue_search</b>     evidence-register expansion · 1
     R1G5["'Parents asking about their mortgage.'"]:::gen
     R1G6["'Got promoted, stock options sweet.'"]:::gen
     R1GD(("…")):::dots
-    R1G1 -.- R1G2 -.- R1G3
-    R1G4 -.- R1G5 -.- R1G6 -.- R1GD
+    R1G1 -.- R1G2 -.- R1G3 -.- R1G4 -.- R1G5 -.- R1G6 -.- R1GD
   end
 end
 R1R -.->|"each clue → top-3 retrieve"| R1L
-R1L -.->|"chain neighbours offered"| R1LB
-R1LB -.->|"merged + fact_ids_cumulative"| R1M
+R1L -.->|"merged + fact_ids_cumulative"| R1M
 R1 -->|"recall 0.000 → <b>1.000</b>"| R2
 
 subgraph R2["<b>round 2 — walk_start</b>     multi-stage Chain-of-Note · σ-governed depth · ~9 stages × ~2 LLM calls"]
@@ -746,12 +740,13 @@ subgraph R2["<b>round 2 — walk_start</b>     multi-stage Chain-of-Note · σ-g
   subgraph R2L["indexed substrate (left)"]
     direction TB
     R2L1["stage 0 — top-7:<br/>D5:4 · <b>★D5:5</b> · D17:9<br/>D10:13 · D10:15 · D6:9 · …"]:::fact
+    R2LA0["ACTION₀ — pivot keyword<br/>'kids · abundance · provide'"]:::action
     R2L2["stage 1 — D5:6 · D29:14 · D24:16<br/>D22:7 · D3:5 · …"]:::fact
+    R2LA1["ACTION₁ — scan giving / community<br/>sub-thread around the gold turn"]:::action
     R2L3["stage 2-8 — D20:4 · D15:16<br/>D31:9 · D32:17 · …"]:::fact
+    R2LA2["ACTION₂ — descend into shared-values<br/>cluster (cross-session)"]:::action
     R2LD(("…")):::dots
-    R2L1 -.- R2L2 -.- R2L3 -.- R2LD
-    R2LA["ACTION (per stage)<br/><i>traverse / pivot</i>"]:::action
-    R2L3 -.- R2LA
+    R2L1 -.- R2LA0 -.- R2L2 -.- R2LA1 -.- R2L3 -.- R2LA2 -.- R2LD
   end
   subgraph R2M["tools / decisions (centre)"]
     direction TB
@@ -806,6 +801,7 @@ classDef genempty     fill:#F5F1EA,stroke:#9A9A9A,color:#6B6B6B,stroke-dasharray
 classDef gold         fill:#FFF2B0,stroke:#A07A00,color:#1F1F1F,stroke-width:2px,font-weight:bold;
 classDef question     fill:#FFFFFF,stroke:#1F1F1F,color:#1F1F1F,stroke-width:2.6px,font-size:22px;
 classDef dots         fill:#FAF7F0,stroke:#7A7A7A,color:#7A7A7A,stroke-dasharray:1 3;
+classDef sep          fill:#FAF7F0,stroke:#C8C8C8,color:#7A7A7A,stroke-dasharray:4 3,font-style:italic;
 class R0,R1,R2,R3 round;
 classDef round fill:#FAF7F0,stroke:#9A9A9A,color:#1F1F1F,stroke-width:1px,stroke-dasharray:6 4;
 class R0L,R0M,R0R,R1L,R1M,R1R,R1LB,R2L,R2M,R2R,R3L,R3M,R3R lane;
