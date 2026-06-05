@@ -595,6 +595,36 @@ _ENUM_Q_RE = re.compile(
     re.IGNORECASE,
 )
 
+# INFERENCE questions — the answer is a CONCLUSION the evidence implies, not
+# a quote from it. "What might X's financial status be?", "Would Caroline
+# likely…?", "Is it likely that…?". These must NOT be answered verbatim from
+# the evidence turn (that is the cat3 failure: echoing "my kids have so much"
+# instead of inferring "wealthy"). Detected to flip the final-answer
+# guidance from extractive to inferential.
+_INFER_Q_RE = re.compile(
+    r"\b(might|would|could|likely|probabl|suspect|presumabl|imply|implies|"
+    r"would .* be|what .* status|what .* leaning|how .* feel)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_inference_q(question: Optional[str]) -> bool:
+    return bool(_INFER_Q_RE.search(question or ""))
+
+
+def _final_answer_hint(question: Optional[str]) -> str:
+    """The verbatim-vs-inference instruction injected at the final step."""
+    if _is_inference_q(question):
+        return (
+            "This is an INFERENCE question — the answer is the concise "
+            "CONCLUSION the evidence implies, NOT a quote. Map the evidence's "
+            "specifics to a canonical label via world knowledge (e.g. "
+            "evidence 'my kids have so much' -> 'wealthy'; 'I volunteer every "
+            "week' -> 'community-minded'). Do NOT echo the turn's words, do "
+            "NOT answer yes/no — give the bare inferred label."
+        )
+    return "Copy the bare value VERBATIM from the evidence (the speaker's words)."
+
 # Loop-safety cap on how many times we redirect a premature final_answer back
 # into a pivot when the walk evidence is still inconclusive (weak grounding).
 # NOT a question-type rule — purely a bound so an answer that genuinely isn't
@@ -1161,7 +1191,8 @@ class McpMetaAgent:
                                         if _ENUM_Q_RE.search(question or "")
                                         else "full list for plural. "
                                     )
-                                    + "No narration."
+                                    + "No narration. "
+                                    + _final_answer_hint(question)
                                 ),
                             }],
                         )
@@ -1458,8 +1489,8 @@ class McpMetaAgent:
                         "content": (
                             _ab_choice_hint(question)
                             + f"Walk finished.{ev_ctx}"
-                            "Call final_answer now with the bare value, "
-                            "copied verbatim from the evidence."
+                            "Call final_answer now with the bare value. "
+                            + _final_answer_hint(question)
                         ),
                     })
             else:
@@ -1489,8 +1520,8 @@ class McpMetaAgent:
                         "content": (
                             _ab_choice_hint(question)
                             + f"Stop searching.{forced_evidence}"
-                            "Call final_answer with the bare value, copied "
-                            "verbatim from the evidence."
+                            "Call final_answer with the bare value. "
+                            + _final_answer_hint(question)
                         ),
                     }],
                 )
