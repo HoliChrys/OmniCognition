@@ -562,6 +562,7 @@ def build_app(
                 entity_extractor=getattr(memory, "entity_extractor", None),
                 keyword_extractor=getattr(memory, "extractor", None),
                 encoder=getattr(memory, "encoder", None),
+                corpus_texts=[p.content for p in memory.points],
             )
             if not anchor.is_empty() and merged_list:
                 pt = {p.id: p for p in memory.points}
@@ -571,8 +572,11 @@ def build_app(
                 rng = (hi - lo) or 1.0
                 for h in merged_list:
                     s = h.get("score")
+                    # Bridge neighbours carry no clue score : give them a
+                    # NEUTRAL relative baseline (0.5) so a strong alignment
+                    # can still surface them, instead of zeroing them out.
                     rel = ((s - lo) / rng
-                           if isinstance(s, (int, float)) else 0.0)
+                           if isinstance(s, (int, float)) else 0.5)
                     p = pt.get(h["id"])
                     al = alignment_score(
                         anchor, h.get("content", ""),

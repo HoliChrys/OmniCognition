@@ -75,12 +75,18 @@ class QueryAnchor:
     salient: List[str] = field(default_factory=list)   # exact-match terms
     soft: List[str] = field(default_factory=list)       # semantic terms
     _emb: Dict[str, tuple] = field(default_factory=dict)
+    _idf: Dict[str, float] = field(default_factory=dict)  # rarity weight ∈ (0,1]
     _encoder: Any = None                                 # for turn-token MaxSim
     _tok_emb: Dict[str, tuple] = field(default_factory=dict)  # token emb cache
     question: str = ""
 
     def is_empty(self) -> bool:
         return not (self.salient or self.soft)
+
+    def idf(self, term: str) -> float:
+        """Rarity weight for `term` in (0, 1]. 1.0 when no corpus stats
+        (everything counts) ; ubiquitous terms (the speaker's name) → ~0."""
+        return self._idf.get(term, 1.0)
 
     def _token_embedding(self, token: str):
         """Cached embedding of a single TURN token (for ColBERT MaxSim)."""
@@ -102,6 +108,7 @@ def build_query_anchor(
     entity_extractor: Any = None,
     keyword_extractor: Any = None,
     encoder: Any = None,
+    corpus_texts: Optional[Sequence[str]] = None,
 ) -> QueryAnchor:
     """Extract the typed alignment terms for `question`.
 
@@ -158,7 +165,25 @@ def build_query_anchor(
                 emb[term] = tuple(encoder.encode(term))
             except Exception:
                 pass
-    return QueryAnchor(salient=salient, soft=soft, _emb=emb,
+
+    # IDF rarity weights — the heart of ColBERT's high-IDF preference.
+    # A term in nearly every turn (the conversation's speaker name, common
+    # words) carries no discriminative signal and must not inflate the
+    # alignment of off-topic turns; a rare term (the question's verb / a
+    # specific object) should dominate. weight = log(N/df) / log(N), in
+    # (0, 1]. No corpus → all weights 1.0 (degrades to un-weighted MaxSim).
+    idf: Dict[str, float] = {}
+    if corpus_texts:
+        docs = [{_stem(w) for w in _tokens(t)} for t in corpus_texts]
+        n = len(docs) or 1
+        log_n = math.log(n + 1)
+        for term in set(salient) | set(soft):
+            ts = {_stem(w) for w in _tokens(term)}
+            if not ts:
+                continue
+            df = sum(1 for d in docs if ts <= d)
+            idf[term] = max(0.0, math.log((n + 1) / (df + 1)) / log_n)
+    return QueryAnchor(salient=salient, soft=soft, _emb=emb, _idf=idf,
                        _encoder=encoder, question=q)
 
 
@@ -211,11 +236,13 @@ def alignment_score(
     score = 0.0
     wsum = 0.0
     for s in anchor.salient:
-        wsum += _W_SALIENT
-        score += _W_SALIENT * _maxsim(s, anchor._emb.get(s), turn_tokens,
-                                      turn_stems, anchor, turn_embedding)
+        w = _W_SALIENT * anchor.idf(s)               # IDF-weighted (high-IDF)
+        wsum += w
+        score += w * _maxsim(s, anchor._emb.get(s), turn_tokens,
+                             turn_stems, anchor, turn_embedding)
     for t in anchor.soft:
-        wsum += _W_SOFT
-        score += _W_SOFT * _maxsim(t, anchor._emb.get(t), turn_tokens,
-                                   turn_stems, anchor, turn_embedding)
+        w = _W_SOFT * anchor.idf(t)
+        wsum += w
+        score += w * _maxsim(t, anchor._emb.get(t), turn_tokens,
+                             turn_stems, anchor, turn_embedding)
     return score / wsum if wsum else 0.0
