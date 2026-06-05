@@ -267,9 +267,16 @@ def lineage_neighbors(
     for root, pos_map in chains.items():
         if len(pos_map) < 2:
             continue
-        lo, hi = min(pos_map), max(pos_map)
-        if hi - lo > _MAX_FILL_SPAN:
+        lo0, hi0 = min(pos_map), max(pos_map)
+        if hi0 - lo0 > _MAX_FILL_SPAN:
             continue
+        # PAD the fill by ±window : the gold is often just BEYOND the span the
+        # clues hit (they land on D5:2/D5:3, the answer is D5:5). Filling only
+        # BETWEEN the hits misses it, and the edge-window then loses the cap
+        # race against dist-1 of many seeds. Padding the contiguous fill makes
+        # the gold deterministically surface whenever a hit is within `window`
+        # of it, and (being added before the edge-window) it survives the cap.
+        lo, hi = max(0, lo0 - window), hi0 + window
         seq: List[str] = []
         cur = root
         guard = 0
