@@ -122,7 +122,15 @@ walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
 walk_keepup         keepup streaming: provisional answer re-written each
                     stage until validated (SSE → a self-rewriting message)
 scoped_answer       tag-filtered cascade: walk the discussion first, then
-                    (knowledge_base=true) the global memory seeded by it
+                    (knowledge_base=true) the global memory seeded by it.
+                    match=exact|fuzzy|regex selects how each tag resolves
+                    (exact = equality OR hierarchical ancestry)
+presearch           BATCH reconnaissance GATE: top-k nearest hits per query
+                    WITHOUT a walk — the agent validates a query is
+                    probative before paying walk_start (optional tag
+                    pre-filter, same exact|fuzzy|regex semantics)
+list_tags           glossary of tag NAMESPACES (parent prefixes of the
+                    hierarchical `:` tags, leaf dropped), depth-ordered
 walk_next           deprecated — walk_start runs to completion
 reason · sleep
 ingest_skill        re-index a named skill-JSON directory tree

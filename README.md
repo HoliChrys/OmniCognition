@@ -161,6 +161,31 @@ strictly inside the filtered set. This is the difference between the soft
 retrieval *first* resolves the reference inside the discussion, *then*
 optionally reaches the global knowledge base seeded by what it found.
 
+**Tag matching is tri-modal** (`match=exact|fuzzy|regex`, resolved by
+`metacog/tags.py`). Tags are hierarchical on `:` — `ref:date:2022`,
+`session:s1`, `ref:skill:plot:path:…`. `exact` matches equality **or
+hierarchical ancestry**, so filtering on the namespace `ref:date` selects
+every `ref:date:2022`/`…:2023` point; `fuzzy` tolerates typos
+(segment-wise Levenshtein, reusing the §-fuzzy edit budget); `regex` runs
+`re.search` on the raw tags (e.g. `^ref:date:202[0-9]$`). The available
+namespaces are discoverable via **`list_tags`**, which returns the
+glossary of **parent prefixes** of every hierarchical tag (the leaf —
+the concrete value — is dropped), ordered by hierarchy depth.
+
+### 3.3 Pre-search gate — validate a query before spending a walk
+
+A single `walk_start` runs the *whole* σ-governed walk **and** (under
+`scoped_answer`) the knowledge-base escalation. A query that has no
+probative evidence at its seed therefore pays that entire cascade for
+nothing. The **`presearch`** tool is the cheap gate in front of it: given
+a **batch of candidate queries**, it returns the top-`k` (default 3)
+nearest hits **per query** by plain kNN — **no walk, no escalation**. The
+agent reads the hits, decides which queries are probative, reformulates
+the empty ones, and only then calls `walk_start` on a validated query. An
+optional `tags` pre-filter (same `exact|fuzzy|regex` semantics) orients
+the gate to a date / session / namespace, so reconnaissance can itself be
+scoped before any walk is paid for.
+
 ---
 
 ## 4. Uncertainty-governed depth
@@ -517,7 +542,12 @@ walk_keepup         KEEPUP (§3.1): the snapshot trajectory — a provisional
                     a message that rewrites itself until done=True.
 scoped_answer       SCOPED (§3.2): tag-filtered cascade — walk the
                     discussion first, then (knowledge_base=true) the global
-                    memory seeded by what it found.
+                    memory seeded by what it found. match=exact|fuzzy|regex.
+presearch           GATE (§3.3): batch reconnaissance — top-k nearest hits
+                    per query, NO walk. Validate a query is probative before
+                    paying walk_start (optional tag pre-filter).
+list_tags           glossary of tag NAMESPACES (parent prefixes of the
+                    hierarchical `:` tags, leaf dropped), depth-ordered.
 walk_next           DEPRECATED — walk_start now runs to completion.
 
 # reasoning & consolidation
