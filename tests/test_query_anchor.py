@@ -91,6 +91,23 @@ def test_score_bounded_unit_interval():
         assert 0.0 <= s <= 1.0
 
 
+def test_maxsim_not_diluted_by_long_turn():
+    """ColBERT MaxSim takes the BEST token match — a salient term present in
+    a long, otherwise-unrelated turn must still score high (turn-level mean
+    cosine would dilute it)."""
+    a = _anchor("What did Caroline research?",
+                ents=[_Ent("person", "caroline")], kws=["research"])
+    enc = SimpleEncoder()
+    short = "Researching adoption"
+    long = ("Researching adoption agencies and also we talked about pottery "
+            "and painting and camping and the weather and food and music "
+            "and a hundred other unrelated things that day honestly")
+    s_short = alignment_score(a, short, enc.encode(short))
+    s_long = alignment_score(a, long, enc.encode(long))
+    # exact stem hit on 'research' fires regardless of turn length
+    assert s_long >= 0.3 and abs(s_long - s_short) < 0.5
+
+
 def test_degrades_without_extractors():
     """No entity/keyword extractor → falls back to raw content tokens (soft),
     still usable, never raises."""

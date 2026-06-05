@@ -75,10 +75,25 @@ class QueryAnchor:
     salient: List[str] = field(default_factory=list)   # exact-match terms
     soft: List[str] = field(default_factory=list)       # semantic terms
     _emb: Dict[str, tuple] = field(default_factory=dict)
+    _encoder: Any = None                                 # for turn-token MaxSim
+    _tok_emb: Dict[str, tuple] = field(default_factory=dict)  # token emb cache
     question: str = ""
 
     def is_empty(self) -> bool:
         return not (self.salient or self.soft)
+
+    def _token_embedding(self, token: str):
+        """Cached embedding of a single TURN token (for ColBERT MaxSim)."""
+        if self._encoder is None:
+            return None
+        e = self._tok_emb.get(token)
+        if e is None and token not in self._tok_emb:
+            try:
+                e = tuple(self._encoder.encode(token))
+            except Exception:
+                e = None
+            self._tok_emb[token] = e
+        return e
 
 
 def build_query_anchor(
@@ -143,7 +158,38 @@ def build_query_anchor(
                 emb[term] = tuple(encoder.encode(term))
             except Exception:
                 pass
-    return QueryAnchor(salient=salient, soft=soft, _emb=emb, question=q)
+    return QueryAnchor(salient=salient, soft=soft, _emb=emb,
+                       _encoder=encoder, question=q)
+
+
+def _maxsim(term: str, term_emb, turn_tokens: List[str],
+            turn_stems: set, anchor: QueryAnchor,
+            turn_embedding) -> float:
+    """ColBERT MaxSim for one query `term` over a turn's tokens.
+
+    The score is `max` over the turn's token embeddings of the cosine to the
+    term — the late-interaction operator — with an EXACT (stem) lexical hit
+    short-circuiting to 1.0 (ColBERT's high-IDF exact-match preference).
+    Falls back to a turn-level cosine when per-token encoding is unavailable
+    (so the operator degrades gracefully, never raises)."""
+    t_stems = {_stem(w) for w in _tokens(term)}
+    if t_stems and t_stems <= turn_stems:            # exact lexical MaxSim = 1
+        return 1.0
+    if term_emb is None:
+        return 0.0
+    best = 0.0
+    saw_token = False
+    for w in turn_tokens:                            # MaxSim over turn tokens
+        te = anchor._token_embedding(w)
+        if te is None:
+            continue
+        saw_token = True
+        c = _cos(term_emb, te)
+        if c > best:
+            best = c
+    if not saw_token:                                # no per-token emb → turn-level
+        return max(0.0, _cos(term_emb, turn_embedding))
+    return max(0.0, best)
 
 
 def alignment_score(
@@ -153,30 +199,23 @@ def alignment_score(
 ) -> float:
     """ColBERT-style typed alignment of `anchor` against one turn, in [0, 1].
 
-    Salient terms: EXACT stem match in the turn text → full credit; else a
-    semantic cosine fallback (a salient term may still be paraphrased).
-    Soft terms: cosine only. Weighted by `_W_SALIENT` / `_W_SOFT` and
-    normalised by the total possible weight so the result is comparable
-    across turns and questions."""
+    For every query term, take the MaxSim over the turn's TOKENS (late
+    interaction) — exact stem match short-circuits to 1.0 for the high-IDF
+    salient terms, soft terms contribute their best token cosine. Weighted
+    by `_W_SALIENT` / `_W_SOFT`, normalised by total weight so the result is
+    comparable across turns and questions."""
     if anchor.is_empty():
         return 0.0
-    turn_stems = {_stem(w) for w in _tokens(turn_text)}
+    turn_tokens = _tokens(turn_text)
+    turn_stems = {_stem(w) for w in turn_tokens}
     score = 0.0
     wsum = 0.0
     for s in anchor.salient:
         wsum += _W_SALIENT
-        s_stems = {_stem(w) for w in _tokens(s)}
-        if s_stems and s_stems <= turn_stems:        # exact (stem) lexical hit
-            score += _W_SALIENT
-        else:                                         # semantic fallback
-            score += _W_SALIENT * max(0.0, _cos(anchor._emb.get(s),
-                                                turn_embedding))
+        score += _W_SALIENT * _maxsim(s, anchor._emb.get(s), turn_tokens,
+                                      turn_stems, anchor, turn_embedding)
     for t in anchor.soft:
         wsum += _W_SOFT
-        t_stems = {_stem(w) for w in _tokens(t)}
-        if t_stems and t_stems <= turn_stems:
-            score += _W_SOFT
-        else:
-            score += _W_SOFT * max(0.0, _cos(anchor._emb.get(t),
-                                             turn_embedding))
+        score += _W_SOFT * _maxsim(t, anchor._emb.get(t), turn_tokens,
+                                   turn_stems, anchor, turn_embedding)
     return score / wsum if wsum else 0.0
