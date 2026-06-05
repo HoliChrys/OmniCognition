@@ -539,8 +539,17 @@ def build_app(
             for n in nbrs:
                 n["tags"] = tag_by_id.get(n["id"], [])
             merged_list = merged_list + nbrs
+        # Expose fact_ids_cumulative so recall / id-extraction credit the
+        # clue hits + lineage bridge (same field walk_start uses), otherwise
+        # a clue_search that DID surface the gold scores recall 0.
+        cum_ids: list = []
+        seen_c: set = set()
+        for h in merged_list:
+            if h["id"] not in seen_c:
+                seen_c.add(h["id"])
+                cum_ids.append(h["id"])
         return {"clues": clues, "results": per_clue, "merged": merged_list,
-                "neighbor_possibilities": nbrs}
+                "neighbor_possibilities": nbrs, "fact_ids_cumulative": cum_ids}
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
