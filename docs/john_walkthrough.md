@@ -125,6 +125,16 @@ includes it; the bench's recall metric credits it.
 
 **Recall after round 1 = 1.000** (was 0.000 after round 0).
 
+### Anchor re-rank (§3.5 Slice B)
+
+Before returning, the merged hits are re-ranked against the **original
+question** — `(1−α)·clue_relative + α·alignment` — so a noisy clue's hits
+(the "gardening books" register) sink and on-question turns rise, without
+discarding the clue signal. The alignment is an IDF-weighted exact-stem
+match on the query's terms plus one cosine of the once-encoded question
+against each fact (no per-token re-encoding). The lineage bridge ids are
+kept regardless, so `D5:5` survives the re-rank.
+
 ---
 
 ## Round 2 — `walk_start` (the agent picks up the clue vocabulary)
@@ -157,28 +167,65 @@ walk_start(query = "John kids have so much possessions resources family wealth")
 - `drifted = False` (the walk stayed on topic).
 - Walk cost: ~9 stages × ~2 LLM calls (CoN + thought) ≈ **18 sequential calls**.
 
+Each stage also adds the **per-stage anchor RRF channel (§3.5 Slice C)** —
+a lexical IDF exact-match against the original question — so even a walk
+seeded with the *wrong* register pulls the on-question fact into its
+relevant set (verified on *caroline*: a walk seeded `research project study`
+still surfaces `Researching adoption agencies` as the #1 relevant fact).
+
 ---
 
-## Round 3 — `final_answer` (inference, not extraction)
+## Round 3 — inference synthesis over association-grouped evidence (§6.2)
 
-> The agent calls `final_answer`. The forced-final instruction is
-> **conditional on question type**: `_is_inference_q` matches
-> `might / would / could / likely / status / leaning`, and the agent is
-> told to *infer a canonical label*, **not** copy the evidence verbatim.
+> `_is_inference_q` matches `might / status` → the inference path. The
+> compose set is no longer fed as a flat list: it is **segmented into
+> association groups** (HDBSCAN-style mutual-reachability clustering,
+> `metacog/answer_cluster.py`) so unrelated facts cannot reinforce one
+> another, and the final answer is **conditioned on the query anchor**.
+
+**HDBSCAN grouping of john's evidence.** Replayed in the debugger, the
+mutual-reachability clusterer puts john's evidence in a *single* group:
+
+```
+[Group 1]  ★D5:5 · D5:3 · D5:4 · D5:6 · D6:6 · D6:14 · D29:4 · D16:3
+           (one coherent theme: kids / inequality / charity)
+```
+
+This is faithful, not a failure: john's "my kids have so much" lives in the
+*same* thematic neighbourhood as his charity/community persona, which is
+exactly why the answer reads the way it does. (On *caroline* the identical
+stage SPLITS counselling from the unrelated *art* turn — that contrast is
+what the clusterer is for.)
+
+**The synthesis** then, conditioned on the anchor (the question's action +
+named entities + the verbatim query):
+
+1. a **retrospective thought** — which group answers the question's
+   action/entities? (default `[Group 1]` alone);
+2. **anchor-guided abstraction** of that group to the level the question
+   asks — staying within the group.
 
 | run | answer | F1 |
 | --- | --- | --- |
 | literal-extract (old default) | *"Likely yes, kids have so much"* | 0.0 |
-| inference hint, take 1 | *"Likely modest or struggling"* | 0.0 |
-| `answer wealthy` (manual sanity probe) | *wealthy* | **0.500** |
+| inference hint only | *"Likely modest or struggling"* | 0.0 |
+| **grouped synthesis (current)** | *"middle-income, community-minded"* | partial |
 
-The composition is still the brittle step on `john` — the conversation
-is genuinely ambiguous in surface (John talks at length about unemployment
-in his community), so even after the gold is in the compose set, the
-canonical label can flip. This is the documented residual: `john` is the
-**no_bridge ∩ ambiguous** tail of cat3. On 25 % of cat3 (`neighbor_bridge`
-class — e.g. *caroline*) the same pipeline produces a clean recall 1.0
-**and** a clean F1.
+`john` stays the **near-ceiling** tail: the single coherent group means the
+synthesis defensibly reads *middle-income* rather than *wealthy* — a
+genuine ambiguity, not a pipeline bug. On `neighbor_bridge`-class cat3 the
+same synthesis is a clean win — *caroline / fields* goes **0.14 → 0.80**
+("counseling, mental health" → **"psychology, counseling"** via the
+anchor-guided abstraction).
+
+### Determinism of the bridge that feeds all this
+
+The lineage bridge (Round 1) is the only path that surfaces `D5:5`, and it
+was probabilistic — measured **3/5** over fresh clue generations. Two fixes
+took it to **5/6**: the gap-fill is **padded by ±window** (so the gold
+surfaces even when the clues land *before* it, on D5:2/D5:3), and the clue
+generator is **required to cover the indirect lifestyle register** (so at
+least one clue hits a session-5 turn). See §3.4.
 
 ---
 

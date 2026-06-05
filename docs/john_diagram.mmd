@@ -90,8 +90,9 @@ subgraph R1["<b>round 1 — clue_search</b>     evidence-register expansion · 1
   subgraph R1M["tools / decisions (centre)"]
     direction TB
     R1T["clue_search(question)<br/><i>brainstorm N short first-person<br/>chat lines, each evidence for<br/>a DIFFERENT plausible answer</i>"]:::tool
-    R1MX["retrieve top-3 per clue<br/>+ lineage bridge (gap-fill)"]:::tool
-    R1T --> R1MX
+    R1MX["retrieve top-3 per clue<br/>+ lineage bridge (±window gap-fill)"]:::tool
+    R1MA["<b>anchor re-rank (§3.5, Rocchio/ColBERT)</b><br/>(1−α)·clue_relative + α·alignment<br/>IDF exact-match on the query terms<br/>→ on-question turns rise, noise sinks"]:::decision
+    R1T --> R1MX --> R1MA
   end
 
   subgraph R1R["generation (right) — clue utterances"]
@@ -132,7 +133,7 @@ subgraph R2["<b>round 2 — walk_start</b>     multi-stage Chain-of-Note · σ-g
   subgraph R2M["tools / decisions (centre)"]
     direction TB
     R2T["walk_start<br/>(query = 'John kids have so much<br/>possessions resources family wealth')"]:::tool
-    R2MX["per stage:<br/>1. rank top-k under σ<br/>2. Chain-of-Note label<br/>3. THOUGHT generation<br/>4. propagate σ"]:::tool
+    R2MX["per stage:<br/>1. rank top-k under σ<br/><b>+ anchor RRF channel (§3.5 Slice C)</b><br/>2. Chain-of-Note label<br/>3. THOUGHT generation<br/>4. propagate σ"]:::tool
     R2MS["stop: σ-cap + keyword coverage<br/>drifted = False · σ_path = 0.63"]:::decision
     R2T --> R2MX --> R2MS
   end
@@ -158,29 +159,35 @@ R2 --> R3
 %% ====================================================================
 %%  ROUND 3 — final_answer (inference, not extraction)
 %% ====================================================================
-subgraph R3["<b>round 3 — final_answer</b>     inferential composition · 1 LLM call · world-knowledge label, not a quote"]
+subgraph R3["<b>round 3 — inference synthesis</b>     §6.2 · association-grouped evidence · anchor-conditioned · 1 LLM call"]
   direction LR
 
-  subgraph R3L["indexed substrate (left)"]
+  subgraph R3L["indexed substrate (left) — HDBSCAN grouping"]
     direction TB
-    R3L1["compose set:<br/>★D5:5 + 14 supporting facts<br/>+ THOUGHT chain"]:::fact
+    R3LH["<b>mutual-reachability clustering</b><br/>s_mr = min(core_i, core_j, cos)<br/>natural-break cut · soft overlap"]:::decision
+    R3LG1["<b>[Group 1]</b> ★D5:5 · D5:3 · D5:4 · D5:6<br/>D6:6 · D6:14 · D29:4 · D16:3<br/><i>one coherent theme: kids /<br/>inequality / charity</i>"]:::fact
+    R3LN["<i>(on Caroline this stage SPLITS<br/>counselling vs art — here john's<br/>evidence is a single theme)</i>"]:::dots
+    R3LH -.- R3LG1 -.- R3LN
   end
 
   subgraph R3M["tools / decisions (centre)"]
     direction TB
-    R3T["final_answer(value)"]:::tool
-    R3D["<b>_is_inference_q</b> matches:<br/>'might / would / could / likely<br/>status / leaning'<br/>→ inferential hint, NOT verbatim"]:::decision
-    R3T --> R3D
+    R3D["<b>_is_inference_q</b> matches<br/>'might / status' → inference path"]:::decision
+    R3T["synthesis conditioned on the<br/>ANCHOR (action + entities + verbatim Q)<br/>+ groups; default [Group 1] alone"]:::tool
+    R3D --> R3T
   end
 
   subgraph R3R["generation (right)"]
     direction TB
-    R3G["inferred label<br/>('wealthy' / 'middle-class')<br/><i>F1 measured against gold</i>"]:::gen
+    R3TH["<b>retrospective THOUGHT</b><br/>'which group answers the<br/>question's action+entities?'"]:::thought
+    R3AB["<b>anchor-guided abstraction</b><br/>group → the level the Q asks<br/>(stay within the group)"]:::gen
+    R3G["inferred label<br/>john → 'middle-income' (near-ceiling)<br/>Caroline → 'psychology, counseling' (0.80)"]:::gen
+    R3TH -.- R3AB -.- R3G
   end
 end
 
-R3L -.->|"compose"| R3M
-R3M -.-> R3R
+R3L -.->|"grouped structure"| R3M
+R3M -.->|"reflect, then abstract"| R3R
 
 %% ====================================================================
 %%  Styling
