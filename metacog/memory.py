@@ -1315,6 +1315,7 @@ class Memory:
         tags: Sequence[str],
         knowledge_base: bool = False,
         n_stages: int = 16,
+        match: str = "exact",
     ) -> Dict[str, Any]:
         """Tag-filtered retrieval as a TWO-PHASE cascade.
 
@@ -1329,14 +1330,21 @@ class Memory:
         search. When `knowledge_base=False` the answer stays strictly within
         the filtered set.
 
+        `match` selects how `tags` are resolved on each Point:
+          - "exact" (default) — equality OR hierarchical ancestry, so
+            filtering on `ref:date` includes points carrying
+            `ref:date:2022`. Drop-in for the previous `issubset` behaviour
+            with the added ancestor convenience.
+          - "fuzzy" — segment-wise Levenshtein (typos / morphological
+            variants on tag names).
+          - "regex" — `re.search` on each raw tag (case-insensitive),
+            e.g. `r"^ref:date:202[0-9]$"`.
+
         Returns `{"scoped_answer", "scoped_evidence", "knowledge_base",
         ["global_answer", "global_evidence"]}`."""
         from metacog.meta_walk import MetaWalker, provisional_answer
-        tagset = {t.lower() for t in tags}
-        scoped_ids = {
-            p.id for p in self.points
-            if tagset.issubset({x.lower() for x in p.tags})
-        }
+        from metacog.tags import filter_points
+        scoped_ids = filter_points(self.points, list(tags or []), mode=match)
 
         def _run(q, *, restrict):
             w = MetaWalker(q, self, n_stages=n_stages, commit=False,

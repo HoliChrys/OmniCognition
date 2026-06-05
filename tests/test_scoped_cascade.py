@@ -69,3 +69,35 @@ def test_mcp_scoped_answer_registered():
     from metacog.mcp_server import build_app
     names = [t.name for t in asyncio.run(build_app(memory=Memory()).list_tools())]
     assert "scoped_answer" in names
+
+
+def test_scoped_answer_match_exact_hierarchical_ancestor():
+    """Filtering on a parent prefix `session` matches every `session:sX`."""
+    m = _mem()
+    # Add another session so the ancestor filter has something to bind to.
+    m.ingest_message("orthogonal note about hawks",
+                     role="user", user_id="u", session_id="s9",
+                     timestamp="2026-06-04T11:00:00", block=True)
+    # `session` is the parent prefix of both `session:s1` and `session:s9` —
+    # exact-mode now resolves hierarchically.
+    out = m.scoped_answer("anything", tags=["session"],
+                          knowledge_base=False, n_stages=2, match="exact")
+    ids = {e["id"] for e in out["scoped_evidence"]}
+    s_any_ids = {p.id for p in m.points
+                 if any(t.startswith("session:") for t in p.tags)}
+    # The global raptor FACT carries no `session:*` tag — must stay out.
+    global_fact_ids = {p.id for p in m.points
+                       if not any(t.startswith("session:") for t in p.tags)
+                       and p.kind.name == "FACT"
+                       and not p.id.startswith("entity_")}
+    assert ids <= s_any_ids
+    assert ids.isdisjoint(global_fact_ids)
+
+
+def test_scoped_answer_match_regex_selects_one_session():
+    m = _mem()
+    out = m.scoped_answer("anything", tags=[r"^session:s1$"],
+                          knowledge_base=False, n_stages=2, match="regex")
+    s1_ids = {p.id for p in m.points if "session:s1" in p.tags}
+    for e in out["scoped_evidence"]:
+        assert e["id"] in s1_ids
