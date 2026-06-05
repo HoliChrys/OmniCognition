@@ -1781,29 +1781,33 @@ class McpMetaAgent:
                         anchor_terms = ", ".join(
                             (qa.salient or [])[:6]) or question
                         er = _create_with_retry(self.client,
-                            model=self.model, max_tokens=200, temperature=0,
+                            model=self.model, max_tokens=220, temperature=0,
                             system=(
-                                "You answer by reflecting on association-"
-                                "grouped evidence THROUGH THE LENS OF THE "
-                                "QUESTION'S OWN TERMS. [Group 1] is the "
-                                "STRONGEST (most mutually-reinforcing) "
-                                "association; items in different groups are "
-                                "unrelated — never merge them.\n"
-                                "1) In ONE sentence, reflect RETROSPECTIVELY: "
-                                "which group(s) match the question's action + "
-                                "named entities — default to [Group 1] ALONE "
-                                "unless another is clearly required.\n"
-                                "2) On a final line 'ANSWER: ...' give 1-3 "
-                                "canonical labels in the EVIDENCE'S OWN WORDS "
-                                "— do NOT re-abstract into academic / "
-                                "field-name categories (keep 'counseling', "
-                                "not 'Psychology'/'LGBTQ Studies'). "
-                                "Comma-separated, no prose."),
+                                "You answer an INFERENCE question by "
+                                "reflecting on association-grouped evidence "
+                                "THROUGH THE LENS OF THE QUESTION. [Group 1] "
+                                "is the STRONGEST (most mutually-reinforcing) "
+                                "association; groups are unrelated — never "
+                                "merge them or borrow labels across groups.\n"
+                                "1) In ONE sentence, reflect RETROSPECTIVELY "
+                                "against the question's action + named "
+                                "entities: which group answers? Default to "
+                                "[Group 1] ALONE unless another is clearly "
+                                "required.\n"
+                                "2) ABSTRACT that group to the LEVEL THE "
+                                "QUESTION ASKS FOR — name the canonical "
+                                "category / field its facts represent, while "
+                                "KEEPING the group's own core term. E.g. for "
+                                "a 'what fields' question, evidence "
+                                "'counseling, mental health' → 'psychology, "
+                                "counseling'. Stay WITHIN the chosen group.\n"
+                                "3) Final line 'ANSWER: ...' — 1-3 canonical "
+                                "labels, comma-separated, no prose."),
                             messages=[{"role": "user", "content":
-                                       f"Question: {question}\n"
+                                       f"Question (verbatim): {question}\n"
                                        f"Question's key terms (action + named "
                                        f"entities): {anchor_terms}\n\n"
-                                       f"{grouped}"}],
+                                       f"Association-grouped evidence:\n{grouped}"}],
                         )
                         if hasattr(er, "usage"):
                             total_in += getattr(er.usage, "input_tokens", 0) or 0
