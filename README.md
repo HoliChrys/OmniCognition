@@ -38,6 +38,9 @@ all claims are reproducible from the included LoCoMo harness.
 
 ---
 
+<details>
+<summary><b>📖 Details — full documentation</b> &nbsp;(click to expand)</summary>
+
 ## 1. Introduction
 
 LLM agents that converse over long horizons need a memory that (a)
@@ -1118,6 +1121,59 @@ uv run python -m benchmarks.locomo.eval \
     --answerer meta --samples 5 --per-category 1 --encoder semantic
 ```
 
+---
+
+## References
+
+1. Romanchuk & Bondar. *Semantic Laundering in AI Agent Architectures.*
+   arXiv:2601.08333.
+2. Zhu et al. *HeLa-Mem.* arXiv:2604.16839. (We keep the reflective spirit;
+   we remove the hyperparameters and the materialized edges.)
+3. Gao et al. *Precise Zero-Shot Dense Retrieval without Relevance Labels*
+   (HyDE), 2022.
+4. Yu et al. *Chain-of-Note*, EMNLP 2024.
+5. Maharana et al. *LoCoMo: Evaluating Very Long-Term Conversational
+   Memory.*
+6. BIPM. *Guide to the Expression of Uncertainty in Measurement* (GUM),
+   1995.
+7. Cormack et al. *Reciprocal Rank Fusion*, 2009.
+
+### Drift resistance — query anchoring (§3.5)
+
+8. Rocchio, J.J. *Relevance Feedback in Information Retrieval*, in Salton
+   (ed.), The SMART Retrieval System, 1971. (The α·q_original anchor term.)
+9. *When More Reformulations Hurt: Avoiding Drift using Ranker Feedback*
+   (ReformIR). arXiv:2605.00560. (Score relevance w.r.t. the ORIGINAL query;
+   reformulations as down-weightable features.)
+10. Khattab & Zaharia. *ColBERT: Efficient and Effective Passage Search via
+    Contextualized Late Interaction over BERT*, SIGIR 2020. (MaxSim;
+    high-IDF terms prefer exact lexical match.)
+11. Wang et al. *Pseudo Relevance Feedback with Deep Language Models and
+    Dense Retrievers.* ACM TOIS, 2023. (Rocchio interpolation in dense
+    embedding space; keep α high to resist drift.)
+12. *When Iterative RAG Beats Ideal Evidence: A Diagnostic Study in
+    Scientific Multi-hop QA.* arXiv:2601.19827. ·  *PAR²-RAG.*
+    arXiv:2603.29085. (Fixed-fraction original-query anchoring per hop.)
+
+### Evidence segmentation — association clustering (§6.2)
+
+13. Wang et al. *Evidence Aggregation for Answer Re-Ranking in Open-Domain
+    Question Answering.* arXiv:1711.05116. (Strength- and coverage-based:
+    an answer supported by more mutually-reinforcing passages wins.)
+14. *TopClustRAG* (SIGIR 2025 LiveRAG). arXiv:2506.15246. (Cluster
+    passages, answer per cluster, marginalise outlier clusters.)
+15. Ahn, Bagrow & Lehmann. *Link communities reveal multiscale complexity
+    in networks.* Nature, 2010. (Edge clustering → native overlap.)
+16. Campello, Moulavi & Sander. *Density-Based Clustering Based on
+    Hierarchical Density Estimates* (HDBSCAN), 2013. (Mutual-reachability
+    distance defeats single-linkage chaining; native outlier labelling.)
+17. Xie & Szymanski. *SLPA: Speaker-Listener Label Propagation* — overlapping
+    community detection.
+18. *EviMem: Evidence-Gap-Driven Iterative Retrieval for Long-Term
+    Conversational Memory.* arXiv:2604.27695.
+
+</details>
+
 <details>
 <summary><b>🔬 <code>debug_qa</code> — the step-by-step QA debugger</b> &nbsp;(click to expand)</summary>
 
@@ -1208,54 +1264,3 @@ cat3 `john` cascade (presearch → clue_search → walk → inference synthesis)
 is in [`docs/john_walkthrough.md`](docs/john_walkthrough.md).
 
 </details>
-
----
-
-## References
-
-1. Romanchuk & Bondar. *Semantic Laundering in AI Agent Architectures.*
-   arXiv:2601.08333.
-2. Zhu et al. *HeLa-Mem.* arXiv:2604.16839. (We keep the reflective spirit;
-   we remove the hyperparameters and the materialized edges.)
-3. Gao et al. *Precise Zero-Shot Dense Retrieval without Relevance Labels*
-   (HyDE), 2022.
-4. Yu et al. *Chain-of-Note*, EMNLP 2024.
-5. Maharana et al. *LoCoMo: Evaluating Very Long-Term Conversational
-   Memory.*
-6. BIPM. *Guide to the Expression of Uncertainty in Measurement* (GUM),
-   1995.
-7. Cormack et al. *Reciprocal Rank Fusion*, 2009.
-
-### Drift resistance — query anchoring (§3.5)
-
-8. Rocchio, J.J. *Relevance Feedback in Information Retrieval*, in Salton
-   (ed.), The SMART Retrieval System, 1971. (The α·q_original anchor term.)
-9. *When More Reformulations Hurt: Avoiding Drift using Ranker Feedback*
-   (ReformIR). arXiv:2605.00560. (Score relevance w.r.t. the ORIGINAL query;
-   reformulations as down-weightable features.)
-10. Khattab & Zaharia. *ColBERT: Efficient and Effective Passage Search via
-    Contextualized Late Interaction over BERT*, SIGIR 2020. (MaxSim;
-    high-IDF terms prefer exact lexical match.)
-11. Wang et al. *Pseudo Relevance Feedback with Deep Language Models and
-    Dense Retrievers.* ACM TOIS, 2023. (Rocchio interpolation in dense
-    embedding space; keep α high to resist drift.)
-12. *When Iterative RAG Beats Ideal Evidence: A Diagnostic Study in
-    Scientific Multi-hop QA.* arXiv:2601.19827. ·  *PAR²-RAG.*
-    arXiv:2603.29085. (Fixed-fraction original-query anchoring per hop.)
-
-### Evidence segmentation — association clustering (§6.2)
-
-13. Wang et al. *Evidence Aggregation for Answer Re-Ranking in Open-Domain
-    Question Answering.* arXiv:1711.05116. (Strength- and coverage-based:
-    an answer supported by more mutually-reinforcing passages wins.)
-14. *TopClustRAG* (SIGIR 2025 LiveRAG). arXiv:2506.15246. (Cluster
-    passages, answer per cluster, marginalise outlier clusters.)
-15. Ahn, Bagrow & Lehmann. *Link communities reveal multiscale complexity
-    in networks.* Nature, 2010. (Edge clustering → native overlap.)
-16. Campello, Moulavi & Sander. *Density-Based Clustering Based on
-    Hierarchical Density Estimates* (HDBSCAN), 2013. (Mutual-reachability
-    distance defeats single-linkage chaining; native outlier labelling.)
-17. Xie & Szymanski. *SLPA: Speaker-Listener Label Propagation* — overlapping
-    community detection.
-18. *EviMem: Evidence-Gap-Driven Iterative Retrieval for Long-Term
-    Conversational Memory.* arXiv:2604.27695.
