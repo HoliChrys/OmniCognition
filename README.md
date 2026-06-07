@@ -664,6 +664,31 @@ prompt.
 | answer token-F1 | 0.676 | 0.63 – 0.68 |
 | worst-case input tokens / QA | — | **19k** (was 118k) |
 
+**V12 — drift-resistance + evidence clustering (§3.4, §3.5, §6.2).** A
+stratified one-per-category run (49 QAs over the 10 conversations) with the
+clue_search bridge, the query-alignment anchor, and the association-grouped
+inference synthesis:
+
+| category | F1 | agent-recall | vs prior F1 |
+|---|---|---|---|
+| 1 — multi-hop | 0.607 | 0.785 | — |
+| 2 — temporal | 0.733 | 0.900 | ≈ (0.80) |
+| **3 — inference** | **0.257** | **0.648** | **0.045 → 0.257 (×5.7)** |
+| 4 — single-hop | 0.624 | 0.967 | 0.53 → 0.62 |
+| 5 — adversarial | 0.800 | 1.000 | = |
+| **overall** | **0.611** | — | 0.599 → 0.611 |
+
+The inference category (cat3) is the one this line of work targets: it
+rises **5.7×** over the pre-anchor baseline (0.045 → 0.257) and its evidence
+agent-recall reaches 0.648 — the clue_search lineage bridge now surfaces the
+gold turn on the majority of cat3 questions. It remains the **lowest** F1,
+and for an honest reason: cat3 gold answers are abstractions of a single
+off-vocabulary aside, so even with the gold retrieved the composition is
+brittle (a probe like *Caroline / fields* reaches 0.80, while the
+charity-ambiguous *john / financial status* is near-ceiling at a partial
+"middle-income"). cat3 is small (n=9 — not every conversation has an
+inference question) so its mean carries more variance than the others.
+
 The walk surfaces ≈ 2.7× the gold evidence of a single-pass retriever.
 Much of the residual answer error is **metric artefact**: token-F1 counts
 "progressive" ≠ "liberal" as a miss, and some gold turns carry only an
