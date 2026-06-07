@@ -522,7 +522,7 @@ def build_app(
     @app.tool()
     def clue_search(
         question: str, k_per_clue: int = 3, n_clues: int = 6,
-        observator_id: str = "",
+        observator_id: str = "", auto_scope: bool = True,
     ) -> dict:
         """INFERENCE-question expander. For a question whose answer is never
         stated directly ("What might John's financial status be?"), the
@@ -549,20 +549,83 @@ def build_app(
                     "note": "no clues generated (no usable LLM?)"}
         k = max(1, int(k_per_clue))
         tag_by_id = {p.id: list(p.tags) for p in memory.points}
+        # AUTO-SCOPE (semantic) — close the inference loop. The clues ARE the
+        # answer-space ("I should lose weight", "took up running"); resolve
+        # them + the question through the segment index to hierarchical tag
+        # NAMESPACES (health:condition, activity:exercise) and narrow the
+        # per-clue retrieval to those. This is the handle that surfaces an
+        # oblique aside whose own words ("fingers too big", "bowling") never
+        # match the question. No-op when the memory has not been tag-refined
+        # (no resolution) or when the scope would be the whole cloud / too
+        # small — it degrades to full-memory clue retrieval, never narrows
+        # away recall.
+        scope_points = None
+        scope_namespaces: list = []
+        if auto_scope:
+            try:
+                from metacog.tag_index import TagIndex
+                from metacog.tags import filter_points
+                idx = getattr(memory, "_tag_index_cache", None)
+                if idx is None:
+                    idx = TagIndex(memory.encoder)
+                    try:
+                        memory._tag_index_cache = idx
+                    except Exception:
+                        pass
+                idx.build(memory.points)
+                resolved: list = []
+                for seed in [question] + clues:
+                    for r in idx.search(seed, memory.points, k=2):
+                        for ns in r["namespaces"]:
+                            if ":" in ns and ns not in resolved:
+                                resolved.append(ns)
+                allowed: set = set()
+                for ns in resolved:
+                    allowed |= filter_points(memory.points, [ns], mode="exact")
+                if allowed and 2 * k <= len(allowed) < len(memory.points):
+                    scope_points = [p for p in memory.points if p.id in allowed]
+                    scope_namespaces = resolved
+            except Exception:
+                scope_points = None
         per_clue = []
         merged: dict = {}              # id -> best hit (highest score)
-        for c in clues:
-            hits = memory.retrieve(c, k=k, observator_id=observator_id or None)
-            trimmed = [
-                {"id": h["id"], "content": h["content"], "score": h["score"],
-                 "kind": h["kind"], "tags": tag_by_id.get(h["id"], [])}
-                for h in hits
-            ]
-            per_clue.append({"clue": c, "hits": trimmed, "n_hits": len(trimmed)})
-            for h in trimmed:
-                cur = merged.get(h["id"])
-                if cur is None or h["score"] > cur["score"]:
-                    merged[h["id"]] = h
+        _orig_pts = memory.points
+        try:
+            if scope_points is not None:
+                memory.points = scope_points
+            probe_clues = list(clues)
+            if scope_points is not None and scope_namespaces:
+                # DETERMINISTIC answer-space probe from the resolved namespace
+                # PATHS (health / condition / overweight / exercise) + the
+                # question. Independent of the stochastic clue brainstorm — so
+                # the oblique aside surfaces even when the LLM clues miss its
+                # branch. The namespace words ARE the answer-space vocabulary
+                # the question semantically resolved to.
+                probe_terms: list = []
+                for ns in scope_namespaces:
+                    for seg in ns.split(":"):
+                        s = seg.replace("_", " ").replace("-", " ")
+                        if s and s not in probe_terms:
+                            probe_terms.append(s)
+                probe = (question + " " + " ".join(probe_terms)).strip()
+                if probe:
+                    probe_clues.append(probe)
+            for c in probe_clues:
+                hits = memory.retrieve(
+                    c, k=k, observator_id=observator_id or None)
+                trimmed = [
+                    {"id": h["id"], "content": h["content"], "score": h["score"],
+                     "kind": h["kind"], "tags": tag_by_id.get(h["id"], [])}
+                    for h in hits
+                ]
+                per_clue.append(
+                    {"clue": c, "hits": trimmed, "n_hits": len(trimmed)})
+                for h in trimmed:
+                    cur = merged.get(h["id"])
+                    if cur is None or h["score"] > cur["score"]:
+                        merged[h["id"]] = h
+        finally:
+            memory.points = _orig_pts
         merged_list = sorted(merged.values(), key=lambda h: -h["score"])
         # LINEAGE BRIDGE — the clues often land on the SPACED neighbours of
         # the real aside (kids/family clues hit D5:3 and D5:6, the gold D5:5
@@ -628,7 +691,8 @@ def build_app(
                 seen_c.add(h["id"])
                 cum_ids.append(h["id"])
         return {"clues": clues, "results": per_clue, "merged": merged_list,
-                "neighbor_possibilities": nbrs, "fact_ids_cumulative": cum_ids}
+                "neighbor_possibilities": nbrs, "fact_ids_cumulative": cum_ids,
+                "scope_namespaces": scope_namespaces}
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
