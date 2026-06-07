@@ -30,6 +30,7 @@ class _FakeLLM:
 
 
 _MAP = {
+    # includes off-vocab roots (body, animal) to exercise canonicalization
     "fingers too big": "body:hand:finger, health:condition:macrodactyly",
     "morning run": "activity:exercise:running, time:period:morning",
     "puppy adoption": "animal:canine:puppy, life_stage:juvenile",
@@ -47,9 +48,26 @@ def _fact(pid, content, kws):
 def test_refine_phrase_decomposes_to_hierarchical_tags():
     llm = _FakeLLM(_MAP)
     tags = refine_phrase("fingers too big", llm)
-    assert tags == ["body:hand:finger", "health:condition:macrodactyly"]
+    # root canonicalized into the closed vocab : body -> health
+    assert tags == ["health:hand:finger", "health:condition:macrodactyly"]
     # every tag is hierarchical (carries a namespace)
     assert all(":" in t for t in tags)
+
+
+def test_canonicalize_coerces_root_into_closed_vocab():
+    from metacog.tag_refine import _canonicalize, _DOMAINS
+    assert _canonicalize("romance:crush:sarah") == "relationship:crush:sarah"
+    assert _canonicalize("medical:procedure:xray") == "health:procedure:xray"
+    assert _canonicalize("animal:canine:puppy") == "nature:canine:puppy"
+    assert _canonicalize("location:geography:stamford") == \
+        "place:geography:stamford"
+    assert _canonicalize("relationship:romantic") == "relationship:romantic"
+    # an in-vocab root is untouched; an unknown root is left as-is
+    assert _canonicalize("health:condition:x") == "health:condition:x"
+    assert _canonicalize("widget:foo") == "widget:foo"
+    # everything mapped lands in the closed set (except deliberate unknowns)
+    for raw in ("social:x", "psychology:y", "geography:z", "learning:w"):
+        assert _canonicalize(raw).split(":")[0] in _DOMAINS
 
 
 def test_refine_phrase_skips_structural_and_short_tags():
@@ -73,7 +91,8 @@ def test_refine_phrase_never_caches_empty():
 def test_refine_tags_union_dedup():
     llm = _FakeLLM(_MAP)
     out = refine_tags(["fingers too big", "morning run"], llm)
-    assert "body:hand:finger" in out and "activity:exercise:running" in out
+    # body -> health canonicalized
+    assert "health:hand:finger" in out and "activity:exercise:running" in out
     assert len(out) == len(set(out))             # deduped
 
 

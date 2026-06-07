@@ -53,18 +53,107 @@ _PROMPT = (
     "Decompose each phrase into HIERARCHICAL namespace tags of the form "
     "domain:subdomain:value (taxonomy paths), lowercase, ':' separator. "
     "Produce SEPARATE facets:\n"
-    "- the OBJECT/entity facet (what it is), e.g. body:finger\n"
+    "- the OBJECT/entity facet (what it is), e.g. health:body:finger\n"
     "- the CONDITION/state facet (what state it is in), e.g. "
     "health:condition:overweight\n"
-    "Emit a health:condition:<inferred-condition> tag ONLY when the phrase "
-    "describes a GENUINE physical ailment, symptom, injury, bodily limitation, "
-    "or clear health RISK (infer the latent condition, not the surface words) "
-    "— NEVER for mood, wellbeing, hobbies, emotions, or positive states. Each "
-    "tag must have at least one ':' (a namespace). At most 4 tags per phrase. "
-    "Output ONLY the comma-separated tags for the single phrase, no prose, no "
-    "code fences.\n\n"
+    "The FIRST segment (the ROOT) MUST be one of this CLOSED list — never "
+    "invent another root, pick the closest:\n"
+    "  person place time health activity emotion mind relationship object "
+    "food media event education work finance nature attribute communication\n"
+    "Map consistently: a romantic/dating/crush/attraction signal -> "
+    "relationship:romantic ; studying/school/learning -> education ; a city or "
+    "country -> place:geography ; a physical ailment/symptom/limitation -> "
+    "health:condition (ONLY for a genuine health issue, never mood/hobby). "
+    "Sub-segments after the root are free. Each tag has >=2 segments. At most 4 "
+    "tags per phrase. Output ONLY the comma-separated tags, no prose, no code "
+    "fences.\n\n"
     "Phrase: {phrase}\nTags:"
 )
+
+# CLOSED root vocabulary : the only allowed first segment. Keeps a concept in
+# ONE home (romance -> relationship, studies -> education) instead of scattering
+# it across 141 invented roots, so a tag namespace is a deterministic handle.
+_DOMAINS = {
+    "person", "place", "time", "health", "activity", "emotion", "mind",
+    "relationship", "object", "food", "media", "event", "education", "work",
+    "finance", "nature", "attribute", "communication",
+}
+
+# Stray roots the LLM still emits -> their canonical home. Applied post-parse so
+# even an off-vocabulary root is coerced into the closed set.
+_ROOT_ALIASES = {
+    # place
+    "location": "place", "geography": "place", "environment": "place",
+    "architecture": "place", "building": "place", "venue": "place",
+    "infrastructure": "place", "city": "place", "terrain": "place",
+    # health / body
+    "medical": "health", "condition": "health", "anatomy": "health",
+    "biology": "health", "body": "health", "symptom": "health",
+    "substance": "health", "wellness": "health", "fitness": "health",
+    # mind
+    "psychology": "mind", "mental": "mind", "cognition": "mind",
+    "personality": "mind", "perception": "mind", "mindset": "mind",
+    "psychological": "mind",
+    # relationship (incl. romance + social)
+    "social": "relationship", "interaction": "relationship",
+    "romance": "relationship", "romantic": "relationship",
+    "dating": "relationship", "companionship": "relationship",
+    "bond": "relationship", "affection": "relationship",
+    "attraction": "relationship", "family": "relationship",
+    # emotion (generic feelings only)
+    "mood": "emotion", "sentiment": "emotion", "feeling": "emotion",
+    # education
+    "learning": "education", "skill": "education", "knowledge": "education",
+    "academic": "education", "science": "education", "study": "education",
+    # work / finance
+    "occupation": "work", "career": "work", "employment": "work",
+    "profession": "work", "business": "work", "job": "work",
+    "commerce": "finance", "economics": "finance", "money": "finance",
+    "transaction": "finance",
+    # object
+    "artifact": "object", "device": "object", "technology": "object",
+    "tool": "object", "equipment": "object", "furniture": "object",
+    "vehicle": "object", "instrument": "object", "product": "object",
+    "material": "object", "software": "object", "gadget": "object",
+    # media
+    "content": "media", "music": "media", "audio": "media",
+    "literature": "media", "narrative": "media", "information": "media",
+    "document": "media", "entertainment": "media",
+    # event
+    "experience": "event", "competition": "event", "achievement": "event",
+    "outcome": "event",
+    # nature
+    "animal": "nature", "plant": "nature", "creature": "nature",
+    "weather": "nature",
+    # attribute
+    "quality": "attribute", "appearance": "attribute", "aesthetic": "attribute",
+    "style": "attribute", "measurement": "attribute", "quantity": "attribute",
+    "property": "attribute", "texture": "attribute", "size": "attribute",
+    # person
+    "demographic": "person", "demographics": "person", "role": "person",
+    "people": "person", "name": "person",
+    # activity
+    "behavior": "activity", "action": "activity", "sport": "activity",
+    "exercise": "activity", "hobby": "activity", "recreation": "activity",
+    "task": "activity", "leisure": "activity",
+    # communication
+    "language": "communication", "speech": "communication",
+}
+
+
+def _canonicalize(tag: str) -> str:
+    """Coerce a tag's ROOT into the closed domain vocabulary (sub-segments
+    untouched). `relationship:romantic` stays ; `romance:crush:x` ->
+    `relationship:crush:x` ; `medical:procedure` -> `health:procedure`."""
+    segs = tag.split(":")
+    root = segs[0]
+    if root in _DOMAINS:
+        return tag
+    canon = _ROOT_ALIASES.get(root)
+    if canon:
+        segs[0] = canon
+        return ":".join(segs)
+    return tag                                  # unknown -> leave as-is
 
 
 def refine_phrase(phrase: str, llm: Any) -> List[str]:
@@ -93,8 +182,10 @@ def refine_phrase(phrase: str, llm: Any) -> List[str]:
     tags: List[str] = []
     for part in raw.replace("\n", ",").split(","):
         t = part.strip().strip("`").lower()
-        # keep only well-formed hierarchical tags
-        if t and ":" in t and t not in _SKIP_TAGS and t not in tags:
+        if not (t and ":" in t and t not in _SKIP_TAGS):
+            continue
+        t = _canonicalize(t)                    # coerce root into closed vocab
+        if t not in tags:
             tags.append(t)
     tags = tags[:4]
     if tags:                              # never cache an empty result
