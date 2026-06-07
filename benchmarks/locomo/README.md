@@ -78,7 +78,8 @@ retrieval channel.
 **Full `debug_qa` reference** — every command (`presearch` / `clues` /
 `walk` / `step` / `checkpoint` / `restore` / `auto` …), the `--script` /
 `--script-file` modes, the gold-recall tracking, and worked scenarios — is
-in [`docs/debugger.md`](../../docs/debugger.md). A worked walkthrough of
+the collapsible *“🔬 debug_qa”* section in the
+[main README](../../README.md#73-tests--benchmark). A worked walkthrough of
 `john` (the hardest cat3) is in
 [`docs/john_walkthrough.md`](../../docs/john_walkthrough.md).
 
