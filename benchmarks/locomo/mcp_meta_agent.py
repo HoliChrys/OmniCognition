@@ -923,6 +923,43 @@ def _ab_choice_hint(question: Optional[str]) -> str:
     )
 
 
+def _looks_like_sentence(text: str) -> bool:
+    """True when the text reads as prose (a mid-string sentence break, or a
+    leading subject pronoun) rather than a bare answer phrase."""
+    t = (text or "").strip()
+    if re.search(r"[.!?]\s+\S", t):              # more than one sentence
+        return True
+    return bool(re.match(r"(?i)^(they|he|she|it|i|we|you|there|that|this)\b", t))
+
+
+def _compress_answer(answer: str, question: Optional[str],
+                     client, model) -> Optional[str]:
+    """Compress a verbose-but-correct answer to the bare phrase the token-F1
+    metric scores on — keep EVERY specific content word (names, items,
+    reasons, numbers), drop narration scaffolding ("they help…", "it really
+    spoke to me"). One cheap LLM call; returns None on failure (caller keeps
+    the original)."""
+    try:
+        r = _create_with_retry(
+            client, model=model, max_tokens=48, temperature=0,
+            system=(
+                "Rewrite the ANSWER as the SHORTEST phrase that still answers "
+                "the QUESTION. Keep every specific content word — names, "
+                "places, items, reasons, numbers — but DROP narration "
+                "scaffolding (subjects like 'they/it', verbs like 'help/"
+                "said', fillers like 'really', whole-sentence framing). No "
+                "full sentence, no quotes, no prose. If it is already a bare "
+                "phrase, return it unchanged. Output only the phrase."),
+            messages=[{"role": "user",
+                       "content": f"QUESTION: {question}\nANSWER: {answer}"}],
+        )
+        out = " ".join(b.text for b in r.content if b.type == "text").strip()
+        out = re.sub(r"^[\s*_#>:•\-\"']+", "", out).strip().strip('"')
+        return out or None
+    except Exception:
+        return None
+
+
 def terse(text: str, question: Optional[str] = None) -> str:
     """Strip Haiku's preamble/interjection wrapping. Mirrors the helper
     in mcp_agent.py — keeps the bare value the F1 metric scores on.
@@ -1875,6 +1912,21 @@ class McpMetaAgent:
         if _is_temporal_q(question):
             answer_text = _resolve_relative_date_answer(
                 answer_text, seen_contents)
+
+        # CONCISION pass. token-F1 precision collapses when a correct answer
+        # is wrapped in a full sentence ("They help LGBTQ+ folks with
+        # adoption. Their inclusivity and support really spoke to me." vs gold
+        # "because of their inclusivity and support for LGBTQ+ individuals").
+        # When the answer is verbose (a sentence / many words) on a non-
+        # temporal, non-yes/no question, compress to the bare answer phrase —
+        # keep every specific content word, drop the narration scaffolding.
+        if (answer_text and not _is_temporal_q(question)
+                and not _is_yesno_q(question)
+                and "not mentioned" not in answer_text.lower()
+                and (len(answer_text.split()) > 8
+                     or _looks_like_sentence(answer_text))):
+            answer_text = _compress_answer(
+                answer_text, question, self.client, self.model) or answer_text
 
         return {
             "answer": terse(answer_text, question),
