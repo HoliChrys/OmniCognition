@@ -141,6 +141,76 @@ def build_or_load_memory(sample: str, nsess: int, rebuild: bool):
     return mem
 
 
+def build_obliq_memory(track: str, query_id: str, bg: int, seed: int,
+                       rebuild: bool):
+    """Load an OBLIQ-Bench track and build a PER-QUESTION memory.
+
+    OBLIQ-Bench (arXiv 2605.06235) is an IR benchmark of OBLIQUE queries —
+    relevance is latent, with little surface overlap. We do NOT index the whole
+    corpus (72k+ docs) : to debug ONE query we ingest only its RELEVANT docs
+    (from qrels) plus `bg` random corpus docs as distractors — a small, fast,
+    honest ranking test. The query text is the question ; gold = the relevant
+    corpus ids ; so the REPL's recall / agent_recall machinery works unchanged.
+
+    `track` is e.g. "descriptive/twitter", "descriptive/wildchat",
+    "analogues/math", "tip-of-tongue/congress"."""
+    import json
+    import random
+    from collections import defaultdict
+    from huggingface_hub import hf_hub_download
+    from metacog.memory import Memory
+    from metacog.llm import ClaudeLLM
+    from benchmarks.locomo.encoders import SemanticEncoder
+
+    cache = f"/tmp/obliq_{track.replace('/', '_')}_{query_id}_{bg}.pkl"
+    enc = SemanticEncoder()
+    llm = ClaudeLLM()
+
+    def dl(f):
+        return hf_hub_download("dianetc/OBLIQ-Bench", f"{track}/{f}",
+                               repo_type="dataset")
+
+    queries = {}
+    for ln in open(dl("queries+qrels/queries.jsonl")):
+        o = json.loads(ln)
+        queries[o["_id"]] = o["text"]
+    if query_id not in queries:
+        query_id = sorted(queries)[0]
+    question = queries[query_id]
+
+    qrels = defaultdict(set)
+    for ln in open(dl("queries+qrels/qrels.tsv")):
+        p = ln.rstrip().split("\t")
+        if p[0].startswith("q") and len(p) >= 3 and p[2].lstrip("-").isdigit() \
+                and int(p[2]) > 0:
+            qrels[p[0]].add(p[1])
+    gold = sorted(qrels[query_id])
+
+    if os.path.exists(cache) and not rebuild:
+        mem = Memory(encoder=enc, llm=llm, storage_path=cache)
+        print(f"[cache] loaded {len(mem.points)} docs from {cache}")
+        return mem, question, gold
+
+    corpus = {}
+    for ln in open(dl("corpus/corpus.jsonl")):
+        o = json.loads(ln)
+        corpus[str(o["_id"])] = (o.get("text") or o.get("title") or "")
+    rel = [g for g in gold if g in corpus]
+    pool = [c for c in corpus if c not in set(rel)]
+    random.Random(seed).shuffle(pool)
+    keep = rel + pool[:max(0, bg)]
+    mem = Memory(encoder=enc, llm=llm)
+    for cid in keep:
+        mem.ingest(corpus[cid][:500], kind="FACT", id=cid)
+    mem.storage_path = cache
+    mem.save()
+    mem.storage_path = None
+    print(f"[build] query {query_id} : {len(rel)} relevant + "
+          f"{len(keep) - len(rel)} distractors = {len(keep)} docs "
+          f"(cached {cache})")
+    return mem, question, gold
+
+
 # ----------------------------------------------------------------------
 # The interactive session
 # ----------------------------------------------------------------------
@@ -598,7 +668,28 @@ def main() -> None:
                     help="run commands from a file (one per line) then exit")
     ap.add_argument("--rebuild", action="store_true",
                     help="force re-embedding the memory cache")
+    ap.add_argument("--obliq", default=None,
+                    help="OBLIQ-Bench track, e.g. descriptive/twitter — debug "
+                         "an oblique IR query instead of a LoCoMo QA")
+    ap.add_argument("--query-id", default="q0000",
+                    help="OBLIQ query id (default first)")
+    ap.add_argument("--bg", type=int, default=300,
+                    help="OBLIQ: number of random corpus distractors to index")
     args = ap.parse_args()
+
+    if args.obliq:
+        mem, question, gold = build_obliq_memory(
+            args.obliq, args.query_id, args.bg, seed=0, rebuild=args.rebuild)
+        answer, cat, sample = "", 3, f"obliq:{args.obliq}:{args.query_id}"
+        print(f"\n  OBLIQ query: {question}\n  gold (relevant ids): "
+              f"{len(gold)}")
+        script = args.script
+        if args.script_file:
+            with open(args.script_file) as fh:
+                script = fh.read()
+        dbg = QADebugger(mem, question, gold, answer, cat, sample)
+        asyncio.run(_run(dbg, script))
+        return
 
     if args.probe:
         p = _PROBES[args.probe]
