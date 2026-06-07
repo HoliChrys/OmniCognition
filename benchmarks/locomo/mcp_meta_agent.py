@@ -652,6 +652,26 @@ def _is_temporal_q(question: Optional[str]) -> bool:
     return bool(_TEMPORAL_Q_RE.search(question or ""))
 
 
+# YES/NO and EITHER-OR inference shapes. Many cat3 questions are not
+# "abstract to a category" — they are booleans ("Would X likely have …?" →
+# "Yes") or choices ("Would Tim enjoy C.S. Lewis OR John Greene?" → "C.S.
+# Lewis"). Routing these through the abstraction synthesis drops the "Yes" /
+# picks a label instead of the option, so they are detected and handled
+# separately (and excluded from the grouped-evidence abstraction).
+_YESNO_Q_RE = re.compile(
+    r"^\s*(would|does|do|did|is|are|was|were|can|could|will|wo|has|have|had|"
+    r"should|might|may|isn't|aren't|wouldn't|doesn't|didn't)\b", re.IGNORECASE)
+
+
+def _is_eitheror_q(question: Optional[str]) -> bool:
+    q = (question or "").lower().strip()
+    return " or " in q and q.endswith("?")
+
+
+def _is_yesno_q(question: Optional[str]) -> bool:
+    return bool(_YESNO_Q_RE.match(question or "")) and not _is_eitheror_q(question)
+
+
 def _grouped_evidence_text(evidence, memory) -> Optional[str]:
     """Segment the evidence into ASSOCIATION groups (metacog.answer_cluster,
     HDBSCAN-style) and format them as labelled groups, so the answerer sees
@@ -689,14 +709,24 @@ def _grouped_evidence_text(evidence, memory) -> Optional[str]:
 
 def _final_answer_hint(question: Optional[str]) -> str:
     """The verbatim-vs-inference instruction injected at the final step."""
+    if _is_eitheror_q(question):
+        return (
+            "This is an EITHER/OR question — answer with EXACTLY ONE of the "
+            "options named in the question (the one the evidence supports). "
+            "Just that option, no prose.")
+    if _is_yesno_q(question):
+        return (
+            "This is a YES/NO question — START the answer with 'Yes' or 'No' "
+            "(or 'Likely yes' / 'Likely no' when inferred), optionally a "
+            "short reason after a comma. Do NOT answer with a category label.")
     if _is_inference_q(question):
         return (
             "This is an INFERENCE question — the answer is the concise "
             "CONCLUSION the evidence implies, NOT a quote. Map the evidence's "
             "specifics to a canonical label via world knowledge (e.g. "
             "evidence 'my kids have so much' -> 'wealthy'; 'I volunteer every "
-            "week' -> 'community-minded'). Do NOT echo the turn's words, do "
-            "NOT answer yes/no — give the bare inferred label."
+            "week' -> 'community-minded'). Do NOT echo the turn's words — "
+            "give the bare inferred label."
         )
     return "Copy the bare value VERBATIM from the evidence (the speaker's words)."
 
@@ -891,6 +921,60 @@ def _ab_choice_hint(question: Optional[str]) -> str:
         f"Pick EXACTLY ONE by name. Do NOT write 'Likely yes'. "
         f"Value must be '{opt_a}' or '{opt_b}' (verbatim). "
     )
+
+
+def _looks_like_sentence(text: str) -> bool:
+    """True when the text reads as prose (a mid-string sentence break, or a
+    leading subject pronoun) rather than a bare answer phrase."""
+    t = (text or "").strip()
+    if re.search(r"[.!?]\s+\S", t):              # more than one sentence
+        return True
+    return bool(re.match(r"(?i)^(they|he|she|it|i|we|you|there|that|this)\b", t))
+
+
+def _compress_answer(answer: str, question: Optional[str],
+                     client, model) -> Optional[str]:
+    """Compress a verbose-but-correct answer to the bare phrase the token-F1
+    metric scores on — keep EVERY specific content word (names, items,
+    reasons, numbers), drop narration scaffolding ("they help…", "it really
+    spoke to me"). One cheap LLM call; returns None on failure (caller keeps
+    the original)."""
+    try:
+        r = _create_with_retry(
+            client, model=model, max_tokens=48, temperature=0,
+            system=(
+                "EXTRACT the shortest span of the ANSWER that answers the "
+                "QUESTION. Use ONLY words that already appear in the ANSWER, "
+                "in their original form — do NOT reword, rephrase, hyphenate, "
+                "or introduce ANY new word. Just delete the narration "
+                "scaffolding (subjects like 'they/it', framing verbs like "
+                "'help/said/spoke', fillers like 'really', and whole "
+                "sentences that don't answer). Keep the specific content "
+                "words (names, places, items, reasons). If it is already a "
+                "bare phrase, return it unchanged. Output only the phrase."),
+            messages=[{"role": "user",
+                       "content": f"QUESTION: {question}\nANSWER: {answer}"}],
+        )
+        out = " ".join(b.text for b in r.content if b.type == "text").strip()
+        out = re.sub(r"^[\s*_#>:•\-\"']+", "", out).strip().strip('"')
+        if not out:
+            return None
+        # EXTRACTIVE guard : accept only if it genuinely shortened AND stayed
+        # within the original's words (else the model paraphrased — keep the
+        # original rather than risk introducing non-gold tokens).
+        def _toks(s):
+            return set(re.findall(r"[a-z0-9]+", s.lower()))
+        ans_t, out_t = _toks(answer), _toks(out)
+        if not out_t:
+            return None
+        new = out_t - ans_t
+        if len(out_t) >= len(ans_t):                 # not shorter → skip
+            return None
+        if len(new) > max(1, len(out_t) // 4):       # >25% new words → paraphrase
+            return None
+        return out
+    except Exception:
+        return None
 
 
 def terse(text: str, question: Optional[str] = None) -> str:
@@ -1763,7 +1847,14 @@ class McpMetaAgent:
             # WITHOUT merging unrelated groups. Not a dominant-cluster vote ;
             # the model decides, the grouping just blocks false reinforcement.
             elif (_is_inference_q(question)
+                    and not _is_yesno_q(question)
+                    and not _is_eitheror_q(question)
                     and len(last_relevant_collected) >= 3):
+                # only the OPEN-LABEL inference questions ("what fields /
+                # status / leaning") get the abstraction synthesis. Yes/No and
+                # either-or inference questions keep the agent's direct answer
+                # (the abstraction would drop the "Yes" or replace the chosen
+                # option with a category label).
                 grouped = _grouped_evidence_text(last_relevant_collected, memory)
                 if grouped:
                     try:
@@ -1838,6 +1929,21 @@ class McpMetaAgent:
         if _is_temporal_q(question):
             answer_text = _resolve_relative_date_answer(
                 answer_text, seen_contents)
+
+        # CONCISION pass. token-F1 precision collapses when a correct answer
+        # is wrapped in a full sentence ("They help LGBTQ+ folks with
+        # adoption. Their inclusivity and support really spoke to me." vs gold
+        # "because of their inclusivity and support for LGBTQ+ individuals").
+        # When the answer is verbose (a sentence / many words) on a non-
+        # temporal, non-yes/no question, compress to the bare answer phrase —
+        # keep every specific content word, drop the narration scaffolding.
+        if (answer_text and not _is_temporal_q(question)
+                and not _is_yesno_q(question)
+                and "not mentioned" not in answer_text.lower()
+                and (len(answer_text.split()) > 8
+                     or _looks_like_sentence(answer_text))):
+            answer_text = _compress_answer(
+                answer_text, question, self.client, self.model) or answer_text
 
         return {
             "answer": terse(answer_text, question),

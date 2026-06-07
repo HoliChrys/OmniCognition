@@ -664,6 +664,31 @@ prompt.
 | answer token-F1 | 0.676 | 0.63 – 0.68 |
 | worst-case input tokens / QA | — | **19k** (was 118k) |
 
+**V12 — drift-resistance + evidence clustering (§3.4, §3.5, §6.2).** A
+stratified one-per-category run (49 QAs over the 10 conversations) with the
+clue_search bridge, the query-alignment anchor, and the association-grouped
+inference synthesis:
+
+| category | F1 | agent-recall | vs prior F1 |
+|---|---|---|---|
+| 1 — multi-hop | 0.607 | 0.785 | — |
+| 2 — temporal | 0.733 | 0.900 | ≈ (0.80) |
+| **3 — inference** | **0.257** | **0.648** | **0.045 → 0.257 (×5.7)** |
+| 4 — single-hop | 0.624 | 0.967 | 0.53 → 0.62 |
+| 5 — adversarial | 0.800 | 1.000 | = |
+| **overall** | **0.611** | — | 0.599 → 0.611 |
+
+The inference category (cat3) is the one this line of work targets: it
+rises **5.7×** over the pre-anchor baseline (0.045 → 0.257) and its evidence
+agent-recall reaches 0.648 — the clue_search lineage bridge now surfaces the
+gold turn on the majority of cat3 questions. It remains the **lowest** F1,
+and for an honest reason: cat3 gold answers are abstractions of a single
+off-vocabulary aside, so even with the gold retrieved the composition is
+brittle (a probe like *Caroline / fields* reaches 0.80, while the
+charity-ambiguous *john / financial status* is near-ceiling at a partial
+"middle-income"). cat3 is small (n=9 — not every conversation has an
+inference question) so its mean carries more variance than the others.
+
 The walk surfaces ≈ 2.7× the gold evidence of a single-pass retriever.
 Much of the residual answer error is **metric artefact**: token-F1 counts
 "progressive" ≠ "liberal" as a miss, and some gold turns carry only an
@@ -1092,6 +1117,97 @@ uv run pytest tests/ -q                                  # 346 tests
 uv run python -m benchmarks.locomo.eval \
     --answerer meta --samples 5 --per-category 1 --encoder semantic
 ```
+
+<details>
+<summary><b>🔬 <code>debug_qa</code> — the step-by-step QA debugger</b> &nbsp;(click to expand)</summary>
+
+<br/>
+
+`benchmarks/locomo/debug_qa.py` is an interactive REPL that drives the
+retrieval / answer tools **one at a time** against a single question,
+showing — live — which tool fires, what it returns, and whether the gold
+evidence has surfaced yet. It exists so you can see *where* a hard question
+(typically a cat3 inference) goes wrong and test a fix in seconds, instead
+of launching a ~1-hour full benchmark to discover nothing moved. Every bug
+fixed in the drift-resistance / clustering work (§3.4–§3.5, §6.2) was found
+here: the *"January 2023"* answer-clobber, the cat3 over-enumeration, the
+Slice-C semantic-bias regression, the yes/no abstraction leak, the verbose
+single-hop F1 loss.
+
+**Fast by construction.** The conversation memory is built **once and cached
+to `/tmp`** (embedding 600+ turns is the expensive step); later runs load
+instantly, and the cheap tools cost zero or one LLM call. Only
+`walk`/`auto`/`step` pay the full multi-stage walk. (`--rebuild` forces a
+fresh build; the cache is `/tmp/locomo_qa_<sample>_<nsess>.pkl`.)
+
+```bash
+# a built-in probe (john = conv-41 cat3, caroline = conv-26 cat3)
+uv run python -m benchmarks.locomo.debug_qa --probe john
+
+# any question over any conversation
+uv run python -m benchmarks.locomo.debug_qa --sample conv-26 \
+    --question "What did Caroline research?" \
+    --gold D2:8 --answer "Adoption agencies" --category 1
+
+# non-interactive: a scripted sequence, or a file (one command per line)
+uv run python -m benchmarks.locomo.debug_qa --probe john \
+    --script "gold; presearch John financial status | John kids have so much; clues; recall"
+uv run python -m benchmarks.locomo.debug_qa --probe john --script-file scenario.txt
+```
+
+**CLI options:** `--probe {john,caroline}` · `--sample conv-NN` ·
+`--question` · `--gold D1:9,D1:11` · `--answer` · `--category 1–5` ·
+`--nsess N` (sessions to ingest, 0 = all) · `--script "a; b"` ·
+`--script-file FILE` · `--rebuild`.
+
+**Gold tracking** flags gold ids with `✓GOLD` and keeps a cumulative recall,
+separating the two failure modes — `recall < 1` ⇒ a *retrieval* problem
+(gold never surfaced); `recall = 1` but a wrong answer ⇒ a *composition /
+format* problem:
+
+```
+cumulative recall = 1.000  hits=['D5:5']  gold=['D5:5']  (seen 67 ids)
+```
+
+**Cheap commands (0–1 LLM call):**
+
+| command | what it does |
+| --- | --- |
+| `q` | the question / gold answer / category |
+| `gold` | gold evidence ids + their turn text |
+| `show <id>` | a turn's text + its ±2 `sequence_prev`/next neighbours |
+| `tools` | list the MCP tools the agent can call |
+| `presearch <q1> \| <q2> …` | batch recon — top-k per query, gold flagged, **no walk** |
+| `retrieve <query>` | raw top-k hybrid retrieval |
+| `clues` | run `clue_search` — generated clue lines, per-clue hits, lineage-bridge neighbours, gold surfaced? |
+| `recall` | cumulative gold recall |
+| `answer <text>` | score token-F1 of `<text>` vs the gold |
+| `reset` | clear the accumulated retrieved-id set |
+
+**Walk / agent commands (many sequential LLM calls):**
+
+| command | what it does |
+| --- | --- |
+| `walk <query>` | one `walk_start`: stages, drift, `relevant_collected`, `neighbor_possibilities`, `fact_ids_cumulative` (gold flagged) |
+| `scoped <q> :: t1,t2 [kb]` | tag-scoped walk (`kb` also queries the knowledge base) |
+| `auto` | the **full autonomous agent** end-to-end, tracing each round, scored |
+
+**Drive the algo vs steer by hand:**
+
+| command | what it does |
+| --- | --- |
+| `step` | let the **algo** take the next step — one autonomous round (model picks the next tool, runs it, pauses) |
+| `say <text>` | inject a user nudge into the live conversation |
+| `checkpoint [name]` / `cp` · `restore [name]` | snapshot / rewind the conversation to branch & replay scenarios |
+| `msgs` | list the live conversation messages |
+
+Manual tool calls are **recorded into the live conversation**, so you can
+steer by hand and then `step` to let the algo continue; `checkpoint` /
+`restore` replay a step to compare scenarios. A complete worked trace of the
+cat3 `john` cascade (presearch → clue_search → walk → inference synthesis)
+is in [`docs/john_walkthrough.md`](docs/john_walkthrough.md).
+
+</details>
 
 ---
 
