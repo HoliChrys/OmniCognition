@@ -107,6 +107,12 @@ class Memory:
     # cloud and the walk finds them recursively. Opt-in.
     _skill_ledger: Any = None
     skills_enabled: bool = False
+    # LATENT TAG REFINER (run in sleep()) : replays FACT phrase keywords and
+    # crystallizes their hierarchical namespace tags ("fingers too big" ->
+    # body:finger, health:condition:swelling) so inference queries can SCOPE
+    # on the latent category. Opt-in, idempotent, LLM-backed. See
+    # metacog.tag_refine.
+    tags_refine_enabled: bool = False
     # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
     # Each entry records a solved task — (query, the walk's resolution path
     # point-ids, the output) — so the distiller can replay it afterwards and
@@ -1463,7 +1469,53 @@ class Memory:
         # explicating facts. Opt-in (skills_enabled), idempotent.
         if self.skills_enabled and self._resolution_ledger:
             out["distilled"] = self.distill_skills(t_now)["distilled"]
+        # LATENT tag refiner : decompose FACT phrase keywords into
+        # hierarchical namespace tags. Opt-in (tags_refine_enabled), idempotent.
+        if self.tags_refine_enabled:
+            out["tags_refined"] = self.refine_tags()["refined_points"]
         return out
+
+    def refine_tags(self) -> Dict[str, Any]:
+        """Decompose FACT phrase keywords into hierarchical namespace tags.
+
+        For every FACT not yet refined, run the LLM taxonomy pass over its
+        keyword phrases and APPEND the resulting hierarchical tags (deduped,
+        normalised lowercase by Point.__post_init__). A "refined" marker tag
+        makes the pass idempotent : a point is visited once across sleeps.
+
+        Tags are INDEXING metadata (Cor. 5 : provenance GENERATOR) — appended
+        directly, never via an Observation. Fully failure-safe : a flaky LLM
+        leaves the cloud unchanged. Returns the count of points refined and
+        the union of new tags added."""
+        from metacog.tag_refine import refine_tags as _refine
+        from metacog.epistemic import PointKind
+
+        refined_points = 0
+        added: List[str] = []
+        for p in self.points:
+            if p.kind != PointKind.FACT or "refined" in p.tags:
+                continue
+            if p.id.startswith("entity_"):      # entity beacons are already typed
+                continue
+            try:
+                new_tags = _refine(list(p.keywords or []), self.llm)
+            except Exception:
+                new_tags = []
+            existing = set(p.tags)
+            fresh = [t for t in new_tags if t not in existing]
+            if fresh:
+                p.tags.extend(fresh)
+                for t in fresh:
+                    if t not in added:
+                        added.append(t)
+            # Mark visited regardless (so a phrase the LLM declined is not
+            # retried every sleep) — but only once we actually reached the LLM
+            # path ; a missing LLM leaves the point unmarked for a later run.
+            if hasattr(self.llm, "generate"):
+                if "refined" not in p.tags:
+                    p.tags.append("refined")
+                refined_points += 1
+        return {"refined_points": refined_points, "tags_added": added}
 
     def compress_chasles(self) -> List[Dict[str, Any]]:
         """Auto-detect spike-driven Chasles paths and compress them.
