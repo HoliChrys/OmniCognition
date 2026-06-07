@@ -652,6 +652,26 @@ def _is_temporal_q(question: Optional[str]) -> bool:
     return bool(_TEMPORAL_Q_RE.search(question or ""))
 
 
+# YES/NO and EITHER-OR inference shapes. Many cat3 questions are not
+# "abstract to a category" — they are booleans ("Would X likely have …?" →
+# "Yes") or choices ("Would Tim enjoy C.S. Lewis OR John Greene?" → "C.S.
+# Lewis"). Routing these through the abstraction synthesis drops the "Yes" /
+# picks a label instead of the option, so they are detected and handled
+# separately (and excluded from the grouped-evidence abstraction).
+_YESNO_Q_RE = re.compile(
+    r"^\s*(would|does|do|did|is|are|was|were|can|could|will|wo|has|have|had|"
+    r"should|might|may|isn't|aren't|wouldn't|doesn't|didn't)\b", re.IGNORECASE)
+
+
+def _is_eitheror_q(question: Optional[str]) -> bool:
+    q = (question or "").lower().strip()
+    return " or " in q and q.endswith("?")
+
+
+def _is_yesno_q(question: Optional[str]) -> bool:
+    return bool(_YESNO_Q_RE.match(question or "")) and not _is_eitheror_q(question)
+
+
 def _grouped_evidence_text(evidence, memory) -> Optional[str]:
     """Segment the evidence into ASSOCIATION groups (metacog.answer_cluster,
     HDBSCAN-style) and format them as labelled groups, so the answerer sees
@@ -689,14 +709,24 @@ def _grouped_evidence_text(evidence, memory) -> Optional[str]:
 
 def _final_answer_hint(question: Optional[str]) -> str:
     """The verbatim-vs-inference instruction injected at the final step."""
+    if _is_eitheror_q(question):
+        return (
+            "This is an EITHER/OR question — answer with EXACTLY ONE of the "
+            "options named in the question (the one the evidence supports). "
+            "Just that option, no prose.")
+    if _is_yesno_q(question):
+        return (
+            "This is a YES/NO question — START the answer with 'Yes' or 'No' "
+            "(or 'Likely yes' / 'Likely no' when inferred), optionally a "
+            "short reason after a comma. Do NOT answer with a category label.")
     if _is_inference_q(question):
         return (
             "This is an INFERENCE question — the answer is the concise "
             "CONCLUSION the evidence implies, NOT a quote. Map the evidence's "
             "specifics to a canonical label via world knowledge (e.g. "
             "evidence 'my kids have so much' -> 'wealthy'; 'I volunteer every "
-            "week' -> 'community-minded'). Do NOT echo the turn's words, do "
-            "NOT answer yes/no — give the bare inferred label."
+            "week' -> 'community-minded'). Do NOT echo the turn's words — "
+            "give the bare inferred label."
         )
     return "Copy the bare value VERBATIM from the evidence (the speaker's words)."
 
@@ -1763,7 +1793,14 @@ class McpMetaAgent:
             # WITHOUT merging unrelated groups. Not a dominant-cluster vote ;
             # the model decides, the grouping just blocks false reinforcement.
             elif (_is_inference_q(question)
+                    and not _is_yesno_q(question)
+                    and not _is_eitheror_q(question)
                     and len(last_relevant_collected) >= 3):
+                # only the OPEN-LABEL inference questions ("what fields /
+                # status / leaning") get the abstraction synthesis. Yes/No and
+                # either-or inference questions keep the agent's direct answer
+                # (the abstraction would drop the "Yes" or replace the chosen
+                # option with a category label).
                 grouped = _grouped_evidence_text(last_relevant_collected, memory)
                 if grouped:
                     try:
