@@ -114,3 +114,15 @@ def test_tools_match_over_glossary():
     assert any("hartford" in ns for ns in nav.regex("hart"))
     assert nav.glossary_under("location:geography") == \
         ["location:geography", "location:geography:stamford"]
+
+
+def test_glob_subtree_and_cross_root():
+    nav = TagNavigator(_points(), index=None)
+    # subtree sweep
+    sub = nav.glob("location:*")
+    assert "location:geography:stamford" in sub and "location:city:hartford" in sub
+    assert "location" not in sub                   # bare root not matched by ':*'
+    # cross-root : a mid segment under any root
+    assert nav.glob("*:geography:*") == ["location:geography:stamford"]
+    # a leaf segment anywhere
+    assert "animal:canine:puppy" in nav.glob("*:puppy")

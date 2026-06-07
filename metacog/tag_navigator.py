@@ -92,10 +92,27 @@ class TagNavigator:
         return [ns for ns in self.glossary
                 if pat == ns or pat in ns.split(":")]
 
+    def glob(self, pattern: str) -> List[str]:
+        """Glob over the glossary : `*` matches anything. Lets the agent sweep
+        the tree cross-cuttingly — `location:*` (the whole location subtree),
+        `*:geography` (geography under ANY root — the taxonomy is fragmented),
+        `*:geography:*` (geography as a mid segment). Full-match, anchored."""
+        pat = (pattern or "").strip().lower()
+        if not pat:
+            return []
+        rx = "^" + "".join(".*" if ch == "*" else re.escape(ch)
+                           for ch in pat) + "$"
+        try:
+            cre = re.compile(rx)
+        except re.error:
+            return []
+        return [ns for ns in self.glossary if cre.match(ns)]
+
     # ---- the LLM loop ----------------------------------------------------
     _ACTIONS = {
         "SEMANTIC": "semantic", "GLOSSARY": "glossary_under",
         "FUZZY": "fuzzy", "REGEX": "regex", "EXACT": "exact",
+        "GLOB": "glob",
     }
 
     @staticmethod
@@ -117,17 +134,30 @@ class TagNavigator:
     def _prompt(self, question: str, log: List[str]) -> str:
         return (
             "You scope a memory search to the right TAG NAMESPACES for a "
-            "question. Tags are hierarchical (domain:subdomain:value). You have "
-            "tools; issue exactly ONE per turn, then read the result and decide "
-            "the next. At EVERY step judge each candidate ONLY by how well it "
-            "fits THIS question/input — KEEP the few namespaces probable given "
-            "the input, PRUNE everything that does not serve it (a generic "
-            "catch-all like 'location' that matches everything is noise; prefer "
-            "the specific namespace the input implies, e.g. the city the input "
-            "is really about). When confident, SELECT the final scope.\n\n"
+            "question by ANALYSING the tag tree with tools — issue exactly ONE "
+            "tool per turn, read its result, then decide the next. The tags are "
+            "in a separate hierarchical store (domain:subdomain:value); the "
+            "taxonomy is FRAGMENTED (the same idea can sit under several roots), "
+            "so sweep cross-cuttingly before committing.\n"
+            "ALGORITHM: when a relevant segment turns up (e.g. 'education'), "
+            "first find ALL the parents/contexts it lives under — GLOB "
+            "*:education and *:education:* — because it may exist as a child of "
+            "several tags. Validate which PARENT fits the input; then GLOB that "
+            "parent's CHILDREN (parent:*) to check what's under it. If that "
+            "branch doesn't fit, BACKTRACK and try another parent. Iterate "
+            "until the branch matches the input, then SELECT.\n\n"
+            "Judge every candidate ONLY by how it fits THIS question — KEEP the "
+            "few namespaces it implies, drop catch-alls that match everything "
+            "('location' alone is noise; prefer the specific branch the input "
+            "is really about, e.g. the city for a state question). Stop at the "
+            "granularity that fits: a broad question selects a mid branch "
+            "(health:condition — its whole subtree); a precise one a leaf "
+            "(location:geography:stamford). Descending to a leaf is optional.\n\n"
             "TOOLS (one per line, then stop):\n"
             "  SEMANTIC <phrase>   nearest tag segments by meaning -> namespaces\n"
-            "  GLOSSARY <prefix>   the structure (children) under a namespace\n"
+            "  GLOSSARY <prefix>   immediate children under a namespace\n"
+            "  GLOB <pattern>      glob the glossary: location:* , *:geography ,\n"
+            "                      *:geography:*  (sweep / cross-root search)\n"
             "  FUZZY <word>        namespaces with a fuzzy-matching segment\n"
             "  REGEX <pattern>     namespaces matching a regex\n"
             "  EXACT <word>        namespaces containing exactly this segment\n"
@@ -136,6 +166,49 @@ class TagNavigator:
             + "\n".join(log)
             + "\nNext action:"
         )
+
+    def resolve_agentic(self, question: str, llm: Any, *,
+                        max_steps: int = 8, k: int = 6) -> List[str]:
+        """Agentic tool-analysis loop : the LLM freely drives the 4 tools
+        (semantic / glob / fuzzy / regex / glossary) to analyse the tag tree —
+        sweeping subtrees, cross-root globbing, checking nearest neighbours —
+        then SELECTs the scope. More thorough than the fixed-lookahead
+        `resolve`; best with a strong model. Failure-safe -> semantic union."""
+        fallback = self._keep_most_specific(self.semantic(question, k=k))
+        if not hasattr(llm, "generate") or not self.glossary:
+            return fallback
+        log: List[str] = []
+        seed = self.semantic(question, k=k)
+        log.append(f"SEMANTIC {question}\n-> {', '.join(seed) or '(none)'}")
+        try:
+            for _ in range(max_steps):
+                raw = (llm.generate(self._prompt(question, log),
+                                    max_tokens=200) or "").strip()
+                line = next((l.strip() for l in raw.splitlines() if l.strip()),
+                            "")
+                if not line:
+                    break
+                verb, _, arg = line.partition(" ")
+                verb = verb.strip().upper().rstrip(":")
+                arg = arg.strip()
+                if verb == "SELECT":
+                    picked = [a.strip().lower() for a in arg.split(",")
+                              if a.strip()]
+                    sel = self._keep_most_specific(
+                        [ns for ns in picked if ns in self._gset])
+                    n = len(self.memory.points) or 1
+                    disc = [ns for ns in sel if self._point_count(ns) <= 0.3 * n]
+                    return (disc or sel) or fallback
+                meth = self._ACTIONS.get(verb)
+                if meth is None:
+                    log.append(f"{line}\n-> (unknown action)")
+                    continue
+                res = getattr(self, meth)(arg)
+                log.append(f"{verb} {arg}\n-> "
+                           + (", ".join(res[:40]) or "(none)"))
+        except Exception:
+            return fallback
+        return fallback
 
     def immediate_children(self, ns: str) -> List[str]:
         """Glossary namespaces exactly ONE level below `ns`."""
