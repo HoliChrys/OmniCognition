@@ -145,50 +145,65 @@ class TagNavigator:
 
     def _llm_decide(self, question: str, options: Sequence[str], llm: Any
                     ) -> "tuple[list, list]":
-        """One focused LLM call deciding, for each sibling namespace, whether
-        to KEEP it as the scope (stop here — the whole subtree, i.e. the
-        `ns:*` wildcard, is in) or DESCEND it (refine into its children).
-        Branches the input doesn't imply are simply dropped.
+        """Decide, with a ONE-LEVEL LOOKAHEAD, where to stop. For each branch
+        we show its sub-branches (n+1) so the LLM judges whether descending
+        actually buys NEEDED precision for the input:
 
-        Returns (keep, descend). It is the LLM — not a fixed depth — that
-        chooses when to stop : a broad question keeps `health:condition` (the
-        oblique leaf comes along via ancestry) ; a precise one descends
-        `location` toward the specific city. Returns ([],[]) on failure."""
+          KEEP <ns>      — keep this branch; descending into its shown
+                           sub-branches would NOT add relevant precision (this
+                           level n was the right stop). The whole ns:* subtree
+                           is the scope.
+          DESCEND <child>— a specific sub-branch (n+1) is a better, more
+                           precise match; go there.
+
+        So stopping at depth n is only confirmed after looking at n+1 — if
+        n+1 offers nothing more precise, n stands. Branches the input doesn't
+        imply are dropped. Returns (keep_nodes, next_children). ([],[]) on
+        failure / no LLM."""
         opts = list(dict.fromkeys(options))
         if not opts:
             return [], []
+        # build the lookahead view : each option with its immediate children.
+        lines: List[str] = []
+        child_set: set = set()
+        for o in opts:
+            kids = self.immediate_children(o)
+            for c in kids:
+                child_set.add(c)
+            shown = ", ".join(kids[:12]) if kids else "(leaf — no sub-branches)"
+            lines.append(f"  {o}\n      sub-branches: {shown}")
         prompt = (
             "Walking a tag tree to scope a search to what the QUESTION needs. "
-            "For each tag namespace below choose ONE:\n"
-            "  KEEP <ns>     — stop here; this whole branch (ns and everything "
-            "under it) is the right scope.\n"
-            "  DESCEND <ns>  — too broad; refine into its sub-branches next.\n"
-            "Omit a namespace entirely to DROP it (off-topic, or a catch-all "
-            "that matches everything). Use world knowledge (a city implies its "
-            "state/country; a symptom implies its condition). You decide when a "
-            "branch is specific enough — descending to a leaf is NOT required. "
-            "Output one KEEP/DESCEND line per chosen namespace, nothing else.\n\n"
+            "Each branch is shown WITH its sub-branches (one level deeper) so "
+            "you can look ahead before deciding. For each branch choose ONE:\n"
+            "  KEEP <ns>       — its sub-branches add NO needed precision for "
+            "the question; stop here, the whole ns:* subtree is the scope.\n"
+            "  DESCEND <child> — a specific sub-branch is a better, more precise "
+            "match; name that child (must be one shown above).\n"
+            "Drop (omit) anything off-topic or a catch-all matching everything. "
+            "Use world knowledge (a city implies its state/country; a symptom "
+            "implies its condition). Descending to a leaf is NOT required — "
+            "stop as soon as the extra depth stops helping. Output one "
+            "KEEP/DESCEND line per decision, nothing else.\n\n"
             f"QUESTION: {question}\n\n"
-            "NAMESPACES:\n" + "\n".join(f"  {o}" for o in opts) + "\n"
+            "BRANCHES:\n" + "\n".join(lines) + "\n"
         )
         try:
-            raw = (llm.generate(prompt, max_tokens=220) or "").strip()
+            raw = (llm.generate(prompt, max_tokens=260) or "").strip()
         except Exception:
             return [], []
         keep: List[str] = []
-        descend: List[str] = []
+        nxt: List[str] = []
         oset = set(opts)
         for ln in raw.splitlines():
-            s = ln.strip()
-            verb, _, arg = s.partition(" ")
+            verb, _, arg = ln.strip().partition(" ")
             ns = arg.strip().lower()
-            if ns not in oset:
-                continue
-            if verb.strip().upper() == "KEEP" and ns not in keep:
+            v = verb.strip().upper()
+            if v == "KEEP" and ns in oset and ns not in keep:
                 keep.append(ns)
-            elif verb.strip().upper() == "DESCEND" and ns not in descend:
-                descend.append(ns)
-        return keep, descend
+            elif v == "DESCEND" and ns in child_set and ns not in nxt:
+                nxt.append(ns)          # already the n+1 child to visit
+        return keep, nxt
 
     def resolve(self, question: str, llm: Any, *,
                 max_depth: int = 4, k: int = 6) -> List[str]:
@@ -221,16 +236,14 @@ class TagNavigator:
             for _ in range(max_depth):
                 if not frontier:
                     break
-                keep, descend = self._llm_decide(question, frontier, llm)
+                # lookahead decision : KEEP nodes (n stands) + the n+1 children
+                # the LLM judged worth descending into.
+                keep, nxt = self._llm_decide(question, frontier, llm)
                 resolved.extend(keep)
-                children: List[str] = []
-                for ns in descend:
-                    kids = self.immediate_children(ns)
-                    if kids:
-                        children.extend(kids)
-                    else:
-                        resolved.append(ns)   # nothing to refine into : keep
-                frontier = children
+                # a descended child with no further sub-branches is a leaf : it
+                # will simply be KEEPt at the next round (its lookahead shows no
+                # sub-branches), so just carry it forward.
+                frontier = nxt
             resolved.extend(frontier)          # leftover at max_depth
             sel = self._keep_most_specific(resolved)
             # DISCRIMINATIVENESS gate (IDF) : a namespace matching most of the

@@ -36,21 +36,28 @@ def _points():
 
 
 class _PathLLM:
-    """DESCENDs every strict ancestor of `target`, KEEPs the target itself,
-    drops the rest — driving the navigator straight down to one leaf."""
+    """Drives the navigator straight down to `target`: at each level, DESCEND
+    the child on the path to target, or KEEP target once reached. Reads the
+    lookahead prompt (options are 2-space-indented; sub-branch lines deeper)."""
     def __init__(self, target):
         self.target = target
         self.calls = 0
 
-    def generate(self, prompt, max_tokens=220):
+    def generate(self, prompt, max_tokens=260):
         self.calls += 1
-        opts = [l.strip() for l in prompt.splitlines() if l.startswith("  ")]
+        opts = [l.strip() for l in prompt.splitlines()
+                if l.startswith("  ") and not l.strip().startswith("sub-branches")
+                and ":" in l or (l.startswith("  ") and l.strip()
+                                 and not l.strip().startswith("sub-branches"))]
+        opts = [o for o in opts if o and not o.startswith("sub-branches")]
         out = []
         for o in opts:
             if o == self.target:
                 out.append(f"KEEP {o}")
             elif self.target.startswith(o + ":"):
-                out.append(f"DESCEND {o}")
+                segs = self.target.split(":")
+                child = ":".join(segs[:o.count(":") + 2])  # one level deeper
+                out.append(f"DESCEND {child}")
         return "\n".join(out)
 
 
@@ -64,19 +71,20 @@ def test_descent_reaches_specific_leaf_pruning_siblings():
     assert "location" not in sel              # the catch-all is never the answer
 
 
-def test_llm_decide_parses_keep_and_descend():
-    """The LLM chooses, per branch, KEEP (stop — subtree is the scope) vs
-    DESCEND (refine) ; omitted branches are dropped."""
+def test_llm_decide_lookahead_keep_and_descend_child():
+    """With the one-level lookahead, KEEP stops at a branch (its subtree is the
+    scope) and DESCEND names a specific CHILD (n+1) to visit next."""
     nav = TagNavigator(_points(), index=None)
 
     class _LLM:
-        def generate(self, prompt, max_tokens=220):
-            return "KEEP location:geography\nDESCEND activity\n(drop the rest)"
-    keep, descend = nav._llm_decide(
+        def generate(self, prompt, max_tokens=260):
+            # keep location:geography broad; descend activity into its child
+            return "KEEP location:geography\nDESCEND activity:gaming"
+    keep, nxt = nav._llm_decide(
         "q", ["location:geography", "activity", "location:city"], _LLM())
     assert keep == ["location:geography"]      # stop here -> ns:* subtree
-    assert descend == ["activity"]
-    assert "location:city" not in keep + descend   # omitted -> dropped
+    assert nxt == ["activity:gaming"]          # the n+1 child to visit next
+    assert "location:city" not in keep + nxt   # omitted -> dropped
 
 
 def test_immediate_children_one_level():
