@@ -207,6 +207,7 @@ def build_app(
         observator_id: str = "",
         user_id: str = "",
         session_id: str = "",
+        date_tags: Optional[List[str]] = None,
     ) -> dict:
         """Run a COMPLETE meta-cognitive walk and return its result.
 
@@ -249,6 +250,16 @@ def build_app(
         # get a retrieval rank boost, alongside the free semantic query.
         section = {f"{k}:{v}" for k, v in
                    (("user", user_id), ("session", session_id)) if v} or None
+        # TEMPORAL HARD-SCOPE : a question that names a period ("during April
+        # 2022") passes its deterministic date tags here ; the walk is then
+        # restricted to turns of that period (restrict_ids), so it cannot drift
+        # to another month (the conv-47 "girlfriend in April -> September" bug).
+        restrict_ids = None
+        if date_tags:
+            from metacog.tags import filter_points
+            ids = filter_points(memory.points, list(date_tags), mode="exact")
+            if ids:
+                restrict_ids = ids
         walker = MetaWalker(
             query, memory,
             n_stages=max(1, n_stages),
@@ -257,6 +268,7 @@ def build_app(
             commit=commit,
             observator_id=observator_id or None,
             section_filter=section,
+            restrict_ids=restrict_ids,
         )
         walk_id = walkers.open(walker)
         # Loop the walk to completion : depth is the walk's own

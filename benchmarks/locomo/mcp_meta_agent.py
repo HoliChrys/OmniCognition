@@ -1640,7 +1640,20 @@ class McpMetaAgent:
                         # Guard : walk_next without any walk_start.
                         result_text = ("Call walk_start first.")
                     else:
-                        call_result = await session.call_tool(tu.name, tu.input)
+                        call_input = tu.input
+                        # TEMPORAL ANCHOR : auto-inject the ORIGINAL question's
+                        # date constraint into every walk so it stays scoped to
+                        # the asked period across all reformulations (the agent
+                        # often drops the date when it rephrases). Deterministic,
+                        # sourced from `question`, never from the reformulation.
+                        if tu.name == "walk_start" and not (
+                                tu.input or {}).get("date_tags"):
+                            from metacog.memory import query_date_tags
+                            _dt = query_date_tags(question)
+                            if _dt:
+                                call_input = dict(tu.input or {})
+                                call_input["date_tags"] = _dt
+                        call_result = await session.call_tool(tu.name, call_input)
                         result_text = _tool_result_text(call_result)
                         seen_ids.update(_extract_fact_ids(call_result))
                         # Track the latest relevant_collected for forced-final,

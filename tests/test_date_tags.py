@@ -11,8 +11,16 @@ it.
 from __future__ import annotations
 
 from metacog.defaults import SimpleEncoder
-from metacog.memory import Memory, _session_date_tags
+from metacog.memory import Memory, _session_date_tags, query_date_tags
 from metacog.tags import filter_points
+
+
+def test_query_date_tags_extracts_constraint():
+    assert query_date_tags("Did James have a girlfriend during April 2022?") == [
+        "time:month:april", "time:year:2022"]
+    assert query_date_tags("what did X do in 2022?") == ["time:year:2022"]
+    assert query_date_tags("anything in July?") == ["time:month:july"]
+    assert query_date_tags("no period named") == []
 
 
 def test_parser_both_formats():

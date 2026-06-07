@@ -104,6 +104,26 @@ def _session_date_tags(content: str) -> List[str]:
     ]
 
 
+def query_date_tags(question: str) -> List[str]:
+    """Deterministic date-CONSTRAINT tags from a QUESTION, e.g. "during April
+    2022" -> ['time:month:april', 'time:year:2022'] ; "in 2022" -> ['time:year:
+    2022'] ; "in July" -> ['time:month:july']. This is the temporal anchor: a
+    question that names a period should scope retrieval to that period's turns
+    (the deterministic ingest date tags), so a walk cannot drift to another
+    month. Sourced from the ORIGINAL question, it stays fixed across the
+    agent's reformulated walks. Empty when the question names no period."""
+    q = (question or "").lower()
+    tags: List[str] = []
+    for mon in _MONTHS:
+        if re.search(r"\b" + mon + r"\b", q):
+            tags.append(f"time:month:{mon}")
+            break
+    ym = re.search(r"\b(19|20)\d{2}\b", q)
+    if ym:
+        tags.append(f"time:year:{ym.group(0)}")
+    return tags
+
+
 @dataclass
 class Memory:
     """High-level service object that orchestrates the whole pipeline."""
