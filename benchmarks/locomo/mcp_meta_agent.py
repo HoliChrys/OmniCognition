@@ -943,19 +943,36 @@ def _compress_answer(answer: str, question: Optional[str],
         r = _create_with_retry(
             client, model=model, max_tokens=48, temperature=0,
             system=(
-                "Rewrite the ANSWER as the SHORTEST phrase that still answers "
-                "the QUESTION. Keep every specific content word — names, "
-                "places, items, reasons, numbers — but DROP narration "
-                "scaffolding (subjects like 'they/it', verbs like 'help/"
-                "said', fillers like 'really', whole-sentence framing). No "
-                "full sentence, no quotes, no prose. If it is already a bare "
-                "phrase, return it unchanged. Output only the phrase."),
+                "EXTRACT the shortest span of the ANSWER that answers the "
+                "QUESTION. Use ONLY words that already appear in the ANSWER, "
+                "in their original form — do NOT reword, rephrase, hyphenate, "
+                "or introduce ANY new word. Just delete the narration "
+                "scaffolding (subjects like 'they/it', framing verbs like "
+                "'help/said/spoke', fillers like 'really', and whole "
+                "sentences that don't answer). Keep the specific content "
+                "words (names, places, items, reasons). If it is already a "
+                "bare phrase, return it unchanged. Output only the phrase."),
             messages=[{"role": "user",
                        "content": f"QUESTION: {question}\nANSWER: {answer}"}],
         )
         out = " ".join(b.text for b in r.content if b.type == "text").strip()
         out = re.sub(r"^[\s*_#>:•\-\"']+", "", out).strip().strip('"')
-        return out or None
+        if not out:
+            return None
+        # EXTRACTIVE guard : accept only if it genuinely shortened AND stayed
+        # within the original's words (else the model paraphrased — keep the
+        # original rather than risk introducing non-gold tokens).
+        def _toks(s):
+            return set(re.findall(r"[a-z0-9]+", s.lower()))
+        ans_t, out_t = _toks(answer), _toks(out)
+        if not out_t:
+            return None
+        new = out_t - ans_t
+        if len(out_t) >= len(ans_t):                 # not shorter → skip
+            return None
+        if len(new) > max(1, len(out_t) // 4):       # >25% new words → paraphrase
+            return None
+        return out
     except Exception:
         return None
 
