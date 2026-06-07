@@ -63,6 +63,31 @@ class TagNavigator:
                     out.append(ns)
         return out
 
+    def seed(self, question: str, k: int = 4) -> List[str]:
+        """Seed candidate namespaces from the question's NOMINAL-ENTITY
+        keywords, each searched SEPARATELY. Searching the whole-question
+        embedding lets a dominant entity/date drown the concept ("Did James
+        have a girlfriend during April 2022?" embeds as james + april-2022, so
+        the romance namespaces never surface). Extracting [james, girlfriend,
+        2022] and presearching EACH keeps every facet's branch in play.
+
+        Falls back to the whole-question semantic search when no extractor."""
+        extr = getattr(self.memory, "extractor", None)
+        kws: List[str] = []
+        if extr is not None and hasattr(extr, "extract"):
+            try:
+                kws = [w for w in extr.extract(question, n=6) if w]
+            except Exception:
+                kws = []
+        if not kws:
+            return self.semantic(question, k=k)
+        out: List[str] = []
+        for kw in kws:
+            for ns in self.semantic(kw, k=k):
+                if ns not in out:
+                    out.append(ns)
+        return out
+
     def glossary_under(self, prefix: str) -> List[str]:
         p = (prefix or "").strip().lower()
         if not p:
@@ -178,8 +203,8 @@ class TagNavigator:
         if not hasattr(llm, "generate") or not self.glossary:
             return fallback
         log: List[str] = []
-        seed = self.semantic(question, k=k)
-        log.append(f"SEMANTIC {question}\n-> {', '.join(seed) or '(none)'}")
+        seed = self.seed(question, k=k)
+        log.append(f"SEED (per nominal keyword)\n-> {', '.join(seed) or '(none)'}")
         try:
             for _ in range(max_steps):
                 raw = (llm.generate(self._prompt(question, log),
@@ -298,7 +323,7 @@ class TagNavigator:
         try:
             # top-level domains seen by the semantic search.
             roots: List[str] = []
-            for ns in self.semantic(question, k=k):
+            for ns in self.seed(question, k=k):
                 r = ns.split(":")[0]
                 if r in self._gset and r not in roots:
                     roots.append(r)
