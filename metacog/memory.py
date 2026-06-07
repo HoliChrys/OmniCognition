@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -63,6 +64,44 @@ from metacog.observator import (
     spawn_observators_from_polarization,
 )
 from metacog.reasoning import ReasoningTrajectory, reason
+
+
+_MONTHS = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12",
+}
+
+
+def _session_date_tags(content: str) -> List[str]:
+    """Deterministic date tags from a turn's leading "[<date>]" prefix.
+
+    Every LoCoMo turn (and any dated ingest) carries its session date in a
+    bracket prefix — "[20 April 2022] Speaker: text". That date is STRUCTURED
+    metadata, so it must be tagged deterministically on EVERY turn, not left to
+    the LLM keyword/entity extractor (which silently skips it on most turns, so
+    a date-scoped search misses them). Returns the hierarchical date tags
+    `time:year:2022`, `time:month:april`, `time:date:2022-04-20`. Empty when no
+    parseable date prefix. Edge-free : these are labels, never relations."""
+    m = re.match(r"\s*\[([^\]]+)\]", content or "")
+    if not m:
+        return []
+    inner = m.group(1)
+    dm = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", inner)   # 20 April 2022
+    if dm:
+        day, mon, year = dm.group(1), dm.group(2).lower(), dm.group(3)
+    else:
+        dm = re.search(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", inner)  # April 20, 2022
+        if not dm:
+            return []
+        mon, day, year = dm.group(1).lower(), dm.group(2), dm.group(3)
+    if mon not in _MONTHS:
+        return []
+    return [
+        f"time:year:{year}",
+        f"time:month:{mon}",
+        f"time:date:{year}-{_MONTHS[mon]}-{int(day):02d}",
+    ]
 
 
 @dataclass
@@ -230,6 +269,13 @@ class Memory:
             keywords_source=kw_src,
         )
         self.points.append(point)
+        # Deterministic session-date tags from the "[<date>]" content prefix —
+        # so EVERY dated turn is date-filterable (time:year/month/date), never
+        # depending on the LLM to notice the date. Enables date-scoped search.
+        if kind.upper() == "FACT" and not id.startswith(("entity_", "atom_")):
+            for dt in _session_date_tags(content):
+                if dt not in point.tags:
+                    point.tags.append(dt)
         # Backfill the previous point's sequence_next if we know it
         if sequence_prev:
             for p in self.points:
