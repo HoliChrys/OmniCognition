@@ -97,6 +97,27 @@ def test_memory_refine_tags_appends_and_is_idempotent():
     assert p.tags == before
 
 
+def test_refine_on_ingest_tags_land_in_glossary_registry():
+    """With tags_refine_on_ingest, a FACT is hierarchically tagged at ingest
+    and the new namespaces appear in the tag glossary (the registry the
+    presearch scope reads)."""
+    enc = SimpleEncoder()
+
+    class _KX:
+        source = SourceClass.COMPUTATION
+        def extract(self, text, n=5):
+            return ["fingers too big"]
+
+    mem = Memory(encoder=enc, llm=_FakeLLM(_MAP), extractor=_KX(),
+                 tags_refine_on_ingest=True)
+    p = mem.ingest("my fingers are too big", kind="FACT", id="D1:27")
+    assert "health:condition:macrodactyly" in p.tags
+    assert "refined" in p.tags
+    # the namespace is now in the glossary registry used by presearch scoping
+    assert "health:condition" in tag_glossary(mem.points)
+    assert filter_points(mem.points, ["health:condition"]) == {"D1:27"}
+
+
 def test_scope_on_namespace_finds_inference_turn():
     """The end-to-end payoff : a turn whose surface words never mention health
     is reachable by SCOPING on the latent `health:condition` namespace, while

@@ -113,6 +113,10 @@ class Memory:
     # on the latent category. Opt-in, idempotent, LLM-backed. See
     # metacog.tag_refine.
     tags_refine_enabled: bool = False
+    # Run the SAME hierarchical refinement at INGEST time for each created
+    # FACT/ACTION (opt-in) instead of waiting for latent sleep. Costs one LLM
+    # call per node on the hot path — off by default ; sleep is the cheap path.
+    tags_refine_on_ingest: bool = False
     # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
     # Each entry records a solved task — (query, the walk's resolution path
     # point-ids, the output) — so the distiller can replay it afterwards and
@@ -257,6 +261,26 @@ class Memory:
         ):
             try:
                 self._spawn_atomics(point)
+            except Exception:
+                pass
+        # Optional INGEST-time hierarchical tag refinement for genuine
+        # FACT/ACTION nodes (entity beacons / atomics are already typed). Off
+        # by default — the latent-sleep pass is the cheap path ; this is the
+        # opt-in eager path. The refined tags land in the tag glossary (the
+        # registry) automatically since they are appended to point.tags.
+        if (
+            self.tags_refine_on_ingest
+            and kind.upper() in ("FACT", "ACTION")
+            and not id.startswith(("entity_", "atom_"))
+            and "refined" not in point.tags
+        ):
+            try:
+                from metacog.tag_refine import refine_tags as _refine
+                fresh = [t for t in _refine(list(point.keywords or []), self.llm)
+                         if t not in point.tags]
+                point.tags.extend(fresh)
+                if hasattr(self.llm, "generate"):
+                    point.tags.append("refined")
             except Exception:
                 pass
         return point
