@@ -573,6 +573,14 @@ def build_app(
                     except Exception:
                         pass
                 idx.build(memory.points)
+                # BROAD semantic union : keeps the wide net (health:condition)
+                # an oblique-leaf question (obesity -> macrodactyly turn) needs.
+                # NOTE: TagNavigator offers an LLM-driven hierarchical descent
+                # that resolves to tight, discriminative leaves
+                # (location -> location:geography:stamford) — better for
+                # precise-entity inference, but it would prune away the
+                # unexpected oblique leaf here, so it is kept as a separate
+                # capability rather than the default scope.
                 resolved: list = []
                 for seed in [question] + clues:
                     for r in idx.search(seed, memory.points, k=2):
