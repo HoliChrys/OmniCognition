@@ -108,6 +108,52 @@ def test_maxsim_not_diluted_by_long_turn():
     assert s_long >= 0.3 and abs(s_long - s_short) < 0.5
 
 
+def test_relative_thought_channel_added_to_input():
+    """The anchor is INPUT + RELATIVE-thought, ADDED. The input alone cannot
+    separate an oblique evidence turn from an ambient one ; once a thought
+    abstracts to the answer register, `with_relative` adds a semantic channel
+    that lifts the oblique turn above the ambient one — the inference bridge.
+    Uses lexical-free terms so only the relative cosine can do the work."""
+    enc = SimpleEncoder()
+    # input with NO lexical overlap with either candidate (isolate relative).
+    a = build_query_anchor("suspected health problems", encoder=enc)
+    oblique = "my fingers are too big, maybe take up exercise and go for a run"
+    ambient = "gaming helps me escape the stress of a heavy workload"
+
+    # before any thought : input semantic OFF, no relative -> no separation.
+    s_obl0 = alignment_score(a, oblique, enc.encode(oblique),
+                             use_input_sem=False)
+    s_amb0 = alignment_score(a, ambient, enc.encode(ambient),
+                             use_input_sem=False)
+    assert s_obl0 == s_amb0     # nothing to separate them yet
+
+    # thought abstracts to the answer register -> added to the anchor.
+    a.with_relative(["overweight", "exercise", "weight"], enc)
+    assert a.relative and a.relative_emb is not None
+    s_obl1 = alignment_score(a, oblique, enc.encode(oblique),
+                             use_input_sem=False)
+    s_amb1 = alignment_score(a, ambient, enc.encode(ambient),
+                             use_input_sem=False)
+    assert s_obl1 > s_amb1      # the bridge ranks the oblique evidence first
+
+
+def test_with_relative_drops_terms_already_in_input():
+    """A thought keyword already covered by the input's salient set adds
+    nothing (would double-count) and must be filtered out."""
+    a = _anchor("What did Caroline research?",
+                ents=[_Ent("person", "caroline")], kws=["research"])
+    a.with_relative(["research", "adoption"], SimpleEncoder())
+    assert "research" not in a.relative      # already a salient input term
+    assert "adoption" in a.relative
+
+
+def test_with_relative_failsafe_no_encoder():
+    a = _anchor("What did Caroline research?", kws=["research"])
+    a.with_relative(["adoption"], encoder=None)
+    assert a.relative == ["adoption"]
+    assert a.relative_emb is None            # no encoder -> no embedding, no raise
+
+
 def test_degrades_without_extractors():
     """No entity/keyword extractor → falls back to raw content tokens (soft),
     still usable, never raises."""

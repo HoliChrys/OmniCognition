@@ -619,15 +619,21 @@ def nearest_facts_with_fallback(
                 from metacog.query_anchor import alignment_score
                 fact_pts = [p for p in search_points
                             if p.kind == PointKind.FACT]
-                # LEXICAL-ONLY here (set ops, zero encoding) : the precise
-                # exact-match-on-salient signal is the drift-resistant anchor
-                # the walk needs. Adding the input-embedding cosine re-injects
-                # the dominant-topic bias (cosine(question, fact) favours the
-                # co-present topic), diluting the gold's exact-match lead — so
-                # the semantic side stays in clue_search, not the walk.
+                # The anchor is INPUT + RELATIVE-thought, added. The INPUT's
+                # embedding cosine is DROPPED (use_input_sem=False) : it
+                # re-injects the dominant-topic bias (cos(question, fact)
+                # favours the co-present topic) — that is what drifted Caroline
+                # to recall 0. The precise IDF exact-match on the input's
+                # salient terms is kept (lex), and the RELATIVE thought
+                # abstraction's cosine is ADDED (use_relative_sem) : it is the
+                # inference bridge — "fingers too big" ranks near stress for the
+                # input (cos .07) but FIRST for the thought "obesity" (cos .15).
+                # Scored against the fact's frozen embedding_orig (no re-encode).
                 scored_al = [
                     (alignment_score(query_anchor, p.content,
-                                     lexical_only=True), p)
+                                     p.embedding_orig,
+                                     use_input_sem=False,
+                                     use_relative_sem=True), p)
                     for p in fact_pts
                 ]
                 scored_al.sort(key=lambda x: -x[0])
@@ -2043,6 +2049,18 @@ class MetaWalker:
                 done=True,
                 sigma_path=self._sigma_path,
             )
+
+        # Refresh the anchor's RELATIVE half from the latest thought — the
+        # "pensée distancielle" that lifts surface facts into the answer
+        # register. From stage 1 on, the thought's abstraction ("overweight")
+        # is ADDED to the input anchor so Slice C can rank the oblique
+        # evidence ("fingers too big") above the ambient topic (stress).
+        if self._query_anchor is not None and self._cur_thought is not None:
+            try:
+                self._query_anchor.with_relative(
+                    self._cur_thought.keywords, self._enc)
+            except Exception:
+                pass
 
         pts = self._all_points()
         facts = nearest_facts_with_fallback(

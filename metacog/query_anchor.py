@@ -82,6 +82,14 @@ class QueryAnchor:
     anchor_emb: Optional[tuple] = None                   # input encoded ONCE
     _idf: Dict[str, float] = field(default_factory=dict)  # rarity weight ∈ (0,1]
     question: str = ""
+    # RELATIVE half of the anchor : the latest walk THOUGHT's keywords — the
+    # abstraction the reasoning has reached ("overweight", "well-off"), kept
+    # SEPARATE from the input and refreshed each stage. The input ranks the
+    # turn "fingers too big" near STRESS (cos .07) ; only the thought's
+    # abstraction "obesity" ranks it first (cos .15) — so the anchor is the
+    # two ADDED. Encoded ONCE per refresh, scored by one cosine (no re-encode).
+    relative: List[str] = field(default_factory=list)
+    relative_emb: Optional[tuple] = None
 
     def is_empty(self) -> bool:
         return not (self.salient or self.soft)
@@ -90,6 +98,36 @@ class QueryAnchor:
         """Rarity weight for `term` in (0, 1]. 1.0 when no corpus stats
         (everything counts) ; ubiquitous terms (the speaker's name) → ~0."""
         return self._idf.get(term, 1.0)
+
+    def with_relative(self, terms: Sequence[str], encoder: Any = None
+                      ) -> "QueryAnchor":
+        """Refresh the RELATIVE half from the latest thought's keywords.
+
+        The thought is "une pensée plus distancielle des fact" — it lifts the
+        surface vocabulary ("fingers too big", "go for a run") into the
+        answer register ("overweight"). We keep only terms NOT already in the
+        input's salient set (those add nothing) and that carry signal, encode
+        the joined phrase ONCE, and store it. Mutates and returns self so the
+        same anchor object stays wired into the walk. Fully failure-safe."""
+        seen = {_stem(w) for s in self.salient for w in _tokens(s)}
+        rel: List[str] = []
+        for t in terms or []:
+            tl = (t or "").lower().strip()
+            if not tl or tl in _STOP:
+                continue
+            ts = {_stem(w) for w in _tokens(tl)}
+            if not ts or ts <= seen:        # already covered by the input
+                continue
+            rel.append(tl)
+        rel = list(dict.fromkeys(rel))[:8]
+        self.relative = rel
+        self.relative_emb = None
+        if rel and encoder is not None:
+            try:
+                self.relative_emb = tuple(encoder.encode(" ".join(rel)))
+            except Exception:
+                self.relative_emb = None
+        return self
 
 
 def build_query_anchor(
@@ -179,12 +217,14 @@ def build_query_anchor(
                        _idf=idf, question=q)
 
 
-# Weight of the lexical exact-match vs the semantic input-anchor cosine in
-# the combined alignment. Lexical (IDF-weighted exact stem hit on a salient
-# term — ColBERT's high-IDF exact-match) is the precise signal ; the cosine
-# of the original-input embedding against the fact is the softer support.
+# Weight of the lexical exact-match vs the semantic anchor cosines in the
+# combined alignment. Lexical (IDF-weighted exact stem hit on a salient term —
+# ColBERT's high-IDF exact-match) is the precise, drift-safe core. The two
+# semantic supports are the INPUT-embedding cosine and the RELATIVE
+# thought-abstraction cosine.
 _W_LEX = 0.7
-_W_SEM = 0.3
+_W_SEM = 0.3            # input-embedding cosine (drift-prone : off in the walk)
+_W_REL = 0.4           # relative thought-abstraction cosine (the inference bridge)
 
 
 def alignment_score(
@@ -193,19 +233,30 @@ def alignment_score(
     turn_embedding: Optional[Sequence[float]] = None,
     *,
     lexical_only: bool = False,
+    use_input_sem: bool = True,
+    use_relative_sem: bool = True,
 ) -> float:
     """Typed alignment of `anchor` against one fact, in [0, 1] — O(1).
 
-    Two ADDED signals, each cheap and needing no re-encoding:
+    The anchor is TWO things ADDED, per the design : the INPUT and the
+    RELATIVE thought-abstraction. Three cheap signals, none re-encoding :
       • LEXICAL (precise) — IDF-weighted fraction of the salient/soft terms
         whose stem appears in the fact (ColBERT's high-IDF exact-match, set
         ops only). The ubiquitous speaker name is IDF-driven to ~0.
-      • SEMANTIC (support) — a single cosine of the ORIGINAL-input embedding
-        (encoded once) against the fact's already-stored embedding.
+      • INPUT SEMANTIC — cosine of the ORIGINAL-input embedding (encoded once)
+        against the fact's stored embedding. DRIFT-PRONE : cos(question, fact)
+        favours the co-present dominant topic, so the walk turns it OFF
+        (`use_input_sem=False`) and keeps only the precise lexical core.
+      • RELATIVE SEMANTIC — cosine of the latest thought's abstraction
+        (`relative_emb`, e.g. "overweight") against the fact. This is the
+        inference BRIDGE : the input ranks "fingers too big" near stress
+        (cos .07), only the abstraction "obesity" ranks it first (cos .15).
+        SAFE to keep on in the walk : it is a TARGETED concept, not the broad
+        question, so it pulls toward the reasoning's conclusion, not the
+        ambient topic.
 
-    `lexical_only` drops the semantic cosine (used where no fact embedding is
-    handy). The input vector is kept SEPARATE from the per-stage relative
-    signal: callers blend `(1−α)·relative + α·alignment` — additive."""
+    `lexical_only` is a shortcut dropping BOTH semantic channels (callers with
+    no fact embedding). Otherwise each channel is gated independently."""
     if anchor.is_empty():
         return 0.0
     turn_stems = {_stem(w) for w in _tokens(turn_text)}
@@ -224,7 +275,11 @@ def alignment_score(
             lex += w
     lex = lex / wsum if wsum else 0.0
 
-    if lexical_only or anchor.anchor_emb is None or turn_embedding is None:
+    if lexical_only or turn_embedding is None:
         return lex
-    sem = max(0.0, _cos(anchor.anchor_emb, turn_embedding))
-    return _W_LEX * lex + _W_SEM * sem
+    score = _W_LEX * lex
+    if use_input_sem and anchor.anchor_emb is not None:
+        score += _W_SEM * max(0.0, _cos(anchor.anchor_emb, turn_embedding))
+    if use_relative_sem and anchor.relative_emb is not None:
+        score += _W_REL * max(0.0, _cos(anchor.relative_emb, turn_embedding))
+    return score
