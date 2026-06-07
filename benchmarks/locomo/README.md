@@ -73,8 +73,14 @@ python -m benchmarks.locomo.debug_qa --probe caroline \
 
 `DEBUG_NSESS` = number of sessions to index (0 = whole conversation) ;
 `DEBUG_PROBE` = `caroline` | `john` ; `METACOG_HYDE=1` toggles the HyDE
-retrieval channel. A worked walkthrough of `john` (the hardest cat3) is
-in [`docs/john_walkthrough.md`](../../docs/john_walkthrough.md).
+retrieval channel.
+
+**Full `debug_qa` reference** — every command (`presearch` / `clues` /
+`walk` / `step` / `checkpoint` / `restore` / `auto` …), the `--script` /
+`--script-file` modes, the gold-recall tracking, and worked scenarios — is
+in [`docs/debugger.md`](../../docs/debugger.md). A worked walkthrough of
+`john` (the hardest cat3) is in
+[`docs/john_walkthrough.md`](../../docs/john_walkthrough.md).
 
 Or via the Makefile :
 

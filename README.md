@@ -1118,6 +1118,15 @@ uv run python -m benchmarks.locomo.eval \
     --answerer meta --samples 5 --per-category 1 --encoder semantic
 ```
 
+To debug a single question step-by-step instead of running the whole
+benchmark — drive each tool by hand, let the algo take the next step,
+checkpoint/branch scenarios — use the **`debug_qa` REPL**, fully documented
+in [`docs/debugger.md`](docs/debugger.md):
+
+```bash
+uv run python -m benchmarks.locomo.debug_qa --probe john
+```
+
 ---
 
 ## References
