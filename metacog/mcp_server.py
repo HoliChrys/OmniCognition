@@ -440,7 +440,15 @@ def build_app(
                                       satisfying ALL these tags under `match`
                                       are searched. Same tri-modal semantics
                                       as `scoped_answer`.
-        match          : str        — "exact" | "fuzzy" | "regex".
+        match          : str        — "exact" | "fuzzy" | "regex" | "semantic".
+                                      "semantic" treats each `tags` entry as a
+                                      MEANING seed (not a literal tag): it is
+                                      resolved through the segment embedding
+                                      index to the closest glossary namespaces,
+                                      then those are OR-scoped. So tags=["weight
+                                      problem"] scopes on health:condition /
+                                      activity:exercise even with no shared
+                                      characters.
         observator_id  : str        — optional Level-1 community lens.
 
         Returns `{"results": [{"query", "hits": [{"id","content","score",
@@ -449,7 +457,30 @@ def build_app(
         from metacog.tags import filter_points
         qs = [str(q) for q in (queries or []) if q]
         tagset = list(tags or [])
-        if tagset:
+        if tagset and match == "semantic":
+            # MEANING-scoped : resolve each seed phrase to concrete glossary
+            # namespaces via the cached segment index, then OR them (a point
+            # in ANY resolved namespace is in scope).
+            from metacog.tag_index import TagIndex
+            idx = getattr(memory, "_tag_index_cache", None)
+            if idx is None:
+                idx = TagIndex(memory.encoder)
+                try:
+                    memory._tag_index_cache = idx
+                except Exception:
+                    pass
+            idx.build(memory.points)
+            resolved: list = []
+            for seed in tagset:
+                for r in idx.search(seed, memory.points, k=3):
+                    for ns in r["namespaces"]:
+                        if ns not in resolved:
+                            resolved.append(ns)
+            allowed: set = set()
+            for ns in resolved:
+                allowed |= filter_points(memory.points, [ns], mode="exact")
+            scope = [p for p in memory.points if p.id in allowed]
+        elif tagset:
             allowed = filter_points(memory.points, tagset, mode=match)
             scope = [p for p in memory.points if p.id in allowed]
         else:
