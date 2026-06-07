@@ -368,8 +368,22 @@ def evaluate_sample(
     if atomic:
         from metacog.atomic import AtomicFactExtractor
         atomic_extractor = AtomicFactExtractor()
-    memory = Memory(encoder=enc, entity_extractor=entity_extractor,
-                    atomic_extractor=atomic_extractor)
+    # LLM keyword extractor : keeps a noun together with its qualifying
+    # condition ("fingers too big", not the meaningless bare "fingers") and
+    # drops frequency noise — the frequency fallback strips the condition that
+    # carries the inference signal. Fails closed to the default frequency
+    # extractor when no credential is available (e.g. offline CI).
+    kw_extractor = None
+    try:
+        from metacog.keywords import LLMKeywordExtractor
+        kw_extractor = LLMKeywordExtractor()
+    except Exception:
+        kw_extractor = None
+    mem_kwargs = dict(encoder=enc, entity_extractor=entity_extractor,
+                      atomic_extractor=atomic_extractor)
+    if kw_extractor is not None:
+        mem_kwargs["extractor"] = kw_extractor
+    memory = Memory(**mem_kwargs)
     ingested = ingest_conversation(
         memory, sample["conversation"], with_dates=with_dates,
     )

@@ -117,11 +117,19 @@ def build_or_load_memory(sample: str, nsess: int, rebuild: bool):
     cache = f"/tmp/locomo_qa_{sample}_{nsess}.pkl"
     enc = SemanticEncoder()
     llm = ClaudeLLM()
+    # Same LLM keyword extractor as the bench (noun+condition phrases, no
+    # frequency noise) ; fails closed to the default frequency extractor.
+    try:
+        from metacog.keywords import LLMKeywordExtractor
+        kw_extractor = LLMKeywordExtractor()
+    except Exception:
+        kw_extractor = None
     if os.path.exists(cache) and not rebuild:
         mem = Memory(encoder=enc, llm=llm, storage_path=cache)
         print(f"[cache] loaded {len(mem.points)} points from {cache}")
     else:
-        mem = Memory(encoder=enc, llm=llm)
+        mem = Memory(encoder=enc, llm=llm,
+                     **({"extractor": kw_extractor} if kw_extractor else {}))
         n = ingest_conversation(mem, _slice(sample, nsess), with_dates=True)
         mem.storage_path = cache
         mem.save()

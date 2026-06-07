@@ -195,6 +195,14 @@ class LLMKeywordExtractor:
         "Extract the most informative keywords from the text. "
         "Prefer proper nouns, dates, entities, rare terms. "
         "Skip stopwords and generic words. "
+        "KEEP a noun TOGETHER with the adjective or condition that qualifies "
+        "it when that qualifier carries the meaning — a physical state, "
+        "quality, or condition — as ONE short 2-3 word phrase, NEVER the bare "
+        "noun alone. 'my fingers are too big' -> 'fingers too big' (NOT "
+        "'fingers', which is meaningless without its condition) ; 'the roof "
+        "keeps leaking' -> 'leaking roof' ; 'I've been so exhausted' -> "
+        "'exhausted'. The qualifier alone ('big', 'leaking') is generic and "
+        "useless on its own — bind it to its noun or drop it. "
         "Return ONLY a comma-separated list, lowercase, no prose, no "
         "code fences. Output at most the number of items requested."
     )
@@ -206,10 +214,19 @@ class LLMKeywordExtractor:
         api_key: Optional[str] = None,
     ) -> None:
         import anthropic
+        from metacog.llm import _resolve_credential
 
-        self.client = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"),
-        )
+        # Reuse the shared credential resolution so OAuth bearer tokens
+        # (ANTHROPIC_AUTH_TOKEN / sk-ant-oat / ingress) go through auth_token=
+        # and a custom gateway via ANTHROPIC_BASE_URL is honoured — the bare
+        # api_key= path silently failed under OAuth sessions, dropping the
+        # extractor to the frequency fallback (no phrase keywords).
+        base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
+        token, is_auth = _resolve_credential(api_key)
+        if is_auth:
+            self.client = anthropic.Anthropic(auth_token=token, base_url=base_url)
+        else:
+            self.client = anthropic.Anthropic(api_key=token, base_url=base_url)
         self.model = model or os.environ.get(
             "CLAUDE_KW_MODEL", "claude-haiku-4-5-20251001",
         )
