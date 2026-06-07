@@ -1052,13 +1052,39 @@ def meta_thought(
         chain_block = (
             "PRIOR (chain so far) :\n" + "\n".join(chain_lines) + "\n"
         )
+    # ACCUMULATED visited elements — the whole point of a THOUGHT is to add
+    # context about each VISITED element RELATIVE to the walk : not just the
+    # new pair, but what has been gathered so far, tagged by its ROLE (chosen
+    # as FACT vs ACTION) and its RELATIVE meta-state (confidence / σ). This is
+    # what lets the reflection notice the chain is drifting (all low-relevance,
+    # same topic) instead of blindly extending it — and it carries that
+    # relative reading into the anchor via the thought's keywords.
+    accum_block = ""
+    chain_pairs = list(zip(list(prev_facts), list(prev_actions)))[-4:]
+    accum_lines: List[str] = []
+    for pf, pa in chain_pairs:
+        if pf is not None:
+            st = _meta_state(pf, population)
+            accum_lines.append(
+                f"  [FACT conf={st['confidence']} sigma={st['uncertainty']}] "
+                f"{pf.content[:80]}")
+        if pa is not None:
+            accum_lines.append(f"  [ACTION] {pa.content[:80]}")
+    if accum_lines:
+        accum_block = (
+            "VISITED (gathered so far, by role + relative state) :\n"
+            + "\n".join(accum_lines) + "\n"
+        )
     query_block = f"QUERY : {query}\n" if query else ""
     prompt = (
         "Write ONE short reflection (≤ 15 words) on the NEW fact+action "
-        "that EXTENDS the prior chain toward the QUERY. Plain sentence, "
-        "no headers, no markdown.\n\n"
+        "that EXTENDS the prior chain toward the QUERY. Weigh it against the "
+        "VISITED elements and their relative state — if they keep missing the "
+        "QUERY, reflect on what kind of evidence is still MISSING. Plain "
+        "sentence, no headers, no markdown.\n\n"
         f"{query_block}"
         f"{chain_block}"
+        f"{accum_block}"
         f"{meta_line}\n"
         f"FACT [{fact_kws}] : {fact.content}\n"
         f"ACTION [{action_kws}] : {action.content}"
