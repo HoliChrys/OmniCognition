@@ -101,3 +101,45 @@ def slot_subquestions(event_name: str, schema: EventSchema
     for slot in schema.slots:
         out.append((slot, f"What is the {slot} of {name}?"))
     return out
+
+
+def fill_event_schema(memory: Any, event_name: str, etype: str, *,
+                      k_per_slot: int = 3, restrict_ids: Any = None
+                      ) -> dict:
+    """Schema-driven slot-filling retrieval for one event instance.
+
+    Induce the type's schema, decompose into one sub-question PER SLOT, retrieve
+    each (optionally scoped to `restrict_ids` — e.g. the event's interval), and
+    aggregate the gathered facts. This is the EXHAUSTIVE, fixed-budget
+    alternative to stochastic answer-space expansion : every recurrent slot of
+    the type is queried, so the latent sub-questions of the event are covered by
+    construction. Returns `{etype, slots, core, filled:{slot:[hits]}, fact_ids}`.
+    Failure-safe : an empty schema yields an empty fill."""
+    schema = induce_event_schema(etype, getattr(memory, "llm", None))
+    out = {"etype": schema.etype, "slots": list(schema.slots),
+           "core": list(schema.core), "filled": {}, "fact_ids": []}
+    if schema.is_empty():
+        return out
+    scope = None
+    if restrict_ids is not None:
+        scope = [p for p in memory.points if p.id in set(restrict_ids)]
+    ids: List[str] = []
+    orig = memory.points
+    try:
+        if scope is not None:
+            memory.points = scope
+        for slot, q in slot_subquestions(event_name, schema):
+            try:
+                hits = memory.retrieve(q, k=max(1, k_per_slot))
+            except Exception:
+                hits = []
+            trimmed = [{"id": h["id"], "content": h["content"],
+                        "score": h["score"]} for h in hits]
+            out["filled"][slot] = trimmed
+            for h in trimmed:
+                if h["id"] not in ids:
+                    ids.append(h["id"])
+    finally:
+        memory.points = orig
+    out["fact_ids"] = ids
+    return out

@@ -62,3 +62,42 @@ def test_slot_subquestions_one_per_slot():
     assert [slot for slot, _ in qs] == ["belligerents", "territory"]
     assert all("the Ukraine war" in q for _, q in qs)
     assert "belligerents" in qs[0][1]
+
+
+class _FakeMem:
+    """Minimal memory for fill_event_schema: scripted retrieve + llm."""
+    def __init__(self, llm, hits_by_kw):
+        self.llm = llm
+        self.hits_by_kw = hits_by_kw
+        class _P:  # minimal point with .id
+            def __init__(s, i): s.id = i
+        self.points = [_P(i) for kw in hits_by_kw.values() for i in kw]
+
+    def retrieve(self, q, k=3):
+        for kw, ids in self.hits_by_kw.items():
+            if kw in q:
+                return [{"id": i, "content": i, "score": 0.5} for i in ids][:k]
+        return []
+
+
+def test_fill_event_schema_decomposes_and_aggregates():
+    from metacog.event_schema import fill_event_schema, _SCHEMA_CACHE
+    _SCHEMA_CACHE.pop("war", None)
+    llm = _FakeLLM("belligerents | core\nterritory | core\ntimeline | core")
+    mem = _FakeMem(llm, {
+        "belligerents": ["F1"], "territory": ["F2"], "timeline": ["F3"],
+    })
+    res = fill_event_schema(mem, "the border war", "war", k_per_slot=2)
+    assert res["etype"] == "war"
+    assert set(res["filled"]) == {"belligerents", "territory", "timeline"}
+    assert res["filled"]["belligerents"][0]["id"] == "F1"
+    # union of per-slot hits, deduped, one sub-question per slot
+    assert res["fact_ids"] == ["F1", "F2", "F3"]
+
+
+def test_fill_event_schema_empty_on_no_schema():
+    from metacog.event_schema import fill_event_schema, _SCHEMA_CACHE
+    _SCHEMA_CACHE.pop("blob", None)
+    mem = _FakeMem(_FakeLLM(""), {})
+    res = fill_event_schema(mem, "x", "blob")
+    assert res["filled"] == {} and res["fact_ids"] == []
