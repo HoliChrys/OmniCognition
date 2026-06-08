@@ -103,43 +103,71 @@ def slot_subquestions(event_name: str, schema: EventSchema
     return out
 
 
-def fill_event_schema(memory: Any, event_name: str, etype: str, *,
-                      k_per_slot: int = 3, restrict_ids: Any = None
-                      ) -> dict:
-    """Schema-driven slot-filling retrieval for one event instance.
-
-    Induce the type's schema, decompose into one sub-question PER SLOT, retrieve
-    each (optionally scoped to `restrict_ids` — e.g. the event's interval), and
-    aggregate the gathered facts. This is the EXHAUSTIVE, fixed-budget
-    alternative to stochastic answer-space expansion : every recurrent slot of
-    the type is queried, so the latent sub-questions of the event are covered by
-    construction. Returns `{etype, slots, core, filled:{slot:[hits]}, fact_ids}`.
-    Failure-safe : an empty schema yields an empty fill."""
-    schema = induce_event_schema(etype, getattr(memory, "llm", None))
-    out = {"etype": schema.etype, "slots": list(schema.slots),
-           "core": list(schema.core), "filled": {}, "fact_ids": []}
-    if schema.is_empty():
-        return out
-    scope = None
-    if restrict_ids is not None:
-        scope = [p for p in memory.points if p.id in set(restrict_ids)]
-    ids: List[str] = []
+def _retrieve_scoped(memory: Any, q: str, k: int, scope: Any) -> List[dict]:
     orig = memory.points
     try:
         if scope is not None:
             memory.points = scope
-        for slot, q in slot_subquestions(event_name, schema):
-            try:
-                hits = memory.retrieve(q, k=max(1, k_per_slot))
-            except Exception:
-                hits = []
-            trimmed = [{"id": h["id"], "content": h["content"],
-                        "score": h["score"]} for h in hits]
-            out["filled"][slot] = trimmed
-            for h in trimmed:
-                if h["id"] not in ids:
-                    ids.append(h["id"])
+        hits = memory.retrieve(q, k=max(1, k))
+    except Exception:
+        hits = []
     finally:
         memory.points = orig
+    return [{"id": h["id"], "content": h["content"], "score": h["score"]}
+            for h in hits]
+
+
+def fill_event_schema(memory: Any, event_name: str, etype: str, *,
+                      k_per_slot: int = 3, gap_fill: bool = True,
+                      restrict_ids: Any = None) -> dict:
+    """Schema-driven slot-filling for one event instance — the two design loops.
+
+    USAGE (open the questions to find everything) : induce the type schema, then
+    PARTITION the event's gravitating CLUSTER (the facts pulled onto its hub)
+    into roles — one sub-question PER SLOT, scoped to the cluster. This is the
+    exhaustive, fixed-budget alternative to stochastic answer-space expansion.
+
+    GAP detection (the "open" question) : a CORE slot with no fact in the
+    cluster is a GAP — `gap_fill` re-asks it against the FULL corpus to fetch
+    the missing piece (additive, only for empty core slots, per the Graphiti
+    'scope must be additive/gated' lesson).
+
+    Returns `{etype, slots, core, cluster_size, filled:{slot:[hits]},
+    gaps:[core-slot…], fact_ids}`. `restrict_ids` overrides the cluster scope
+    (e.g. the event interval). Failure-safe : empty schema -> empty fill."""
+    schema = induce_event_schema(etype, getattr(memory, "llm", None))
+    out = {"etype": schema.etype, "slots": list(schema.slots),
+           "core": list(schema.core), "cluster_size": 0,
+           "filled": {}, "gaps": [], "fact_ids": []}
+    if schema.is_empty():
+        return out
+
+    # the gravitating cluster = "everything there is" about the event
+    cluster = None
+    if restrict_ids is not None:
+        cluster = [p for p in memory.points if p.id in set(restrict_ids)]
+    elif hasattr(memory, "_event_registry") and hasattr(memory, "event_cluster"):
+        hub_id = memory._event_registry.get(
+            f"{schema.etype}::{(event_name or '').strip().lower()}")
+        if hub_id:
+            cluster = memory.event_cluster(hub_id)
+    out["cluster_size"] = len(cluster) if cluster is not None else 0
+
+    ids: List[str] = []
+    core = set(schema.core)
+    for slot, q in slot_subquestions(event_name, schema):
+        # (1) partition the gravitating cluster
+        hits = _retrieve_scoped(memory, q, k_per_slot, cluster)
+        # (2) a CORE slot empty in the cluster is a GAP -> additive corpus search
+        if not hits and slot in core and gap_fill:
+            hits = _retrieve_scoped(memory, q, k_per_slot, None)
+            if hits:
+                out["gaps"].append(slot)
+        elif not hits and slot in core:
+            out["gaps"].append(slot)
+        out["filled"][slot] = hits
+        for h in hits:
+            if h["id"] not in ids:
+                ids.append(h["id"])
     out["fact_ids"] = ids
     return out

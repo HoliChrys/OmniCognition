@@ -567,12 +567,24 @@ class Memory:
             self._event_registry[key] = hub.id
 
         # ---- selective gravitation ----
+        # A fact that gravitates is also TAGGED with its hub membership
+        # (event:in:<hub_id>) — edge-free, persists with the point, and lets
+        # the schema later partition this event's gravitating CLUSTER.
+        member = f"event:in:{hub.id}"
         for f in source_facts or ():
             if f is None or f.id == hub.id:
                 continue
             if self._cos(f.embedding_orig, hub.embedding_orig) >= salience:
                 apply_pull(hub, f, +1.0, t_now)
+                if member not in f.tags:
+                    f.tags.append(member)
         return hub
+
+    def event_cluster(self, event_id: str) -> List[Point]:
+        """The facts that gravitate to an event hub (its `event:in:<id>`
+        members) — 'everything there is' about the event."""
+        m = f"event:in:{event_id}"
+        return [p for p in self.points if m in p.tags]
 
     def _spawn_events(self, source_fact: Point) -> None:
         """Detect events in a freshly ingested FACT and gravitate it onto each
