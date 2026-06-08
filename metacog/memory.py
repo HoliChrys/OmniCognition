@@ -586,6 +586,75 @@ class Memory:
         m = f"event:in:{event_id}"
         return [p for p in self.points if m in p.tags]
 
+    _EVENT_STOP = {
+        "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
+        "over", "into", "this", "that", "their", "his", "her", "its", "new",
+        "us", "a", "an", "by", "at", "as", "is", "are", "was",
+    }
+
+    def _event_tokens(self, hub: Point) -> set:
+        """Salient entity tokens of an event hub's name (drop its type word and
+        stopwords) — the participants that decide if two events are facets of
+        the SAME situation."""
+        et = next((t.split(":", 2)[2] for t in hub.tags
+                   if t.startswith("event:type:")), "")
+        name = hub.content.split(" ", 1)[1] if " " in hub.content else ""
+        et_words = set(re.findall(r"[a-z]{3,}", et.lower()))
+        return {w for w in re.findall(r"[a-z]{3,}", name.lower())
+                if w not in self._EVENT_STOP and w not in et_words}
+
+    def consolidate_events(self, *, min_shared: int = 1) -> Dict[str, Any]:
+        """Hierarchical aggregation : micro-event hubs that share a salient
+        entity (≥ `min_shared` name tokens) are facets of ONE situation and are
+        MERGED into a macro hub — its cluster becomes the UNION of their
+        gravitating facts. Fixes event fragmentation (27 tweets → 31 micro-hubs
+        → 1 'iran-israel war' macro). Edge-free : facts are re-tagged
+        event:in:<macro> and pulled onto the macro ; registry re-pointed."""
+        events = [p for p in self.points if p.kind is PointKind.EVENT]
+        toks = {e.id: self._event_tokens(e) for e in events}
+        parent = {e.id: e.id for e in events}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i in range(len(events)):
+            for j in range(i + 1, len(events)):
+                a, b = events[i], events[j]
+                if len(toks[a.id] & toks[b.id]) >= min_shared:
+                    parent[find(a.id)] = find(b.id)
+
+        groups: Dict[str, List[Point]] = {}
+        for e in events:
+            groups.setdefault(find(e.id), []).append(e)
+
+        t_now = self._now()
+        merged = 0
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            # canonical = the hub with the largest gravitating cluster
+            canon = max(members, key=lambda e: len(self.event_cluster(e.id)))
+            cmem = f"event:in:{canon.id}"
+            for e in members:
+                if e.id == canon.id:
+                    continue
+                for f in self.event_cluster(e.id):
+                    if cmem not in f.tags:
+                        f.tags.append(cmem)
+                        apply_pull(canon, f, +1.0, t_now)
+                # re-point the registry entries of the merged hub to the canon
+                for k, v in list(self._event_registry.items()):
+                    if v == e.id:
+                        self._event_registry[k] = canon.id
+                if cmem not in e.tags:           # the micro stays as a sub-event
+                    e.tags.append(cmem)
+                merged += 1
+        return {"events": len(events), "groups": sum(
+            1 for m in groups.values() if len(m) >= 2), "merged": merged}
+
     def detect_event_type(self, query: str, *, threshold: float = 0.42
                           ) -> Optional[dict]:
         """Decide whether a QUERY is about an event, and of which TYPE.
