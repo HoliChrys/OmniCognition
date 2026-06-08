@@ -134,6 +134,12 @@ You have the FULL tool surface. The ones that matter for answering :
                               and bridges to the in-between turn. Use it the
                               moment a walk on the question's own words
                               drifts or returns only generic on-topic turns.
+  • event_search(query=…)    — EVENT channel (ADDITIVE, never a replacement).
+                              For a question about an EVENT (a war, trip,
+                              project, conflict, …), this gathers the facts that
+                              gravitate to the event's hub by its recurrent
+                              schema. Its evidence UNIONS with your walks — use
+                              it as an extra angle, then keep walking.
   • list_tags()             — the glossary of available tag NAMESPACES
                               (e.g. ref:date, session, person) to aim
                               presearch / scoped_answer.
@@ -483,13 +489,26 @@ def _tool_result_text(call_result) -> str:
 
 
 def _extract_fact_ids(call_result) -> List[str]:
-    """Pull `fact_ids_cumulative` out of a walk_* tool result, for
-    agent-recall measurement.
+    """Pull gathered evidence ids out of a tool result, for agent-recall
+    measurement. The walk publishes `fact_ids_cumulative` ; event_search
+    publishes `cluster_ids` / `fact_ids` — ALL are unioned, so the event channel
+    is ADDITIVE alongside the walk/clue (it adds evidence, never replaces it).
 
-    FastMCP serialises dict-returning tools as a JSON string in the
-    first TextContent block (structuredContent is not set), so we try
-    text blocks first then fall back to structuredContent.
+    FastMCP serialises dict-returning tools as a JSON string in the first
+    TextContent block (structuredContent is not set), so we try text blocks
+    first then fall back to structuredContent.
     """
+    _KEYS = ("fact_ids_cumulative", "cluster_ids", "fact_ids")
+
+    def _harvest(obj) -> List[str]:
+        out: List[str] = []
+        if isinstance(obj, dict):
+            for k in _KEYS:
+                v = obj.get(k)
+                if isinstance(v, list):
+                    out.extend(str(x) for x in v)
+        return out
+
     # 1. Text-block JSON (the path FastMCP actually uses for our tools).
     for block in getattr(call_result, "content", []) or []:
         text = getattr(block, "text", None)
@@ -499,18 +518,16 @@ def _extract_fact_ids(call_result) -> List[str]:
             obj = json.loads(text)
         except Exception:
             continue
-        if isinstance(obj, dict):
-            ids = obj.get("fact_ids_cumulative")
-            if isinstance(ids, list):
-                return [str(x) for x in ids]
+        ids = _harvest(obj)
+        if ids:
+            return list(dict.fromkeys(ids))
     # 2. structuredContent fallback for tools that do publish it.
     structured = getattr(call_result, "structuredContent", None)
     if isinstance(structured, dict):
         payload = structured.get("result", structured)
-        if isinstance(payload, dict):
-            ids = payload.get("fact_ids_cumulative")
-            if isinstance(ids, list):
-                return [str(x) for x in ids]
+        ids = _harvest(payload)
+        if ids:
+            return list(dict.fromkeys(ids))
     return []
 
 
