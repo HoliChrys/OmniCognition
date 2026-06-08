@@ -143,3 +143,37 @@ def test_detect_routes_to_macro_after_consolidation():
     # the macro's cluster is the UNION (both facts)
     cl = {p.id for p in mem.event_cluster(det["event_id"])}
     assert {"D1", "D2"} <= cl
+
+
+def test_consolidate_merges_dedup_failures_via_cluster_overlap():
+    """Two hubs of the same type with NO shared name token still merge if
+    their gravitating clusters overlap on ≥1 fact (the strongest signal that
+    ingest-time dedup failed and they describe the SAME real-world event)."""
+    enc = SimpleEncoder()
+    mem = Memory(encoder=enc)
+    # one fact gravitates onto BOTH hubs (cluster overlap = {f})
+    f = mem.ingest("naval blockade and missile strike", kind="FACT", id="D1")
+    g = mem.ingest("missile strike and counterattack", kind="FACT", id="D2")
+    # names share no tokens; etype is the same
+    e1 = mem.ingest_event("alpha", "war", source_facts=[f], salience=-1)
+    e2 = mem.ingest_event("omega", "war", source_facts=[f, g], salience=-1)
+    assert not (mem._event_tokens(e1) & mem._event_tokens(e2))   # no token share
+    rep = mem.consolidate_events(use_llm=False)
+    assert rep["merged"] >= 1
+    # the canonical macro = larger cluster ; both facts gather under it
+    macro = e2 if len(mem.event_cluster(e2.id)) >= len(
+        mem.event_cluster(e1.id)) else e1
+    assert {"D1", "D2"} <= {p.id for p in mem.event_cluster(macro.id)}
+
+
+def test_consolidate_does_not_merge_unrelated_events():
+    """Different etype OR no overlap on any signal -> stay separate."""
+    enc = SimpleEncoder()
+    mem = Memory(encoder=enc)
+    f1 = mem.ingest("alpha quarterly results", kind="FACT", id="D1")
+    f2 = mem.ingest("beta launches new product", kind="FACT", id="D2")
+    mem.ingest_event("alpha", "earnings", source_facts=[f1], salience=-1)
+    mem.ingest_event("beta", "launch", source_facts=[f2], salience=-1)
+    rep = mem.consolidate_events(use_llm=False)
+    assert rep["merged"] == 0
+    assert rep["groups"] == 0

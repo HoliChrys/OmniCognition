@@ -691,15 +691,33 @@ class Memory:
         return {w for w in re.findall(r"[a-z]{3,}", name.lower())
                 if w not in self._EVENT_STOP and w not in et_words}
 
-    def consolidate_events(self, *, min_shared: int = 1) -> Dict[str, Any]:
-        """Hierarchical aggregation : micro-event hubs that share a salient
-        entity (≥ `min_shared` name tokens) are facets of ONE situation and are
-        MERGED into a macro hub — its cluster becomes the UNION of their
-        gravitating facts. Fixes event fragmentation (27 tweets → 31 micro-hubs
-        → 1 'iran-israel war' macro). Edge-free : facts are re-tagged
-        event:in:<macro> and pulled onto the macro ; registry re-pointed."""
+    def consolidate_events(
+        self, *, min_shared: int = 1, name_cos: float = 0.85,
+        cluster_overlap: int = 1, use_llm: bool = True,
+    ) -> Dict[str, Any]:
+        """Hierarchical aggregation : micro-event hubs that describe the SAME
+        real-world situation are MERGED into a macro hub ; its cluster becomes
+        the UNION of their gravitating facts. Fixes event fragmentation (27
+        tweets → 31 micro-hubs → 1 'iran-israel war' macro).
+
+        Multi-signal merge (mirrors the ingest dedup recipe, but post-hoc, so
+        it ALSO catches dedup failures where the LLM gave the same event two
+        very different names) — pair (a,b) merges when ANY of :
+          * `len(toks(a) ∩ toks(b)) ≥ min_shared`         (shared entity)
+          * same etype AND cos(name(a), name(b)) ≥ `name_cos`   (synonyms)
+          * same etype AND `|cluster(a) ∩ cluster(b)| ≥ cluster_overlap`
+              (the SAME facts gravitate to both : strongest signal)
+          * same etype, ambiguous cosine (0.45-0.85), LLM arbitrates yes
+              (Graphiti dedup recipe, bounded ; skipped when `use_llm=False`)
+        Edge-free : facts re-tagged event:in:<macro> and pulled onto the macro,
+        registry re-pointed. Last-write-wins on hub absorption ; deterministic
+        choice of canonical = the hub with the largest gravitating cluster."""
         events = [p for p in self.points if p.kind is PointKind.EVENT]
         toks = {e.id: self._event_tokens(e) for e in events}
+        etype = {e.id: next((t.split(":", 2)[2] for t in e.tags
+                             if t.startswith("event:type:")), "") for e in events}
+        cluster_ids = {e.id: {p.id for p in self.event_cluster(e.id)}
+                       for e in events}
         parent = {e.id: e.id for e in events}
 
         def find(x):
@@ -708,11 +726,27 @@ class Memory:
                 x = parent[x]
             return x
 
+        def union(a_id, b_id):
+            parent[find(a_id)] = find(b_id)
+
         for i in range(len(events)):
             for j in range(i + 1, len(events)):
                 a, b = events[i], events[j]
+                if find(a.id) == find(b.id):
+                    continue
                 if len(toks[a.id] & toks[b.id]) >= min_shared:
-                    parent[find(a.id)] = find(b.id)
+                    union(a.id, b.id); continue
+                if etype[a.id] and etype[a.id] == etype[b.id]:
+                    if (cluster_ids[a.id] and cluster_ids[b.id]
+                            and len(cluster_ids[a.id] & cluster_ids[b.id])
+                                >= cluster_overlap):
+                        union(a.id, b.id); continue
+                    cos = self._cos(a.embedding_orig, b.embedding_orig)
+                    if cos >= name_cos:
+                        union(a.id, b.id); continue
+                    if use_llm and cos >= 0.45 and self._same_event_llm(
+                            a.content.split(" ", 1)[-1], b):
+                        union(a.id, b.id)
 
         groups: Dict[str, List[Point]] = {}
         for e in events:
