@@ -743,6 +743,60 @@ class Memory:
         return {"events": len(events), "groups": sum(
             1 for m in groups.values() if len(m) >= 2), "merged": merged}
 
+    def event_tag_signature(self, event_id: str, *, top: int = 12) -> List[str]:
+        """The TAG SIGNATURE of an event : the meaningful tags shared across its
+        gravitating cluster, most-frequent first (structural tags dropped). A
+        compact, discriminative fingerprint of what the event is about — far
+        less to reason over than the raw facts."""
+        from collections import Counter
+        cl = self.event_cluster(event_id)
+        cnt: Counter = Counter()
+        for p in cl:
+            for t in p.tags:                    # hierarchical tags (if refined)
+                if (":" in t and not t.startswith(("event:in:", "valid:",
+                                                   "time:"))
+                        and t not in ("fact", "refined", "invalidated")):
+                    cnt[t] += 1
+            for kw in (p.keywords or []):        # + the facts' keywords
+                k = (kw or "").strip().lower()
+                if len(k) >= 3:
+                    cnt[k] += 1
+        # the SHARED signal = tags/keywords recurring across the cluster.
+        return [t for t, c in cnt.most_common(top) if c >= 2] or \
+               [t for t, _ in cnt.most_common(top)]
+
+    def _route_event_llm(self, query: str, cands: List[Point]) -> Optional[Point]:
+        """LLM event routing : of these candidate events, which one is the query
+        REALLY about? Uses reasoning, so it bridges the obliqueness cosine can't
+        (a query sharing no words with its event). Each candidate is shown by
+        its TAG SIGNATURE (the cluster's shared tags) — compact and
+        discriminative, much less to process than the raw facts. Returns the
+        chosen Point or None (declines / no LLM). Fails closed."""
+        if not hasattr(self.llm, "generate") or not cands:
+            return None
+        lines = []
+        for i, m in enumerate(cands, 1):
+            et = next((t.split(":", 2)[2] for t in m.tags
+                       if t.startswith("event:type:")), "")
+            nm = m.content.split(" ", 1)[1] if " " in m.content else m.content
+            sig = ", ".join(self.event_tag_signature(m.id, top=10))
+            lines.append(f"{i}. {nm} [{et}] — tags: {sig}")
+        try:
+            r = self.llm.generate(
+                "Which numbered EVENT is the QUESTION really about? It may share "
+                "NO words with the event (e.g. 'mocking branding while wars "
+                "intensify' is about a WAR). Reason about the referent. Answer "
+                "ONLY the number, or 0 if none.\n\n"
+                f"QUESTION: {query}\n\nEVENTS:\n" + "\n".join(lines) + "\nNumber:",
+                max_tokens=6)
+        except Exception:
+            return None
+        m = re.search(r"\d+", r or "")
+        if not m:
+            return None
+        n = int(m.group(0))
+        return cands[n - 1] if 1 <= n <= len(cands) else None
+
     def detect_event_type(self, query: str, *, threshold: float = 0.42
                           ) -> Optional[dict]:
         """Decide whether a QUERY is about an event, and of which TYPE.
@@ -791,14 +845,27 @@ class Memory:
                 macro_score[m.id] = s
                 macro_pt[m.id] = m
         if macro_score:
-            mid = max(macro_score, key=macro_score.get)
-            if macro_score[mid] >= threshold:
-                best = macro_pt[mid]
+            ranked = sorted(macro_score, key=macro_score.get, reverse=True)
+            best_id = ranked[0]
+            via = "hub"
+            # LLM ROUTING for oblique disambiguation. When several events
+            # compete, cosine cannot route a query that shares NO surface words
+            # with its own evidence ("mocking branding while wars intensify" ->
+            # a war). Give the LLM the event glossary and let it pick by
+            # reasoning (cosine only narrows the candidate list). Cosine is the
+            # fallback (single event, or the LLM declines).
+            cands = [macro_pt[i] for i in ranked[:8]]
+            if len(cands) > 1:
+                pick = self._route_event_llm(q, cands)
+                if pick is not None:
+                    best_id, via = pick.id, "llm"
+            if via == "llm" or macro_score[best_id] >= threshold:
+                best = macro_pt[best_id]
                 et = next((t.split(":", 2)[2] for t in best.tags
                            if t.startswith("event:type:")), "")
                 nm = best.content.split(" ", 1)[1] if " " in best.content else ""
                 return {"name": nm, "etype": et, "event_id": best.id,
-                        "score": round(macro_score[mid], 3), "via": "hub"}
+                        "score": round(macro_score[best_id], 3), "via": via}
         if self.event_extractor is not None:
             try:
                 evs = self.event_extractor.extract_events(q)
