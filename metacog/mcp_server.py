@@ -715,6 +715,25 @@ def build_app(
                 "scope_namespaces": scope_namespaces}
 
     @app.tool()
+    def collect(ids: List[str]) -> dict:
+        """RETRIEVE-mode bag. For a 'find all / list every …' task, ADD the node
+        ids you judge relevant to the answer bag — call this at EACH step as you
+        find matches, accumulating the exhaustive set. The final answer renders
+        the bag as a list (you don't need to restate the ids). Returns the
+        current bag size + the ids just added."""
+        before = len(memory._bag)
+        size = memory.bag_add([str(i) for i in (ids or [])])
+        return {"bag_size": size, "added": size - before}
+
+    @app.tool()
+    def bag() -> dict:
+        """Show the current retrieve-mode bag (the collected node refs + their
+        content), so you can review what has been gathered before answering."""
+        items = memory.bag_items()
+        return {"bag_size": len(items),
+                "items": [{"id": i, "content": c[:160]} for i, c in items]}
+
+    @app.tool()
     def event_search(query: str, k_per_slot: int = 3) -> dict:
         """EVENT-schema retrieval. For a question ABOUT AN EVENT ("what were the
         casualties of the border war?", "how did the trip go?"), detect the

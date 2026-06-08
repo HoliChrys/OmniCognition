@@ -307,6 +307,10 @@ def event_search(memory: Any, query: str, *, k_per_slot: int = 3,
     # ENUMERATION / retrieve mode : the cluster IS the bag — return it as a list.
     from metacog.enumeration import is_enumeration_query, format_bag_answer
     if is_enumeration_query(query) and fill.get("cluster_ids"):
+        # SEED the agent's retrieve-mode bag with the event cluster ; the agent
+        # can then bag_add more across iterations before the list is rendered.
+        if hasattr(memory, "bag_add"):
+            memory.bag_add(fill["cluster_ids"])
         by_id = {p.id: p for p in memory.points}
         bag = [(cid, getattr(by_id.get(cid), "content", ""))
                for cid in fill["cluster_ids"]]

@@ -31,3 +31,19 @@ def test_empty_bag_returns_empty():
 def test_failsafe_no_llm_plain_list():
     out = format_bag_answer("find all", [("A", "x")], object())
     assert "Found 1 matching items" in out and "[A] x" in out
+
+
+def test_memory_bag_add_dedup_order():
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    mem = Memory(encoder=SimpleEncoder())
+    mem.ingest("alpha", kind="FACT", id="A")
+    mem.ingest("beta", kind="FACT", id="B")
+    assert mem.bag_add(["A", "B"]) == 2
+    assert mem.bag_add("A") == 2            # dedup
+    assert mem.bag_add("B") == 2
+    items = mem.bag_items()
+    assert [i for i, _ in items] == ["A", "B"]   # order preserved
+    assert items[0][1] == "alpha"          # content resolved
+    mem.bag_clear()
+    assert mem.bag_items() == []

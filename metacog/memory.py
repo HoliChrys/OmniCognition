@@ -156,6 +156,11 @@ class Memory:
     # (a war mentioned in 10 turns must resolve to ONE hub, not 10). Rebuilt
     # from points on load(). The hub aggregates the facts that gravitate to it.
     _event_registry: Dict[str, str] = field(default_factory=dict)
+    # RETRIEVE-mode BAG : an agent-curated, order-preserving list of node refs
+    # the agent decides to collect across iterations (for "find all / list"
+    # tasks). Rendered as the exhaustive list answer at the end. Seeded from an
+    # event cluster, grown by the agent via bag_add.
+    _bag: List[str] = field(default_factory=list)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
     # Total number of multi-hop transitions recorded by record_hop ;
@@ -585,6 +590,25 @@ class Memory:
         members) — 'everything there is' about the event."""
         m = f"event:in:{event_id}"
         return [p for p in self.points if m in p.tags]
+
+    # ---- retrieve-mode bag : the agent's curated answer list ----------------
+    def bag_add(self, ids) -> int:
+        """Append node ref(s) the agent decides to KEEP for a retrieve/list
+        answer (deduped, order-preserving). Returns the bag size."""
+        if isinstance(ids, str):
+            ids = [ids]
+        for i in ids or []:
+            if isinstance(i, str) and i and i not in self._bag:
+                self._bag.append(i)
+        return len(self._bag)
+
+    def bag_items(self):
+        """The bag as (id, content) pairs, in collection order."""
+        by_id = {p.id: p for p in self.points}
+        return [(i, getattr(by_id.get(i), "content", "")) for i in self._bag]
+
+    def bag_clear(self) -> None:
+        self._bag = []
 
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
