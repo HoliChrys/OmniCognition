@@ -280,6 +280,11 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   COMMON") → list EVERY gathered item, comma-separated (a list of bare
   nouns / short noun phrases, one per item). One item only when there
   truly is one. Tokens count : each listed item earns score.
+- RETRIEVE / "find all" task (return a SET of matching nodes, e.g. "find
+  all turns/tweets that …") → as you find each match during your walks,
+  call `collect(ids=[…])` to keep it in the answer bag. Keep searching with
+  different angles for EXHAUSTIVE coverage. The final answer is rendered
+  from the bag automatically — you do not need to restate the ids.
 - "Would / Could X likely … ?" inference (STARTS with "Would" or "Could")
   → answer "Likely yes, <short reason ≤4 words>" or "Likely no, <short reason ≤4 words>".
   CRITICAL: keep the reason VERY short — 2-4 words max. Reason form
@@ -1201,32 +1206,6 @@ class McpMetaAgent:
         # tools are unaffected ; the cost is one snapshot per QA.
         memory = memory.snapshot()
 
-        # AUTO event/enumeration short-circuit. A "find all / list every …"
-        # question about an EVENT is answered by the event CLUSTER (the bag)
-        # directly — exhaustive retrieval, no walk loop. The cluster aggregates
-        # facts by their real-world referent, so it recovers oblique members
-        # that share none of the question's surface words. retrieved_ids = the
-        # bag so recall credits the gathered set. Gated : only fires when the
-        # memory actually has event hubs and the question is an enumeration.
-        try:
-            from metacog.enumeration import is_enumeration_query
-            from metacog.event_schema import event_search as _evsearch
-            if is_enumeration_query(question):
-                memory.consolidate_events(min_shared=1)
-                ev = _evsearch(memory, question)
-                if ev and ev.get("event") and ev.get("bag_answer"):
-                    return {
-                        "answer": ev["bag_answer"],
-                        "answer_raw": ev["bag_answer"],
-                        "steps": 1, "tokens_in": 0, "tokens_out": 0,
-                        "retrieved_ids": sorted(ev.get("cluster_ids") or []),
-                        "trace": [{"action": "event_bag",
-                                   "event": ev.get("event"),
-                                   "bag_size": ev.get("cluster_size", 0)}],
-                    }
-        except Exception:
-            pass
-
         app = build_app(memory=memory)
         total_in = 0
         total_out = 0
@@ -1985,8 +1964,23 @@ class McpMetaAgent:
             answer_text = _compress_answer(
                 answer_text, question, self.client, self.model) or answer_text
 
+        # PARALLEL bag : the whole process above is UNCHANGED. ONLY here, if the
+        # agent collected a non-empty retrieve-mode bag during the walk (via the
+        # `collect` tool), the answer becomes the rendered LIST instead of a
+        # terse value — and the bag refs join retrieved_ids (still pure
+        # agent_recall : it is what the agent gathered). Empty bag -> identical
+        # to no-bag behaviour.
+        final_answer = terse(answer_text, question)
+        bag_items = memory.bag_items() if hasattr(memory, "bag_items") else []
+        if bag_items:
+            from metacog.enumeration import format_bag_answer
+            rendered = format_bag_answer(question, bag_items, memory.llm)
+            if rendered:
+                final_answer = rendered
+                seen_ids.update(i for i, _ in bag_items)
+
         return {
-            "answer": terse(answer_text, question),
+            "answer": final_answer,
             "answer_raw": answer_text,
             "steps": len([t for t in trace if t["action"] == "tool"]),
             "tokens_in": total_in,
