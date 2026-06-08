@@ -145,3 +145,35 @@ def test_cluster_partition_and_gap_fill():
     assert res["filled"]["territory"][0]["id"] == "F9"
     # 'treaties' is peripheral -> not a gap even though empty in cluster
     assert "treaties" not in res["gaps"]
+
+
+def test_enrich_record_reinforce():
+    from metacog.event_schema import (
+        enrich_schema, record_fill, reinforce_schema, induce_event_schema,
+        _SCHEMA_CACHE, _SCHEMA_STATS, EventSchema)
+    _SCHEMA_CACHE.clear(); _SCHEMA_STATS.clear()
+    # seed a cached schema for 'war'
+    induce_event_schema("war", _FakeLLM(
+        "belligerents | core\nterritory | core\ntreaties | peripheral"))
+
+    # A.2 enrich : a leftover cluster fact -> fake LLM proposes a new slot
+    class _M:
+        llm = _FakeLLM("front lines")
+        _event_registry = {"war::the war": "event_x"}
+        class _P:
+            def __init__(s, i, t): s.id = i; s.content = t; s.tags = []
+        def event_cluster(self, eid):
+            return [self._P("F9", "troops dug trenches on the front")]
+    new = enrich_schema(_M(), "war", "the war",
+                        {"slots": ["belligerents"], "fact_ids": ["F1"]})
+    assert "front lines" in new
+    assert "front lines" in _SCHEMA_CACHE["war"].slots   # added to type schema
+
+    # A.3 reinforce : 'territory' never filled across 3 instances -> dropped ;
+    # 'belligerents' always filled -> core.
+    sc = _SCHEMA_CACHE["war"]
+    for _ in range(3):
+        record_fill("war", sc, {"filled": {"belligerents": [1], "treaties": [1]}})
+    out = reinforce_schema("war", min_instances=3, core_frac=0.6)
+    assert "territory" not in out.slots          # never filled -> dropped
+    assert "belligerents" in out.core            # always filled -> core

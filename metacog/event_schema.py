@@ -25,9 +25,13 @@ NEVER cache an empty result (one 529 must not disable schema induction).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 _SCHEMA_CACHE: dict = {}
+# Cross-instance slot statistics per type : etype -> {slot: [filled, seen]}.
+# Reinforces the recurrent slots (A.3) : slots filled across many instances of a
+# type are promoted to core ; slots never filled are dropped.
+_SCHEMA_STATS: dict = {}
 
 
 @dataclass
@@ -171,3 +175,106 @@ def fill_event_schema(memory: Any, event_name: str, etype: str, *,
                 ids.append(h["id"])
     out["fact_ids"] = ids
     return out
+
+
+def enrich_schema(memory: Any, etype: str, event_name: str, fill: dict
+                  ) -> List[str]:
+    """A.2 — instance-overlay enrichment. Cluster facts that filled NO slot are
+    candidate NEW slots : ask the LLM what recurrent role of an `etype` they
+    describe and ADD it to the type schema (cached), so future fills cover it.
+    Returns the new slot names added. Failure-safe."""
+    llm = getattr(memory, "llm", None)
+    if not hasattr(llm, "generate"):
+        return []
+    eid = (memory._event_registry.get(f"{etype}::{(event_name or '').lower()}")
+           if hasattr(memory, "_event_registry") else None)
+    if not eid or not hasattr(memory, "event_cluster"):
+        return []
+    covered = set(fill.get("fact_ids") or [])
+    leftover = [p for p in memory.event_cluster(eid) if p.id not in covered]
+    if not leftover:
+        return []
+    sample = " / ".join((p.content or "")[:80] for p in leftover[:5])
+    existing = ", ".join(fill.get("slots") or [])
+    try:
+        raw = (llm.generate(
+            f"For an event of type \"{etype}\", these facts did NOT fit any of "
+            f"the known slots [{existing}]:\n{sample}\nName up to 2 NEW recurrent "
+            "slots (1-3 lowercase words each) they fill, comma-separated, or "
+            "'none'.", max_tokens=30) or "").strip().lower()
+    except Exception:
+        return []
+    if "none" in raw:
+        return []
+    new = [s.strip() for s in raw.replace("\n", ",").split(",")
+           if s.strip() and s.strip() not in (fill.get("slots") or [])][:2]
+    if new and etype in _SCHEMA_CACHE:
+        s = _SCHEMA_CACHE[etype]
+        s.slots = list(s.slots) + [n for n in new if n not in s.slots]
+    return new
+
+
+def record_fill(etype: str, schema: EventSchema, fill: dict) -> None:
+    """A.3 — accumulate cross-instance slot statistics (which slots get filled
+    across instances of a type)."""
+    et = (etype or "").lower()
+    if not et or schema.is_empty():
+        return
+    stats = _SCHEMA_STATS.setdefault(et, {})
+    filled_slots = {s for s, hits in (fill.get("filled") or {}).items() if hits}
+    for slot in schema.slots:
+        cell = stats.setdefault(slot, [0, 0])
+        cell[1] += 1                         # seen
+        if slot in filled_slots:
+            cell[0] += 1                     # filled
+
+
+def reinforce_schema(etype: str, *, min_instances: int = 3,
+                     core_frac: float = 0.6) -> EventSchema:
+    """A.3 — refine a type's cached schema from accumulated statistics : promote
+    slots filled in ≥ `core_frac` of instances to CORE, drop slots never filled.
+    No-op until `min_instances` observed. Returns the (possibly updated) schema."""
+    et = (etype or "").lower()
+    stats = _SCHEMA_STATS.get(et)
+    sc = _SCHEMA_CACHE.get(et)
+    if not stats or sc is None:
+        return sc or EventSchema(etype=et)
+    seen_max = max((v[1] for v in stats.values()), default=0)
+    if seen_max < min_instances:
+        return sc
+    kept, core = [], []
+    for slot in sc.slots:
+        filled, seen = stats.get(slot, [0, 0])
+        if seen and filled == 0:
+            continue                          # never filled -> drop
+        kept.append(slot)
+        if seen and filled / seen >= core_frac:
+            core.append(slot)
+    sc.slots, sc.core = kept, core
+    return sc
+
+
+def event_search(memory: Any, query: str, *, k_per_slot: int = 3,
+                 enrich: bool = True) -> Optional[dict]:
+    """End-to-end event-schema retrieval for a QUERY : detect the event type,
+    fill the schema by partitioning the gravitating cluster (+ gap-fill core
+    slots), enrich the schema from leftover cluster facts (A.2), and record
+    cross-instance stats (A.3). Returns the fill result (+ event/new_slots) or
+    None when the query is not about an event (caller falls back to the walk)."""
+    det = memory.detect_event_type(query) if hasattr(
+        memory, "detect_event_type") else None
+    if not det:
+        return None
+    fill = fill_event_schema(memory, det["name"], det["etype"],
+                             k_per_slot=k_per_slot)
+    fill["event"] = det
+    if enrich:
+        try:
+            fill["new_slots"] = enrich_schema(
+                memory, det["etype"], det["name"], fill)
+        except Exception:
+            fill["new_slots"] = []
+        record_fill(det["etype"],
+                    induce_event_schema(det["etype"], getattr(memory, "llm", None)),
+                    fill)
+    return fill

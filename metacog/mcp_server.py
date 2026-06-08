@@ -715,6 +715,28 @@ def build_app(
                 "scope_namespaces": scope_namespaces}
 
     @app.tool()
+    def event_search(query: str, k_per_slot: int = 3) -> dict:
+        """EVENT-schema retrieval. For a question ABOUT AN EVENT ("what were the
+        casualties of the border war?", "how did the trip go?"), detect the
+        event TYPE, then gather its facts EXHAUSTIVELY by its recurrent schema :
+        one sub-question PER SLOT of the type (belligerents, territory, timeline,
+        casualties, … for a war), partitioning the facts that gravitate to the
+        event's hub. A CORE slot with no fact is reported as a GAP. This covers
+        ALL the latent sub-questions of the event type by construction — use it
+        instead of guessing, when the question targets an event.
+
+        Returns `{event:{name,etype,via}, slots, core, cluster_size,
+        filled:{slot:[hits]}, gaps:[…], new_slots:[…], fact_ids}` or
+        `{"event": null}` when the question is not about an event (then use
+        walk_start / clue_search)."""
+        from metacog.event_schema import event_search as _evsearch
+        res = _evsearch(memory, query, k_per_slot=max(1, int(k_per_slot)))
+        if res is None:
+            return {"event": None,
+                    "note": "not an event question; use walk_start/clue_search"}
+        return res
+
+    @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:
         """Run a full reasoning trajectory until output convenable."""
         result = memory.reason(query, with_executor=with_executor, apply_compression=apply_compression)

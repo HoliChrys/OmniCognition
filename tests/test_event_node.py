@@ -112,3 +112,14 @@ def test_event_extractor_not_run_on_derived_nodes():
     # an entity_/atom_/event_-prefixed id must not recurse into event spawning
     mem.ingest("the war", kind="FACT", id="entity_x")
     assert not any(p.kind is PointKind.EVENT for p in mem.points)
+
+
+def test_detect_event_type_via_hub_and_none():
+    enc = SimpleEncoder()
+    mem = Memory(encoder=enc)
+    mem.ingest_event("the border war", "war")
+    # a query close to the hub name detects the type via the hub node
+    det = mem.detect_event_type("the border war", threshold=0.3)
+    assert det and det["etype"] == "war" and det["via"] == "hub"
+    # an unrelated query with no hub match and no extractor -> None
+    assert mem.detect_event_type("zzzz qqqq", threshold=0.99) is None

@@ -586,6 +586,45 @@ class Memory:
         m = f"event:in:{event_id}"
         return [p for p in self.points if m in p.tags]
 
+    def detect_event_type(self, query: str, *, threshold: float = 0.42
+                          ) -> Optional[dict]:
+        """Decide whether a QUERY is about an event, and of which TYPE.
+
+        Two signals (grounded first) : (1) the EVENT hubs are first-class
+        retrievable nodes — the query's nearest hub (cosine ≥ threshold) carries
+        the type, because the hub embeds near its gravitating facts ; (2)
+        fallback to the LLM event extractor on the query for events not yet
+        hubbed. Returns `{name, etype, event_id, score, via}` or None (then the
+        caller runs the normal walk/clue_search)."""
+        q = (query or "").strip()
+        if not q:
+            return None
+        try:
+            qe = tuple(self.encoder.encode(q))
+        except Exception:
+            return None
+        best, best_s = None, 0.0
+        for p in self.points:
+            if p.kind is PointKind.EVENT:
+                s = self._cos(qe, p.embedding_orig)
+                if s > best_s:
+                    best, best_s = p, s
+        if best is not None and best_s >= threshold:
+            et = next((t.split(":", 2)[2] for t in best.tags
+                       if t.startswith("event:type:")), "")
+            nm = best.content.split(" ", 1)[1] if " " in best.content else ""
+            return {"name": nm, "etype": et, "event_id": best.id,
+                    "score": round(best_s, 3), "via": "hub"}
+        if self.event_extractor is not None:
+            try:
+                evs = self.event_extractor.extract_events(q)
+            except Exception:
+                evs = []
+            if evs:
+                return {"name": evs[0].name, "etype": evs[0].etype,
+                        "event_id": None, "score": 0.0, "via": "llm"}
+        return None
+
     def _spawn_events(self, source_fact: Point) -> None:
         """Detect events in a freshly ingested FACT and gravitate it onto each
         event's hub (create/dedup the hub via ingest_event). The selective
