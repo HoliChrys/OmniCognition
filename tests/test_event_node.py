@@ -123,3 +123,23 @@ def test_detect_event_type_via_hub_and_none():
     assert det and det["etype"] == "war" and det["via"] == "hub"
     # an unrelated query with no hub match and no extractor -> None
     assert mem.detect_event_type("zzzz qqqq", threshold=0.99) is None
+
+
+def test_detect_routes_to_macro_after_consolidation():
+    enc = SimpleEncoder()
+    mem = Memory(encoder=enc)
+    # two war micro-events sharing the entity "iran" -> consolidate merges them
+    f1 = mem.ingest("iran blockade incident", kind="FACT", id="D1")
+    f2 = mem.ingest("iran strikes incident", kind="FACT", id="D2")
+    e1 = mem.ingest_event("iran blockade", "war", source_facts=[f1], salience=-1)
+    e2 = mem.ingest_event("iran strikes", "war", source_facts=[f2], salience=-1)
+    rep = mem.consolidate_events(min_shared=1)
+    assert rep["merged"] >= 1
+    # the macro is the canonical hub (largest cluster); a sub-event carries
+    # event:in:<macro>. detecting the sub must route up to the macro.
+    macro_ids = {e1.id, e2.id}
+    det = mem.detect_event_type("iran strikes", threshold=0.2)
+    assert det and det["event_id"] in macro_ids
+    # the macro's cluster is the UNION (both facts)
+    cl = {p.id for p in mem.event_cluster(det["event_id"])}
+    assert {"D1", "D2"} <= cl

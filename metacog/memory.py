@@ -679,6 +679,22 @@ class Memory:
                 if s > best_s:
                     best, best_s = p, s
         if best is not None and best_s >= threshold:
+            # ROUTE TO THE MACRO : if the matched hub is a SUB-event (it was
+            # merged under a macro by consolidate_events, so it carries an
+            # event:in:<macro> tag pointing at another EVENT node), resolve to
+            # the macro hub — its cluster is the UNION of all the sub-events'
+            # facts, which is what we want to gather.
+            ev_by_id = {p.id: p for p in self.points if p.kind is PointKind.EVENT}
+            seen = set()
+            while True:
+                macro_id = next((t.split(":", 2)[2] for t in best.tags
+                                 if t.startswith("event:in:")
+                                 and t.split(":", 2)[2] in ev_by_id
+                                 and t.split(":", 2)[2] != best.id), None)
+                if not macro_id or macro_id in seen:
+                    break
+                seen.add(macro_id)
+                best = ev_by_id[macro_id]
             et = next((t.split(":", 2)[2] for t in best.tags
                        if t.startswith("event:type:")), "")
             nm = best.content.split(" ", 1)[1] if " " in best.content else ""

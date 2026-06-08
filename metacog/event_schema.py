@@ -141,12 +141,13 @@ def fill_event_schema(memory: Any, event_name: str, etype: str, *,
     (e.g. the event interval). Failure-safe : empty schema -> empty fill."""
     schema = induce_event_schema(etype, getattr(memory, "llm", None))
     out = {"etype": schema.etype, "slots": list(schema.slots),
-           "core": list(schema.core), "cluster_size": 0,
+           "core": list(schema.core), "cluster_size": 0, "cluster_ids": [],
            "filled": {}, "gaps": [], "fact_ids": []}
     if schema.is_empty():
         return out
 
-    # the gravitating cluster = "everything there is" about the event
+    # the gravitating cluster = "everything there is" about the event = the BAG
+    # the enumeration/retrieve mode returns wholesale.
     cluster = None
     if restrict_ids is not None:
         cluster = [p for p in memory.points if p.id in set(restrict_ids)]
@@ -156,6 +157,7 @@ def fill_event_schema(memory: Any, event_name: str, etype: str, *,
         if hub_id:
             cluster = memory.event_cluster(hub_id)
     out["cluster_size"] = len(cluster) if cluster is not None else 0
+    out["cluster_ids"] = [p.id for p in cluster] if cluster is not None else []
 
     ids: List[str] = []
     core = set(schema.core)
@@ -254,6 +256,40 @@ def reinforce_schema(etype: str, *, min_instances: int = 3,
     return sc
 
 
+def event_anchor(memory: Any, query: str):
+    """Build a query anchor ENRICHED with the detected event's schema elements
+    — the convergence of the event subsystem and the drift-resistance anchor.
+
+    When the query is about an event, the anchor's RELATIVE half is seeded with
+    the event vocabulary (event name tokens + schema slot names + filled slot
+    leaf values) so retrieval/the walk is pulled toward ALL facets of the event
+    — recovering oblique facts that share the event's vocabulary but NONE of the
+    query's surface words ("bomb Iran during peace negotiations" -> belligerents
+    + timeline). Returns (anchor, detection) or (None, None) when not an event."""
+    from metacog.query_anchor import build_query_anchor
+    det = memory.detect_event_type(query) if hasattr(
+        memory, "detect_event_type") else None
+    if not det:
+        return None, None
+    schema = induce_event_schema(det["etype"], getattr(memory, "llm", None))
+    fill = fill_event_schema(memory, det["name"], det["etype"], k_per_slot=2)
+    terms: List[str] = [w for w in det["name"].split() if len(w) >= 3]
+    terms += [s for s in schema.slots]
+    for hits in fill.get("filled", {}).values():       # filled slot evidence
+        for h in hits[:1]:
+            terms += [w for w in (h.get("content") or "").split()[:4]
+                      if len(w) >= 4]
+    try:
+        anchor = build_query_anchor(
+            query, encoder=getattr(memory, "encoder", None),
+            corpus_texts=[p.content for p in memory.points])
+        anchor.with_relative(list(dict.fromkeys(terms))[:16],
+                             getattr(memory, "encoder", None))
+    except Exception:
+        return None, det
+    return anchor, det
+
+
 def event_search(memory: Any, query: str, *, k_per_slot: int = 3,
                  enrich: bool = True) -> Optional[dict]:
     """End-to-end event-schema retrieval for a QUERY : detect the event type,
@@ -268,6 +304,14 @@ def event_search(memory: Any, query: str, *, k_per_slot: int = 3,
     fill = fill_event_schema(memory, det["name"], det["etype"],
                              k_per_slot=k_per_slot)
     fill["event"] = det
+    # ENUMERATION / retrieve mode : the cluster IS the bag — return it as a list.
+    from metacog.enumeration import is_enumeration_query, format_bag_answer
+    if is_enumeration_query(query) and fill.get("cluster_ids"):
+        by_id = {p.id: p for p in memory.points}
+        bag = [(cid, getattr(by_id.get(cid), "content", ""))
+               for cid in fill["cluster_ids"]]
+        fill["bag_answer"] = format_bag_answer(query, bag,
+                                               getattr(memory, "llm", None))
     if enrich:
         try:
             fill["new_slots"] = enrich_schema(
