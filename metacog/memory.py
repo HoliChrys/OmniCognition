@@ -760,34 +760,45 @@ class Memory:
             qe = tuple(self.encoder.encode(q))
         except Exception:
             return None
-        best, best_s = None, 0.0
-        for p in self.points:
-            if p.kind is PointKind.EVENT:
-                s = self._cos(qe, p.embedding_orig)
-                if s > best_s:
-                    best, best_s = p, s
-        if best is not None and best_s >= threshold:
-            # ROUTE TO THE MACRO : if the matched hub is a SUB-event (it was
-            # merged under a macro by consolidate_events, so it carries an
-            # event:in:<macro> tag pointing at another EVENT node), resolve to
-            # the macro hub — its cluster is the UNION of all the sub-events'
-            # facts, which is what we want to gather.
-            ev_by_id = {p.id: p for p in self.points if p.kind is PointKind.EVENT}
-            seen = set()
+        # CLUSTER-AWARE multi-event routing : score each MACRO event not just by
+        # its name's cosine to the query but by how well its gravitating CLUSTER
+        # matches — so a query routes to the event whose facts it is really
+        # about, not merely the nearest hub name (multi-event disambiguation).
+        ev_by_id = {p.id: p for p in self.points if p.kind is PointKind.EVENT}
+
+        def _macro(hub: Point) -> Point:
+            seen: set = set()
             while True:
-                macro_id = next((t.split(":", 2)[2] for t in best.tags
-                                 if t.startswith("event:in:")
-                                 and t.split(":", 2)[2] in ev_by_id
-                                 and t.split(":", 2)[2] != best.id), None)
-                if not macro_id or macro_id in seen:
-                    break
-                seen.add(macro_id)
-                best = ev_by_id[macro_id]
-            et = next((t.split(":", 2)[2] for t in best.tags
-                       if t.startswith("event:type:")), "")
-            nm = best.content.split(" ", 1)[1] if " " in best.content else ""
-            return {"name": nm, "etype": et, "event_id": best.id,
-                    "score": round(best_s, 3), "via": "hub"}
+                mid = next((t.split(":", 2)[2] for t in hub.tags
+                            if t.startswith("event:in:")
+                            and t.split(":", 2)[2] in ev_by_id
+                            and t.split(":", 2)[2] != hub.id), None)
+                if not mid or mid in seen:
+                    return hub
+                seen.add(mid)
+                hub = ev_by_id[mid]
+
+        macro_score: Dict[str, float] = {}
+        macro_pt: Dict[str, Point] = {}
+        for p in ev_by_id.values():
+            m = _macro(p)
+            name_s = self._cos(qe, m.embedding_orig)
+            clus = self.event_cluster(m.id)
+            clus_s = max((self._cos(qe, f.embedding_orig)
+                          for f in clus[:40]), default=0.0)
+            s = max(name_s, 0.5 * name_s + 0.5 * clus_s)
+            if s > macro_score.get(m.id, -1.0):
+                macro_score[m.id] = s
+                macro_pt[m.id] = m
+        if macro_score:
+            mid = max(macro_score, key=macro_score.get)
+            if macro_score[mid] >= threshold:
+                best = macro_pt[mid]
+                et = next((t.split(":", 2)[2] for t in best.tags
+                           if t.startswith("event:type:")), "")
+                nm = best.content.split(" ", 1)[1] if " " in best.content else ""
+                return {"name": nm, "etype": et, "event_id": best.id,
+                        "score": round(macro_score[mid], 3), "via": "hub"}
         if self.event_extractor is not None:
             try:
                 evs = self.event_extractor.extract_events(q)
