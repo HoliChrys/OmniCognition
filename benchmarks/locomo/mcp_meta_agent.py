@@ -1200,6 +1200,33 @@ class McpMetaAgent:
         # mutation stays local and cannot race another worker. Read-only
         # tools are unaffected ; the cost is one snapshot per QA.
         memory = memory.snapshot()
+
+        # AUTO event/enumeration short-circuit. A "find all / list every …"
+        # question about an EVENT is answered by the event CLUSTER (the bag)
+        # directly — exhaustive retrieval, no walk loop. The cluster aggregates
+        # facts by their real-world referent, so it recovers oblique members
+        # that share none of the question's surface words. retrieved_ids = the
+        # bag so recall credits the gathered set. Gated : only fires when the
+        # memory actually has event hubs and the question is an enumeration.
+        try:
+            from metacog.enumeration import is_enumeration_query
+            from metacog.event_schema import event_search as _evsearch
+            if is_enumeration_query(question):
+                memory.consolidate_events(min_shared=1)
+                ev = _evsearch(memory, question)
+                if ev and ev.get("event") and ev.get("bag_answer"):
+                    return {
+                        "answer": ev["bag_answer"],
+                        "answer_raw": ev["bag_answer"],
+                        "steps": 1, "tokens_in": 0, "tokens_out": 0,
+                        "retrieved_ids": sorted(ev.get("cluster_ids") or []),
+                        "trace": [{"action": "event_bag",
+                                   "event": ev.get("event"),
+                                   "bag_size": ev.get("cluster_size", 0)}],
+                    }
+        except Exception:
+            pass
+
         app = build_app(memory=memory)
         total_in = 0
         total_out = 0
