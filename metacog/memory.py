@@ -610,6 +610,70 @@ class Memory:
     def bag_clear(self) -> None:
         self._bag = []
 
+    # ---- bi-temporal validity (Graphiti : t_valid / t_invalid) --------------
+    # event_time lives in the time:* tags ; ingestion_time is t_last_obs. A fact
+    # superseded by newer contradicting info is INVALIDATED (tagged
+    # valid:until:<date>) rather than deleted — preserving history for "as-of"
+    # queries. valid:until absent ⇒ still valid / ongoing (right-open).
+    @staticmethod
+    def is_valid(fact: Point, as_of: Optional[str] = None) -> bool:
+        """True if `fact` holds (no valid:until, or `as_of` precedes it)."""
+        until = next((t.split(":", 2)[2] for t in fact.tags
+                      if t.startswith("valid:until:")), None)
+        if not until:
+            return True
+        return bool(as_of) and as_of < until
+
+    def invalidate(self, fact_id: str, until: str) -> bool:
+        """Mark a fact invalid from `until` (a YYYY-MM-DD date), last-write-wins.
+        Edge-free : a tag, never a deletion."""
+        p = next((q for q in self.points if q.id == fact_id), None)
+        if p is None:
+            return False
+        tag = f"valid:until:{until}"
+        if not any(t.startswith("valid:until:") for t in p.tags):
+            p.tags.append(tag)
+            if "invalidated" not in p.tags:
+                p.tags.append("invalidated")
+            return True
+        return False
+
+    def invalidate_contradictions(self, new_fact: Point, *,
+                                  threshold: float = 0.55,
+                                  max_check: int = 5) -> List[str]:
+        """Graphiti-style temporal invalidation : find prior FACTs semantically
+        close to `new_fact`, ask the LLM if the new one CONTRADICTS/supersedes
+        each, and invalidate the superseded ones at the new fact's event date
+        (last-write-wins). Bounded (top `max_check` by cosine). Returns the
+        invalidated ids. Failure-safe / no-op without an LLM."""
+        if not hasattr(self.llm, "generate"):
+            return []
+        until = next((t.split(":", 2)[2] for t in new_fact.tags
+                      if t.startswith("time:date:")), None) or "9999-99-99"
+        cands = []
+        for p in self.points:
+            if (p.kind is PointKind.FACT and p.id != new_fact.id
+                    and not p.id.startswith(("entity_", "atom_", "event_"))
+                    and self.is_valid(p)):
+                s = self._cos(new_fact.embedding_orig, p.embedding_orig)
+                if s >= threshold:
+                    cands.append((s, p))
+        cands.sort(key=lambda x: -x[0])
+        invalidated: List[str] = []
+        for _, p in cands[:max_check]:
+            try:
+                r = self.llm.generate(
+                    "Does NEW information CONTRADICT and supersede OLD (a later "
+                    "update replacing it)? Answer only yes or no.\n"
+                    f"OLD: {p.content[:160]}\nNEW: {new_fact.content[:160]}\n"
+                    "Answer:", max_tokens=4)
+            except Exception:
+                r = ""
+            if (r or "").strip().lower().startswith("y"):
+                if self.invalidate(p.id, until):
+                    invalidated.append(p.id)
+        return invalidated
+
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
         "over", "into", "this", "that", "their", "his", "her", "its", "new",
