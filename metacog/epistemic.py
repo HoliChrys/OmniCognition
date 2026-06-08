@@ -41,22 +41,27 @@ class SourceClass(Enum):
 
 
 class PointKind(Enum):
-    """Ontological kind of a Point — three coexisting types in the same DB.
+    """Ontological kind of a Point — four coexisting types in the same DB.
 
-    All three share the same schema, A(·), and lifecycle. They differ
-    only in what they REPRESENT and in how they typically get
-    corroborated :
+    All share the same schema, A(·), and lifecycle. They differ only in
+    what they REPRESENT and in how they typically get corroborated :
 
       FACT     external observation, world-anchored
       THOUGHT  internal derivation / reasoning step
       ACTION   contextualized intervention (replaces the old `skill`
                concept — actions live in the manifold, not in a
                separate registry)
+      EVENT    a temporally-extended HUB that aggregates the facts which
+               gravitate around it (apply_pull), carries an event:type:*
+               schema and an interval [t_start, t_end?] (t_end absent =
+               ongoing / right-open). Distinct from a FACT : it is an
+               aggregator with its own identity, not an observation.
     """
 
     FACT = "FACT"
     THOUGHT = "THOUGHT"
     ACTION = "ACTION"
+    EVENT = "EVENT"
 
 
 class EpistemicState(Enum):
@@ -213,7 +218,7 @@ class Point:
     # ------------------------------------------------------------------
     # Evolutive tagging (multi-tag, multi-kind, open vocabulary)
     # ------------------------------------------------------------------
-    _KIND_TAGS = ("fact", "thought", "action")
+    _KIND_TAGS = ("fact", "thought", "action", "event")
 
     def add_tag(self, *tags: str) -> "Point":
         """Append tag(s) (lowercased, deduped). Lets the typing EVOLVE —

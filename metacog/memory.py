@@ -148,6 +148,10 @@ class Memory:
     conversation_log: ConversationLog = field(default_factory=ConversationLog)
     # atomic-fact id -> source turn id (for retrieval resolution).
     _atom_parent: Dict[str, str] = field(default_factory=dict)
+    # EVENT hub registry : "<type>::<name>" -> event_id, for resolution/dedup
+    # (a war mentioned in 10 turns must resolve to ONE hub, not 10). Rebuilt
+    # from points on load(). The hub aggregates the facts that gravitate to it.
+    _event_registry: Dict[str, str] = field(default_factory=dict)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
     # Total number of multi-hop transitions recorded by record_hop ;
@@ -437,6 +441,99 @@ class Memory:
         if parent_entity is not None:
             apply_pull(beacon, parent_entity, +1.0, t_now)
         return beacon
+
+    @staticmethod
+    def _cos(a, b) -> float:
+        if not a or not b:
+            return 0.0
+        num = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(y * y for y in b) ** 0.5
+        return num / (na * nb) if na and nb else 0.0
+
+    def ingest_event(
+        self,
+        name: str,
+        etype: str,
+        *,
+        source_facts: Sequence[Point] = (),
+        t_start: Optional[str] = None,
+        t_end: Optional[str] = None,
+        salience: float = 0.30,
+        t_now: Optional[float] = None,
+    ) -> Point:
+        """Create (or RESOLVE to an existing) EVENT hub and gravitate the
+        relevant source facts onto it.
+
+        The EVENT is a `PointKind.EVENT` aggregator — NOT a fact — carrying a
+        hierarchical `event:type:<etype>` schema tag and an interval
+        [t_start, t_end?] (t_end absent ⇒ ongoing / right-open). It is the
+        temporally-extended HUB the facts gravitate around.
+
+        RESOLUTION / DEDUP (Graphiti recipe, edge-free) : a hub with the same
+        type and a name that matches an existing hub (registry key OR cosine
+        ≥ 0.85) is REUSED — the new facts are pulled onto the existing hub, so
+        "the war" across many turns is ONE node, not many.
+
+        SELECTIVE GRAVITATION (EventKG/MEAD : centrality = relevance) : a source
+        fact is pulled onto the hub only when cos(fact, hub) ≥ `salience`, so
+        the hub aggregates the salient facts, not noise.
+
+        Cor. 5 : the hub is GENERATOR-sourced ; apply_pull is called directly,
+        never via an Observation.
+        """
+        if t_now is None:
+            t_now = self._now()
+        nm = (name or "").strip()
+        et = (etype or "").strip().lower()
+        key = f"{et}::{nm.lower()}"
+        emb = tuple(self.encoder.encode(nm or et))
+
+        # ---- resolution / dedup ----
+        hub: Optional[Point] = None
+        if key in self._event_registry:
+            hub = next((p for p in self.points
+                        if p.id == self._event_registry[key]), None)
+        if hub is None:
+            best, best_s = None, 0.0
+            for p in self.points:
+                if p.kind is PointKind.EVENT and f"event:type:{et}" in p.tags:
+                    s = self._cos(emb, p.embedding_orig)
+                    if s > best_s:
+                        best, best_s = p, s
+            if best is not None and best_s >= 0.85:
+                hub = best
+
+        if hub is None:
+            tags = ["event", f"event:type:{et}"]
+            for dt in _session_date_tags(f"[{t_start}]") if t_start else []:
+                tags.append(dt.replace("time:", "event:start:", 1)
+                            if dt.startswith("time:") else dt)
+            if t_end:
+                for dt in _session_date_tags(f"[{t_end}]"):
+                    tags.append(dt.replace("time:", "event:end:", 1))
+            kws = [w for w in (nm.split() + [et]) if w]
+            hub = Point(
+                id=f"event_{uuid.uuid4().hex[:8]}",
+                content=f"event:{et} {nm}".strip(),
+                embedding_orig=emb,
+                kind=PointKind.EVENT,
+                keywords=kws,
+                keywords_embedding=position_weighted_keyword_embedding(
+                    kws, self.encoder),
+                keywords_source=SourceClass.GENERATOR,
+                tags=tags,
+            )
+            self.points.append(hub)
+            self._event_registry[key] = hub.id
+
+        # ---- selective gravitation ----
+        for f in source_facts or ():
+            if f is None or f.id == hub.id:
+                continue
+            if self._cos(f.embedding_orig, hub.embedding_orig) >= salience:
+                apply_pull(hub, f, +1.0, t_now)
+        return hub
 
     def _spawn_entities(self, source_fact: Point) -> None:
         """Extract entities from a freshly ingested FACT and spawn their
@@ -1989,3 +2086,12 @@ class Memory:
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)
         self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
+        # Rebuild the EVENT-hub registry from the restored points (it is not
+        # serialised — the points carry the canonical event:type tags).
+        self._event_registry = {}
+        for p in self.points:
+            if p.kind is PointKind.EVENT:
+                et = next((t.split(":", 2)[2] for t in p.tags
+                           if t.startswith("event:type:")), "")
+                nm = p.content.split(" ", 1)[1] if " " in p.content else ""
+                self._event_registry[f"{et}::{nm.lower()}"] = p.id
