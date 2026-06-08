@@ -50,8 +50,9 @@ def test_never_caches_empty():
 
 
 def test_failsafe_without_llm():
-    s = induce_event_schema("war", object())   # no .generate
-    assert s.is_empty() and s.etype == "war"
+    _SCHEMA_CACHE.pop("uncachedtype", None)
+    s = induce_event_schema("uncachedtype", object())   # no .generate, no cache
+    assert s.is_empty() and s.etype == "uncachedtype"
 
 
 def test_slot_subquestions_one_per_slot():
