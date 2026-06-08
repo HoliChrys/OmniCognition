@@ -73,3 +73,42 @@ def test_event_registry_rebuilt_on_load():
         # resolving the same event after load reuses the persisted hub
         e = mem2.ingest_event("the war", "war")
         assert e.id == mem._event_registry["war::the war"]
+
+
+class _FakeEventExtractor:
+    """Scripted: maps a turn substring -> events to spawn."""
+    def __init__(self, mapping):
+        self.mapping = mapping
+    def extract_events(self, text):
+        from metacog.event_extractor import ExtractedEvent
+        for sub, evs in self.mapping.items():
+            if sub in text:
+                return [ExtractedEvent(*e) for e in evs]
+        return []
+
+
+def test_auto_spawn_dedups_event_across_turns():
+    enc = SimpleEncoder()
+    ex = _FakeEventExtractor({
+        "war": [("the war", "war", None)],
+        "cake": [("birthday", "celebration", None)],
+    })
+    mem = Memory(encoder=enc, event_extractor=ex)
+    mem.ingest("the war started over the border", kind="FACT", id="D1")
+    mem.ingest("troops at the front of the war", kind="FACT", id="D2")
+    mem.ingest("i baked a cake today", kind="FACT", id="D3")
+    hubs = [p for p in mem.points if p.kind is PointKind.EVENT]
+    # the two war turns dedup to ONE war hub; the cake is a separate event hub
+    war = [h for h in hubs if "event:type:war" in h.tags]
+    assert len(war) == 1
+    assert any("event:type:celebration" in h.tags for h in hubs)
+    assert len(hubs) == 2
+
+
+def test_event_extractor_not_run_on_derived_nodes():
+    enc = SimpleEncoder()
+    ex = _FakeEventExtractor({"war": [("the war", "war", None)]})
+    mem = Memory(encoder=enc, event_extractor=ex)
+    # an entity_/atom_/event_-prefixed id must not recurse into event spawning
+    mem.ingest("the war", kind="FACT", id="entity_x")
+    assert not any(p.kind is PointKind.EVENT for p in mem.points)

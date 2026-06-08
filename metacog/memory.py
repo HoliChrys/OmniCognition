@@ -141,6 +141,10 @@ class Memory:
     # GENERATOR) that act as retrieval handles ; retrieval resolves an
     # atomic hit back to its source turn (dia_id) and dedups.
     atomic_extractor: Any = None
+    # Opt-in LLM EVENT detector. When set, each ingested FACT is scanned for a
+    # notable event ; a PointKind.EVENT hub is created/deduped (ingest_event)
+    # and the turn gravitates onto it. None = current behavior unchanged.
+    event_extractor: Any = None
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
@@ -333,6 +337,17 @@ class Memory:
                 self._spawn_atomics(point)
             except Exception:
                 pass
+        # Detect/type an EVENT in the turn and gravitate it onto its hub (opt-in,
+        # never on derived nodes ; a flaky extractor must not break ingestion).
+        if (
+            self.event_extractor is not None
+            and kind.upper() == "FACT"
+            and not id.startswith(("entity_", "atom_", "event_"))
+        ):
+            try:
+                self._spawn_events(point)
+            except Exception:
+                pass
         # Optional INGEST-time hierarchical tag refinement for genuine
         # FACT/ACTION nodes (entity beacons / atomics are already typed). Off
         # by default — the latent-sleep pass is the cheap path ; this is the
@@ -451,6 +466,22 @@ class Memory:
         nb = sum(y * y for y in b) ** 0.5
         return num / (na * nb) if na and nb else 0.0
 
+    def _same_event_llm(self, new_name: str, hub: Point) -> bool:
+        """LLM arbitration : is `new_name` the SAME real-world event as the
+        existing hub? Bounded (only called for same-type, mid-cosine
+        candidates). Fails closed (False) so a flaky LLM never over-merges."""
+        if not hasattr(self.llm, "generate"):
+            return False
+        existing = hub.content.split(" ", 1)[1] if " " in hub.content else hub.content
+        try:
+            r = self.llm.generate(
+                "Are these two references to the SAME real-world event? "
+                "Answer only yes or no.\n"
+                f"A: {new_name}\nB: {existing}\nAnswer:", max_tokens=4)
+            return (r or "").strip().lower().startswith("y")
+        except Exception:
+            return False
+
     def ingest_event(
         self,
         name: str,
@@ -489,7 +520,7 @@ class Memory:
         key = f"{et}::{nm.lower()}"
         emb = tuple(self.encoder.encode(nm or et))
 
-        # ---- resolution / dedup ----
+        # ---- resolution / dedup (Graphiti recipe : cosine + LLM arbitration) ----
         hub: Optional[Point] = None
         if key in self._event_registry:
             hub = next((p for p in self.points
@@ -501,8 +532,16 @@ class Memory:
                     s = self._cos(emb, p.embedding_orig)
                     if s > best_s:
                         best, best_s = p, s
-            if best is not None and best_s >= 0.85:
-                hub = best
+            if best is not None:
+                if best_s >= 0.85:
+                    hub = best
+                elif best_s >= 0.45 and self._same_event_llm(nm, best):
+                    # same type, ambiguous name — let the LLM decide if it is the
+                    # same real-world event ("the war" == "war between two
+                    # nations"). This is what cosine-on-names alone misses.
+                    hub = best
+            if hub is not None:                 # alias the new name to the hub
+                self._event_registry[key] = hub.id
 
         if hub is None:
             tags = ["event", f"event:type:{et}"]
@@ -534,6 +573,21 @@ class Memory:
             if self._cos(f.embedding_orig, hub.embedding_orig) >= salience:
                 apply_pull(hub, f, +1.0, t_now)
         return hub
+
+    def _spawn_events(self, source_fact: Point) -> None:
+        """Detect events in a freshly ingested FACT and gravitate it onto each
+        event's hub (create/dedup the hub via ingest_event). The selective
+        gravitation gate in ingest_event keeps only turns actually about the
+        event."""
+        evs = self.event_extractor.extract_events(source_fact.content)
+        if not evs:
+            return
+        t_now = self._now()
+        for e in evs:
+            self.ingest_event(
+                e.name, e.etype, source_facts=[source_fact],
+                t_start=getattr(e, "t_start", None), t_now=t_now,
+            )
 
     def _spawn_entities(self, source_fact: Point) -> None:
         """Extract entities from a freshly ingested FACT and spawn their
