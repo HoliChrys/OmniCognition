@@ -161,6 +161,7 @@ class Memory:
     # tasks). Rendered as the exhaustive list answer at the end. Seeded from an
     # event cluster, grown by the agent via bag_add.
     _bag: List[str] = field(default_factory=list)
+    _bags: Dict[str, List[str]] = field(default_factory=dict)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
     # Total number of multi-hop transitions recorded by record_hop ;
@@ -668,24 +669,97 @@ class Memory:
                  and p.embedding_orig]
         return self._centroid(vecs)
 
-    # ---- retrieve-mode bag : the agent's curated answer list ----------------
-    def bag_add(self, ids) -> int:
-        """Append node ref(s) the agent decides to KEEP for a retrieve/list
-        answer (deduped, order-preserving). Returns the bag size."""
+    # ---- NAMED BAGS : retrieve-mode + cluster + schema-slot containers ------
+    # The bag is the primitive container used everywhere parallel channels
+    # collect ids — the agent's retrieve list ("default"), an event cluster
+    # ("event:<hid>"), a schema slot ("event:<hid>:slot:<slot>"), a normal
+    # search ("normal:<q>") — all live in `_bags`. Intersecting two bags is the
+    # cheap, INTERPRETED join (a fact found by both channels is the high-
+    # precision nugget). ACTION/THOUGHT generators read every non-empty bag for
+    # context (an empty bag has no influence — the invariant of empty steps).
+    def _bag_ref(self, name: str) -> List[str]:
+        if not hasattr(self, "_bags") or self._bags is None:
+            self._bags = {}
+        return self._bags.setdefault(name or "default", [])
+
+    def bag_add(self, ids, *, bag: str = "default") -> int:
+        """Append node ref(s) to a NAMED bag (deduped, order-preserving).
+        Default bag is the agent's retrieve list (backwards-compatible)."""
+        b = self._bag_ref(bag)
         if isinstance(ids, str):
             ids = [ids]
         for i in ids or []:
-            if isinstance(i, str) and i and i not in self._bag:
-                self._bag.append(i)
-        return len(self._bag)
+            if isinstance(i, str) and i and i not in b:
+                b.append(i)
+        # mirror the default into the legacy `_bag` field so external readers
+        # (format_bag_answer wiring, agent loop) keep working unchanged.
+        if bag == "default":
+            self._bag = list(b)
+        return len(b)
 
-    def bag_items(self):
-        """The bag as (id, content) pairs, in collection order."""
+    def bag_items(self, *, bag: str = "default"):
+        """A bag as (id, content) pairs, in collection order."""
+        b = self._bag_ref(bag)
         by_id = {p.id: p for p in self.points}
-        return [(i, getattr(by_id.get(i), "content", "")) for i in self._bag]
+        return [(i, getattr(by_id.get(i), "content", "")) for i in b]
 
-    def bag_clear(self) -> None:
-        self._bag = []
+    def bag_clear(self, *, bag: Optional[str] = None) -> None:
+        """Clear ONE named bag (default 'default') or, when `bag is None`, the
+        default bag — backwards-compatible with the old no-arg form."""
+        if not hasattr(self, "_bags") or self._bags is None:
+            self._bags = {}
+        name = bag if bag is not None else "default"
+        self._bags[name] = []
+        if name == "default":
+            self._bag = []
+
+    def bag_names(self) -> List[str]:
+        if not hasattr(self, "_bags") or self._bags is None:
+            self._bags = {}
+        return [n for n, b in self._bags.items() if b]
+
+    def bag_intersect(self, names: Sequence[str]) -> List[str]:
+        """Intersection of the NAMED bags — the INTERPRETED join : an id that
+        every listed channel surfaced. Order-preserving on the first bag."""
+        names = [n for n in (names or []) if n]
+        if not names:
+            return []
+        first = self._bag_ref(names[0])
+        rest = [set(self._bag_ref(n)) for n in names[1:]]
+        if not rest:
+            return list(first)
+        return [i for i in first if all(i in s for s in rest)]
+
+    def bag_union(self, names: Sequence[str]) -> List[str]:
+        """Union of the NAMED bags (dedup, order-preserving)."""
+        seen: set = set()
+        out: List[str] = []
+        for n in (names or []):
+            for i in self._bag_ref(n):
+                if i not in seen:
+                    seen.add(i)
+                    out.append(i)
+        return out
+
+    def bag_publish_cluster(self, event_id: str) -> int:
+        """Publish an event's gravitating cluster as a NAMED bag — so the
+        cluster becomes an intersect-able channel like any other bag."""
+        return self.bag_add([p.id for p in self.event_cluster(event_id)],
+                            bag=f"event:{event_id}")
+
+    def bag_publish_schema(self, event_id: str, fill: dict) -> int:
+        """Publish each filled schema SLOT as its own bag, plus a roll-up
+        'event:<id>:schema' = union of the slots. Lets ACTION/THOUGHT read
+        them, and lets bag_intersect surface a fact found by multiple slots."""
+        rolled: List[str] = []
+        for slot, hits in ((fill or {}).get("filled") or {}).items():
+            ids = [h["id"] for h in hits if isinstance(h, dict) and h.get("id")]
+            if ids:
+                self.bag_add(ids, bag=f"event:{event_id}:slot:{slot}")
+                rolled += [i for i in ids if i not in rolled]
+        if rolled:
+            self.bag_add(rolled, bag=f"event:{event_id}:schema")
+        return len(rolled)
 
     # ---- bi-temporal validity (Graphiti : t_valid / t_invalid) --------------
     # event_time lives in the time:* tags ; ingestion_time is t_last_obs. A fact
@@ -1875,6 +1949,12 @@ class Memory:
         if beacons and not atomics:
             search_pts = [p for p in self.points
                           if not p.id.startswith("entity_")]
+        # event-action beacons : event_action_enrich plants a GENERATOR ACTION
+        # that re-anchors the WALK on the schema's findings. Like entity beacons
+        # their pull already shifted the real facts ; they are dead weight in a
+        # cosine retrieve and would only displace evidence (and aren't answers).
+        search_pts = [p for p in search_pts
+                      if "event:action" not in (p.tags or ())]
         # Over-fetch more when atomic facts are present : many atoms resolve
         # to the same source turn, so we need headroom to dedup to k turns.
         k_fetch = k

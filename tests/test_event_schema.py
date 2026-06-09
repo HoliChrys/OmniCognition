@@ -216,3 +216,52 @@ def test_event_action_enrich_noop_on_empty():
     mem = Memory(encoder=SimpleEncoder(), llm=_ActLLM())
     e = mem.ingest_event("x", "attack")
     assert event_action_enrich(mem, e.id, {"fact_ids": []}) is None
+
+
+def test_bag_publish_intersect_and_action_seed_on_intersection():
+    """Bags work as named containers : the cluster + each schema slot are
+    published as bags, their INTERSECTION is the interpreted nugget, and
+    event_action_enrich seeds its ACTION on that intersection when non-empty."""
+    from metacog.event_schema import event_action_enrich
+    from metacog.epistemic import PointKind
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+
+    class _ActLLM2:
+        def generate(self, prompt, max_tokens=64):
+            return "review the attacks"
+
+    mem = Memory(encoder=SimpleEncoder(), llm=_ActLLM2())
+    f1 = mem.ingest("missile strike on the oil terminal", kind="FACT", id="D1")
+    f2 = mem.ingest("naval blockade of the strait", kind="FACT", id="D2")
+    f3 = mem.ingest("a peripheral diplomatic remark", kind="FACT", id="D3")
+    e = mem.ingest_event("strait attack", "attack",
+                         source_facts=[f1, f2, f3], salience=-1)
+    # cluster bag = D1,D2,D3 ; one slot bag = D1,D2 -> intersection = {D1,D2}
+    mem.bag_publish_cluster(e.id)
+    mem.bag_publish_schema(e.id, {"filled": {
+        "target": [{"id": "D1"}, {"id": "D2"}],
+    }})
+    inter = mem.bag_intersect([f"event:{e.id}", f"event:{e.id}:schema"])
+    assert set(inter) == {"D1", "D2"}
+    assert set(mem.bag_union([f"event:{e.id}", f"event:{e.id}:schema"])) == {
+        "D1", "D2", "D3"}
+    # action seed picks the intersection, so parents = {D1,D2}, NOT D3
+    aid = event_action_enrich(mem, e.id, {"fact_ids": ["D1", "D2", "D3"]})
+    act = next(p for p in mem.points if p.id == aid)
+    assert set(act.parents) == {"D1", "D2"}
+
+
+def test_named_bags_independent_and_clearable():
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    mem = Memory(encoder=SimpleEncoder())
+    mem.bag_add(["A", "B"], bag="x")
+    mem.bag_add(["B", "C"], bag="y")
+    assert set(mem.bag_intersect(["x", "y"])) == {"B"}
+    assert mem.bag_intersect(["x", "z-empty"]) == []
+    mem.bag_clear(bag="x")
+    assert mem.bag_intersect(["x", "y"]) == []
+    # default bag is backwards-compatible
+    mem.bag_add(["Z"])
+    assert mem._bag == ["Z"]

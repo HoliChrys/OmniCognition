@@ -370,7 +370,18 @@ def event_action_enrich(memory: Any, event_id: str, fill: dict
     from metacog.meta_walk import generate_action
     from metacog.geometry import apply_pull
     by_id = {p.id: p for p in memory.points}
-    facts = [by_id[i] for i in (fill.get("fact_ids") or []) if i in by_id]
+    # Seed the action on the INTERSECTION of every non-empty bag for this event
+    # (the interpreted nuggets that several channels agreed on) — if it is non-
+    # empty those facts ground the action the tightest. Fall back to the union
+    # of the schema's filled facts. An empty step yields no facts -> no action.
+    inter: List[str] = []
+    if hasattr(memory, "bag_names") and hasattr(memory, "bag_intersect"):
+        ev_bags = [n for n in memory.bag_names()
+                   if n.startswith(f"event:{event_id}")]
+        if len(ev_bags) >= 2:
+            inter = memory.bag_intersect(ev_bags)
+    seeds = inter or (fill.get("fact_ids") or [])
+    facts = [by_id[i] for i in seeds if i in by_id]
     if not facts or not hasattr(memory, "_now"):
         return None
     t_now = memory._now()
@@ -434,6 +445,20 @@ def event_search(memory: Any, query: str, *, k_per_slot: int = 5,
             fill["action_id"] = event_action_enrich(memory, hub_id, fill)
         except Exception:
             fill["action_id"] = None
+
+    # PUBLISH the cluster and each schema slot as NAMED BAGS, so any caller can
+    # bag_intersect them (cluster ∩ slot:attacker ∩ slot:target = the nugget the
+    # multiple channels agree on) and ACTION/THOUGHT can read every non-empty
+    # bag as additional grounding. The intersection is the cheap interpreted
+    # join across channels.
+    if hub_id and hasattr(memory, "bag_publish_cluster"):
+        memory.bag_publish_cluster(hub_id)
+        memory.bag_publish_schema(hub_id, fill)
+        try:
+            fill["bag_intersection_cluster_schema"] = memory.bag_intersect([
+                f"event:{hub_id}", f"event:{hub_id}:schema"])
+        except Exception:
+            fill["bag_intersection_cluster_schema"] = []
 
     # COLLECT each NECESSARY (core) slot's clue into the BAG : the schema's list
     # of required roles IS a retrieve-bag. Parallel — it only feeds the final
