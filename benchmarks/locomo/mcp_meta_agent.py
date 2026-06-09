@@ -1011,21 +1011,8 @@ def _compose_final(focused, bags, question, llm):
     (answer, bag_ids_used). Empty -> the focused answer unchanged. A pure
     enumeration query, or no real focused answer, yields the list(s) alone ;
     otherwise focused answer and list(s) coexist."""
-    from metacog.enumeration import is_enumeration_query
-    from metacog.bag_render import render_bags
-    focused = (focused or "").strip()
-    bags_map = bags if isinstance(bags, dict) else {"default": list(bags or [])}
-    bags_map = {k: v for k, v in bags_map.items() if v}
-    if not bags_map:
-        return focused, []
-    rendered, ids = render_bags(question, bags_map, llm)
-    if not rendered:
-        return focused, []
-    real = bool(focused) and "not mentioned" not in focused.lower() \
-        and "no information" not in focused.lower()
-    if is_enumeration_query(question) or not real:
-        return rendered, ids                    # exhaustive : the list(s) ARE it
-    return focused + "\n\n" + rendered, ids      # BOTH
+    from metacog.bag_render import compose_answer
+    return compose_answer(question, focused, bags, llm)
 
 
 def terse(text: str, question: Optional[str] = None) -> str:
@@ -2020,12 +2007,9 @@ class McpMetaAgent:
         # Gather the agent's CURATED bags (default + any named bags it collected)
         # as a MAP of lists ; internal channel bags (event:*) are excluded from
         # the surface answer to avoid bloat. One map -> dynamic multi-value inject.
-        if hasattr(memory, "bag_names"):
-            curated = [n for n in memory.bag_names() if not n.startswith("event:")]
-            bags_map = {n: memory.bag_items(bag=n) for n in curated}
-        else:
-            bags_map = {"default": memory.bag_items()} \
-                if hasattr(memory, "bag_items") else {}
+        bags_map = memory.curated_bags() if hasattr(memory, "curated_bags") \
+            else ({"default": memory.bag_items()}
+                  if hasattr(memory, "bag_items") else {})
         final_answer, _bag_used = _compose_final(
             terse(answer_text, question), bags_map, question, memory.llm)
         seen_ids.update(_bag_used)

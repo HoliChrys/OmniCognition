@@ -740,6 +740,14 @@ class Memory:
                 "description": m.get("description", ""),
                 "schema": m.get("schema"), "sample": b[:5]}
 
+    def curated_bags(self) -> Dict[str, list]:
+        """The agent's CURATED bags as a map {name: [(id, content)]} — the
+        default retrieve list plus any named bags it collected. Internal channel
+        bags (event:*) are excluded : they feed generators, not the surface
+        answer. This is the map of lists the final generation / keepup injects."""
+        return {n: self.bag_items(bag=n) for n in self.bag_names()
+                if not n.startswith("event:")}
+
     def bag_overview(self) -> List[dict]:
         """Every non-empty bag with its decision metadata — what the agent reads
         to choose which list(s) to surface and how. Default + curated bags first,
@@ -2162,6 +2170,64 @@ class Memory:
         )
         yield from walker.keepup()
 
+    @staticmethod
+    def _point_date(p: Point) -> Optional[str]:
+        """A point's event date (YYYY-MM-DD) from its time:date tag, or None."""
+        return next((t.split(":", 2)[2] for t in p.tags
+                     if t.startswith("time:date:")), None)
+
+    def filter_list(
+        self,
+        *,
+        tags: Optional[Sequence[str]] = None,
+        match: str = "exact",
+        event_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        kind: Optional[str] = None,
+        valid_only: bool = False,
+        as_of: Optional[str] = None,
+    ) -> List[Point]:
+        """NON-kNN FILTERED LISTING : return ALL points matching the PARAMETERS
+        as a plain list — a scan, with no query embedding, no walk, no top-k.
+
+        This is the "refer an exhaustive set" primitive the walk's ACTION
+        launches once meta-cognition sees the input relates to an event : a
+        targeted, filtered knowledge-base query by `event_id` (the gravitating
+        cluster), inclusive `date_from`/`date_to` range (ISO dates, lexical),
+        hierarchical `tags`, and `kind`. Ordered by event date then id, so the
+        listing is deterministic and exhaustive (every match, not a similarity
+        ranking)."""
+        from metacog.tags import filter_points
+        if tags:
+            keep = set(filter_points(self.points, list(tags), mode=match))
+            pts = [p for p in self.points if p.id in keep]
+        else:
+            pts = list(self.points)
+        if event_id:
+            ev = {p.id for p in self.event_cluster(event_id)}
+            pts = [p for p in pts if p.id in ev]
+        if kind:
+            kn = str(kind).upper()
+            pts = [p for p in pts
+                   if getattr(p.kind, "name", str(p.kind)).upper() == kn]
+        if date_from or date_to:
+            ranged = []
+            for p in pts:
+                d = self._point_date(p)
+                if d is None:
+                    continue
+                if date_from and d < date_from:
+                    continue
+                if date_to and d > date_to:
+                    continue
+                ranged.append(p)
+            pts = ranged
+        if valid_only:
+            pts = [p for p in pts if self.is_valid(p, as_of=as_of)]
+        pts.sort(key=lambda p: (self._point_date(p) or "9999-99-99", p.id))
+        return pts
+
     def scoped_answer(
         self,
         query: str,
@@ -2170,6 +2236,10 @@ class Memory:
         knowledge_base: bool = False,
         n_stages: int = 16,
         match: str = "exact",
+        list_only: bool = False,
+        event_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Tag-filtered retrieval as a TWO-PHASE cascade.
 
@@ -2198,7 +2268,25 @@ class Memory:
         ["global_answer", "global_evidence"]}`."""
         from metacog.meta_walk import MetaWalker, provisional_answer
         from metacog.tags import filter_points
+
+        # NON-kNN listing : the walk's ACTION saw the input relates to an event
+        # and asks for the exhaustive set by parameters, not a similarity walk.
+        if list_only:
+            pts = self.filter_list(tags=tags, match=match, event_id=event_id,
+                                   date_from=date_from, date_to=date_to)
+            return {
+                "scoped_list": [{"id": p.id, "content": p.content} for p in pts],
+                "scoped_ids": [p.id for p in pts],
+                "knowledge_base": bool(knowledge_base), "list_only": True,
+            }
+
         scoped_ids = filter_points(self.points, list(tags or []), mode=match)
+        # Targeted filter : narrow the kNN walk's pool by event / date too.
+        if event_id or date_from or date_to:
+            filt = {p.id for p in self.filter_list(
+                event_id=event_id, date_from=date_from, date_to=date_to)}
+            scoped_ids = [i for i in (scoped_ids or
+                          [p.id for p in self.points]) if i in filt]
 
         def _run(q, *, restrict):
             w = MetaWalker(q, self, n_stages=n_stages, commit=False,

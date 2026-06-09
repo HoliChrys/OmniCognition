@@ -171,6 +171,34 @@ def _inject(question: str, listing: str, n: int, llm: Any) -> str:
     return f"Found {n} matching items:\n{listing}"
 
 
+def compose_answer(question: str, focused: str, bags: Any, llm: Any):
+    """Mode-aware composition of the two answer modes — the single home for the
+    rule, used by both the agent's final pass and the keepup stream.
+
+      * "generate a focused answer" -> the focused walk answer (F1 mode).
+      * "refer an exhaustive set"   -> the rendered list(s) (recall mode).
+      * BOTH                        -> focused answer + the list(s).
+
+    `bags` is a MAP {name: [(ref, content)]} (a plain list = the default bag).
+    Returns (answer, bag_ids_used). Empty bags -> the focused answer unchanged
+    (and no LLM call). A pure enumeration query, or no real focused answer,
+    yields the list(s) alone ; otherwise the two coexist."""
+    from metacog.enumeration import is_enumeration_query
+    focused = (focused or "").strip()
+    bags_map = bags if isinstance(bags, dict) else {"default": list(bags or [])}
+    bags_map = {k: v for k, v in bags_map.items() if v}
+    if not bags_map:
+        return focused, []
+    rendered, ids = render_bags(question, bags_map, llm)
+    if not rendered:
+        return focused, []
+    real = bool(focused) and "not mentioned" not in focused.lower() \
+        and "no information" not in focused.lower()
+    if is_enumeration_query(question) or not real:
+        return rendered, ids                    # exhaustive : the list(s) ARE it
+    return focused + "\n\n" + rendered, ids      # BOTH
+
+
 def render_bags(question: str, bags: dict, llm: Any, *, strategy: str = "auto",
                 head: int = 20, tail: int = 20, batch: int = 4):
     """A MAP of lists -> a dynamic multi-value inject.

@@ -411,6 +411,25 @@ def build_app(
         )
 
     @app.tool()
+    def scoped_list(
+        tags: Optional[list] = None, event_id: Optional[str] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        kind: Optional[str] = None, match: str = "exact",
+    ) -> dict:
+        """NON-kNN FILTERED LISTING — the 'refer an exhaustive set' query. When
+        the walk sees the input relates to an EVENT, launch this to get EVERY
+        node matching the parameters (a scan, not a similarity top-k) : by
+        `event_id` (the gravitating cluster), inclusive `date_from`/`date_to`
+        (YYYY-MM-DD), hierarchical `tags`, and `kind`. Ordered by event date.
+        Returns the exhaustive list + ids."""
+        pts = memory.filter_list(
+            tags=list(tags) if tags else None, match=str(match or "exact"),
+            event_id=event_id, date_from=date_from, date_to=date_to, kind=kind)
+        return {"count": len(pts),
+                "items": [{"id": p.id, "content": p.content[:200]} for p in pts],
+                "ids": [p.id for p in pts]}
+
+    @app.tool()
     def list_tags() -> dict:
         """Return the GLOSSARY of tag NAMESPACES across the whole memory.
 

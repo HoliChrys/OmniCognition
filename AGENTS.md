@@ -104,11 +104,14 @@ Benchmarks need `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Tests must not.
 ## Two answer modes (drives evaluation)
 
 A query is either **"generate a focused answer"** (precision/F1; the
-uncertainty-stopped walk excels) or **"refer an exhaustive set"** (recall; the
-event cluster / bag excels), and they can coexist (answer + bag). Report recall
-**and** precision/F1, always with set size `n`. The walk's evidence set is
-uncertainty-bounded and **must not be hard-capped** — a subject can have
-arbitrarily many relevant items.
+uncertainty-stopped walk excels) or **"refer an exhaustive set"** (recall; a
+NON-kNN filtered listing — `Memory.filter_list` by event/date/tags/kind —
+excels), and they can coexist (answer + bag/list). The exhaustive set is reached
+by SCAN over parameters, not similarity top-k : the walk's meta-cognition/ACTION
+sees the input relates to an event and launches the targeted filtered query.
+Report recall **and** precision/F1, always with set size `n`. The walk's
+evidence set is uncertainty-bounded and **must not be hard-capped** — a subject
+can have arbitrarily many relevant items.
 
 ## User Preferences
 

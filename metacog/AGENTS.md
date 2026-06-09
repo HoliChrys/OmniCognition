@@ -25,9 +25,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `event_absorb`); **named bags** (`bag_add/items/clear` with a `bag` kwarg,
   `bag_intersect`/`bag_union`/`bag_names`, `bag_publish_cluster/_schema`; each
   bag carries description+schema via `bag_meta`/`bag_overview`, and the
-  description tracks the schema — a schema change re-derives the description);
+  description tracks the schema — a schema change re-derives the description;
+  `curated_bags` = the map of non-`event:` bags for the answer);
   bi-temporal validity (`is_valid`/`invalidate`); `scoped_answer` (two-phase
-  scoped→knowledge_base cascade). The default bag mirrors into `_bag` for
+  scoped→knowledge_base cascade) and `filter_list` — the NON-kNN filtered
+  listing (scan by `event_id` / `date_from`/`date_to` / `tags` / `kind`,
+  returns every match ordered by date, no embedding/walk/top-k; also reachable
+  via `scoped_answer(list_only=True)`). The default bag mirrors into `_bag` for
   backwards compatibility.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
@@ -50,7 +54,8 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
 - `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
   excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
   description)`, `bag(name)`, `bags()` (overview with description/schema for
-  decisions), `bag_render(name, strategy, placement)`.
+  decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
+  `scoped_answer` and `scoped_list` (the non-kNN filtered listing).
 
 ## Work Guidance
 
