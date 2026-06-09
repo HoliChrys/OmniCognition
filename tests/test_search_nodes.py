@@ -66,3 +66,15 @@ def test_event_filter_scopes_the_pool(monkeypatch):
     got = {p.id for p in m.search_nodes("iran", mode="sim", on="content",
                                         event_id="e1")}
     assert got == {"A"}                           # pool restricted to the event
+
+
+def test_semantic_mode_surfaces_token_disjoint_node():
+    """Semantic (embedding) mode ranks by cosine, so it can surface a relevant
+    node sharing NO query tokens — the gap sim/fuzzy/regex miss."""
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    m = Memory(encoder=SimpleEncoder())
+    m.ingest("the cat sat on the mat", kind="FACT", id="A")
+    m.ingest("a completely different subject entirely", kind="FACT", id="B")
+    got = m.search_nodes("the cat sat on the mat", mode="semantic", on="content")
+    assert got and got[0].id == "A"          # nearest by embedding cosine

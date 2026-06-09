@@ -2287,6 +2287,28 @@ class Memory:
         if exclude_derived:
             pool = [p for p in pool if not self._is_derived(p.id)]
 
+        # SEMANTIC mode : embedding cosine — surfaces LATENT/oblique candidates
+        # that share no surface tokens (the gap the sim/fuzzy/regex matchers miss).
+        if mode == "semantic":
+            from metacog.geometry import cosine, effective_embedding
+            if not getattr(self, "encoder", None):
+                return []
+            try:
+                qv = self.encoder.encode(query)
+            except Exception:
+                return []
+            t = self._now()
+            sc: List[Tuple[float, Point]] = []
+            for p in pool:
+                try:
+                    s = cosine(qv, effective_embedding(p, t))
+                except Exception:
+                    s = 0.0
+                if s > 0:
+                    sc.append((s, p))
+            sc.sort(key=lambda x: (-x[0], x[1].id))
+            return [p for _, p in sc[:max(1, k)]]
+
         def _toks(s: str) -> set:
             return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
@@ -2481,7 +2503,7 @@ class Memory:
         tags: Optional[Sequence[str]] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
-        modes: Sequence[str] = ("sim", "fuzzy", "regex"),
+        modes: Sequence[str] = ("semantic", "sim", "fuzzy", "regex"),
         on: str = "both",
         bag: str = "default",
         max_rounds: int = 6,

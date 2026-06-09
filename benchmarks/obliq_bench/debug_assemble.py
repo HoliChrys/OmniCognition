@@ -73,7 +73,7 @@ def main() -> None:
     fate = {g: {"surf": None, "label": None} for g in gold}
     for r in range(args.max_rounds):
         surfaced = 0
-        for mode in ("sim", "fuzzy", "regex"):
+        for mode in ("semantic", "sim", "fuzzy", "regex"):
             cand = mem.search_nodes(question, mode=mode, on="both",
                                     exclude_ids=seen, k=args.k)
             cand = [p for p in cand if p.id not in seen]
