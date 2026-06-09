@@ -37,6 +37,11 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
   view for synthesis. `generate_action` / `meta_thought` produce GENERATOR nodes.
+  `_maybe_event_scan`: meta-cognition trigger — when a focused fact carries
+  `event:in:<id>` and the query is a set request, launches `filter_list` over
+  that event (date-bounded by a year in the query) and folds the exhaustive scan
+  into the evidence (recall-gated, once per event). Replaces the parallel event
+  query with a targeted filtered one inside the single walk.
 - `event_schema.py` — schema induction per event TYPE (= a CONTEXT), slot-filling
   (`fill_event_schema` with scoped+KB per core slot and cross-slot dedup),
   `event_search`, `event_action_enrich` (meta-cognition bridge: the schema result

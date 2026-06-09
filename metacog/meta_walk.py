@@ -1280,6 +1280,16 @@ def synthesize_answer_from_walk(
         return ""
 
 
+def _query_year_range(query: str):
+    """A YYYY year in the query -> its inclusive (date_from, date_to) range, so
+    the event scan can be date-bounded ; (None, None) otherwise."""
+    m = re.search(r"\b(?:19|20)\d{2}\b", query or "")
+    if not m:
+        return None, None
+    y = m.group(0)
+    return f"{y}-01-01", f"{y}-12-31"
+
+
 def provisional_answer(query: str, evidence: Sequence[dict],
                        chain: Sequence[str], llm: Any,
                        *, max_tokens: int = 80) -> str:
@@ -2206,6 +2216,12 @@ class MetaWalker:
             if relevance[i] != "irrelevant"
         ] or list(facts)
 
+        # META-COGNITION : if the focused facts reveal the input relates to an
+        # EVENT and the request refers to an exhaustive set, the ACTION launches
+        # the NON-kNN filtered scan over that event and folds it into evidence —
+        # a targeted filtered KB query instead of a parallel one.
+        self._maybe_event_scan(focus_facts)
+
         # ACTIONs : at stage 0 nearest by query embedding ; at later
         # stages nearest to the previous action.
         if self._stage_idx == 0 or self._prev_action is None:
@@ -2410,6 +2426,61 @@ class MetaWalker:
     # first walk and re-write it every stage until the depth-stop validates
     # it — the last snapshot IS the final answer (no separate final pass).
     # ----------------------------------------------------------------
+
+    def _maybe_event_scan(self, focus_facts):
+        """Meta-cognition + ACTION : when the focused facts show the input relates
+        to an EVENT and the request refers to an exhaustive SET, launch the
+        NON-kNN filtered scan (Memory.filter_list) over that event — optionally
+        date-bounded by a year in the query — and FOLD the result into the walk's
+        evidence. This is the targeted filtered knowledge-base query that
+        replaces a separate parallel one.
+
+        Gated to RECALL intent : a focused query wins on the walk alone (the
+        walk-vs-event finding), so the scan only fires for set-style requests.
+        Once per event ; fully failure-safe / no-op without the primitive."""
+        mem = self.memory
+        if not hasattr(mem, "filter_list"):
+            return
+        try:
+            from metacog.enumeration import is_enumeration_query
+            if not is_enumeration_query(self.query):
+                return
+        except Exception:
+            return
+        if not hasattr(self, "_scanned_events"):
+            self._scanned_events = set()
+        eid = None
+        for f in focus_facts or ():
+            for t in getattr(f, "tags", ()) or ():
+                if t.startswith("event:in:"):
+                    eid = t.split(":", 2)[2]
+                    break
+            if eid:
+                break
+        if not eid or eid in self._scanned_events:
+            return
+        self._scanned_events.add(eid)
+        df, dt = _query_year_range(self.query)
+        try:
+            pts = mem.filter_list(event_id=eid, date_from=df, date_to=dt)
+        except Exception:
+            return
+        for p in pts:
+            if p.id not in self._relevant_ids:
+                self._relevant_cum.append(p)
+                self._relevant_ids.add(p.id)
+                self._relevant_label[p.id] = "relevant"
+            if p.id not in self._visited_fact_ids:
+                self._fact_ids_cum.append(p.id)
+                self._visited_fact_ids.add(p.id)
+        if pts and hasattr(mem, "bag_add"):
+            try:
+                mem.bag_add([p.id for p in pts], bag=f"event:{eid}",
+                            description=f"Exhaustive filtered scan of event "
+                                        f"{eid}.",
+                            schema={"kind": "event_cluster", "event_id": eid})
+            except Exception:
+                pass
 
     def keepup(self):
         """Generator yielding one snapshot per stage :
