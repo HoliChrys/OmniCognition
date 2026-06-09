@@ -430,6 +430,29 @@ def build_app(
                 "ids": [p.id for p in pts]}
 
     @app.tool()
+    def search_nodes(
+        query: str, mode: str = "sim", on: str = "both",
+        event_id: Optional[str] = None, tags: Optional[list] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        bag: str = "default", k: int = 10,
+    ) -> dict:
+        """Tri-modal relevance search over a FILTERED node pool — WITHOUT
+        REPLACEMENT. The loop for assembling an exhaustive set : presearch finds
+        the context events, then call this to draw candidates from the filtered
+        pool (`event_id` / `tags` / date), ranked by `mode` (sim | regex |
+        fuzzy) over `on` (content | tags | both). Nodes already in `bag` are
+        EXCLUDED, so each call returns only NEW candidates. Judge them, then
+        `collect(ids, bag)` the relevant ones — and call again ; the pool shrinks
+        until exhausted (drawing without replacement)."""
+        pts = memory.search_nodes(
+            query, mode=str(mode or "sim"), on=str(on or "both"),
+            event_id=event_id, tags=list(tags) if tags else None,
+            date_from=date_from, date_to=date_to, exclude_bag=bag, k=max(1, k))
+        return {"count": len(pts),
+                "items": [{"id": p.id, "content": p.content[:200],
+                           "tags": list(p.tags)[:12]} for p in pts]}
+
+    @app.tool()
     def list_tags() -> dict:
         """Return the GLOSSARY of tag NAMESPACES across the whole memory.
 

@@ -2228,6 +2228,92 @@ class Memory:
         pts.sort(key=lambda p: (self._point_date(p) or "9999-99-99", p.id))
         return pts
 
+    def search_nodes(
+        self,
+        query: str,
+        *,
+        mode: str = "sim",
+        on: str = "both",
+        restrict_ids: Optional[Sequence[str]] = None,
+        event_id: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        match: str = "exact",
+        exclude_ids: Optional[Sequence[str]] = None,
+        exclude_bag: Optional[str] = None,
+        k: int = 10,
+    ) -> List[Point]:
+        """Tri-modal search over a FILTERED node pool, on content and/or TAGS,
+        WITHOUT REPLACEMENT.
+
+        The agent's relevance loop : presearch finds the context events, then
+        this draws candidates from the filtered pool (by `event_id` / `tags` /
+        date / `restrict_ids`) and ranks them —
+
+          mode 'sim'   : keyword overlap (query tokens ∩ content/tag tokens),
+          mode 'regex' : `re.search(query, …)` on content / raw tags,
+          mode 'fuzzy' : edit-budget token match (content) / fuzzy tag segments,
+
+        over `on` = content | tags | both. Already-collected nodes (`exclude_ids`
+        and every id in `exclude_bag`) are removed from the pool, so each pass
+        returns only NEW candidates — sampling without replacement, the loop
+        converges as the bag grows. Returns up to `k` points, best first."""
+        from metacog.tags import match_tag
+        from metacog.fuzzy import fuzzy_match
+
+        pool = self.filter_list(tags=tags, match=match, event_id=event_id,
+                                date_from=date_from, date_to=date_to)
+        if restrict_ids is not None:
+            rid = set(restrict_ids)
+            pool = [p for p in pool if p.id in rid]
+        exclude = set(exclude_ids or [])
+        if exclude_bag:
+            exclude |= set(self._bag_ref(exclude_bag))
+        pool = [p for p in pool if p.id not in exclude]
+
+        def _toks(s: str) -> set:
+            return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+        qtok = _toks(query)
+        qwords = [w for w in (query or "").split() if w]
+        want_c = on in ("content", "both")
+        want_t = on in ("tags", "both")
+        rx = None
+        if mode == "regex":
+            try:
+                rx = re.compile(query, re.IGNORECASE)
+            except re.error:
+                return []
+
+        scored: List[Tuple[float, Point]] = []
+        for p in pool:
+            content = p.content or ""
+            ptags = list(getattr(p, "tags", []) or [])
+            score = 0.0
+            if mode == "regex":
+                if want_c and rx.search(content):
+                    score += 1.0
+                if want_t and any(rx.search(t) for t in ptags):
+                    score += 1.0
+            elif mode == "fuzzy":
+                if want_c:
+                    dtok = _toks(content)
+                    score += sum(1 for q in qtok
+                                 if any(fuzzy_match(q, d) for d in dtok))
+                if want_t:
+                    score += sum(1 for w in qwords
+                                 if match_tag(ptags, w, mode="fuzzy"))
+            else:  # sim = keyword overlap
+                if want_c:
+                    score += len(qtok & _toks(content))
+                if want_t:
+                    score += len(qtok & _toks(" ".join(ptags)))
+            if score > 0:
+                scored.append((score, p))
+        scored.sort(key=lambda sp: (-sp[0], sp[1].id))
+        return [p for _, p in scored[:max(1, k)]]
+
     def scoped_answer(
         self,
         query: str,

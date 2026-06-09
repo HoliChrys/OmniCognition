@@ -113,6 +113,13 @@ Report recall **and** precision/F1, always with set size `n`. The walk's
 evidence set is uncertainty-bounded and **must not be hard-capped** — a subject
 can have arbitrarily many relevant items.
 
+The exhaustive set is assembled by an AGENTIC loop, not by reading every event :
+presearch (scoped, `knowledge_base=False`) surfaces the context events, then
+`search_nodes` draws candidates from the filtered pool by sim/regex/fuzzy over
+content AND tags ; the agent judges relevance and `collect`s the hits into the
+bag. Drawing is WITHOUT REPLACEMENT — a collected node is excluded from later
+passes (`exclude_bag`), so the pool shrinks and the loop converges.
+
 ## User Preferences
 
 - Develop only on the designated feature branch; never push to another branch

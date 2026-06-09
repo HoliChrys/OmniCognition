@@ -31,7 +31,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   scoped→knowledge_base cascade) and `filter_list` — the NON-kNN filtered
   listing (scan by `event_id` / `date_from`/`date_to` / `tags` / `kind`,
   returns every match ordered by date, no embedding/walk/top-k; also reachable
-  via `scoped_answer(list_only=True)`). The default bag mirrors into `_bag` for
+  via `scoped_answer(list_only=True)`); `search_nodes` — tri-modal relevance
+  search (sim | regex | fuzzy) over a filtered pool, on content AND/OR tags,
+  WITHOUT REPLACEMENT (`exclude_bag` removes already-collected nodes), the
+  agent's collect-loop primitive. The default bag mirrors into `_bag` for
   backwards compatibility.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
@@ -60,7 +63,8 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
   description)`, `bag(name)`, `bags()` (overview with description/schema for
   decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
-  `scoped_answer` and `scoped_list` (the non-kNN filtered listing).
+  `scoped_answer`, `scoped_list` (non-kNN filtered listing), and `search_nodes`
+  (tri-modal relevance loop over content+tags, without replacement vs the bag).
 
 ## Work Guidance
 
