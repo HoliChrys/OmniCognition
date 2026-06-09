@@ -12,13 +12,19 @@ from metacog.memory import Memory
 
 
 class _JudgeLLM:
-    """Accepts only ids whose content mentions 'iran' (deterministic judge)."""
+    """Chain-of-Note judge : labels each `[i] content` line relevant when it
+    mentions 'iran', else irrelevant (deterministic)."""
     def generate(self, prompt, max_tokens=160):
-        keep = []
+        out = []
         for line in prompt.splitlines():
-            if line.startswith("[") and "iran" in line.lower():
-                keep.append(line[1:line.index("]")])
-        return ", ".join(keep) if keep else "none"
+            line = line.strip()
+            if line.startswith("[") and "]" in line:
+                idx = line[1:line.index("]")]
+                if not idx.isdigit():
+                    continue
+                lab = "relevant" if "iran" in line.lower() else "irrelevant"
+                out.append(f"{idx}: {lab}")
+        return "\n".join(out)
 
 
 def _mem(llm=None):

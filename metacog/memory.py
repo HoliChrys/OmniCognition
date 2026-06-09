@@ -2314,27 +2314,24 @@ class Memory:
         scored.sort(key=lambda sp: (-sp[0], sp[1].id))
         return [p for _, p in scored[:max(1, k)]]
 
-    def _judge_relevance(self, query: str, cands: Sequence[Point]) -> List[Point]:
-        """LLM judges which candidates bear on the request. No LLM / failure ->
-        accept all (recall-first). Returns the kept points."""
+    def _judge_relevance(self, query: str, cands: Sequence[Point],
+                         collected: Optional[Sequence[Point]] = None
+                         ) -> List[Point]:
+        """REASON over the candidates (not surface-match them). Reuses the walk's
+        Chain-of-Note reading pass : each candidate is analysed AS A MAILLON of
+        the chain toward the request — a node that bridges / implicitly bears on
+        the intent is kept, only genuine off-topic is dropped. Recall-first
+        (fails OPEN). `collected` (the bag so far) is the chain context so each
+        candidate is judged for what it ADDS. No LLM -> keep all."""
         cands = list(cands)
-        if not cands or not hasattr(self.llm, "generate"):
-            return cands
-        listing = "\n".join(f"[{p.id}] {(p.content or '')[:160]}" for p in cands)
+        if not cands:
+            return []
+        from metacog.meta_walk import chain_of_note
         try:
-            out = self.llm.generate(
-                "Which of these items are RELEVANT to the request? Reply with "
-                "ONLY the matching ids separated by commas, or 'none'.\n"
-                f"Request: {query}\nItems:\n{listing}\nRelevant ids:",
-                max_tokens=160) or ""
+            labels = chain_of_note(query, cands, self.llm, collected=collected)
         except Exception:
             return cands
-        if "none" in out.lower() and not re.search(r"[\[\]]", out):
-            picked = set(re.findall(r"[A-Za-z0-9_@.]+", out)) - {"none"}
-        else:
-            picked = set(re.findall(r"[A-Za-z0-9_@.]+", out))
-        keep = [p for p in cands if p.id in picked]
-        return keep
+        return [p for p, lab in zip(cands, labels) if lab != "irrelevant"]
 
     def assemble_set(
         self,
@@ -2388,7 +2385,12 @@ class Memory:
                 cand = [p for p in cand if p.id not in seen]
                 if not cand:
                     continue
-                keep = self._judge_relevance(query, cand) if judge else cand
+                if judge:
+                    bag_ids = set(self._bag_ref(bag))
+                    collected = [p for p in self.points if p.id in bag_ids]
+                    keep = self._judge_relevance(query, cand, collected=collected)
+                else:
+                    keep = cand
                 for p in cand:                          # judged once : no remise
                     seen.add(p.id)
                 if keep:
