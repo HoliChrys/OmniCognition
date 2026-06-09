@@ -2350,6 +2350,7 @@ class Memory:
         max_rounds: int = 6,
         k: int = 10,
         judge: bool = True,
+        auto_route: bool = True,
     ) -> Dict[str, Any]:
         """AGENTIC exhaustive-set assembly — the orchestrated loop.
 
@@ -2362,8 +2363,13 @@ class Memory:
            the pool shrinks and the loop converges when no new relevant node is
            found (or `max_rounds`).
 
+        With `auto_route=False` and no event_id/tags, the loop runs GLOBALLY over
+        the whole pool — recovering relevant nodes that the (possibly fragmented)
+        clustering scattered across micro-events, since content/tag matching does
+        not depend on cluster membership.
+
         Returns {bag, size, rounds, added, scope}."""
-        if event_id is None and not tags:
+        if auto_route and event_id is None and not tags:
             try:
                 det = self.detect_event_type(query)
             except Exception:
