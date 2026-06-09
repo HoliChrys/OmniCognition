@@ -2329,23 +2329,76 @@ class Memory:
         scored.sort(key=lambda sp: (-sp[0], sp[1].id))
         return [p for _, p in scored[:max(1, k)]]
 
+    def oblique_labels(self, query: str, cands: Sequence[Point],
+                       collected: Optional[Sequence[Point]] = None) -> List[str]:
+        """OBLIQUE-aware relevance labels — reason about IMPLICIT relevance.
+
+        OBLIQ relevance is latent : an item belongs to the set if it bears on the
+        request by STANCE, TONE, IMPLICATION, sarcasm, allusion, or by
+        expressing / opposing / exemplifying the position described — even when it
+        shares NO words with the request and never states the topic. The plain
+        Chain-of-Note reading (built for multi-hop bridging) under-recognises
+        this and drops obliquely-relevant items. Returns 'relevant'/'irrelevant'
+        per candidate ; recall-first (fails OPEN -> all relevant). No LLM -> all
+        relevant."""
+        cands = list(cands)
+        if not cands or not hasattr(self.llm, "generate"):
+            return ["relevant"] * len(cands)
+        listing = "\n".join(f"[{i}] {(p.content or '')[:200]}"
+                            for i, p in enumerate(cands))
+        ctx = ""
+        if collected:
+            ctx = "ALREADY GATHERED :\n" + "\n".join(
+                f"  - {(p.content or '')[:100]}" for p in list(collected)[-6:]
+            ) + "\n"
+        prompt = (
+            "You are assembling the EXHAUSTIVE set of items that bear on a "
+            "request. Relevance is OBLIQUE : an item counts if it bears on the "
+            "request by STANCE, TONE, IMPLICATION, sarcasm, allusion, or by "
+            "expressing / opposing / exemplifying the position described — EVEN "
+            "IF it shares no words with the request and never states the topic "
+            "explicitly. Be GENEROUS : when an item plausibly belongs to the "
+            "set, label it relevant ; label irrelevant only when it is clearly a "
+            "different subject.\n"
+            "For EACH numbered item output one line `i: relevant` or "
+            "`i: irrelevant`, nothing else.\n\n"
+            f"REQUEST : {query}\n{ctx}ITEMS :\n{listing}"
+        )
+        try:
+            raw = self.llm.generate(prompt, max_tokens=max(16, 6 * len(cands)))
+        except Exception:
+            return ["relevant"] * len(cands)
+        labels = ["relevant"] * len(cands)          # fail OPEN
+        for ln in (raw or "").splitlines():
+            ln = ln.strip().lstrip("-•* ").strip()
+            if ":" not in ln:
+                continue
+            a, _, b = ln.partition(":")
+            a = a.strip().strip("[]")
+            if a.isdigit() and 0 <= int(a) < len(cands):
+                labels[int(a)] = "irrelevant" if "irrelevant" in b.lower() \
+                    else "relevant"
+        return labels
+
     def _judge_relevance(self, query: str, cands: Sequence[Point],
-                         collected: Optional[Sequence[Point]] = None
-                         ) -> List[Point]:
-        """REASON over the candidates (not surface-match them). Reuses the walk's
-        Chain-of-Note reading pass : each candidate is analysed AS A MAILLON of
-        the chain toward the request — a node that bridges / implicitly bears on
-        the intent is kept, only genuine off-topic is dropped. Recall-first
-        (fails OPEN). `collected` (the bag so far) is the chain context so each
-        candidate is judged for what it ADDS. No LLM -> keep all."""
+                         collected: Optional[Sequence[Point]] = None,
+                         oblique: bool = True) -> List[Point]:
+        """REASON over the candidates (not surface-match them). With `oblique`
+        (default) use the implicit-relevance judge ; else the walk's Chain-of-Note
+        reading. Recall-first either way (keep everything not labelled
+        irrelevant). No LLM -> keep all."""
         cands = list(cands)
         if not cands:
             return []
-        from metacog.meta_walk import chain_of_note
-        try:
-            labels = chain_of_note(query, cands, self.llm, collected=collected)
-        except Exception:
-            return cands
+        if oblique:
+            labels = self.oblique_labels(query, cands, collected=collected)
+        else:
+            from metacog.meta_walk import chain_of_note
+            try:
+                labels = chain_of_note(query, cands, self.llm,
+                                       collected=collected)
+            except Exception:
+                return cands
         return [p for p, lab in zip(cands, labels) if lab != "irrelevant"]
 
     def assemble_set(

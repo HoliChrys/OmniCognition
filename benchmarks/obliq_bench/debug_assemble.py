@@ -68,7 +68,6 @@ def main() -> None:
     # it was SURFACED to the judge and the CoN label it got — the actual decisions
     # (not inferred from rank). This distinguishes a k/search miss (never
     # surfaced) from a JUDGE miss (surfaced then labelled irrelevant).
-    from metacog.meta_walk import chain_of_note
     seen: set = set()
     bag_ids: list = []
     fate = {g: {"surf": None, "label": None} for g in gold}
@@ -82,7 +81,7 @@ def main() -> None:
                 continue
             surfaced += len(cand)
             collected = [p for p in mem.points if p.id in set(bag_ids)]
-            labels = chain_of_note(question, cand, mem.llm, collected=collected)
+            labels = mem.oblique_labels(question, cand, collected=collected)
             for p, lab in zip(cand, labels):
                 if p.id in fate and fate[p.id]["surf"] is None:
                     fate[p.id]["surf"] = (r, mode)
