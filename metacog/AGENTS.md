@@ -1,0 +1,59 @@
+# metacog — core library
+
+## Purpose
+
+The MetaCog-Mem library: an epistemically-typed Point manifold, edge-free
+geometric relations, an uncertainty-governed retrieval walk, the event
+subsystem, and the MCP service. Importable as `metacog`.
+
+## Ownership
+
+Owns all runtime memory/retrieval/reasoning logic. Benchmarks and tests depend
+on it; it depends on neither. Inherits all root invariants (edge-free,
+hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
+
+## Local Contracts
+
+- `epistemic.py` — `Point` (one schema for all kinds), `PointKind`
+  (FACT / THOUGHT / ACTION / EVENT), `SourceClass`, epistemic state. A new kind
+  is a deliberate, schema-level change.
+- `geometry.py` — `apply_pull(a, b, sign, t_now)` moves `a` toward `b`; first
+  pull = 1/(1+0) = 1.0. The ONLY way to relate points. Plus retrieval / spreading.
+- `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
+  `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
+  `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
+  `event_absorb`); **named bags** (`bag_add/items/clear` with a `bag` kwarg,
+  `bag_intersect`/`bag_union`/`bag_names`, `bag_publish_cluster/_schema`);
+  bi-temporal validity (`is_valid`/`invalidate`); `scoped_answer` (two-phase
+  scoped→knowledge_base cascade). The default bag mirrors into `_bag` for
+  backwards compatibility.
+- `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
+  spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
+  is the committed evidence set (uncapped); `_composable_evidence` is the bounded
+  view for synthesis. `generate_action` / `meta_thought` produce GENERATOR nodes.
+- `event_schema.py` — schema induction per event TYPE (= a CONTEXT), slot-filling
+  (`fill_event_schema` with scoped+KB per core slot and cross-slot dedup),
+  `event_search`, `event_action_enrich` (meta-cognition bridge: the schema result
+  seeds a `generate_action` beacon that re-anchors the walk; seeds on the bag
+  INTERSECTION when non-empty).
+- Extractors (`event_extractor.py`, `keywords.py`, `entities.py`, `atomic.py`):
+  cached, failure-safe, never cache empty.
+- `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
+  excluded from `retrieve`'s search pool.
+
+## Work Guidance
+
+- Match each file's surrounding style and comment density.
+- Relate points with `apply_pull`, never a new edge structure.
+- Keep generated content GENERATOR-sourced; never route generated nodes through
+  an `Observation`.
+
+## Verification
+
+`python -m pytest tests/ -q` (the suite covers this package). Targeted:
+`tests/test_no_laundering.py`, `test_event_node.py`, `test_event_schema.py`,
+`test_kind.py`, `test_spreading.py`, `test_persistence.py`.
+
+## Child DOX Index
+
+No child docs — this is a flat module package.
