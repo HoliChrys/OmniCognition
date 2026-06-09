@@ -350,8 +350,48 @@ def event_anchor(memory: Any, query: str):
     return anchor, det
 
 
+def event_action_enrich(memory: Any, event_id: str, fill: dict
+                        ) -> Optional[str]:
+    """Reuse the META-COGNITION ACTION system to fold the schema result back
+    into the cluster — and, by the same node, bridge it to the normal search.
+
+    The schema's filled facts seed `generate_action` : a GENERATOR-sourced
+    ACTION node (Cor.5 safe) whose `parents` are those facts (lineage) and whose
+    keywords are anchored on their entities (no drift). It is co-located with
+    the event hub (`apply_pull`) and pulls the schema facts toward itself, so —
+    because the walk RE-ANCHORS on the nearest ACTION and SPREADS from it — the
+    action becomes a beacon that drags the schema findings into co-retrieval
+    whenever the context is touched (geometric, edge-free enrichment, no bespoke
+    plumbing). Living in the shared manifold, the SAME action is also a global
+    ACTION node the NORMAL walk picks up via nearest_by_kind — so the normal
+    channel 'regresses' back onto what the event channel found. Returns the
+    action id, or None when there is nothing to fold (an empty step has no
+    influence)."""
+    from metacog.meta_walk import generate_action
+    from metacog.geometry import apply_pull
+    by_id = {p.id: p for p in memory.points}
+    facts = [by_id[i] for i in (fill.get("fact_ids") or []) if i in by_id]
+    if not facts or not hasattr(memory, "_now"):
+        return None
+    t_now = memory._now()
+    act = generate_action(facts, getattr(memory, "llm", None),
+                          getattr(memory, "encoder", None),
+                          getattr(memory, "extractor", None), t_now)
+    if act is None:
+        return None
+    act.tags = list(act.tags) + [f"event:in:{event_id}", "event:action"]
+    memory.points.append(act)
+    hub = by_id.get(event_id)
+    if hub is not None:
+        apply_pull(hub, act, +1.0, t_now)           # the action joins the cluster
+    for f in facts:                                  # re-anchor facts on the find
+        apply_pull(act, f, +1.0, t_now)
+    return act.id
+
+
 def event_search(memory: Any, query: str, *, k_per_slot: int = 5,
-                 enrich: bool = True) -> Optional[dict]:
+                 enrich: bool = True, action_bridge: bool = True
+                 ) -> Optional[dict]:
     """End-to-end event-schema retrieval for a QUERY : detect the event type,
     fill the schema by partitioning the gravitating cluster (+ gap-fill core
     slots), enrich the schema from leftover cluster facts (A.2), and record
@@ -386,6 +426,14 @@ def event_search(memory: Any, query: str, *, k_per_slot: int = 5,
                              scope_tag=scope_tag)
     fill["event"] = det
     fill["context_ids"] = context_ids
+
+    # REUSE the schema result via a meta-cognitive ACTION : fold it into the
+    # cluster AND bridge it to the normal search (one beacon, both directions).
+    if action_bridge and hub_id:
+        try:
+            fill["action_id"] = event_action_enrich(memory, hub_id, fill)
+        except Exception:
+            fill["action_id"] = None
 
     # COLLECT each NECESSARY (core) slot's clue into the BAG : the schema's list
     # of required roles IS a retrieve-bag. Parallel — it only feeds the final

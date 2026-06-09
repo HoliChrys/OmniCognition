@@ -177,3 +177,42 @@ def test_enrich_record_reinforce():
     out = reinforce_schema("war", min_instances=3, core_frac=0.6)
     assert "territory" not in out.slots          # never filled -> dropped
     assert "belligerents" in out.core            # always filled -> core
+
+
+class _ActLLM:
+    """Returns a fixed action string for generate_action (deterministic)."""
+    def generate(self, prompt, max_tokens=64):
+        return "track the strikes on the energy nodes"
+
+
+def test_event_action_enrich_bridges_schema_to_cluster():
+    """The schema result is folded back via a meta-cognition ACTION : a
+    GENERATOR ACTION node, parents = the schema facts, tagged into the cluster
+    and pulled — the edge-free beacon that re-injects the findings."""
+    from metacog.event_schema import event_action_enrich
+    from metacog.epistemic import PointKind
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    mem = Memory(encoder=SimpleEncoder(), llm=_ActLLM())
+    f1 = mem.ingest("missile strike on the oil terminal", kind="FACT", id="D1")
+    f2 = mem.ingest("naval blockade of the strait", kind="FACT", id="D2")
+    e = mem.ingest_event("strait attack", "attack",
+                         source_facts=[f1, f2], salience=-1)
+    aid = event_action_enrich(mem, e.id, {"fact_ids": ["D1", "D2"]})
+    assert aid is not None
+    act = next(p for p in mem.points if p.id == aid)
+    assert act.kind is PointKind.ACTION
+    assert set(act.parents) >= {"D1", "D2"}                 # lineage preserved
+    assert f"event:in:{e.id}" in act.tags and "event:action" in act.tags
+    assert any(abs(x) > 0 for x in act.delta_active)        # the action was pulled
+    assert aid in {p.id for p in mem.event_cluster(e.id)}   # joined the cluster
+
+
+def test_event_action_enrich_noop_on_empty():
+    """A step that found nothing produces no action -> no influence."""
+    from metacog.event_schema import event_action_enrich
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    mem = Memory(encoder=SimpleEncoder(), llm=_ActLLM())
+    e = mem.ingest_event("x", "attack")
+    assert event_action_enrich(mem, e.id, {"fact_ids": []}) is None

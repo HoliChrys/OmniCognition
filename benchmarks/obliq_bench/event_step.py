@@ -164,6 +164,18 @@ def main() -> None:
         print("  [6] ADDITIVE (baseline ∪ event) recall=%.3f (gold %d/%d)" % (
             _recall(union, gold_set), len(union & gold_set), len(gold)))
 
+        # ---- REGRESS to NORMAL : event_search planted a meta-cognition ACTION
+        # beacon ; re-run the PLAIN retrieval and see the normal channel pick it
+        # up (the action re-anchors the cluster's facts into the normal search).
+        aid = fill.get("action_id")
+        post = mem.retrieve(question, k=max(10, len(gold)))
+        post_ids = {h["id"] for h in post}
+        print("  [7] NORMAL after action-bridge (id=%s) recall=%.3f (%d/%d)  "
+              "Δvs[1]=%+d" % (
+                  aid, _recall(post_ids, gold_set),
+                  len(post_ids & gold_set), len(gold),
+                  len(post_ids & gold_set) - len(base_ids & gold_set)))
+
 
 if __name__ == "__main__":
     main()
