@@ -2341,11 +2341,14 @@ class Memory:
         if hasattr(self.llm, "generate"):
             try:
                 out = self.llm.generate(
-                    "A retrieval request describes items by an OBLIQUE stance. In "
-                    "ONE sentence, state the underlying PROPOSITION an item must "
-                    "express or imply to qualify — the specific position/attitude, "
-                    "NOT the surface topic.\n"
-                    f"Request : {query}\nProposition :", max_tokens=90)
+                    "A retrieval request describes items by an OBLIQUE stance. "
+                    "State the underlying ATTITUDE an item must take to qualify — "
+                    "the position/target it is for or against — but keep it BROAD : "
+                    "cover EVERY facet/angle the request implies, do not collapse "
+                    "it to a single narrow sub-claim (an item that takes the "
+                    "attitude via a DIFFERENT facet still qualifies). 1-2 "
+                    "sentences.\n"
+                    f"Request : {query}\nAttitude (broad) :", max_tokens=110)
                 if out and out.strip():
                     prop = out.strip()
             except Exception:
@@ -2353,21 +2356,26 @@ class Memory:
         self._prop_cache[query] = prop
         return prop
 
-    # Meta-prompt for the per-item stance THOUGHT — the markers a real author
-    # uses to take a stance. Detect irony BUT NOT ONLY ; stay general (judge the
-    # plain case too, never force irony where there is none).
+    # Meta-prompt for the per-item stance THOUGHT — GENERAL (domain-agnostic)
+    # markers an author uses to take a stance. Detect humour/irony BUT NOT ONLY ;
+    # judge the plain case too ; never force irony where there is none. The
+    # examples are ILLUSTRATIVE of a general phenomenon, not tied to any topic.
     _STANCE_META = (
-        "An item takes the wanted stance when ANY of these hold — reason about "
-        "what the author TRULY means, do not force irony where there is none :\n"
-        " - IRONY / SARCASM : literal vs intended meaning (🤣, 'lol', absurd or "
-        "false-premise claims, mock-innocent questions).\n"
-        " - EXAGGERATED SUPERLATIVES / PROPAGANDA REGISTER echoed by a non-"
-        "official voice : grandiose official language ('supreme leader', "
-        "'obliterated', 'decimated', 'totally', 'Epic Fury', 'mission "
-        "accomplished') — sincerely, no one outside propaganda speaks this way, "
-        "so echoing it is a DISTANCING / mocking signal.\n"
-        " - PLAIN statement of the stance (no irony at all) — this qualifies too.\n"
-        "An item merely on the same TOPIC without taking the stance, or a "
+        "Judge what the author TRULY means, in ANY domain. An item takes the "
+        "wanted stance when ANY of these hold (do not force irony where there is "
+        "none) :\n"
+        " - HUMOUR / IRONY / SARCASM / SATIRE : literal meaning ≠ intended "
+        "meaning — signalled (in any context) by laughter/emoji, 'lol', absurd "
+        "or fictional/false-premise scenarios, hyperbole, mock-innocent "
+        "questions, parody.\n"
+        " - EXAGGERATED SUPERLATIVES / OFFICIAL or PROMOTIONAL REGISTER echoed by "
+        "an ordinary voice : grandiose, hype, or boilerplate wording that sincere "
+        "speakers don't use (e.g. titles, 'totally', 'epic', 'flawless', "
+        "press-release phrasing) — echoing it is a DISTANCING / mocking signal.\n"
+        " - the stance, or any FACET of it, stated PLAINLY (no irony) — qualifies "
+        "too ; an item that takes the attitude via a DIFFERENT angle than the "
+        "obvious one still qualifies.\n"
+        "An item merely on the same TOPIC without taking the stance, or on a "
         "different subject, does NOT qualify."
     )
 
