@@ -2368,9 +2368,13 @@ class Memory:
                     "the position/target it is for or against — but keep it BROAD : "
                     "cover EVERY facet/angle the request implies, do not collapse "
                     "it to a single narrow sub-claim (an item that takes the "
-                    "attitude via a DIFFERENT facet still qualifies). 1-2 "
-                    "sentences.\n"
-                    f"Request : {query}\nAttitude (broad) :", max_tokens=110)
+                    "attitude via a DIFFERENT facet still qualifies). If the "
+                    "request is about IMPLICITLY alleging / suggesting something, "
+                    "state the CLAIM being raised — an item that presupposes, "
+                    "raises, questions, reports or reacts to it qualifies ; do NOT "
+                    "harden it into a demand that the item explicitly assert a "
+                    "loaded conclusion (legality, blame, etc.). 1-2 sentences.\n"
+                    f"Request : {query}\nAttitude (broad) :", max_tokens=120)
                 if out and out.strip():
                     prop = out.strip()
             except Exception:
@@ -2397,6 +2401,10 @@ class Memory:
         " - the stance, or any FACET of it, stated PLAINLY (no irony) — qualifies "
         "too ; an item that takes the attitude via a DIFFERENT angle than the "
         "obvious one still qualifies.\n"
+        " - IMPLICIT ALLEGATION / PRESUPPOSITION : an item that raises, questions, "
+        "reports, reacts to, or takes for granted the alleged situation TREATS IT "
+        "AS REAL — that implicit allegation qualifies ; it need NOT explicitly "
+        "assert the loaded conclusion (legality, blame, harm, etc.).\n"
         "An item merely on the same TOPIC without taking the stance, or on a "
         "different subject, does NOT qualify."
     )
