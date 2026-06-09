@@ -498,7 +498,7 @@ def _extract_fact_ids(call_result) -> List[str]:
     TextContent block (structuredContent is not set), so we try text blocks
     first then fall back to structuredContent.
     """
-    _KEYS = ("fact_ids_cumulative", "cluster_ids", "fact_ids")
+    _KEYS = ("fact_ids_cumulative", "cluster_ids", "context_ids", "fact_ids")
 
     def _harvest(obj) -> List[str]:
         out: List[str] = []

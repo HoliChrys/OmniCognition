@@ -591,6 +591,83 @@ class Memory:
         m = f"event:in:{event_id}"
         return [p for p in self.points if m in p.tags]
 
+    def event_absorb(self, event_id: str, facts: Sequence[Point],
+                     *, t_now: Optional[float] = None) -> int:
+        """Fold newly-found facts INTO an event's gravitating cluster (= the
+        context's knowledge base) : tag event:in:<id> and pull onto the hub.
+        Used when a schema GAP is filled from the corpus — 'after the first
+        search the result joins the knowledge base', so later slots and future
+        queries see it. Edge-free ; returns the number of facts absorbed."""
+        hub = next((p for p in self.points if p.id == event_id), None)
+        if hub is None:
+            return 0
+        if t_now is None:
+            t_now = self._now()
+        member = f"event:in:{event_id}"
+        n = 0
+        for f in facts or ():
+            if f is None or f.id == event_id or member in f.tags:
+                continue
+            f.tags.append(member)
+            apply_pull(hub, f, +1.0, t_now)
+            n += 1
+        return n
+
+    @staticmethod
+    def _centroid(vecs: Sequence[Sequence[float]]) -> Tuple[float, ...]:
+        """Mean (L2-normalised) of a set of embeddings — the AGGREGATE 'aboutness'
+        vector. Mean-pooling denoises : each member's idiosyncratic tokens cancel,
+        the shared latent theme survives. That is what an OBLIQUE query (latent
+        relevance, no single member matching on surface) can lock onto."""
+        vv = [v for v in vecs if v]
+        if not vv:
+            return ()
+        dim = len(vv[0])
+        acc = [0.0] * dim
+        for v in vv:
+            for i in range(dim):
+                acc[i] += v[i]
+        n = float(len(vv))
+        m = [x / n for x in acc]
+        nrm = sum(x * x for x in m) ** 0.5 or 1.0
+        return tuple(x / nrm for x in m)
+
+    def event_centroid(self, event_id: str) -> Tuple[float, ...]:
+        """Centroid of an event's gravitating cluster (+ the hub name vector) —
+        the event's latent-theme representation for oblique routing."""
+        hub = next((p for p in self.points if p.id == event_id), None)
+        vecs = [p.embedding_orig for p in self.event_cluster(event_id)]
+        if hub is not None and hub.embedding_orig:
+            vecs.append(hub.embedding_orig)
+        return self._centroid(vecs)
+
+    def context_members(self, ctx: str) -> List[Point]:
+        """A CONTEXT = an event TYPE (war, earnings, …) : the thematic frame an
+        oblique query is SITUATED in. Returns the UNION of facts gravitating to
+        every event of that type — the broadest pool of latent evidence for the
+        context (deduped, order-preserving)."""
+        tag = f"event:type:{(ctx or '').strip().lower()}"
+        seen: set = set()
+        out: List[Point] = []
+        for ev in [p for p in self.points
+                   if p.kind is PointKind.EVENT and tag in p.tags]:
+            for f in self.event_cluster(ev.id):
+                if f.id not in seen:
+                    seen.add(f.id)
+                    out.append(f)
+        return out
+
+    def context_centroid(self, ctx: str) -> Tuple[float, ...]:
+        """Centroid pooled over the WHOLE context (all events of the type and
+        their clusters) — strictly more evidence than a single event's centroid,
+        so it denoises harder and matches an oblique query's latent theme best."""
+        tag = f"event:type:{(ctx or '').strip().lower()}"
+        vecs = [p.embedding_orig for p in self.context_members(ctx)]
+        vecs += [p.embedding_orig for p in self.points
+                 if p.kind is PointKind.EVENT and tag in p.tags
+                 and p.embedding_orig]
+        return self._centroid(vecs)
+
     # ---- retrieve-mode bag : the agent's curated answer list ----------------
     def bag_add(self, ids) -> int:
         """Append node ref(s) the agent decides to KEEP for a retrieve/list
@@ -872,9 +949,17 @@ class Memory:
             m = _macro(p)
             name_s = self._cos(qe, m.embedding_orig)
             clus = self.event_cluster(m.id)
+            # best single member — catches a SPECIFIC query naming one fact.
             clus_s = max((self._cos(qe, f.embedding_orig)
                           for f in clus[:40]), default=0.0)
-            s = max(name_s, 0.5 * name_s + 0.5 * clus_s)
+            # CONTEXT centroid — the latent-theme signal. An OBLIQUE query shares
+            # no surface words with any single member (so name_s and clus_s are
+            # both low), but is close to the mean of the whole context : the
+            # denoised 'aboutness' vector. This is the path that avoids '0 clue'.
+            et = next((t.split(":", 2)[2] for t in m.tags
+                       if t.startswith("event:type:")), "")
+            cent_s = self._cos(qe, self.context_centroid(et)) if et else 0.0
+            s = max(name_s, 0.5 * name_s + 0.5 * clus_s, cent_s)
             if s > macro_score.get(m.id, -1.0):
                 macro_score[m.id] = s
                 macro_pt[m.id] = m

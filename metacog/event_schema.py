@@ -107,6 +107,27 @@ def slot_subquestions(event_name: str, schema: EventSchema
     return out
 
 
+def _scoped_slot(memory: Any, q: str, scope_tag: str, *, n_stages: int = 4
+                 ) -> Tuple[List[dict], List[dict]]:
+    """A NECESSARY slot's filtered scoped search, with `knowledge_base=True`.
+
+    Phase 1 is HARD-FILTERED to the context (`scope_tag` = event:in:<hub>) ;
+    Phase 2 (knowledge_base) runs a SECOND walk over the WHOLE knowledge base,
+    seeded by the Phase-1 finding — 'after the first search the result can join
+    the KB'. Returns (scoped_hits, kb_hits) as id/content/score dicts."""
+    try:
+        res = memory.scoped_answer(q, tags=[scope_tag], knowledge_base=True,
+                                   n_stages=n_stages)
+    except Exception:
+        return [], []
+
+    def _ev(key: str) -> List[dict]:
+        return [{"id": e["id"], "content": e.get("content", ""), "score": 1.0}
+                for e in (res.get(key) or []) if isinstance(e, dict)
+                and e.get("id")]
+    return _ev("scoped_evidence"), _ev("global_evidence")
+
+
 def _retrieve_scoped(memory: Any, q: str, k: int, scope: Any) -> List[dict]:
     orig = memory.points
     try:
@@ -123,7 +144,7 @@ def _retrieve_scoped(memory: Any, q: str, k: int, scope: Any) -> List[dict]:
 
 def fill_event_schema(memory: Any, event_name: str, etype: str, *,
                       k_per_slot: int = 3, gap_fill: bool = True,
-                      restrict_ids: Any = None) -> dict:
+                      restrict_ids: Any = None, scope_tag: Any = None) -> dict:
     """Schema-driven slot-filling for one event instance — the two design loops.
 
     USAGE (open the questions to find everything) : induce the type schema, then
@@ -161,16 +182,41 @@ def fill_event_schema(memory: Any, event_name: str, etype: str, *,
 
     ids: List[str] = []
     core = set(schema.core)
+    # A NECESSARY (core) slot is answered by the FILTERED scoped search with
+    # knowledge_base=True (when a scope tag + scoped_answer are available) :
+    # Phase 1 hard-filtered to the context, Phase 2 over the whole KB. Phase-2
+    # finds are absorbed back INTO the context (tag event:in + pull), so they
+    # join the knowledge base for later slots / future queries.
+    use_scoped = (scope_tag is not None and hasattr(memory, "scoped_answer"))
+    hub_id = (scope_tag.split("event:in:", 1)[1]
+              if isinstance(scope_tag, str)
+              and scope_tag.startswith("event:in:") else None)
+
+    def _absorb(hits):
+        if not (hub_id and hits and hasattr(memory, "event_absorb")):
+            return
+        by_id = {p.id: p for p in memory.points}
+        memory.event_absorb(
+            hub_id, [by_id[h["id"]] for h in hits if h["id"] in by_id])
+
     for slot, q in slot_subquestions(event_name, schema):
-        # (1) partition the gravitating cluster
-        hits = _retrieve_scoped(memory, q, k_per_slot, cluster)
-        # (2) a CORE slot empty in the cluster is a GAP -> additive corpus search
-        if not hits and slot in core and gap_fill:
-            hits = _retrieve_scoped(memory, q, k_per_slot, None)
-            if hits:
+        if use_scoped and slot in core:
+            scoped_hits, kb_hits = _scoped_slot(memory, q, scope_tag)
+            _absorb(kb_hits)                       # KB finds join the context
+            hits = scoped_hits[:k_per_slot]
+            if not hits:                           # GAP -> filled by the KB phase
+                hits = kb_hits[:k_per_slot]
                 out["gaps"].append(slot)
-        elif not hits and slot in core:
-            out["gaps"].append(slot)
+        else:
+            # (1) partition the gravitating cluster
+            hits = _retrieve_scoped(memory, q, k_per_slot, cluster)
+            # (2) a CORE slot empty in the cluster is a GAP -> corpus search
+            if not hits and slot in core and gap_fill:
+                hits = _retrieve_scoped(memory, q, k_per_slot, None)
+                if hits:
+                    out["gaps"].append(slot)
+            elif not hits and slot in core:
+                out["gaps"].append(slot)
         out["filled"][slot] = hits
         for h in hits:
             if h["id"] not in ids:
@@ -301,14 +347,45 @@ def event_search(memory: Any, query: str, *, k_per_slot: int = 3,
         memory, "detect_event_type") else None
     if not det:
         return None
+    # CONTEXT channel : the query is situated in a CONTEXT (= the event:type) ;
+    # its knowledge base is the UNION of facts gravitating to EVERY event of the
+    # type (broadest latent evidence). The schema's NECESSARY sub-questions are
+    # then answered by a FILTERED retrieval SCOPED to that context KB — not the
+    # whole corpus.
+    context_ids: List[str] = []
+    if hasattr(memory, "context_members"):
+        try:
+            context_ids = [p.id for p in memory.context_members(det["etype"])]
+        except Exception:
+            context_ids = []
+    # the context filter for the scoped NECESSARY-slot search : the macro hub's
+    # event:in tag (post-consolidation it covers the whole context). knowledge_
+    # base=True (inside fill) then expands beyond it.
+    hub_id = det.get("event_id") or (
+        memory._event_registry.get(
+            f"{det['etype']}::{(det['name'] or '').strip().lower()}")
+        if hasattr(memory, "_event_registry") else None)
+    scope_tag = f"event:in:{hub_id}" if hub_id else None
     fill = fill_event_schema(memory, det["name"], det["etype"],
-                             k_per_slot=k_per_slot)
+                             k_per_slot=k_per_slot,
+                             restrict_ids=context_ids or None,
+                             scope_tag=scope_tag)
     fill["event"] = det
-    # ENUMERATION / retrieve mode : the cluster IS the bag — return it as a list.
+    fill["context_ids"] = context_ids
+
+    # COLLECT each NECESSARY (core) slot's clue into the BAG : the schema's list
+    # of required roles IS a retrieve-bag. Parallel — it only feeds the final
+    # list rendering, the rest of the agent process is unchanged.
+    if hasattr(memory, "bag_add"):
+        core = set(fill.get("core") or [])
+        need = [h["id"] for slot, hits in (fill.get("filled") or {}).items()
+                if slot in core for h in hits]
+        if need:
+            memory.bag_add(need)
+
+    # ENUMERATION / retrieve mode : the context IS the bag — return it as a list.
     from metacog.enumeration import is_enumeration_query, format_bag_answer
     if is_enumeration_query(query) and fill.get("cluster_ids"):
-        # SEED the agent's retrieve-mode bag with the event cluster ; the agent
-        # can then bag_add more across iterations before the list is rendered.
         if hasattr(memory, "bag_add"):
             memory.bag_add(fill["cluster_ids"])
         by_id = {p.id: p for p in memory.points}
