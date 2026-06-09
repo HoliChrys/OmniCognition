@@ -999,6 +999,32 @@ def _compress_answer(answer: str, question: Optional[str],
         return None
 
 
+def _compose_final(focused, bag_items, question, llm):
+    """Mode-aware final composition of the two answer modes.
+
+      * "generate a focused answer" -> the terse walk answer (F1 mode).
+      * "refer an exhaustive set"   -> the rendered bag list (recall mode).
+      * BOTH                        -> focused answer + the exhaustive list.
+
+    Returns (answer, bag_ids_used). Empty bag (or no rendering) -> the focused
+    answer unchanged and no bag ids. A pure enumeration query, or no real
+    focused answer, yields the list alone ; otherwise both coexist."""
+    from metacog.enumeration import format_bag_answer, is_enumeration_query
+    focused = (focused or "").strip()
+    items = list(bag_items or [])
+    if not items:
+        return focused, []
+    rendered = format_bag_answer(question, items, llm)
+    if not rendered:
+        return focused, []
+    ids = [i for i, _ in items]
+    real = bool(focused) and "not mentioned" not in focused.lower() \
+        and "no information" not in focused.lower()
+    if is_enumeration_query(question) or not real:
+        return rendered, ids                    # exhaustive : the list IS it
+    return focused + "\n\n" + rendered, ids      # BOTH
+
+
 def terse(text: str, question: Optional[str] = None) -> str:
     """Strip Haiku's preamble/interjection wrapping. Mirrors the helper
     in mcp_agent.py — keeps the bare value the F1 metric scores on.
@@ -1981,20 +2007,17 @@ class McpMetaAgent:
             answer_text = _compress_answer(
                 answer_text, question, self.client, self.model) or answer_text
 
-        # PARALLEL bag : the whole process above is UNCHANGED. ONLY here, if the
-        # agent collected a non-empty retrieve-mode bag during the walk (via the
-        # `collect` tool), the answer becomes the rendered LIST instead of a
-        # terse value — and the bag refs join retrieved_ids (still pure
-        # agent_recall : it is what the agent gathered). Empty bag -> identical
-        # to no-bag behaviour.
-        final_answer = terse(answer_text, question)
+        # MODE-AWARE composition (the two answer modes coexist).
+        #   * "generate a focused answer" -> the terse walk answer (F1 mode).
+        #   * "refer an exhaustive set"   -> the rendered bag list (recall mode).
+        #   * BOTH                        -> answer + the exhaustive list.
+        # The whole process above is UNCHANGED ; this only shapes the final
+        # output. Empty bag -> identical to no-bag behaviour. The bag refs join
+        # retrieved_ids either way (pure agent_recall — what the agent gathered).
         bag_items = memory.bag_items() if hasattr(memory, "bag_items") else []
-        if bag_items:
-            from metacog.enumeration import format_bag_answer
-            rendered = format_bag_answer(question, bag_items, memory.llm)
-            if rendered:
-                final_answer = rendered
-                seen_ids.update(i for i, _ in bag_items)
+        final_answer, _bag_used = _compose_final(
+            terse(answer_text, question), bag_items, question, memory.llm)
+        seen_ids.update(_bag_used)
 
         return {
             "answer": final_answer,

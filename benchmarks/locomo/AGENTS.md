@@ -17,8 +17,11 @@ holds the LoCoMo conversations.
   `--max-qa`, `--debug-jsonl`).
 - `mcp_meta_agent.py` — the agentic meta-walk answerer. `_extract_fact_ids`
   unions walk + event-channel ids (`fact_ids_cumulative`, `cluster_ids`,
-  `context_ids`, `fact_ids`) — ADDITIVE. The parallel bag renders a list answer
-  at the end only when non-empty; the rest of the process is unchanged.
+  `context_ids`, `fact_ids`) — ADDITIVE. `_compose_final` shapes the output by
+  the two answer modes: focused walk answer (F1), exhaustive bag list (recall),
+  or BOTH (answer + list) — list-only for enumeration queries or when there is
+  no real focused answer; otherwise the two coexist. The rest of the process is
+  unchanged when the bag is empty.
 - `debug_qa.py` — the `QADebugger` REPL (presearch / clues / walk / auto /
   recall / step). Reused verbatim by the OBLIQ debugger.
 - `encoders.py` — `SemanticEncoder` (sentence-transformers).
