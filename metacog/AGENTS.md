@@ -34,8 +34,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   via `scoped_answer(list_only=True)`); `search_nodes` — tri-modal relevance
   search (sim | regex | fuzzy) over a filtered pool, on content AND/OR tags,
   WITHOUT REPLACEMENT (`exclude_bag` removes already-collected nodes), the
-  agent's collect-loop primitive. The default bag mirrors into `_bag` for
-  backwards compatibility.
+  agent's collect-loop primitive; `assemble_set` — the ORCHESTRATED loop
+  (auto-route the event → loop sim→fuzzy→regex search_nodes → `_judge_relevance`
+  (LLM, recall-first fallback) → collect, without replacement, until converged).
+  The default bag mirrors into `_bag` for backwards compatibility.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
@@ -63,8 +65,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
   description)`, `bag(name)`, `bags()` (overview with description/schema for
   decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
-  `scoped_answer`, `scoped_list` (non-kNN filtered listing), and `search_nodes`
-  (tri-modal relevance loop over content+tags, without replacement vs the bag).
+  `scoped_answer`, `scoped_list` (non-kNN filtered listing), `search_nodes`
+  (tri-modal relevance step over content+tags, without replacement vs the bag),
+  and `assemble_set` (the whole orchestrated loop in one call).
 
 ## Work Guidance
 

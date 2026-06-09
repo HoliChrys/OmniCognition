@@ -453,6 +453,23 @@ def build_app(
                            "tags": list(p.tags)[:12]} for p in pts]}
 
     @app.tool()
+    def assemble_set(
+        query: str, event_id: Optional[str] = None, tags: Optional[list] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        on: str = "both", bag: str = "default", max_rounds: int = 6, k: int = 10,
+    ) -> dict:
+        """ASSEMBLE an exhaustive set in one call — the orchestrated relevance
+        loop. Scopes to the event (`event_id`/`tags`, else auto-routed from the
+        query), then loops sim→fuzzy→regex `search_nodes` over content+tags,
+        judges relevance, and collects the hits into `bag` WITHOUT REPLACEMENT
+        until the pool yields nothing new. Returns the bag + per-round adds; read
+        it back with `bag(name)` / render with `bag_render`."""
+        return memory.assemble_set(
+            query, event_id=event_id, tags=list(tags) if tags else None,
+            date_from=date_from, date_to=date_to, on=str(on or "both"),
+            bag=str(bag or "default"), max_rounds=max(1, max_rounds), k=max(1, k))
+
+    @app.tool()
     def list_tags() -> dict:
         """Return the GLOSSARY of tag NAMESPACES across the whole memory.
 

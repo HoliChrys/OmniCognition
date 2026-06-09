@@ -2314,6 +2314,91 @@ class Memory:
         scored.sort(key=lambda sp: (-sp[0], sp[1].id))
         return [p for _, p in scored[:max(1, k)]]
 
+    def _judge_relevance(self, query: str, cands: Sequence[Point]) -> List[Point]:
+        """LLM judges which candidates bear on the request. No LLM / failure ->
+        accept all (recall-first). Returns the kept points."""
+        cands = list(cands)
+        if not cands or not hasattr(self.llm, "generate"):
+            return cands
+        listing = "\n".join(f"[{p.id}] {(p.content or '')[:160]}" for p in cands)
+        try:
+            out = self.llm.generate(
+                "Which of these items are RELEVANT to the request? Reply with "
+                "ONLY the matching ids separated by commas, or 'none'.\n"
+                f"Request: {query}\nItems:\n{listing}\nRelevant ids:",
+                max_tokens=160) or ""
+        except Exception:
+            return cands
+        if "none" in out.lower() and not re.search(r"[\[\]]", out):
+            picked = set(re.findall(r"[A-Za-z0-9_@.]+", out)) - {"none"}
+        else:
+            picked = set(re.findall(r"[A-Za-z0-9_@.]+", out))
+        keep = [p for p in cands if p.id in picked]
+        return keep
+
+    def assemble_set(
+        self,
+        query: str,
+        *,
+        event_id: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        modes: Sequence[str] = ("sim", "fuzzy", "regex"),
+        on: str = "both",
+        bag: str = "default",
+        max_rounds: int = 6,
+        k: int = 10,
+        judge: bool = True,
+    ) -> Dict[str, Any]:
+        """AGENTIC exhaustive-set assembly — the orchestrated loop.
+
+        1. Scope : the given `event_id`/`tags`, or auto-route via
+           `detect_event_type(query)` (presearch the context event).
+        2. Loop : `search_nodes` over the filtered pool across `modes`
+           (sim → fuzzy → regex) on content+tags ; judge relevance (LLM) ;
+           `collect` the hits into `bag`. WITHOUT REPLACEMENT — every candidate
+           is judged once (collected ones via the bag, rejected ones tracked) so
+           the pool shrinks and the loop converges when no new relevant node is
+           found (or `max_rounds`).
+
+        Returns {bag, size, rounds, added, scope}."""
+        if event_id is None and not tags:
+            try:
+                det = self.detect_event_type(query)
+            except Exception:
+                det = None
+            if det and det.get("event_id"):
+                event_id = det["event_id"]
+        seen: set = set()
+        added_log: List[int] = []
+        for _r in range(max(1, max_rounds)):
+            added = 0
+            for mode in modes:
+                cand = self.search_nodes(
+                    query, mode=mode, on=on, event_id=event_id, tags=tags,
+                    date_from=date_from, date_to=date_to,
+                    exclude_ids=seen, exclude_bag=bag, k=k)
+                cand = [p for p in cand if p.id not in seen]
+                if not cand:
+                    continue
+                keep = self._judge_relevance(query, cand) if judge else cand
+                for p in cand:                          # judged once : no remise
+                    seen.add(p.id)
+                if keep:
+                    self.bag_add(
+                        [p.id for p in keep], bag=bag,
+                        description=f"Assembled relevant set for: {query[:80]}",
+                        schema={"kind": "assembled_set", "query": query,
+                                "event_id": event_id})
+                    added += len(keep)
+            added_log.append(added)
+            if added == 0:
+                break
+        return {"bag": bag, "size": len(self.bag_items(bag=bag)),
+                "rounds": len(added_log), "added": added_log,
+                "scope": {"event_id": event_id, "tags": list(tags or [])}}
+
     def scoped_answer(
         self,
         query: str,

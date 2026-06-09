@@ -1,0 +1,66 @@
+"""
+Orchestrated exhaustive-set assembly — the agentic loop.
+
+assemble_set scopes to the event, loops sim→fuzzy→regex search_nodes, judges
+relevance (LLM), collects hits into the bag WITHOUT REPLACEMENT, and converges.
+"""
+
+from __future__ import annotations
+
+from metacog.defaults import SimpleEncoder
+from metacog.memory import Memory
+
+
+class _JudgeLLM:
+    """Accepts only ids whose content mentions 'iran' (deterministic judge)."""
+    def generate(self, prompt, max_tokens=160):
+        keep = []
+        for line in prompt.splitlines():
+            if line.startswith("[") and "iran" in line.lower():
+                keep.append(line[1:line.index("]")])
+        return ", ".join(keep) if keep else "none"
+
+
+def _mem(llm=None):
+    m = Memory(encoder=SimpleEncoder(), llm=llm)
+    a = m.ingest("iran strike on the refinery", kind="FACT", id="A")
+    b = m.ingest("tehran market reaction in iran", kind="FACT", id="B")
+    c = m.ingest("unrelated cooking recipe", kind="FACT", id="C")
+    for p in (a, b, c):
+        p.tags.append("event:type:war")          # same filtered pool
+    return m
+
+
+def test_assemble_collects_relevant_until_converged():
+    m = _mem(_JudgeLLM())
+    rep = m.assemble_set("war in iran", tags=["event:type:war"],
+                         modes=("sim", "regex"), k=10, max_rounds=4)
+    bag = {i for i, _ in m.bag_items(bag="default")}
+    assert bag == {"A", "B"}                      # only the iran-relevant kept
+    assert "C" not in bag                          # judged irrelevant
+    assert rep["size"] == 2
+    assert rep["added"][-1] == 0                   # converged (a quiet last round)
+
+
+def test_without_replacement_no_double_count():
+    m = _mem(_JudgeLLM())
+    rep = m.assemble_set("war in iran", tags=["event:type:war"],
+                         modes=("sim", "fuzzy", "regex"), k=10, max_rounds=5)
+    # each relevant node counted exactly once across all rounds/modes
+    assert sum(rep["added"]) == 2
+    assert rep["rounds"] <= 5
+
+
+def test_no_llm_accepts_all_recall_first():
+    m = _mem(llm=None)                             # no judge -> recall-first
+    m.assemble_set(r"war", tags=["event:type:war"], modes=("regex",),
+                   on="tags", k=10, max_rounds=3)
+    bag = {i for i, _ in m.bag_items(bag="default")}
+    assert bag == {"A", "B", "C"}                  # all in-scope nodes collected
+
+
+def test_bag_carries_assembled_schema():
+    m = _mem(_JudgeLLM())
+    m.assemble_set("war in iran", tags=["event:type:war"], modes=("sim",), k=10)
+    meta = m.bag_meta("default")
+    assert meta["schema"]["kind"] == "assembled_set"

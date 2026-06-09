@@ -118,7 +118,9 @@ presearch (scoped, `knowledge_base=False`) surfaces the context events, then
 `search_nodes` draws candidates from the filtered pool by sim/regex/fuzzy over
 content AND tags ; the agent judges relevance and `collect`s the hits into the
 bag. Drawing is WITHOUT REPLACEMENT — a collected node is excluded from later
-passes (`exclude_bag`), so the pool shrinks and the loop converges.
+passes (`exclude_bag`), so the pool shrinks and the loop converges. The whole
+loop is orchestrated by `Memory.assemble_set` (auto-route the event, cycle the
+modes, judge relevance, collect, converge) — one call returns the assembled bag.
 
 ## User Preferences
 
