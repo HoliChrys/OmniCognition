@@ -33,12 +33,23 @@ import argparse
 
 from benchmarks.obliq_bench.event_step import build
 
+# Ingestion auto-spawns DERIVED nodes (atoms, entities, event hubs) and the walk
+# generates actions ; none are corpus documents, none can be gold. They must be
+# excluded from the measured set or n exceeds the pool size and precision is
+# meaningless. Gold are corpus doc ids ; recall is unaffected, but a clean n
+# matters for the over-selection read.
+_DERIVED = ("entity_", "atom_", "event_", "act_", "lateral_", "thought_", "gen_")
+
+
+def _docs(ids):
+    return {i for i in ids if not (str(i).startswith(_DERIVED) or "@" in str(i))}
+
 
 def _scores(found, gold):
-    # Report BOTH : recall (OBLIQ is recall-only) AND precision/F1 (the metric on
-    # other benchmarks, e.g. LoCoMo). n (set size) exposes over-selection — a
-    # huge set gets recall=1 trivially, which precision/F1 then penalises.
-    f, g = set(found), set(gold)
+    # OBLIQ is RECALL-only ; precision/F1/n are shown for cross-benchmark context
+    # but DO NOT count for OBLIQ. The set is restricted to document ids first so
+    # n never exceeds the pool.
+    f, g = _docs(found), set(gold)
     hit = len(f & g)
     rec = hit / len(g) if g else 0.0
     prec = hit / len(f) if f else 0.0
