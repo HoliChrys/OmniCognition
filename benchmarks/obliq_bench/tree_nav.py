@@ -207,7 +207,7 @@ def build_tree(mem, qmap: dict) -> Node:
             hub_id = mem._event_registry.get(
                 f"{etype}::{event_name.strip().lower()}")
             scope = f"event:in:{hub_id}" if hub_id else None
-            fill = fill_event_schema(mem, event_name, etype, k_per_slot=3,
+            fill = fill_event_schema(mem, event_name, etype, k_per_slot=5,
                                      scope_tag=scope)
             nodes = []
             core = set(fill.get("core") or [])

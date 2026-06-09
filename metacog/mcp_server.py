@@ -734,7 +734,7 @@ def build_app(
                 "items": [{"id": i, "content": c[:160]} for i, c in items]}
 
     @app.tool()
-    def event_search(query: str, k_per_slot: int = 3) -> dict:
+    def event_search(query: str, k_per_slot: int = 5) -> dict:
         """EVENT-schema retrieval. For a question ABOUT AN EVENT ("what were the
         casualties of the border war?", "how did the trip go?"), detect the
         event TYPE, then gather its facts EXHAUSTIVELY by its recurrent schema :

@@ -128,22 +128,27 @@ def _scoped_slot(memory: Any, q: str, scope_tag: str, *, n_stages: int = 4
     return _ev("scoped_evidence"), _ev("global_evidence")
 
 
-def _retrieve_scoped(memory: Any, q: str, k: int, scope: Any) -> List[dict]:
+def _retrieve_scoped(memory: Any, q: str, k: int, scope: Any, *,
+                     exclude: Any = None) -> List[dict]:
+    exclude = exclude or set()
     orig = memory.points
     try:
         if scope is not None:
             memory.points = scope
-        hits = memory.retrieve(q, k=max(1, k))
+        # over-fetch so excluding ids already taken by earlier slots still
+        # leaves k fresh ones (slots diversify coverage, not repeat the top).
+        hits = memory.retrieve(q, k=max(1, k + len(exclude)))
     except Exception:
         hits = []
     finally:
         memory.points = orig
-    return [{"id": h["id"], "content": h["content"], "score": h["score"]}
-            for h in hits]
+    out = [{"id": h["id"], "content": h["content"], "score": h["score"]}
+           for h in hits if h["id"] not in exclude]
+    return out[:k]
 
 
 def fill_event_schema(memory: Any, event_name: str, etype: str, *,
-                      k_per_slot: int = 3, gap_fill: bool = True,
+                      k_per_slot: int = 5, gap_fill: bool = True,
                       restrict_ids: Any = None, scope_tag: Any = None) -> dict:
     """Schema-driven slot-filling for one event instance — the two design loops.
 
@@ -199,20 +204,28 @@ def fill_event_schema(memory: Any, event_name: str, etype: str, *,
         memory.event_absorb(
             hub_id, [by_id[h["id"]] for h in hits if h["id"] in by_id])
 
+    # ids already assigned to earlier slots — EXCLUDED from later slots so the
+    # schema DIVERSIFIES coverage instead of every slot repeating the same top
+    # facts (the redundancy that capped slot-fill recall below the cluster).
+    taken: set = set()
     for slot, q in slot_subquestions(event_name, schema):
         if use_scoped and slot in core:
             scoped_hits, kb_hits = _scoped_slot(memory, q, scope_tag)
             _absorb(kb_hits)                       # KB finds join the context
-            hits = scoped_hits[:k_per_slot]
+            hits = [h for h in scoped_hits
+                    if h["id"] not in taken][:k_per_slot]
             if not hits:                           # GAP -> filled by the KB phase
-                hits = kb_hits[:k_per_slot]
+                hits = [h for h in kb_hits
+                        if h["id"] not in taken][:k_per_slot]
                 out["gaps"].append(slot)
         else:
-            # (1) partition the gravitating cluster
-            hits = _retrieve_scoped(memory, q, k_per_slot, cluster)
+            # (1) partition the gravitating cluster (excluding taken ids)
+            hits = _retrieve_scoped(memory, q, k_per_slot, cluster,
+                                    exclude=taken)
             # (2) a CORE slot empty in the cluster is a GAP -> corpus search
             if not hits and slot in core and gap_fill:
-                hits = _retrieve_scoped(memory, q, k_per_slot, None)
+                hits = _retrieve_scoped(memory, q, k_per_slot, None,
+                                        exclude=taken)
                 if hits:
                     out["gaps"].append(slot)
             elif not hits and slot in core:
@@ -221,6 +234,7 @@ def fill_event_schema(memory: Any, event_name: str, etype: str, *,
         for h in hits:
             if h["id"] not in ids:
                 ids.append(h["id"])
+                taken.add(h["id"])
     out["fact_ids"] = ids
     return out
 
@@ -336,7 +350,7 @@ def event_anchor(memory: Any, query: str):
     return anchor, det
 
 
-def event_search(memory: Any, query: str, *, k_per_slot: int = 3,
+def event_search(memory: Any, query: str, *, k_per_slot: int = 5,
                  enrich: bool = True) -> Optional[dict]:
     """End-to-end event-schema retrieval for a QUERY : detect the event type,
     fill the schema by partitioning the gravitating cluster (+ gap-fill core

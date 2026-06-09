@@ -142,7 +142,7 @@ def main() -> None:
     # ---- FILL : schema slots, scoped+KB, bag -------------------------------
     from metacog.event_schema import event_search
     t0 = time.time()
-    fill = event_search(mem, question, k_per_slot=3)
+    fill = event_search(mem, question, k_per_slot=5)
     print("  [5] EVENT_SEARCH (%.1fs) ->" % (time.time() - t0))
     if not fill:
         print("        no event detected (channel silent)")
