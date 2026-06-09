@@ -2176,6 +2176,14 @@ class Memory:
         return next((t.split(":", 2)[2] for t in p.tags
                      if t.startswith("time:date:")), None)
 
+    _DERIVED_PREFIXES = ("entity_", "atom_", "event_", "act_", "lateral_",
+                         "thought_", "gen_")
+
+    @classmethod
+    def _is_derived(cls, pid: str) -> bool:
+        """True for auto-spawned / generated nodes (never source documents)."""
+        return str(pid).startswith(cls._DERIVED_PREFIXES) or "@" in str(pid)
+
     def filter_list(
         self,
         *,
@@ -2243,6 +2251,7 @@ class Memory:
         exclude_ids: Optional[Sequence[str]] = None,
         exclude_bag: Optional[str] = None,
         k: int = 10,
+        exclude_derived: bool = True,
     ) -> List[Point]:
         """Tri-modal search over a FILTERED node pool, on content and/or TAGS,
         WITHOUT REPLACEMENT.
@@ -2271,6 +2280,12 @@ class Memory:
         if exclude_bag:
             exclude |= set(self._bag_ref(exclude_bag))
         pool = [p for p in pool if p.id not in exclude]
+        # POOL HYGIENE : auto-spawned derived nodes (atoms, entities, event hubs,
+        # generated actions) are never documents and never the answer ; left in,
+        # they win top-k slots by surface score and push low-signal document gold
+        # past k. Drop them so the candidate pool is documents only.
+        if exclude_derived:
+            pool = [p for p in pool if not self._is_derived(p.id)]
 
         def _toks(s: str) -> set:
             return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
@@ -2377,6 +2392,7 @@ class Memory:
         added_log: List[int] = []
         for _r in range(max(1, max_rounds)):
             added = 0
+            surfaced = 0
             for mode in modes:
                 cand = self.search_nodes(
                     query, mode=mode, on=on, event_id=event_id, tags=tags,
@@ -2385,6 +2401,7 @@ class Memory:
                 cand = [p for p in cand if p.id not in seen]
                 if not cand:
                     continue
+                surfaced += len(cand)
                 if judge:
                     bag_ids = set(self._bag_ref(bag))
                     collected = [p for p in self.points if p.id in bag_ids]
@@ -2401,7 +2418,12 @@ class Memory:
                                 "event_id": event_id})
                     added += len(keep)
             added_log.append(added)
-            if added == 0:
+            # Stop only when the pool is EXHAUSTED (no new candidate surfaced) —
+            # without replacement guarantees this terminates. Stopping on a quiet
+            # `added==0` round was premature : low-signal gold sit past top-k and
+            # only surface once the higher-ranked (often irrelevant) nodes are
+            # drawn and removed. `max_rounds` bounds the compute for huge pools.
+            if surfaced == 0:
                 break
         return {"bag": bag, "size": len(self.bag_items(bag=bag)),
                 "rounds": len(added_log), "added": added_log,
