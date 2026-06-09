@@ -2329,21 +2329,44 @@ class Memory:
         scored.sort(key=lambda sp: (-sp[0], sp[1].id))
         return [p for _, p in scored[:max(1, k)]]
 
-    def oblique_labels(self, query: str, cands: Sequence[Point],
-                       collected: Optional[Sequence[Point]] = None) -> List[str]:
-        """OBLIQUE-aware relevance labels — reason about IMPLICIT relevance.
+    def distill_proposition(self, query: str) -> str:
+        """Distil the request's SPECIFIC oblique proposition — the exact stance an
+        item must take to qualify, not the surface topic. Cached per query.
+        Failure / no LLM -> the query itself."""
+        if not hasattr(self, "_prop_cache") or self._prop_cache is None:
+            self._prop_cache = {}
+        if query in self._prop_cache:
+            return self._prop_cache[query]
+        prop = query
+        if hasattr(self.llm, "generate"):
+            try:
+                out = self.llm.generate(
+                    "A retrieval request describes items by an OBLIQUE stance. In "
+                    "ONE sentence, state the underlying PROPOSITION an item must "
+                    "express or imply to qualify — the specific position/attitude, "
+                    "NOT the surface topic.\n"
+                    f"Request : {query}\nProposition :", max_tokens=90)
+                if out and out.strip():
+                    prop = out.strip()
+            except Exception:
+                pass
+        self._prop_cache[query] = prop
+        return prop
 
-        OBLIQ relevance is latent : an item belongs to the set if it bears on the
-        request by STANCE, TONE, IMPLICATION, sarcasm, allusion, or by
-        expressing / opposing / exemplifying the position described — even when it
-        shares NO words with the request and never states the topic. The plain
-        Chain-of-Note reading (built for multi-hop bridging) under-recognises
-        this and drops obliquely-relevant items. Returns 'relevant'/'irrelevant'
-        per candidate ; recall-first (fails OPEN -> all relevant). No LLM -> all
+    def oblique_labels(self, query: str, cands: Sequence[Point],
+                       collected: Optional[Sequence[Point]] = None,
+                       proposition: Optional[str] = None) -> List[str]:
+        """OBLIQUE-aware relevance labels — TWO-STEP : test each candidate against
+        the request's distilled PROPOSITION (the specific stance), not generic
+        relevance. An item qualifies if it expresses / implies / mocks-in-
+        agreement / exemplifies that proposition by stance/tone/sarcasm/allusion,
+        even sharing no words ; an item merely on the SAME TOPIC without taking
+        the stance is irrelevant. Recall-first (fails OPEN). No LLM -> all
         relevant."""
         cands = list(cands)
         if not cands or not hasattr(self.llm, "generate"):
             return ["relevant"] * len(cands)
+        prop = proposition or self.distill_proposition(query)
         listing = "\n".join(f"[{i}] {(p.content or '')[:200]}"
                             for i, p in enumerate(cands))
         ctx = ""
@@ -2352,17 +2375,17 @@ class Memory:
                 f"  - {(p.content or '')[:100]}" for p in list(collected)[-6:]
             ) + "\n"
         prompt = (
-            "You are assembling the EXHAUSTIVE set of items that bear on a "
-            "request. Relevance is OBLIQUE : an item counts if it bears on the "
-            "request by STANCE, TONE, IMPLICATION, sarcasm, allusion, or by "
-            "expressing / opposing / exemplifying the position described — EVEN "
-            "IF it shares no words with the request and never states the topic "
-            "explicitly. Be GENEROUS : when an item plausibly belongs to the "
-            "set, label it relevant ; label irrelevant only when it is clearly a "
-            "different subject.\n"
+            "You are assembling the EXHAUSTIVE set of items that take a specific "
+            "OBLIQUE stance. An item QUALIFIES if it expresses, implies, mocks in "
+            "agreement, supports, or exemplifies THIS proposition — by stance, "
+            "tone, sarcasm, or allusion, even sharing no words with it :\n"
+            f"  PROPOSITION : {prop}\n"
+            "Label irrelevant an item that is merely on the same TOPIC without "
+            "taking this stance, or a different subject. Be generous for items "
+            "that genuinely take the stance.\n"
             "For EACH numbered item output one line `i: relevant` or "
             "`i: irrelevant`, nothing else.\n\n"
-            f"REQUEST : {query}\n{ctx}ITEMS :\n{listing}"
+            f"{ctx}ITEMS :\n{listing}"
         )
         try:
             raw = self.llm.generate(prompt, max_tokens=max(16, 6 * len(cands)))
