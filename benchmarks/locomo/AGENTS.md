@@ -20,8 +20,10 @@ holds the LoCoMo conversations.
   `context_ids`, `fact_ids`) — ADDITIVE. `_compose_final` shapes the output by
   the two answer modes: focused walk answer (F1), exhaustive bag list (recall),
   or BOTH (answer + list) — list-only for enumeration queries or when there is
-  no real focused answer; otherwise the two coexist. The rest of the process is
-  unchanged when the bag is empty.
+  no real focused answer; otherwise the two coexist. The bag is rendered by
+  `metacog.bag_render.render_bag` (agent picks strategy raw/extract/interpret/
+  mapreduce + placement inject/bare). The rest of the process is unchanged when
+  the bag is empty.
 - `debug_qa.py` — the `QADebugger` REPL (presearch / clues / walk / auto /
   recall / step). Reused verbatim by the OBLIQ debugger.
 - `encoders.py` — `SemanticEncoder` (sentence-transformers).

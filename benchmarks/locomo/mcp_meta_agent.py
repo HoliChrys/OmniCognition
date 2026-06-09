@@ -1009,12 +1009,15 @@ def _compose_final(focused, bag_items, question, llm):
     Returns (answer, bag_ids_used). Empty bag (or no rendering) -> the focused
     answer unchanged and no bag ids. A pure enumeration query, or no real
     focused answer, yields the list alone ; otherwise both coexist."""
-    from metacog.enumeration import format_bag_answer, is_enumeration_query
+    from metacog.enumeration import is_enumeration_query
+    from metacog.bag_render import render_bag
     focused = (focused or "").strip()
     items = list(bag_items or [])
     if not items:
         return focused, []
-    rendered = format_bag_answer(question, items, llm)
+    # the agent decides the rendering strategy (raw / extract / interpret /
+    # mapreduce) and placement (inject / bare) — render_bag(strategy=auto).
+    rendered = render_bag(question, items, llm)
     if not rendered:
         return focused, []
     ids = [i for i, _ in items]

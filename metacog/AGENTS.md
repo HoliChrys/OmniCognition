@@ -38,6 +38,11 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   INTERSECTION when non-empty).
 - Extractors (`event_extractor.py`, `keywords.py`, `entities.py`, `atomic.py`):
   cached, failure-safe, never cache empty.
+- `enumeration.py` — retrieve/"bag" mode detection + `format_bag_answer`.
+  `bag_render.py` — the agent's bag rendering strategies: `raw`, `extract`
+  (head/tail ellipsis), `interpret` (one interpretation per node), `mapreduce`
+  (rolling batch summary) + placement `inject`/`bare`. `render_bag(strategy=
+  "auto", placement="auto")` lets the agent decide.
 - `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
   excluded from `retrieve`'s search pool.
 
