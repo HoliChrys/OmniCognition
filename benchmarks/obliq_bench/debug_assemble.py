@@ -64,46 +64,68 @@ def main() -> None:
         p = by_id.get(g)
         cos[g] = _cos(qv, mem.encoder.encode(p.content)) if p else 0.0
 
-    # run the real assemble loop (global, CoN judge)
-    rep = mem.assemble_set(question, k=args.k, max_rounds=args.max_rounds,
-                           bag="autopsy", auto_route=False)
-    bag = _docs({i for i, _ in mem.bag_items(bag="autopsy")})
+    # INSTRUMENTED loop : replicate assemble_set but record, per gold, the round
+    # it was SURFACED to the judge and the CoN label it got — the actual decisions
+    # (not inferred from rank). This distinguishes a k/search miss (never
+    # surfaced) from a JUDGE miss (surfaced then labelled irrelevant).
+    from metacog.meta_walk import chain_of_note
+    seen: set = set()
+    bag_ids: list = []
+    fate = {g: {"surf": None, "label": None} for g in gold}
+    for r in range(args.max_rounds):
+        surfaced = 0
+        for mode in ("sim", "fuzzy", "regex"):
+            cand = mem.search_nodes(question, mode=mode, on="both",
+                                    exclude_ids=seen, k=args.k)
+            cand = [p for p in cand if p.id not in seen]
+            if not cand:
+                continue
+            surfaced += len(cand)
+            collected = [p for p in mem.points if p.id in set(bag_ids)]
+            labels = chain_of_note(question, cand, mem.llm, collected=collected)
+            for p, lab in zip(cand, labels):
+                if p.id in fate and fate[p.id]["surf"] is None:
+                    fate[p.id]["surf"] = (r, mode)
+                    fate[p.id]["label"] = lab
+                seen.add(p.id)
+                if lab != "irrelevant":
+                    bag_ids.append(p.id)
+        if surfaced == 0:
+            break
+    bag = _docs(set(bag_ids))
 
-    print("\nQUERY [%s] gold=%d   assemble bag recall=%d/%d  rounds=%d %s" % (
-        args.query_id, len(gold), len(bag & gset), len(gold),
-        rep["rounds"], rep["added"]))
+    print("\nQUERY [%s] gold=%d   loop recall=%d/%d" % (
+        args.query_id, len(gold), len(bag & gset), len(gold)))
     print("  Q: %s\n" % question[:100])
-    print("  %-10s %4s | %-22s | %5s | %s" % (
-        "gold", "in?", "best surface rank (mode)", "emb", "verdict"))
-    print("  " + "-" * 74)
+    print("  %-10s %4s | %-14s | %-11s | %5s | %s" % (
+        "gold", "in?", "surfaced", "CoN label", "emb", "verdict"))
+    print("  " + "-" * 72)
 
-    buckets = {"HIT": [], "REJECTED": [], "BEYOND_K": [],
+    buckets = {"HIT": [], "JUDGE_REJECTED": [], "NEVER_SURFACED": [],
                "NEEDS_SEMANTIC": [], "OBLIQUE_TAIL": []}
     for g in gold:
-        best_rank, best_mode = None, "-"
-        for m in ("sim", "fuzzy", "regex"):
-            if g in ranks[m] and (best_rank is None or ranks[m][g] < best_rank):
-                best_rank, best_mode = ranks[m][g], m
         hit = g in bag
+        surf = fate[g]["surf"]
+        lab = fate[g]["label"] or "-"
         if hit:
             verdict = "HIT"
-        elif best_rank is None:
-            verdict = "NEEDS_SEMANTIC" if cos[g] >= 0.30 else "OBLIQUE_TAIL"
-        elif best_rank < args.k:
-            verdict = "REJECTED"            # surfaced in budget, judge dropped it
+        elif surf is not None:
+            verdict = "JUDGE_REJECTED"           # surfaced to CoN, labelled irrelevant
+        elif cos[g] >= 0.30:
+            verdict = "NEEDS_SEMANTIC"           # never surfaced, but semantically close
         else:
-            verdict = "BEYOND_K"
+            verdict = "OBLIQUE_TAIL"
         buckets[verdict].append(g)
-        rk = ("#%d (%s)" % (best_rank, best_mode)) if best_rank is not None \
-            else "none (no surface match)"
-        print("  %-10s %4s | %-22s | %.2f | %s" % (
-            g[:10], "Y" if hit else "·", rk, cos[g], verdict))
+        sf = ("r%d/%s" % (surf[0], surf[1])) if surf else "never"
+        print("  %-10s %4s | %-14s | %-11s | %.2f | %s" % (
+            g[:10], "Y" if hit else "·", sf, lab, cos[g], verdict))
 
     print("\n  SUMMARY")
     for k, v in buckets.items():
         print("    %-15s %2d   %s" % (k, len(v), ", ".join(x[:8] for x in v)))
-    print("\n  -> levers : REJECTED=loosen judge ; BEYOND_K=raise k ; "
-          "NEEDS_SEMANTIC=add embedding mode ; OBLIQUE_TAIL=intrinsic.")
+    print("\n  -> levers : JUDGE_REJECTED=fix CoN on oblique relevance ; "
+          "NEVER_SURFACED/NEEDS_SEMANTIC=add embedding search ; "
+          "OBLIQUE_TAIL=intrinsic.")
 
 
 if __name__ == "__main__":
