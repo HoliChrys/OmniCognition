@@ -45,6 +45,18 @@ def _recall(found: set, gold: set) -> float:
     return (len(found & g) / len(g)) if g else 0.0
 
 
+def _walk(mem, question, n=6):
+    """The NORMAL meta-cognitive walk's cumulative facts — the right sonde for
+    the action-bridge (it re-anchors on the nearest ACTION each stage and
+    spreads from it, which retrieve@k cannot see)."""
+    from metacog.meta_walk import MetaWalker
+    w = MetaWalker(question, mem, n_stages=n, commit=False)
+    for _ in range(n):
+        if w.step().done:
+            break
+    return set(w._fact_ids_cum)
+
+
 def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     """Per-question memory with EVENT auto-spawn (event_extractor set)."""
     import json
@@ -103,6 +115,11 @@ def main() -> None:
         len(base), _recall(base_ids, gold_set),
         len(base_ids & gold_set), len(gold)))
 
+    # ---- baseline WALK on the CLEAN manifold (before any event processing) --
+    walk_base = _walk(mem, question)
+    print("  [1b] BASELINE WALK         recall=%.3f  (hits %d/%d)" % (
+        _recall(walk_base, gold_set), len(walk_base & gold_set), len(gold)))
+
     # ---- events spawned ----------------------------------------------------
     hubs = [p for p in mem.points if p.kind is PointKind.EVENT]
     from collections import Counter
@@ -139,10 +156,14 @@ def main() -> None:
             det["etype"], len(ctx_ids), _recall(ctx_ids, gold_set),
             len(ctx_ids & gold_set), len(gold)))
 
-    # ---- FILL : schema slots, scoped+KB, bag -------------------------------
-    from metacog.event_schema import event_search
+    # ---- FILL : schema slots, scoped+KB, bag (ACTION BRIDGE OFF for now) ----
+    # We ablate the bridge cleanly : run event_search WITHOUT the beacon, walk
+    # (walk_mid = event_search's general perturbation), THEN plant the beacon and
+    # walk again (walk_post). Δ(post-mid) isolates the action bridge's marginal
+    # effect on the NORMAL walk — the right sonde, not retrieve@k.
+    from metacog.event_schema import event_search, event_action_enrich
     t0 = time.time()
-    fill = event_search(mem, question, k_per_slot=5)
+    fill = event_search(mem, question, k_per_slot=5, action_bridge=False)
     print("  [5] EVENT_SEARCH (%.1fs) ->" % (time.time() - t0))
     if not fill:
         print("        no event detected (channel silent)")
@@ -156,25 +177,31 @@ def main() -> None:
         print("        cluster=%d context=%d slot_facts=%d  bag=%d" % (
             len(cl_ids), len(cx_ids), len(fa_ids),
             len(mem.bag_items()) if hasattr(mem, "bag_items") else 0))
+        inter = fill.get("bag_intersection_cluster_schema") or []
+        print("        bag ∩ (cluster,schema) = %d ids, goldᶜ=%d" % (
+            len(inter), len(set(inter) & gold_set)))
         print("        EVENT CHANNEL recall=%.3f (gold %d/%d)" % (
             _recall(chan, gold_set), len(chan & gold_set), len(gold)))
 
-        # ---- ADDITIVE union with the baseline walk ------------------------
+        # ---- ADDITIVE union with the baseline retrieval -------------------
         union = base_ids | chan
         print("  [6] ADDITIVE (baseline ∪ event) recall=%.3f (gold %d/%d)" % (
             _recall(union, gold_set), len(union & gold_set), len(gold)))
 
-        # ---- REGRESS to NORMAL : event_search planted a meta-cognition ACTION
-        # beacon ; re-run the PLAIN retrieval and see the normal channel pick it
-        # up (the action re-anchors the cluster's facts into the normal search).
-        aid = fill.get("action_id")
-        post = mem.retrieve(question, k=max(10, len(gold)))
-        post_ids = {h["id"] for h in post}
-        print("  [7] NORMAL after action-bridge (id=%s) recall=%.3f (%d/%d)  "
-              "Δvs[1]=%+d" % (
-                  aid, _recall(post_ids, gold_set),
-                  len(post_ids & gold_set), len(gold),
-                  len(post_ids & gold_set) - len(base_ids & gold_set)))
+        # ---- VALIDATE THE BRIDGE VIA THE WALK (ablation) ------------------
+        bw = len(walk_base & gold_set)
+        walk_mid = _walk(mem, question)
+        mw = len(walk_mid & gold_set)
+        print("  [7] WALK after event_search (no beacon)  recall=%.3f (%d/%d)"
+              "  Δvs[1b]=%+d" % (
+                  _recall(walk_mid, gold_set), mw, len(gold), mw - bw))
+        hub_id = (fill.get("event") or {}).get("event_id")
+        aid = event_action_enrich(mem, hub_id, fill) if hub_id else None
+        walk_post = _walk(mem, question)
+        pw = len(walk_post & gold_set)
+        print("  [8] WALK after ACTION BRIDGE (id=%s)     recall=%.3f (%d/%d)"
+              "  Δvs[7]=%+d  (marginal bridge effect)" % (
+                  aid, _recall(walk_post, gold_set), pw, len(gold), pw - mw))
 
 
 if __name__ == "__main__":
