@@ -12,11 +12,15 @@ from metacog.memory import Memory
 
 
 class _JudgeLLM:
-    """Chain-of-Note judge : labels each `[i] content` line relevant when it
-    mentions 'iran', else irrelevant (deterministic)."""
+    """Deterministic judge : an item is relevant iff it mentions 'iran'. Speaks
+    the per-item VERDICT format and the batch `i: label` format."""
     def generate(self, prompt, max_tokens=160):
+        if "ITEM :" in prompt:                          # per-item stance THOUGHT
+            item = prompt.split("ITEM :", 1)[1]
+            return ("VERDICT: RELEVANT" if "iran" in item.lower()
+                    else "VERDICT: IRRELEVANT")
         out = []
-        for line in prompt.splitlines():
+        for line in prompt.splitlines():                # batch CoN format
             line = line.strip()
             if line.startswith("[") and "]" in line:
                 idx = line[1:line.index("]")]

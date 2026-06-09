@@ -2353,19 +2353,60 @@ class Memory:
         self._prop_cache[query] = prop
         return prop
 
+    # Meta-prompt for the per-item stance THOUGHT — the markers a real author
+    # uses to take a stance. Detect irony BUT NOT ONLY ; stay general (judge the
+    # plain case too, never force irony where there is none).
+    _STANCE_META = (
+        "An item takes the wanted stance when ANY of these hold — reason about "
+        "what the author TRULY means, do not force irony where there is none :\n"
+        " - IRONY / SARCASM : literal vs intended meaning (🤣, 'lol', absurd or "
+        "false-premise claims, mock-innocent questions).\n"
+        " - EXAGGERATED SUPERLATIVES / PROPAGANDA REGISTER echoed by a non-"
+        "official voice : grandiose official language ('supreme leader', "
+        "'obliterated', 'decimated', 'totally', 'Epic Fury', 'mission "
+        "accomplished') — sincerely, no one outside propaganda speaks this way, "
+        "so echoing it is a DISTANCING / mocking signal.\n"
+        " - PLAIN statement of the stance (no irony at all) — this qualifies too.\n"
+        "An item merely on the same TOPIC without taking the stance, or a "
+        "different subject, does NOT qualify."
+    )
+
+    def _judge_one(self, proposition: str, p: Point) -> str:
+        """Per-item stance THOUGHT (the mode that detects irony / superlatives).
+        Returns 'relevant'/'irrelevant' ; recall-first (fail OPEN)."""
+        if not hasattr(self.llm, "generate"):
+            return "relevant"
+        prompt = (
+            "Decide whether this ONE item belongs to a set defined by a STANCE.\n"
+            f"STANCE WANTED : {proposition}\n"
+            f"{self._STANCE_META}\n"
+            f"ITEM : {(p.content or '')[:400]}\n"
+            "Reason in ONE line, then end with `VERDICT: RELEVANT` or "
+            "`VERDICT: IRRELEVANT`."
+        )
+        try:
+            out = self.llm.generate(prompt, max_tokens=120) or ""
+        except Exception:
+            return "relevant"
+        tail = out.lower().rsplit("verdict", 1)[-1]
+        return "irrelevant" if "irrelevant" in tail else "relevant"
+
     def oblique_labels(self, query: str, cands: Sequence[Point],
                        collected: Optional[Sequence[Point]] = None,
-                       proposition: Optional[str] = None) -> List[str]:
-        """OBLIQUE-aware relevance labels — TWO-STEP : test each candidate against
-        the request's distilled PROPOSITION (the specific stance), not generic
-        relevance. An item qualifies if it expresses / implies / mocks-in-
-        agreement / exemplifies that proposition by stance/tone/sarcasm/allusion,
-        even sharing no words ; an item merely on the SAME TOPIC without taking
-        the stance is irrelevant. Recall-first (fails OPEN). No LLM -> all
-        relevant."""
+                       proposition: Optional[str] = None,
+                       per_item: bool = True) -> List[str]:
+        """OBLIQUE-aware relevance labels — test each candidate against the
+        request's distilled PROPOSITION (the specific stance), not generic
+        relevance. With `per_item` (default) each candidate gets its own stance
+        THOUGHT (`_judge_one`) — the mode that actually detects irony / echoed
+        superlatives, where batch labelling read them literally. Recall-first
+        (fails OPEN). No LLM -> all relevant."""
         cands = list(cands)
         if not cands or not hasattr(self.llm, "generate"):
             return ["relevant"] * len(cands)
+        if per_item:
+            prop = proposition or self.distill_proposition(query)
+            return [self._judge_one(prop, p) for p in cands]
         prop = proposition or self.distill_proposition(query)
         listing = "\n".join(f"[{i}] {(p.content or '')[:200]}"
                             for i, p in enumerate(cands))
