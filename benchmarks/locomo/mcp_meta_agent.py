@@ -999,32 +999,32 @@ def _compress_answer(answer: str, question: Optional[str],
         return None
 
 
-def _compose_final(focused, bag_items, question, llm):
+def _compose_final(focused, bags, question, llm):
     """Mode-aware final composition of the two answer modes.
 
       * "generate a focused answer" -> the terse walk answer (F1 mode).
-      * "refer an exhaustive set"   -> the rendered bag list (recall mode).
-      * BOTH                        -> focused answer + the exhaustive list.
+      * "refer an exhaustive set"   -> the rendered bag list(s) (recall mode).
+      * BOTH                        -> focused answer + the exhaustive list(s).
 
-    Returns (answer, bag_ids_used). Empty bag (or no rendering) -> the focused
-    answer unchanged and no bag ids. A pure enumeration query, or no real
-    focused answer, yields the list alone ; otherwise both coexist."""
+    `bags` is a MAP {name: [(ref, content)]} (a legacy plain list is accepted as
+    the default bag). Multiple lists are a dynamic multi-value inject. Returns
+    (answer, bag_ids_used). Empty -> the focused answer unchanged. A pure
+    enumeration query, or no real focused answer, yields the list(s) alone ;
+    otherwise focused answer and list(s) coexist."""
     from metacog.enumeration import is_enumeration_query
-    from metacog.bag_render import render_bag
+    from metacog.bag_render import render_bags
     focused = (focused or "").strip()
-    items = list(bag_items or [])
-    if not items:
+    bags_map = bags if isinstance(bags, dict) else {"default": list(bags or [])}
+    bags_map = {k: v for k, v in bags_map.items() if v}
+    if not bags_map:
         return focused, []
-    # the agent decides the rendering strategy (raw / extract / interpret /
-    # mapreduce) and placement (inject / bare) — render_bag(strategy=auto).
-    rendered = render_bag(question, items, llm)
+    rendered, ids = render_bags(question, bags_map, llm)
     if not rendered:
         return focused, []
-    ids = [i for i, _ in items]
     real = bool(focused) and "not mentioned" not in focused.lower() \
         and "no information" not in focused.lower()
     if is_enumeration_query(question) or not real:
-        return rendered, ids                    # exhaustive : the list IS it
+        return rendered, ids                    # exhaustive : the list(s) ARE it
     return focused + "\n\n" + rendered, ids      # BOTH
 
 
@@ -2017,9 +2017,17 @@ class McpMetaAgent:
         # The whole process above is UNCHANGED ; this only shapes the final
         # output. Empty bag -> identical to no-bag behaviour. The bag refs join
         # retrieved_ids either way (pure agent_recall — what the agent gathered).
-        bag_items = memory.bag_items() if hasattr(memory, "bag_items") else []
+        # Gather the agent's CURATED bags (default + any named bags it collected)
+        # as a MAP of lists ; internal channel bags (event:*) are excluded from
+        # the surface answer to avoid bloat. One map -> dynamic multi-value inject.
+        if hasattr(memory, "bag_names"):
+            curated = [n for n in memory.bag_names() if not n.startswith("event:")]
+            bags_map = {n: memory.bag_items(bag=n) for n in curated}
+        else:
+            bags_map = {"default": memory.bag_items()} \
+                if hasattr(memory, "bag_items") else {}
         final_answer, _bag_used = _compose_final(
-            terse(answer_text, question), bag_items, question, memory.llm)
+            terse(answer_text, question), bags_map, question, memory.llm)
         seen_ids.update(_bag_used)
 
         return {

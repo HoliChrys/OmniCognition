@@ -85,3 +85,34 @@ def test_render_bag_bare_placement_returns_list_only():
 def test_render_bag_empty_is_empty():
     assert render_bag("q", [], object()) == ""
     assert render_list("q", [], object()) == ""
+
+
+# ---- map of lists : dynamic multi-value inject -------------------------------
+from metacog.bag_render import render_bags
+
+
+class _MultiLLM:
+    def generate(self, prompt, max_tokens=240):
+        # places one list, leaves the other to be appended
+        return "Summary then {{alpha}} and done."
+
+
+def test_render_bags_multi_inject_and_leftover_append():
+    bags = {"alpha": [("A1", "a one"), ("A2", "a two")],
+            "beta": [("B1", "b one")]}
+    out, ids = render_bags("q", bags, _MultiLLM())
+    assert "A1" in out and "A2" in out          # placed list injected
+    assert "B1" in out                          # unplaced list appended
+    assert set(ids) == {"A1", "A2", "B1"}
+
+
+def test_render_bags_single_is_clean():
+    out, ids = render_bags("list all", {"default": [("D1", "x"), ("D2", "y")]},
+                           object())
+    assert out.startswith("- [D1]")             # single -> plain bare list
+    assert ids == ["D1", "D2"]
+
+
+def test_render_bags_empty():
+    assert render_bags("q", {}, object()) == ("", [])
+    assert render_bags("q", {"a": []}, object()) == ("", [])

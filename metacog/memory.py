@@ -162,6 +162,7 @@ class Memory:
     # event cluster, grown by the agent via bag_add.
     _bag: List[str] = field(default_factory=list)
     _bags: Dict[str, List[str]] = field(default_factory=dict)
+    _bag_meta: Dict[str, dict] = field(default_factory=dict)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
     # Total number of multi-hop transitions recorded by record_hop ;
@@ -682,20 +683,70 @@ class Memory:
             self._bags = {}
         return self._bags.setdefault(name or "default", [])
 
-    def bag_add(self, ids, *, bag: str = "default") -> int:
+    def _bag_meta_ref(self) -> Dict[str, dict]:
+        if not hasattr(self, "_bag_meta") or self._bag_meta is None:
+            self._bag_meta = {}
+        return self._bag_meta
+
+    @staticmethod
+    def _bag_describe(schema: Any) -> str:
+        """Derive a description from a bag schema, so description tracks schema."""
+        if not isinstance(schema, dict):
+            return str(schema or "")
+        kind = schema.get("kind", "bag")
+        if kind == "event_cluster":
+            return f"Exhaustive cluster of event {schema.get('event_id', '')}."
+        if kind == "event_slot":
+            tier = "core" if schema.get("core") else "peripheral"
+            return f"Schema slot «{schema.get('slot', '')}» ({tier})."
+        if kind == "event_schema":
+            return "Schema roll-up: slots " + \
+                   ", ".join(schema.get("slots", []) or []) + "."
+        return f"{kind} bag."
+
+    def bag_add(self, ids, *, bag: str = "default",
+                description: Optional[str] = None, schema: Any = None) -> int:
         """Append node ref(s) to a NAMED bag (deduped, order-preserving).
-        Default bag is the agent's retrieve list (backwards-compatible)."""
+        Default bag is the agent's retrieve list (backwards-compatible).
+        `description` / `schema` annotate the bag so the agent can DECIDE which
+        bag to use and how to render it (set/overwritten when provided)."""
         b = self._bag_ref(bag)
         if isinstance(ids, str):
             ids = [ids]
         for i in ids or []:
             if isinstance(i, str) and i and i not in b:
                 b.append(i)
+        if description is not None or schema is not None:
+            m = self._bag_meta_ref().setdefault(bag, {})
+            if schema is not None:
+                m["schema"] = schema
+                # description MUST track the schema : a schema change with no
+                # explicit description re-derives the description from it.
+                if description is None:
+                    description = self._bag_describe(schema)
+            if description is not None:
+                m["description"] = description
         # mirror the default into the legacy `_bag` field so external readers
         # (format_bag_answer wiring, agent loop) keep working unchanged.
         if bag == "default":
             self._bag = list(b)
         return len(b)
+
+    def bag_meta(self, name: str) -> dict:
+        """A bag's decision metadata : description, schema, size, sample ids."""
+        b = self._bag_ref(name)
+        m = self._bag_meta_ref().get(name, {})
+        return {"name": name, "size": len(b),
+                "description": m.get("description", ""),
+                "schema": m.get("schema"), "sample": b[:5]}
+
+    def bag_overview(self) -> List[dict]:
+        """Every non-empty bag with its decision metadata — what the agent reads
+        to choose which list(s) to surface and how. Default + curated bags first,
+        internal channel bags (event:*) after."""
+        names = self.bag_names()
+        names.sort(key=lambda n: (n.startswith("event:"), n != "default", n))
+        return [self.bag_meta(n) for n in names]
 
     def bag_items(self, *, bag: str = "default"):
         """A bag as (id, content) pairs, in collection order."""
@@ -743,22 +794,41 @@ class Memory:
 
     def bag_publish_cluster(self, event_id: str) -> int:
         """Publish an event's gravitating cluster as a NAMED bag — so the
-        cluster becomes an intersect-able channel like any other bag."""
-        return self.bag_add([p.id for p in self.event_cluster(event_id)],
-                            bag=f"event:{event_id}")
+        cluster becomes an intersect-able channel like any other bag. Carries a
+        description + schema so the agent can decide how to use it."""
+        cl = self.event_cluster(event_id)
+        hub = next((p for p in self.points if p.id == event_id), None)
+        nm = (hub.content if hub else event_id)
+        return self.bag_add(
+            [p.id for p in cl], bag=f"event:{event_id}",
+            description=f"Everything gravitating to the event «{nm}» "
+                        f"({len(cl)} nodes) — the exhaustive cluster.",
+            schema={"kind": "event_cluster", "event_id": event_id,
+                    "element": "node/fact"})
 
     def bag_publish_schema(self, event_id: str, fill: dict) -> int:
         """Publish each filled schema SLOT as its own bag, plus a roll-up
-        'event:<id>:schema' = union of the slots. Lets ACTION/THOUGHT read
-        them, and lets bag_intersect surface a fact found by multiple slots."""
+        'event:<id>:schema' = union of the slots. Each carries a description +
+        schema (the slot role) so the agent can decide what to surface."""
         rolled: List[str] = []
         for slot, hits in ((fill or {}).get("filled") or {}).items():
             ids = [h["id"] for h in hits if isinstance(h, dict) and h.get("id")]
             if ids:
-                self.bag_add(ids, bag=f"event:{event_id}:slot:{slot}")
+                core = slot in set((fill or {}).get("core") or [])
+                self.bag_add(
+                    ids, bag=f"event:{event_id}:slot:{slot}",
+                    description=f"Schema slot «{slot}» "
+                                f"({'core' if core else 'peripheral'}) of the "
+                                f"event — the nodes filling this role.",
+                    schema={"kind": "event_slot", "slot": slot, "core": core})
                 rolled += [i for i in ids if i not in rolled]
         if rolled:
-            self.bag_add(rolled, bag=f"event:{event_id}:schema")
+            self.bag_add(
+                rolled, bag=f"event:{event_id}:schema",
+                description="Union of all filled schema slots for the event.",
+                schema={"kind": "event_schema",
+                        "slots": list((fill or {}).get("slots") or []),
+                        "core": list((fill or {}).get("core") or [])})
         return len(rolled)
 
     # ---- bi-temporal validity (Graphiti : t_valid / t_invalid) --------------

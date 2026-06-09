@@ -23,7 +23,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
   `event_absorb`); **named bags** (`bag_add/items/clear` with a `bag` kwarg,
-  `bag_intersect`/`bag_union`/`bag_names`, `bag_publish_cluster/_schema`);
+  `bag_intersect`/`bag_union`/`bag_names`, `bag_publish_cluster/_schema`; each
+  bag carries description+schema via `bag_meta`/`bag_overview`, and the
+  description tracks the schema — a schema change re-derives the description);
   bi-temporal validity (`is_valid`/`invalidate`); `scoped_answer` (two-phase
   scoped→knowledge_base cascade). The default bag mirrors into `_bag` for
   backwards compatibility.
@@ -41,10 +43,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
 - `enumeration.py` — retrieve/"bag" mode detection + `format_bag_answer`.
   `bag_render.py` — the agent's bag rendering strategies: `raw`, `extract`
   (head/tail ellipsis), `interpret` (one interpretation per node), `mapreduce`
-  (rolling batch summary) + placement `inject`/`bare`. `render_bag(strategy=
-  "auto", placement="auto")` lets the agent decide.
+  (rolling batch summary) + placement `inject`/`bare`. `render_bag` (one list)
+  and `render_bags` (a MAP of lists -> dynamic multi-value inject: prose with one
+  `{{name}}` placeholder per list, unplaced lists appended). `strategy="auto"`/
+  `placement="auto"` let the agent decide.
 - `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
-  excluded from `retrieve`'s search pool.
+  excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
+  description)`, `bag(name)`, `bags()` (overview with description/schema for
+  decisions), `bag_render(name, strategy, placement)`.
 
 ## Work Guidance
 

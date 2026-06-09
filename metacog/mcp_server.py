@@ -715,23 +715,48 @@ def build_app(
                 "scope_namespaces": scope_namespaces}
 
     @app.tool()
-    def collect(ids: List[str]) -> dict:
+    def collect(ids: List[str], bag: str = "default",
+                description: Optional[str] = None) -> dict:
         """RETRIEVE-mode bag. For a 'find all / list every …' task, ADD the node
-        ids you judge relevant to the answer bag — call this at EACH step as you
-        find matches, accumulating the exhaustive set. The final answer renders
-        the bag as a list (you don't need to restate the ids). Returns the
-        current bag size + the ids just added."""
-        before = len(memory._bag)
-        size = memory.bag_add([str(i) for i in (ids or [])])
-        return {"bag_size": size, "added": size - before}
+        ids you judge relevant to a NAMED bag — call this at EACH step as you find
+        matches, accumulating the exhaustive set. Use distinct `bag` names to keep
+        SEPARATE lists (a map of lists you can later inject at different places);
+        pass a `description` so you remember what each bag holds. The final answer
+        renders the bag(s) as list(s). Returns the bag size + ids just added."""
+        b = bag or "default"
+        before = len(memory.bag_items(bag=b))
+        size = memory.bag_add([str(i) for i in (ids or [])], bag=b,
+                              description=description)
+        return {"bag": b, "bag_size": size, "added": size - before}
 
     @app.tool()
-    def bag() -> dict:
-        """Show the current retrieve-mode bag (the collected node refs + their
-        content), so you can review what has been gathered before answering."""
-        items = memory.bag_items()
-        return {"bag_size": len(items),
+    def bag(name: str = "default") -> dict:
+        """Show ONE named bag : its description, schema, and the collected node
+        refs + content — review what a list holds before deciding how to use it."""
+        meta = memory.bag_meta(name)
+        items = memory.bag_items(bag=name)
+        return {"name": name, "size": meta["size"],
+                "description": meta["description"], "schema": meta["schema"],
                 "items": [{"id": i, "content": c[:160]} for i, c in items]}
+
+    @app.tool()
+    def bags() -> dict:
+        """OVERVIEW of every non-empty bag — name, size, description, schema,
+        sample ids. Read this to DECIDE which list(s) to surface in the answer
+        and how to render each (the map of lists at your disposal)."""
+        return {"bags": memory.bag_overview()}
+
+    @app.tool()
+    def bag_render(name: str = "default", strategy: str = "auto",
+                   placement: str = "auto") -> dict:
+        """Render a named bag for the answer. `strategy`: raw | extract |
+        interpret | mapreduce | auto. `placement`: inject | bare | auto. Returns
+        the rendered text you can drop into your reply."""
+        from metacog.bag_render import render_bag
+        items = memory.bag_items(bag=name)
+        text = render_bag("", items, memory.llm, strategy=strategy,
+                          placement=placement)
+        return {"name": name, "size": len(items), "rendered": text}
 
     @app.tool()
     def event_search(query: str, k_per_slot: int = 5) -> dict:

@@ -265,3 +265,39 @@ def test_named_bags_independent_and_clearable():
     # default bag is backwards-compatible
     mem.bag_add(["Z"])
     assert mem._bag == ["Z"]
+
+
+def test_bag_metadata_and_description_tracks_schema():
+    """Bags carry description + schema for agent decisions ; a schema change with
+    no explicit description re-derives the description (they stay coupled)."""
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    mem = Memory(encoder=SimpleEncoder())
+    mem.bag_add(["A1"], bag="x",
+                schema={"kind": "event_slot", "slot": "attacker", "core": True})
+    meta = mem.bag_meta("x")
+    assert meta["schema"]["slot"] == "attacker"
+    assert "attacker" in meta["description"]     # derived from schema
+    # change the schema with no description -> description follows
+    mem.bag_add([], bag="x",
+                schema={"kind": "event_slot", "slot": "target", "core": False})
+    assert "target" in mem.bag_meta("x")["description"]
+    assert "attacker" not in mem.bag_meta("x")["description"]
+    # explicit description wins
+    mem.bag_add([], bag="x", description="custom", schema={"kind": "k"})
+    assert mem.bag_meta("x")["description"] == "custom"
+
+
+def test_bag_overview_orders_and_describes():
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+    mem = Memory(encoder=SimpleEncoder())
+    mem.bag_add(["D1"], bag="default")
+    mem.bag_add(["C1"], bag="event:e1",
+                schema={"kind": "event_cluster", "event_id": "e1"})
+    mem.bag_add(["U1"], bag="my_list", description="curated")
+    ov = mem.bag_overview()
+    names = [b["name"] for b in ov]
+    assert names[0] == "default"                 # default first
+    assert names[-1].startswith("event:")        # internal channel last
+    assert {b["name"] for b in ov} == {"default", "event:e1", "my_list"}

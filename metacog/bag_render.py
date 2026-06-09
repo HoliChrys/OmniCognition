@@ -171,6 +171,62 @@ def _inject(question: str, listing: str, n: int, llm: Any) -> str:
     return f"Found {n} matching items:\n{listing}"
 
 
+def render_bags(question: str, bags: dict, llm: Any, *, strategy: str = "auto",
+                head: int = 20, tail: int = 20, batch: int = 4):
+    """A MAP of lists -> a dynamic multi-value inject.
+
+    The bag is not one list but several named lists (`{name: [(ref, content)]}`).
+    The final generation writes prose with one `{{name}}` placeholder per list it
+    wants, placed wherever it chooses ; each placeholder is replaced by that
+    list's rendered form (its own strategy). Lists the model did not place are
+    appended so an exhaustive set is never silently dropped. One bag -> the plain
+    single-bag inject. Returns (rendered, all_ids). Empty -> ("", [])."""
+    bags = {k: [(str(r), c) for r, c in (v or []) if r]
+            for k, v in (bags or {}).items()}
+    bags = {k: v for k, v in bags.items() if v}
+    all_ids: List[str] = []
+    for v in bags.values():
+        for i, _ in v:
+            if i not in all_ids:
+                all_ids.append(i)
+    if not bags:
+        return "", []
+    if len(bags) == 1:                                   # single -> clean inject
+        items = next(iter(bags.values()))
+        return render_bag(question, items, llm, strategy=strategy,
+                          head=head, tail=tail, batch=batch), all_ids
+    rendered = {k: render_list(question, v, llm, strategy=strategy,
+                               head=head, tail=tail, batch=batch)
+                for k, v in bags.items()}
+    body = ""
+    if hasattr(llm, "generate"):
+        try:
+            body = (llm.generate(
+                "Write the final answer to the request. Insert each exhaustive "
+                "list at the right place by writing its NAME as a placeholder "
+                "{{name}} (use each name at most once). Names: "
+                f"{', '.join(rendered)}.\nRequest: {question}\nAnswer:",
+                max_tokens=240) or "").strip()
+        except Exception:
+            body = ""
+    if not body:                                         # deterministic fallback
+        return "\n\n".join(f"{k}:\n{r}" for k, r in rendered.items()), all_ids
+    placed: set = set()
+
+    def sub(m):
+        key = m.group(1).strip()
+        if key in rendered:
+            placed.add(key)
+            return "\n" + rendered[key] + "\n"
+        return ""
+
+    out = re.sub(r"\{\{([^}]+)\}\}", sub, body)
+    leftover = [f"{k}:\n{r}" for k, r in rendered.items() if k not in placed]
+    if leftover:
+        out = out.rstrip() + "\n\n" + "\n\n".join(leftover)
+    return out.strip(), all_ids
+
+
 def render_bag(question: str, items: Sequence[Item], llm: Any, *,
                strategy: str = "auto", placement: str = "auto",
                head: int = 20, tail: int = 20, batch: int = 4) -> str:
