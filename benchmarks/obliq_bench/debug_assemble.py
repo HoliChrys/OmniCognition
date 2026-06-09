@@ -54,6 +54,18 @@ def main() -> None:
     pool_ids = {p.id for p in mem.points}
     n_full = len(mem.points)
 
+    # context ceiling (detect_event_type -> cluster ∪ context) for comparison
+    det = mem.detect_event_type(question, threshold=0.30)
+    ctx = set()
+    if det:
+        if det.get("event_id"):
+            ctx |= {p.id for p in mem.event_cluster(det["event_id"])}
+        try:
+            ctx |= {p.id for p in mem.context_members(det["etype"])}
+        except Exception:
+            pass
+    ctx_recall = len(_docs(ctx) & gset)
+
     # surface-mode ranks + embedding cosine per gold
     ranks = {m: _ranks(mem, question, gold, m, n_full)
              for m in ("sim", "fuzzy", "regex")}
@@ -93,8 +105,9 @@ def main() -> None:
             break
     bag = _docs(set(bag_ids))
 
-    print("\nQUERY [%s] gold=%d   loop recall=%d/%d" % (
-        args.query_id, len(gold), len(bag & gset), len(gold)))
+    print("\nQUERY [%s] gold=%d   loop recall=%d/%d   (context %d/%d)" % (
+        args.query_id, len(gold), len(bag & gset), len(gold),
+        ctx_recall, len(gold)))
     print("  Q: %s\n" % question[:100])
     print("  %-10s %4s | %-14s | %-11s | %5s | %s" % (
         "gold", "in?", "surfaced", "CoN label", "emb", "verdict"))
