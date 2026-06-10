@@ -377,9 +377,13 @@ class Memory:
                 pass
         # Detect/type an EVENT in the turn and gravitate it onto its hub (opt-in,
         # never on derived nodes ; a flaky extractor must not break ingestion).
+        # EVENTS keep the DEDICATED extractor even in card mode : Phase-1
+        # validation showed the card's embedded event line reads events far
+        # worse (context channel 13->2) — a specialised short read wins here.
+        # The card's events are only a degraded fallback when no dedicated
+        # extractor is wired.
         if (
             self.event_extractor is not None
-            and not card_ok
             and kind.upper() == "FACT"
             and not id.startswith(("entity_", "atom_", "event_"))
         ):
@@ -2336,7 +2340,7 @@ class Memory:
                 self._spawn_entities(fact, pre=card.entities)
             except Exception:
                 pass
-        if card.events:
+        if card.events and self.event_extractor is None:
             try:
                 self._spawn_events(fact, pre=card.events)
             except Exception:
