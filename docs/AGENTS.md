@@ -16,6 +16,9 @@ Owns long-form research write-ups and diagrams.
   (temporal extent, gravitation, schema typology, sub-questions, Graphiti/Zep,
   DyG-RAG) mapped onto MetaCog-Mem primitives.
 - `john_walkthrough.md` + `john_diagram.mmd` — a worked end-to-end example.
+- `ingest_index_plan.md` — the ACTIVE phased plan for ingest-time indexing
+  (Document Card, inverted index, stance cards, doc2query, hybrid kNN cache).
+  Update phase status here as phases land; delete when fully shipped.
 
 ## Work Guidance
 
