@@ -18,7 +18,15 @@ la query ne paie que ce qui dépend d'elle.*
 
 ## Phases (ordonnées par ROI)
 
-### Phase 1 — Document Card unifiée  [fondation] — ✅ LANDÉE (validation OBLIQ en cours)
+### Phase 1 — Document Card unifiée  [fondation] — ✅ VALIDÉE
+
+Verdict (q0459/q0424) : loop 22/23 & 25/25, context 13/23 & 21/25 — les deux
+canaux intacts. AMENDEMENT validé empiriquement : les EVENTS restent à
+l'extracteur DÉDIÉ (la lecture event intégrée à la card était bien plus faible,
+context 13→2 ; une lecture courte spécialisée gagne) — la card consolide
+keywords/entités/tone/gloss/stance/questions, ses events ne sont qu'un fallback.
+Coût : 2 appels/doc (card+events) aujourd'hui, MAIS stance+questions des
+phases 3-4 déjà payés → 2 vs 5 à terme.
 UN appel LLM structuré par doc à l'ingestion, retournant :
 `{keywords, entities, atoms, event{type,name,dates}, tone, intended_gloss,
 stance{position, cibles}, questions[2-3]}`.
