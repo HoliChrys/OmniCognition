@@ -31,6 +31,7 @@ Usage
 
 from __future__ import annotations
 
+import os
 import argparse
 import time
 from typing import List
@@ -83,12 +84,15 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
 
     llm = ClaudeLLM()
     # DOCUMENT CARD : one structured LLM reading per doc (keywords, entities,
-    # event, tone+intended gloss, stance, questions) — replaces the separate
-    # event + tone calls. The individual extractors stay wired as FALLBACK for
-    # docs whose card read fails (card_ok guards skip them otherwise).
+    # event, tone+intended gloss, stance, questions). It roughly DOUBLES ingest
+    # latency (a heavy structured call per doc on top of the dedicated event
+    # read), so it is opt-OUT via OBLIQ_NO_CARD=1 for fast validation runs — the
+    # individual extractors (event + tone_reading) then carry the pipeline and
+    # phases 3/4 gracefully no-op (no stance_/dq_ artifacts). Default: card ON.
     from metacog.doc_card import DocCardExtractor
+    card = None if os.environ.get("OBLIQ_NO_CARD") else DocCardExtractor(llm)
     mem = Memory(encoder=SemanticEncoder(), llm=llm,
-                 doc_card_extractor=DocCardExtractor(llm),
+                 doc_card_extractor=card,
                  event_extractor=LLMEventExtractor(llm),
                  tone_reading=True)
     t0 = time.time()
