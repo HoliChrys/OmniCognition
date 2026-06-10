@@ -38,14 +38,91 @@ def _ranks(mem, query, gold, mode, k_full):
     return {g: pos[g] for g in gold if g in pos}
 
 
+def _ingest_debug(args) -> None:
+    """INGESTION mode : trace the per-document indexing pipeline step by step —
+    the document card, every spawned node (tone gloss / stance / doc2query
+    questions / entities / event hubs), the tags added, and the text-index
+    artifacts. Ingests only `--n-docs` gold docs so it is fast and legible."""
+    import json
+    import os
+    from metacog.memory import Memory
+    from metacog.llm import ClaudeLLM
+    from metacog.event_extractor import LLMEventExtractor
+    from metacog.doc_card import DocCardExtractor
+    from benchmarks.locomo.encoders import SemanticEncoder
+    from benchmarks.obliq_bench.debug_qa import _load_qrels, _dl
+
+    gold = sorted(_load_qrels(args.track)[args.query_id])
+    corpus = {}
+    for ln in open(_dl(args.track, "corpus/corpus.jsonl")):
+        o = json.loads(ln)
+        corpus[str(o["_id"])] = (o.get("text") or o.get("title") or "")
+    docs = [(g, corpus[g]) for g in gold if g in corpus][:args.n_docs]
+
+    llm = ClaudeLLM()
+    card = None if os.environ.get("OBLIQ_NO_CARD") else DocCardExtractor(llm)
+    mem = Memory(encoder=SemanticEncoder(), llm=llm, doc_card_extractor=card,
+                 event_extractor=LLMEventExtractor(llm), tone_reading=True)
+
+    print("\nINGEST DEBUG [%s] — %d docs, card=%s\n" % (
+        args.query_id, len(docs), "OFF" if card is None else "ON"))
+    for did, text in docs:
+        print("=" * 78)
+        print("DOC [%s]\n  %s" % (did, text[:160].replace("\n", " ")))
+        if card is not None:
+            c = card.extract_card(text[:500])
+            if c:
+                print("  CARD : tone=%s | kw=%s | ents=%s | event=%s" % (
+                    c.tone, c.keywords,
+                    [(e.value, e.etype) for e in c.entities],
+                    [(e.name, e.etype) for e in c.events]))
+                print("       intended: %s" % (c.intended or "-"))
+                print("       stance  : %s" % (c.stance or "-"))
+                print("       doc2query: %s" % (c.questions or []))
+            else:
+                print("  CARD : <unparseable -> fallback to extractors>")
+        before = {p.id for p in mem.points}
+        mem.ingest(text[:500], kind="FACT", id=did)
+        new = [p for p in mem.points if p.id not in before]
+        fact = next(p for p in mem.points if p.id == did)
+
+        def _kind(p):
+            return getattr(p.kind, "name", str(p.kind))
+        print("  SPAWNED %d nodes:" % len(new))
+        for p in sorted(new, key=lambda x: x.id):
+            if p.id == did:
+                continue
+            print("    %-22s [%-7s] %s" % (
+                p.id[:22], _kind(p), (p.content or "")[:60].replace("\n", " ")))
+        cats = [t for t in fact.tags if t.startswith(
+            ("tone:", "event:in:", "event:type:", "time:date:"))]
+        print("  DOC TAGS : %s" % (cats or "-"))
+        ti = mem._text_index
+        rt = sorted(ti.raw_tokens(fact))
+        print("  INDEX : raw_tokens=%s" % rt[:12])
+        print("          bm25_doc=%s" % ti.bm25_doc(fact)[:12])
+    print("=" * 78)
+    print("postings sample :", dict(list(mem._text_index.postings.items())[:6]))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("retrieve", "ingest"),
+                    default="retrieve",
+                    help="retrieve: the assemble/recall autopsy ; "
+                         "ingest: trace the per-doc indexing pipeline")
     ap.add_argument("--track", default="descriptive/twitter")
     ap.add_argument("--query-id", default="q0459")
     ap.add_argument("--bg", type=int, default=30)
     ap.add_argument("--k", type=int, default=12)
     ap.add_argument("--max-rounds", type=int, default=14)
+    ap.add_argument("--n-docs", type=int, default=4,
+                    help="ingest mode: how many gold docs to trace")
     args = ap.parse_args()
+
+    if args.mode == "ingest":
+        _ingest_debug(args)
+        return
 
     mem, question, gold = build(args.track, args.query_id, args.bg)
     mem.consolidate_events(use_llm=False)
