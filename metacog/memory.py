@@ -2606,6 +2606,16 @@ class Memory:
             if a.isdigit() and 0 <= int(a) < len(cands):
                 labels[int(a)] = "irrelevant" if "irrelevant" in b.lower() \
                     else "relevant"
+        # SECOND OPINION : re-judge ONLY the batch-rejected candidates with the
+        # live per-item stance THOUGHT. The batch on precomputed glosses is
+        # cheap but slightly blunter than reasoning against the precise stance ;
+        # a per-item pass restricted to the rejects costs ∝ |rejected| (small)
+        # and recovers most of the per-item recall — recall-first, an accept is
+        # never overturned.
+        if any(lab == "irrelevant" for lab in labels):
+            for i, (p, lab) in enumerate(zip(cands, labels)):
+                if lab == "irrelevant":
+                    labels[i] = self._judge_one(prop, p)
         return labels
 
     def _judge_relevance(self, query: str, cands: Sequence[Point],

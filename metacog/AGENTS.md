@@ -43,7 +43,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   author's INTENDED meaning are document properties, read ONCE at ingest
   (`_read_tone` cached never-empty, `_spawn_tone` → `tone:*` tag + `gloss_<id>`
   THOUGHT via apply_pull), so `oblique_labels(per_item="auto")` BATCHES over
-  glosses (1 call) instead of per-item judging, and never on derived ids.
+  glosses (1 call) instead of per-item judging, and never on derived ids; a
+  SECOND-OPINION pass then re-judges only the batch-rejected candidates with the
+  live per-item stance THOUGHT (cost ∝ rejects, accepts never overturned).
   The default bag mirrors into `_bag` for backwards compatibility.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`

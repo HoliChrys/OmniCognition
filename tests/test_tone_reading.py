@@ -25,8 +25,10 @@ class _ToneLLM:
             if "lol" in txt.lower():
                 return "TONE: ironic\nINTENDED: the author mocks the claim of victory"
             return "TONE: plain\nINTENDED: says what it means"
-        if "ITEM :" in prompt:                       # per-item judge fallback
-            return "VERDICT: RELEVANT"
+        if "ITEM :" in prompt:                       # per-item stance THOUGHT
+            item = prompt.split("ITEM :", 1)[1]
+            return ("VERDICT: RELEVANT" if "lol" in item.lower()
+                    else "VERDICT: IRRELEVANT")
         # batch judge : relevant iff the INTENDED line mentions 'mocks'
         out = []
         cur = None
@@ -80,10 +82,36 @@ def test_judge_batches_when_tone_annotated():
     m, a, b = _mem()
     calls_before = m.llm.calls
     labels = m.oblique_labels("mocking victory claims", [a, b])
-    # batch path : ONE call (annotated majority), not one per candidate
-    assert m.llm.calls - calls_before <= 2           # distill may add one
+    # batch (1) + distill (1) + SECOND OPINION on the single reject (1) —
+    # not one call per candidate.
+    assert m.llm.calls - calls_before <= 3
     assert labels[0] == "relevant"                   # judged by INTENDED gloss
-    assert labels[1] == "irrelevant"
+    assert labels[1] == "irrelevant"                 # reject CONFIRMED per-item
+
+
+def test_second_opinion_recovers_batch_false_reject():
+    """A candidate the batch wrongly rejects is re-judged per-item and kept."""
+    m, a, b = _mem()
+
+    class _Flip:
+        """Batch rejects EVERYTHING ; per-item recognises the ironic one."""
+        def generate(self, prompt, max_tokens=90):
+            if "ITEM :" in prompt:
+                item = prompt.split("ITEM :", 1)[1]
+                return ("VERDICT: RELEVANT" if "lol" in item.lower()
+                        else "VERDICT: IRRELEVANT")
+            if "Attitude (broad)" in prompt or "Request :" in prompt:
+                return "the stance"
+            out = []
+            for ln in prompt.splitlines():
+                s = ln.strip()
+                if s.startswith("[") and "]" in s and s[1:s.index("]")].isdigit():
+                    out.append(f"{s[1:s.index(']')]}: irrelevant")
+            return "\n".join(out)
+    m.llm = _Flip()
+    labels = m.oblique_labels("mocking victory claims", [a, b])
+    assert labels[0] == "relevant"                   # recovered by 2nd opinion
+    assert labels[1] == "irrelevant"                 # confirmed reject
 
 
 def test_judge_falls_back_per_item_without_tones():
