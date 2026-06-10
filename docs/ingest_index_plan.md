@@ -46,7 +46,7 @@ réécrit). Équivalence byte-for-byte testée contre les scans naïfs ; ~5× su
 chemin sim (60 appels/400 docs : 165→34 ms). Les TAGS restent scannés live
 (ils mutent : event:in, tone:*, valid:until). Non picklé — reset au `load()`.
 
-### Phase 3 — Stance card générale  [recall + coût judge]
+### Phase 3 — Stance card générale  [recall + coût judge] — ✅ VALIDÉE (tests)
 Depuis la card de Phase 1 : un gloss de POSITION pour TOUS les docs (plain
 inclus). Le juge devient un entonnoir : (a) filtre embedding
 proposition↔stance, permissif ; (b) batch LLM sur la bande ambiguë ;

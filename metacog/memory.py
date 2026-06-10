@@ -2321,6 +2321,11 @@ class Memory:
         gid = f"gloss_{fact_id}"
         return next((p.content for p in self.points if p.id == gid), "")
 
+    def stance_of(self, fact_id: str) -> str:
+        """The stance card of a fact ('' if the text takes no position)."""
+        sid = f"stance_{fact_id}"
+        return next((p.content for p in self.points if p.id == sid), "")
+
     def _spawn_card(self, fact: Point) -> bool:
         """ONE document-card reading -> every ingest artifact (Phase 1).
 
@@ -2681,6 +2686,39 @@ class Memory:
             return [self._judge_one(prop, p) for p in cands]
         prop = proposition or self.distill_proposition(query)
 
+        # FUNNEL stage (a) — Phase 3 : embedding pre-accept against the
+        # PROPOSITION. Each candidate scores max-cos(prop, doc | its stance
+        # card | its gloss) ; the acceptance threshold is EMERGENT — mean + std
+        # of THIS candidate set's own similarities (a statistical property of
+        # the data, not a tuned constant). Pre-accepted items skip the batch
+        # and are NEVER overturned (recall-first : accepting more never costs
+        # recall). Degenerate sets (<4) skip the stage.
+        pre_accept: set = set()
+        if len(cands) >= 4 and getattr(self, "encoder", None):
+            try:
+                from metacog.geometry import cosine, effective_embedding
+                pv = self.encoder.encode(prop)
+                t = self._now()
+                by_id = {p.id: p for p in self.points}
+                sims = []
+                for p in cands:
+                    best = cosine(pv, effective_embedding(p, t))
+                    for did in (f"stance_{p.id}", f"gloss_{p.id}"):
+                        dp = by_id.get(did)
+                        if dp is not None:
+                            best = max(best, cosine(
+                                pv, effective_embedding(dp, t)))
+                    sims.append(best)
+                mu = sum(sims) / len(sims)
+                sd = (sum((s - mu) ** 2 for s in sims) / len(sims)) ** 0.5
+                pre_accept = {i for i, s in enumerate(sims) if s >= mu + sd}
+            except Exception:
+                pre_accept = set()
+        rest = [i for i in range(len(cands)) if i not in pre_accept]
+        labels = ["relevant"] * len(cands)
+        if not rest:
+            return labels
+
         def _line(i, p):
             base = f"[{i}] {(p.content or '')[:200]}"
             gloss = self.gloss_of(p.id)
@@ -2688,8 +2726,12 @@ class Memory:
                          if t.startswith("tone:")), "")
             if gloss:
                 base += f"\n    INTENDED ({tone}): {gloss[:160]}"
+            stance = self.stance_of(p.id)
+            if stance:
+                base += f"\n    STANCE: {stance[:140]}"
             return base
-        listing = "\n".join(_line(i, p) for i, p in enumerate(cands))
+        listing = "\n".join(_line(j, cands[gi])
+                             for j, gi in enumerate(rest))
         ctx = ""
         if collected:
             ctx = "ALREADY GATHERED :\n" + "\n".join(
@@ -2711,19 +2753,18 @@ class Memory:
             f"{ctx}ITEMS :\n{listing}"
         )
         try:
-            raw = self.llm.generate(prompt, max_tokens=max(16, 6 * len(cands)))
+            raw = self.llm.generate(prompt, max_tokens=max(16, 6 * len(rest)))
         except Exception:
-            return ["relevant"] * len(cands)
-        labels = ["relevant"] * len(cands)          # fail OPEN
+            return labels                            # fail OPEN (all relevant)
         for ln in (raw or "").splitlines():
             ln = ln.strip().lstrip("-•* ").strip()
             if ":" not in ln:
                 continue
             a, _, b = ln.partition(":")
             a = a.strip().strip("[]")
-            if a.isdigit() and 0 <= int(a) < len(cands):
-                labels[int(a)] = "irrelevant" if "irrelevant" in b.lower() \
-                    else "relevant"
+            if a.isdigit() and 0 <= int(a) < len(rest):
+                labels[rest[int(a)]] = "irrelevant" \
+                    if "irrelevant" in b.lower() else "relevant"
         # SECOND OPINION : re-judge ONLY the batch-rejected candidates with the
         # live per-item stance THOUGHT. The batch on precomputed glosses is
         # cheap but slightly blunter than reasoning against the precise stance ;
