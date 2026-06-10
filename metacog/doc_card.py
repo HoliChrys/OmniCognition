@@ -30,9 +30,13 @@ _PROMPT = (
     "KEYWORDS: 3-6 comma-separated content words from the text\n"
     "ENTITIES: `value|type` pairs separated by ` ; ` (types : person, place, "
     "organization, date, …) or NONE\n"
-    "EVENT: `name | type | start` — a notable event the text refers to (short "
-    "name built only from words present ; type = one lowercase word ; start = "
-    "date if stated, else blank) or NONE\n"
+    "EVENT: does the text describe, mention, or refer to a notable EVENT — "
+    "something with a beginning that unfolds over time (a war, election, trip, "
+    "strike, attack, accident, project, deal, …) ? If yes output "
+    "`name | type | start` (several separated by ` ;; `) where name is a SHORT "
+    "instance name built ONLY from words in the text (do NOT invent specifics "
+    "— if it just says 'the war', name it 'the war'), type is ONE lowercase "
+    "word, start a date if stated else blank. If none : NONE\n"
     "TONE: one of ironic (irony/sarcasm/satire/absurd or false-premise/"
     "mock-innocent), hyperbole, echo-register (grandiose official/promotional "
     "wording echoed by an ordinary voice), plain — do not force irony where "
@@ -87,12 +91,14 @@ def _parse_card(raw: str) -> Optional[DocCard]:
         elif low.startswith("event:"):
             body = ls.split(":", 1)[1].strip()
             if body and body.lower() != "none":
-                parts = [p.strip() for p in body.split("|")]
-                if len(parts) >= 2 and parts[0] and parts[1]:
-                    card.events.append(ExtractedEvent(
-                        name=parts[0].lower(),
-                        etype=parts[1].lower().split()[0],
-                        t_start=(parts[2] or None) if len(parts) > 2 else None))
+                for ev in body.split(";;"):
+                    parts = [p.strip() for p in ev.split("|")]
+                    if len(parts) >= 2 and parts[0] and parts[1]:
+                        card.events.append(ExtractedEvent(
+                            name=parts[0].lower(),
+                            etype=parts[1].lower().split()[0],
+                            t_start=(parts[2] or None)
+                            if len(parts) > 2 else None))
         elif low.startswith("tone:"):
             cand = ls.split(":", 1)[1].strip().lower()
             t = next((t for t in _TONES if t in cand), None)
