@@ -18,7 +18,7 @@ la query ne paie que ce qui dépend d'elle.*
 
 ## Phases (ordonnées par ROI)
 
-### Phase 1 — Document Card unifiée  [fondation]
+### Phase 1 — Document Card unifiée  [fondation] — ✅ LANDÉE (validation OBLIQ en cours)
 UN appel LLM structuré par doc à l'ingestion, retournant :
 `{keywords, entities, atoms, event{type,name,dates}, tone, intended_gloss,
 stance{position, cibles}, questions[2-3]}`.

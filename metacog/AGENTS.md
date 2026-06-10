@@ -63,6 +63,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   INTERSECTION when non-empty).
 - Extractors (`event_extractor.py`, `keywords.py`, `entities.py`, `atomic.py`):
   cached, failure-safe, never cache empty.
+- `doc_card.py` — the DOCUMENT CARD (Phase 1 of docs/ingest_index_plan.md):
+  ONE structured LLM reading per ingested FACT (keywords, entities, event,
+  tone+intended gloss, stance, answerable questions). `Memory(
+  doc_card_extractor=...)`: `_spawn_card` dispatches the single reading to the
+  existing spawners via their `pre=` hooks and creates `stance_<id>` /
+  `dq_<id>_<n>` THOUGHTs (later-phase consumers, derived prefixes). A failed/
+  unparseable card is never cached and the individual extractors run as
+  fallback (`card_ok` guards).
 - `enumeration.py` — retrieve/"bag" mode detection + `format_bag_answer`.
   `bag_render.py` — the agent's bag rendering strategies: `raw`, `extract`
   (head/tail ellipsis), `interpret` (one interpretation per node), `mapreduce`

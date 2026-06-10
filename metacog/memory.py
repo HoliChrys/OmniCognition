@@ -201,6 +201,13 @@ class Memory:
     # FACT on the hot path.
     tone_reading: bool = False
     _tone_cache: Dict[str, dict] = field(default_factory=dict)
+    # DOCUMENT CARD (Phase 1, docs/ingest_index_plan.md) : ONE structured LLM
+    # reading per ingested FACT replacing the separate keyword/entity/event/
+    # tone reads — and pre-computing the stance + answerable-questions
+    # artifacts consumed by later phases. When set it supersedes the individual
+    # hooks ; on a failed/unparseable card the individual extractors run as
+    # FALLBACK (never lose ingestion to a flaky combined call).
+    doc_card_extractor: Any = None
     # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
     # Each entry records a solved task — (query, the walk's resolution path
     # point-ids, the output) — so the distiller can replay it afterwards and
@@ -333,10 +340,24 @@ class Memory:
             for p in self.points:
                 if p.id in parent_set and id not in p.children:
                     p.children = list(p.children) + [id]
+        # DOCUMENT CARD (Phase 1) : ONE structured reading replacing the
+        # separate entity/event/tone reads below. On failure card_ok stays
+        # False and the individual extractors run as fallback.
+        card_ok = False
+        if (
+            self.doc_card_extractor is not None
+            and kind.upper() == "FACT"
+            and not self._is_derived(id)
+        ):
+            try:
+                card_ok = self._spawn_card(point)
+            except Exception:
+                card_ok = False
         # Spawn entity beacon nodes (opt-in). Only from genuine FACTs —
         # never recurse on entity-derived facts (their ids start "entity_").
         if (
             self.entity_extractor is not None
+            and not card_ok
             and kind.upper() == "FACT"
             and not id.startswith("entity_")
         ):
@@ -358,6 +379,7 @@ class Memory:
         # never on derived nodes ; a flaky extractor must not break ingestion).
         if (
             self.event_extractor is not None
+            and not card_ok
             and kind.upper() == "FACT"
             and not id.startswith(("entity_", "atom_", "event_"))
         ):
@@ -369,6 +391,7 @@ class Memory:
         # ONCE, here — query-independent, amortized across every later query.
         if (
             self.tone_reading
+            and not card_ok
             and kind.upper() == "FACT"
             and not self._is_derived(id)
         ):
@@ -1168,12 +1191,13 @@ class Memory:
                         "event_id": None, "score": 0.0, "via": "llm"}
         return None
 
-    def _spawn_events(self, source_fact: Point) -> None:
+    def _spawn_events(self, source_fact: Point, pre=None) -> None:
         """Detect events in a freshly ingested FACT and gravitate it onto each
         event's hub (create/dedup the hub via ingest_event). The selective
         gravitation gate in ingest_event keeps only turns actually about the
         event."""
-        evs = self.event_extractor.extract_events(source_fact.content)
+        evs = pre if pre is not None else \
+            self.event_extractor.extract_events(source_fact.content)
         if not evs:
             return
         t_now = self._now()
@@ -1183,15 +1207,19 @@ class Memory:
                 t_start=getattr(e, "t_start", None), t_now=t_now,
             )
 
-    def _spawn_entities(self, source_fact: Point) -> None:
+    def _spawn_entities(self, source_fact: Point, pre=None) -> None:
         """Extract entities from a freshly ingested FACT and spawn their
         beacon nodes. A date yields a full-date beacon plus day/month/year
         component beacons — all tagged "date" and all pulled onto the SAME
         source fact, so they cluster together near it (their geometric
         "part_of" link is this shared co-location, not a separate pull,
         which would only fight the source pull). One frozen t_now per fact
-        so pulls accumulate without inter-pull decay."""
-        ents = self.entity_extractor.extract_entities(source_fact.content)
+        so pulls accumulate without inter-pull decay.
+
+        `pre` : entities already extracted by the document card — skips the
+        extractor call (one reading of the document, not two)."""
+        ents = pre if pre is not None else \
+            self.entity_extractor.extract_entities(source_fact.content)
         if not ents:
             return
         t_now = self._now()
@@ -2198,7 +2226,7 @@ class Memory:
                      if t.startswith("time:date:")), None)
 
     _DERIVED_PREFIXES = ("entity_", "atom_", "event_", "act_", "lateral_",
-                         "thought_", "gen_", "gloss_")
+                         "thought_", "gen_", "gloss_", "stance_", "dq_")
 
     @classmethod
     def _is_derived(cls, pid: str) -> bool:
@@ -2245,12 +2273,12 @@ class Memory:
         self._tone_cache[key] = res
         return res
 
-    def _spawn_tone(self, fact: Point) -> None:
+    def _spawn_tone(self, fact: Point, pre=None) -> None:
         """Tag the fact with its tone and, for NON-plain tones, spawn a GLOSS
         THOUGHT (`gloss_<id>`, GENERATOR, pulled onto the fact) carrying the
         author's intended meaning — searchable, judge-readable. Edge-free ;
         Cor. 5 : created directly, never through an Observation."""
-        res = self._read_tone(fact.content)
+        res = pre if pre is not None else self._read_tone(fact.content)
         if not res:
             return
         tag = f"tone:{res['tone']}"
@@ -2281,6 +2309,77 @@ class Memory:
         """The intended-meaning gloss of a fact ('' if none/plain)."""
         gid = f"gloss_{fact_id}"
         return next((p.content for p in self.points if p.id == gid), "")
+
+    def _spawn_card(self, fact: Point) -> bool:
+        """ONE document-card reading -> every ingest artifact (Phase 1).
+
+        Dispatches the single coherent reading to the existing spawners via
+        their `pre` hooks : keywords (enrich), entity beacons, event hubs,
+        tone tag + intended gloss — plus the STANCE thought (`stance_<id>`)
+        and answerable-QUESTION thoughts (`dq_<id>_<n>`) consumed by later
+        phases. Returns True when the card was read (the individual ingest
+        hooks then skip) ; False -> caller falls back. Cor. 5 : every spawned
+        node is GENERATOR, created via apply_pull, never an Observation."""
+        card = self.doc_card_extractor.extract_card(fact.content)
+        if card is None:
+            return False
+        t_now = self._now()
+        if card.keywords:
+            merged = list(card.keywords) + [k for k in (fact.keywords or [])
+                                            if k not in card.keywords]
+            fact.keywords = merged[:8]
+            fact.keywords_embedding = position_weighted_keyword_embedding(
+                fact.keywords, self.encoder)
+            fact.keywords_source = SourceClass.GENERATOR
+        if card.entities:
+            try:
+                self._spawn_entities(fact, pre=card.entities)
+            except Exception:
+                pass
+        if card.events:
+            try:
+                self._spawn_events(fact, pre=card.events)
+            except Exception:
+                pass
+        try:
+            self._spawn_tone(fact, pre={"tone": card.tone,
+                                        "gloss": card.intended})
+        except Exception:
+            pass
+        # STANCE thought (Phase 3 consumer) : the position the text takes.
+        if card.stance:
+            sid = f"stance_{fact.id}"
+            if not any(p.id == sid for p in self.points):
+                kws = [w for w in card.stance.split()[:6] if w]
+                sp = Point(
+                    id=sid, content=card.stance,
+                    embedding_orig=tuple(self.encoder.encode(card.stance)),
+                    kind=PointKind.THOUGHT, keywords=kws,
+                    keywords_embedding=position_weighted_keyword_embedding(
+                        kws, self.encoder),
+                    keywords_source=SourceClass.GENERATOR,
+                    tags=["stance", f"stance:of:{fact.id}"],
+                )
+                self.points.append(sp)
+                apply_pull(fact, sp, +1.0, t_now)
+        # Answerable QUESTIONS (Phase 4 consumer) : doc2query.
+        for n, q in enumerate(card.questions):
+            qid = f"dq_{fact.id}_{n}"
+            if any(p.id == qid for p in self.points):
+                continue
+            kws = [w for w in q.split()[:6] if w]
+            qp = Point(
+                id=qid, content=q,
+                embedding_orig=tuple(self.encoder.encode(q)),
+                kind=PointKind.THOUGHT, keywords=kws,
+                keywords_embedding=position_weighted_keyword_embedding(
+                    kws, self.encoder),
+                keywords_source=SourceClass.GENERATOR,
+                tags=["dq", f"dq:of:{fact.id}"],
+            )
+            self.points.append(qp)
+            apply_pull(fact, qp, +1.0, t_now)
+        return True
 
     def filter_list(
         self,

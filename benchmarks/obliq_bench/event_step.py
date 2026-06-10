@@ -82,9 +82,13 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     keep = rel + pool[:max(0, bg)]
 
     llm = ClaudeLLM()
-    # tone_reading : irony/intended-meaning read ONCE per doc at ingest (the
-    # per-item judge's hard part, amortized) — the judge then batches on gloss.
+    # DOCUMENT CARD : one structured LLM reading per doc (keywords, entities,
+    # event, tone+intended gloss, stance, questions) — replaces the separate
+    # event + tone calls. The individual extractors stay wired as FALLBACK for
+    # docs whose card read fails (card_ok guards skip them otherwise).
+    from metacog.doc_card import DocCardExtractor
     mem = Memory(encoder=SemanticEncoder(), llm=llm,
+                 doc_card_extractor=DocCardExtractor(llm),
                  event_extractor=LLMEventExtractor(llm),
                  tone_reading=True)
     t0 = time.time()
