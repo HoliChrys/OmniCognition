@@ -82,8 +82,11 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     keep = rel + pool[:max(0, bg)]
 
     llm = ClaudeLLM()
+    # tone_reading : irony/intended-meaning read ONCE per doc at ingest (the
+    # per-item judge's hard part, amortized) — the judge then batches on gloss.
     mem = Memory(encoder=SemanticEncoder(), llm=llm,
-                 event_extractor=LLMEventExtractor(llm))
+                 event_extractor=LLMEventExtractor(llm),
+                 tone_reading=True)
     t0 = time.time()
     for cid in keep:
         mem.ingest(corpus[cid][:500], kind="FACT", id=cid)

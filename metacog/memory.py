@@ -191,6 +191,16 @@ class Memory:
     # FACT/ACTION (opt-in) instead of waiting for latent sleep. Costs one LLM
     # call per node on the hot path — off by default ; sleep is the cheap path.
     tags_refine_on_ingest: bool = False
+    # TONE READING at ingest (opt-in). Irony / sarcasm / hyperbole / echoed
+    # register are properties of the DOCUMENT, not of any query — so they are
+    # read ONCE here (amortized across every later query) instead of per-query
+    # per-candidate by the stance judge. Produces tone:* tags and, for
+    # non-plain tones, a GLOSS THOUGHT (`gloss_<id>`) carrying the author's
+    # INTENDED meaning : the judge batches over glosses and semantic search
+    # matches the intended meaning, not the literal surface. One LLM call per
+    # FACT on the hot path.
+    tone_reading: bool = False
+    _tone_cache: Dict[str, dict] = field(default_factory=dict)
     # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
     # Each entry records a solved task — (query, the walk's resolution path
     # point-ids, the output) — so the distiller can replay it afterwards and
@@ -353,6 +363,17 @@ class Memory:
         ):
             try:
                 self._spawn_events(point)
+            except Exception:
+                pass
+        # TONE READING (opt-in) : read the document's tone + intended meaning
+        # ONCE, here — query-independent, amortized across every later query.
+        if (
+            self.tone_reading
+            and kind.upper() == "FACT"
+            and not self._is_derived(id)
+        ):
+            try:
+                self._spawn_tone(point)
             except Exception:
                 pass
         # Optional INGEST-time hierarchical tag refinement for genuine
@@ -2177,12 +2198,89 @@ class Memory:
                      if t.startswith("time:date:")), None)
 
     _DERIVED_PREFIXES = ("entity_", "atom_", "event_", "act_", "lateral_",
-                         "thought_", "gen_")
+                         "thought_", "gen_", "gloss_")
 
     @classmethod
     def _is_derived(cls, pid: str) -> bool:
         """True for auto-spawned / generated nodes (never source documents)."""
         return str(pid).startswith(cls._DERIVED_PREFIXES) or "@" in str(pid)
+
+    # ---- TONE READING : ingest-time irony / register / intended meaning -----
+    _TONES = ("ironic", "hyperbole", "echo-register", "plain")
+
+    def _read_tone(self, content: str) -> Optional[dict]:
+        """One cached LLM reading of a document's TONE and INTENDED meaning.
+        Query-independent. Returns {'tone': <label>, 'gloss': <intended>} or
+        None on failure ; never caches an empty result."""
+        key = (content or "").strip()
+        if not key or not hasattr(self.llm, "generate"):
+            return None
+        if key in self._tone_cache:
+            return self._tone_cache[key]
+        try:
+            out = self.llm.generate(
+                "Read this text. 1) TONE — one of : ironic (irony/sarcasm/"
+                "satire/absurd or false-premise scenario/mock-innocent), "
+                "hyperbole (gross exaggeration), echo-register (grandiose "
+                "official/promotional wording echoed by an ordinary voice, a "
+                "distancing signal), plain (says what it means). Do not force "
+                "irony where there is none. 2) INTENDED — one short sentence of "
+                "what the author TRULY means (for plain, restate plainly).\n"
+                f"TEXT : {key[:400]}\n"
+                "Answer exactly :\nTONE: <label>\nINTENDED: <sentence>",
+                max_tokens=90) or ""
+        except Exception:
+            return None
+        tone, gloss = None, ""
+        for ln in out.splitlines():
+            ls = ln.strip()
+            if ls.lower().startswith("tone:"):
+                cand = ls.split(":", 1)[1].strip().lower()
+                tone = next((t for t in self._TONES if t in cand), None)
+            elif ls.lower().startswith("intended:"):
+                gloss = ls.split(":", 1)[1].strip()
+        if tone is None:
+            return None                          # unparseable -> never cache
+        res = {"tone": tone, "gloss": gloss}
+        self._tone_cache[key] = res
+        return res
+
+    def _spawn_tone(self, fact: Point) -> None:
+        """Tag the fact with its tone and, for NON-plain tones, spawn a GLOSS
+        THOUGHT (`gloss_<id>`, GENERATOR, pulled onto the fact) carrying the
+        author's intended meaning — searchable, judge-readable. Edge-free ;
+        Cor. 5 : created directly, never through an Observation."""
+        res = self._read_tone(fact.content)
+        if not res:
+            return
+        tag = f"tone:{res['tone']}"
+        if tag not in fact.tags:
+            fact.tags.append(tag)
+        gloss = (res.get("gloss") or "").strip()
+        if res["tone"] == "plain" or not gloss:
+            return                               # plain : the text IS the meaning
+        gid = f"gloss_{fact.id}"
+        if any(p.id == gid for p in self.points):
+            return
+        kws = [w for w in gloss.split()[:6] if w]
+        gp = Point(
+            id=gid,
+            content=gloss,
+            embedding_orig=tuple(self.encoder.encode(gloss)),
+            kind=PointKind.THOUGHT,
+            keywords=kws,
+            keywords_embedding=position_weighted_keyword_embedding(
+                kws, self.encoder),
+            keywords_source=SourceClass.GENERATOR,
+            tags=["gloss", f"gloss:of:{fact.id}", tag],
+        )
+        self.points.append(gp)
+        apply_pull(fact, gp, +1.0, self._now())
+
+    def gloss_of(self, fact_id: str) -> str:
+        """The intended-meaning gloss of a fact ('' if none/plain)."""
+        gid = f"gloss_{fact_id}"
+        return next((p.content for p in self.points if p.id == gid), "")
 
     def filter_list(
         self,
@@ -2298,10 +2396,18 @@ class Memory:
             except Exception:
                 return []
             t = self._now()
+            # ingest-time GLOSS thoughts : an ironic doc whose SURFACE is far
+            # from the query may have an INTENDED meaning that is close — score
+            # each doc by max(cos(doc), cos(its gloss)).
+            gloss_by_fact = {p.id[len("gloss_"):]: p for p in self.points
+                             if p.id.startswith("gloss_")}
             sc: List[Tuple[float, Point]] = []
             for p in pool:
                 try:
                     s = cosine(qv, effective_embedding(p, t))
+                    g = gloss_by_fact.get(p.id)
+                    if g is not None:
+                        s = max(s, cosine(qv, effective_embedding(g, t)))
                 except Exception:
                     s = 0.0
                 if s > 0:
@@ -2432,22 +2538,40 @@ class Memory:
     def oblique_labels(self, query: str, cands: Sequence[Point],
                        collected: Optional[Sequence[Point]] = None,
                        proposition: Optional[str] = None,
-                       per_item: bool = True) -> List[str]:
+                       per_item="auto") -> List[str]:
         """OBLIQUE-aware relevance labels — test each candidate against the
         request's distilled PROPOSITION (the specific stance), not generic
-        relevance. With `per_item` (default) each candidate gets its own stance
-        THOUGHT (`_judge_one`) — the mode that actually detects irony / echoed
-        superlatives, where batch labelling read them literally. Recall-first
-        (fails OPEN). No LLM -> all relevant."""
+        relevance.
+
+        COST GATING by ingest-time tone reading : the hard part of the per-item
+        judgment (literal vs intended meaning) is query-independent ; when the
+        candidates carry ingest-time tone/GLOSS annotations, ONE batch call over
+        `content + INTENDED gloss` suffices (the gloss is the per-item THOUGHT,
+        precomputed and amortized). `per_item="auto"` (default) batches when a
+        majority of candidates are tone-annotated, else falls back to the
+        per-item stance THOUGHT (`_judge_one`) that detects irony live. Recall-
+        first (fails OPEN). No LLM -> all relevant."""
         cands = list(cands)
         if not cands or not hasattr(self.llm, "generate"):
             return ["relevant"] * len(cands)
+        if per_item == "auto":
+            toned = sum(1 for p in cands
+                        if any(t.startswith("tone:") for t in p.tags))
+            per_item = toned < max(1, len(cands) // 2)   # batch when annotated
         if per_item:
             prop = proposition or self.distill_proposition(query)
             return [self._judge_one(prop, p) for p in cands]
         prop = proposition or self.distill_proposition(query)
-        listing = "\n".join(f"[{i}] {(p.content or '')[:200]}"
-                            for i, p in enumerate(cands))
+
+        def _line(i, p):
+            base = f"[{i}] {(p.content or '')[:200]}"
+            gloss = self.gloss_of(p.id)
+            tone = next((t.split(":", 1)[1] for t in p.tags
+                         if t.startswith("tone:")), "")
+            if gloss:
+                base += f"\n    INTENDED ({tone}): {gloss[:160]}"
+            return base
+        listing = "\n".join(_line(i, p) for i, p in enumerate(cands))
         ctx = ""
         if collected:
             ctx = "ALREADY GATHERED :\n" + "\n".join(
@@ -2461,7 +2585,9 @@ class Memory:
             f"  PROPOSITION : {prop}\n"
             "Label irrelevant an item that is merely on the same TOPIC without "
             "taking this stance, or a different subject. Be generous for items "
-            "that genuinely take the stance.\n"
+            "that genuinely take the stance. When an item carries an INTENDED "
+            "line, judge by THAT (the author's true meaning), not the literal "
+            "surface.\n"
             "For EACH numbered item output one line `i: relevant` or "
             "`i: irrelevant`, nothing else.\n\n"
             f"{ctx}ITEMS :\n{listing}"

@@ -31,12 +31,19 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   scoped→knowledge_base cascade) and `filter_list` — the NON-kNN filtered
   listing (scan by `event_id` / `date_from`/`date_to` / `tags` / `kind`,
   returns every match ordered by date, no embedding/walk/top-k; also reachable
-  via `scoped_answer(list_only=True)`); `search_nodes` — tri-modal relevance
-  search (sim | regex | fuzzy) over a filtered pool, on content AND/OR tags,
+  via `scoped_answer(list_only=True)`); `search_nodes` — relevance search
+  (semantic | sim | regex | fuzzy) over a filtered pool, on content AND/OR tags,
   WITHOUT REPLACEMENT (`exclude_bag` removes already-collected nodes), the
-  agent's collect-loop primitive; `assemble_set` — the ORCHESTRATED loop
-  (auto-route the event → loop sim→fuzzy→regex search_nodes → `_judge_relevance`
-  (LLM, recall-first fallback) → collect, without replacement, until converged).
+  agent's collect-loop primitive — semantic mode scores each doc by
+  max(cos(doc), cos(its gloss)); `assemble_set` — the ORCHESTRATED loop
+  (auto-route the event → loop semantic→sim→fuzzy→regex search_nodes →
+  `_judge_relevance` (LLM, recall-first fallback) → collect, without
+  replacement, until the pool is exhausted); **tone reading**
+  (`tone_reading=True`, opt-in) — irony/hyperbole/echoed-register and the
+  author's INTENDED meaning are document properties, read ONCE at ingest
+  (`_read_tone` cached never-empty, `_spawn_tone` → `tone:*` tag + `gloss_<id>`
+  THOUGHT via apply_pull), so `oblique_labels(per_item="auto")` BATCHES over
+  glosses (1 call) instead of per-item judging, and never on derived ids.
   The default bag mirrors into `_bag` for backwards compatibility.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
