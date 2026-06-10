@@ -3012,6 +3012,8 @@ class Memory:
         diverse queries collapse into a single keeper. No-op unless
         lateral collision is enabled and the cloud is past the gate."""
         t_now = self._now(t)
+        from metacog.geometry import clear_geo_cache
+        clear_geo_cache()                       # rebuild geometric stats fresh
         report = sleep_cycle_collisions(
             self.points, self.llm, self.encoder, t_now=t_now,
         )
@@ -3456,6 +3458,8 @@ class Memory:
             snapshot = pickle.load(f)
         self.points = snapshot.get("points", [])
         self._text_index = TextIndex()          # refills lazily (not pickled)
+        from metacog.geometry import clear_geo_cache
+        clear_geo_cache()                       # geometric stats rebuild too
         self.observators = snapshot.get("observators", {})
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)

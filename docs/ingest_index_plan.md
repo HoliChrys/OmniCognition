@@ -59,14 +59,36 @@ obliques incluses), embeddées. La recherche sémantique score
 `max(doc, gloss, questions)`. Attaque le NEEDS_SEMANTIC résiduel.
 - Tests : match d'une question token-disjointe du contenu.
 
-### Phase 5 — Cache kNN HYBRIDE  [latence walk ; fallback décidé]
-Listes de k-voisins par point, construites paresseusement / en `sleep()`.
-**Invalidation hybride (décision)** : un `apply_pull` marque les deux
-extrémités DIRTY ; un point dirty utilise le **scan exact** (fallback), un
-point clean utilise le cache ; `sleep()` reconstruit les listes dirty. La
-justesse ne se dégrade JAMAIS (dirty ⇒ exact), seul le gain de latence varie.
-- Tests : cache == top-k exact sur points clean ; correction du fallback après
-  pulls ; rebuild en sleep.
+### Phase 5 — Cache du seuil géométrique HYBRIDE  [latence ; re-périmétré] — ✅ VALIDÉE (tests)
+
+ÉTUDE DE TERRAIN (re-périmétrage motivé) :
+- Le coût dominant n'est PAS le kNN par point : c'est `geometric_spread` qui
+  recalcule **O(n²) distances pairwise À CHAQUE APPEL** (80k computes pour
+  400 pts) uniquement pour dériver le seuil émergent median−σ — appelé par
+  `retrieve_hybrid(use_spreading)` et `_reflective_context` (chaque thought).
+- L'horloge avance à chaque opération (`_now()` += 1) et le decay 1/(1+Δt)
+  fait dériver les embeddings effectifs ENTRE deux appels même sans pull → un
+  cache byte-exact inter-appels est impossible par principe.
+- Les scans query→points (walk per-stage, `k_nearest`) sont incachables
+  (l'embedding de query change à chaque stage).
+
+DESIGN (hybride, fallback = recalcul exact) :
+1. `geometry.GEO_EPOCH` : compteur module incrémenté par `apply_pull` (toute
+   mutation de deltas). Toute modification STRUCTURELLE invalide.
+2. Cache du SEUIL : clé = (n, hash(tuple des ids du sous-ensemble), GEO_EPOCH).
+   Hit → réutilise le seuil (saute le O(n²)) ; miss (pull/ingest/retrait/
+   sous-ensemble différent) → **recalcul exact** (= comportement actuel, la
+   justesse ne se dégrade jamais sur changement structurel).
+3. Approximation ASSUMÉE et bornée : entre deux hits, seule la dérive de
+   PUR DECAY (uniforme, lente, sur un statistique robuste median−σ) est
+   ignorée. Tout pull/ingest force l'exact.
+4. `sleep()` et `load()` vident le cache (rebuild).
+5. Le reste de geometric_spread (embs O(n) + scan seeds×n) reste exact et
+   recalculé à chaque appel — linéaire, pas un goulot.
+
+Tests : hit→résultat identique sur manifold figé (t explicite) ; pull → epoch
+bump → recalcul ; ingest → clé différente → recalcul ; smoke perf (appels
+répétés ~n× plus rapides).
 
 ## Validation par phase
 

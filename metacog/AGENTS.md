@@ -19,6 +19,11 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   is a deliberate, schema-level change.
 - `geometry.py` — `apply_pull(a, b, sign, t_now)` moves `a` toward `b`; first
   pull = 1/(1+0) = 1.0. The ONLY way to relate points. Plus retrieval / spreading.
+  Phase-5 cache: `GEO_EPOCH` counts structural mutations (every apply_pull);
+  `geometric_spread`'s O(n²) emergent threshold (median−σ) is cached on
+  (subset ids, epoch) — any pull/ingest/subset change falls back to the exact
+  recompute; only pure-decay drift between hits is accepted. `clear_geo_cache()`
+  is called by `sleep()` and `load()`.
 - `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
