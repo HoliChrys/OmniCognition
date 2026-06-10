@@ -34,8 +34,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   via `scoped_answer(list_only=True)`); `search_nodes` — relevance search
   (semantic | sim | regex | fuzzy) over a filtered pool, on content AND/OR tags,
   WITHOUT REPLACEMENT (`exclude_bag` removes already-collected nodes), the
-  agent's collect-loop primitive — semantic mode scores each doc by
-  max(cos(doc), cos(its gloss)); `assemble_set` — the ORCHESTRATED loop
+  agent's collect-loop primitive — semantic mode scores each doc by the MAX
+  over all its card views (gloss INTENDED, stance card, dq_ answerable
+  questions = doc2query, Phase 4); `assemble_set` — the ORCHESTRATED loop
   (auto-route the event → loop semantic→sim→fuzzy→regex search_nodes →
   `_judge_relevance` (LLM, recall-first fallback) → collect, without
   replacement, until the pool is exhausted); **tone reading**

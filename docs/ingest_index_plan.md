@@ -53,7 +53,7 @@ proposition↔stance, permissif ; (b) batch LLM sur la bande ambiguë ;
 (c) seconde opinion per-item sur les seuls rejets (existant). Recall-first à
 chaque étage (un accept n'est jamais renversé).
 
-### Phase 4 — doc2query  [recall oblique]
+### Phase 4 — doc2query  [recall oblique] — ✅ VALIDÉE (tests)
 Depuis la card : 2-3 « questions auxquelles ce doc répond » (formulations
 obliques incluses), embeddées. La recherche sémantique score
 `max(doc, gloss, questions)`. Attaque le NEEDS_SEMANTIC résiduel.

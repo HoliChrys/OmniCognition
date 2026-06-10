@@ -103,3 +103,20 @@ def test_card_artifacts_are_derived_not_documents():
     m.ingest("we totally won the refinery strike lol", kind="FACT", id="D1")
     ids = {p.id for p in m.search_nodes("strike", mode="sim", on="content")}
     assert not any(i.startswith(("stance_", "dq_", "gloss_")) for i in ids)
+
+
+def test_doc2query_semantic_match_via_question():
+    """Phase 4 : a query phrased like an answerable QUESTION finds the doc even
+    when sharing no tokens with its surface (and the stance view works too)."""
+    _CARD_CACHE.clear()
+    m, _ = _mem()
+    m.ingest("we totally won the refinery strike lol", kind="FACT", id="D1")
+    m.ingest("unrelated gardening notes about tulips", kind="FACT", id="D2")
+    # query ≈ the generated question "who mocked the victory claims"
+    got = m.search_nodes("who mocked the victory claims", mode="semantic",
+                         on="content")
+    assert got and got[0].id == "D1"            # found via its dq_ view
+    # query ≈ the stance card "mocks official triumphalism about the strike"
+    got2 = m.search_nodes("mocks official triumphalism", mode="semantic",
+                          on="content")
+    assert got2 and got2[0].id == "D1"          # found via its stance_ view

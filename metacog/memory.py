@@ -2511,18 +2511,27 @@ class Memory:
             except Exception:
                 return []
             t = self._now()
-            # ingest-time GLOSS thoughts : an ironic doc whose SURFACE is far
-            # from the query may have an INTENDED meaning that is close — score
-            # each doc by max(cos(doc), cos(its gloss)).
-            gloss_by_fact = {p.id[len("gloss_"):]: p for p in self.points
-                             if p.id.startswith("gloss_")}
+            # ingest-time card thoughts : an oblique doc whose SURFACE is far
+            # from the query may have an INTENDED meaning (gloss), a STANCE
+            # card, or an answerable QUESTION (doc2query, Phase 4) that is
+            # close — score each doc by the max over all its card views.
+            views_by_fact: Dict[str, List[Point]] = {}
+            for p in self.points:
+                fid = None
+                if p.id.startswith("gloss_"):
+                    fid = p.id[len("gloss_"):]
+                elif p.id.startswith("stance_"):
+                    fid = p.id[len("stance_"):]
+                elif p.id.startswith("dq_"):
+                    fid = p.id[len("dq_"):].rsplit("_", 1)[0]
+                if fid:
+                    views_by_fact.setdefault(fid, []).append(p)
             sc: List[Tuple[float, Point]] = []
             for p in pool:
                 try:
                     s = cosine(qv, effective_embedding(p, t))
-                    g = gloss_by_fact.get(p.id)
-                    if g is not None:
-                        s = max(s, cosine(qv, effective_embedding(g, t)))
+                    for v in views_by_fact.get(p.id, ()):
+                        s = max(s, cosine(qv, effective_embedding(v, t)))
                 except Exception:
                     s = 0.0
                 if s > 0:
