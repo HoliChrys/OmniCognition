@@ -38,13 +38,13 @@ stance{position, cibles}, questions[2-3]}`.
 - Gain : ÷4-5 le coût LLM d'ingestion + une lecture COHÉRENTE unique.
 - Tests : fake déterministe ; parité avec les spawns individuels ; never-cache-empty.
 
-### Phase 2 — Index inversé + BM25 incrémental  [CPU, zéro risque]
-`metacog/text_index.py` : token-sets par doc, postings token→ids, compteurs df,
-longueurs — maintenus à l'ingestion (les contents ne mutent pas ; seuls des
-points s'ajoutent). `search_nodes` sim/fuzzy génèrent les candidats par union
-de postings puis scorent ; `bm25_score` consomme df/len précalculés.
-- Persistance : non picklé — **rebuild dans `load()`** (invariant du repo).
-- Tests : équivalence stricte avec le scan naïf sur petits corpus ; smoke perf.
+### Phase 2 — Index inversé + BM25 incrémental  [CPU, zéro risque] — ✅ VALIDÉE
+`metacog/text_index.py` : token-sets bruts + docs BM25 stemmés + postings,
+memoizés au premier toucher (compute-on-miss : auto-réparant pour les points
+créés hors ingest ; memo re-clé à la mutation des keywords — la card les
+réécrit). Équivalence byte-for-byte testée contre les scans naïfs ; ~5× sur le
+chemin sim (60 appels/400 docs : 165→34 ms). Les TAGS restent scannés live
+(ils mutent : event:in, tone:*, valid:until). Non picklé — reset au `load()`.
 
 ### Phase 3 — Stance card générale  [recall + coût judge]
 Depuis la card de Phase 1 : un gloss de POSITION pour TOUS les docs (plain

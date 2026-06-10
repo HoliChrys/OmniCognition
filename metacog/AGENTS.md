@@ -63,6 +63,12 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   INTERSECTION when non-empty).
 - Extractors (`event_extractor.py`, `keywords.py`, `entities.py`, `atomic.py`):
   cached, failure-safe, never cache empty.
+- `text_index.py` — Phase-2 per-doc token index: raw token sets, stemmed BM25
+  docs, postings — memoized at first touch (compute-on-miss, self-healing;
+  keyword-keyed memo survives the card's keyword overwrite). Consumed by
+  `search_nodes` (content tokens; tags stay live-scanned because they mutate)
+  and `bm25_score(text_index=)` via `retrieve_hybrid`. Not pickled; reset in
+  `load()`.
 - `doc_card.py` — the DOCUMENT CARD (Phase 1 of docs/ingest_index_plan.md):
   ONE structured LLM reading per ingested FACT (keywords, entities, event,
   tone+intended gloss, stance, answerable questions). `Memory(

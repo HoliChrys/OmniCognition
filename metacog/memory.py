@@ -64,6 +64,7 @@ from metacog.observator import (
     spawn_observators_from_polarization,
 )
 from metacog.reasoning import ReasoningTrajectory, reason
+from metacog.text_index import TextIndex, raw_token_set
 
 
 _MONTHS = {
@@ -208,6 +209,10 @@ class Memory:
     # hooks ; on a failed/unparseable card the individual extractors run as
     # FALLBACK (never lose ingestion to a flaky combined call).
     doc_card_extractor: Any = None
+    # Phase-2 text index : per-doc token artifacts (raw token sets, stemmed
+    # BM25 docs, postings) memoized at first touch — never re-tokenize a doc
+    # per query. Lazy/self-healing ; NOT pickled (refills after load()).
+    _text_index: Any = field(default_factory=TextIndex)
     # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
     # Each entry records a solved task — (query, the walk's resolution path
     # point-ids, the output) — so the distiller can replay it afterwards and
@@ -2113,6 +2118,7 @@ class Memory:
                 use_spreading=use_spreading,
                 lineage_depth=lineage_depth,
                 prefer_kind=kind_filter,
+                text_index=self._text_index,
             )
             if atomics:
                 # Second pass over RAW turns only — atoms flood the joint
@@ -2125,6 +2131,7 @@ class Memory:
                     encoder=self.encoder, extractor=self.extractor,
                     use_lineage=use_lineage, use_spreading=use_spreading,
                     lineage_depth=lineage_depth, prefer_kind=kind_filter,
+                    text_index=self._text_index,
                 )
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))
@@ -2521,7 +2528,15 @@ class Memory:
         def _toks(s: str) -> set:
             return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 
-        qtok = _toks(query)
+        ti = self._text_index
+        qtok = set(raw_token_set(query))
+        # Phase 2 : content tokens come from the per-doc index (memoized at
+        # first touch) instead of re-tokenizing the pool on every call. TAGS
+        # stay live-scanned : they mutate after ingest (event:in, tone:*,
+        # valid:until) so indexing them would go stale. For content-only sim,
+        # postings give the candidate set directly (the exact score>0 set).
+        if mode == "sim" and on == "content":
+            pool = ti.candidates(qtok, pool)
         qwords = [w for w in (query or "").split() if w]
         want_c = on in ("content", "both")
         want_t = on in ("tags", "both")
@@ -2544,7 +2559,7 @@ class Memory:
                     score += 1.0
             elif mode == "fuzzy":
                 if want_c:
-                    dtok = _toks(content)
+                    dtok = ti.raw_tokens(p)
                     score += sum(1 for q in qtok
                                  if any(fuzzy_match(q, d) for d in dtok))
                 if want_t:
@@ -2552,7 +2567,7 @@ class Memory:
                                  if match_tag(ptags, w, mode="fuzzy"))
             else:  # sim = keyword overlap
                 if want_c:
-                    score += len(qtok & _toks(content))
+                    score += len(qtok & ti.raw_tokens(p))
                 if want_t:
                     score += len(qtok & _toks(" ".join(ptags)))
             if score > 0:
@@ -3390,6 +3405,7 @@ class Memory:
         with open(source, "rb") as f:
             snapshot = pickle.load(f)
         self.points = snapshot.get("points", [])
+        self._text_index = TextIndex()          # refills lazily (not pickled)
         self.observators = snapshot.get("observators", {})
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)

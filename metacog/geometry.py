@@ -388,6 +388,7 @@ def retrieve_hybrid(
     rrf_k: int = 60,
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
     restrict_kind: Optional["PointKind"] = None,  # noqa: F821
+    text_index=None,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -462,6 +463,7 @@ def retrieve_hybrid(
     bm25_pool = bm25_score(
         query_text, points, k_pool=pool_per_signal,
         query_keywords=query_kw or None,
+        text_index=text_index,
     )
 
     # Phase 2b — fuzzy lexical (Levenshtein) : recovers morphological /
