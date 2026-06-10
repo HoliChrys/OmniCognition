@@ -59,7 +59,8 @@ def main():
     args = ap.parse_args()
 
     import os
-    os.environ["OBLIQ_NO_CARD"] = "1"            # tone-only build (fast)
+    # Card mode follows OBLIQ_NO_CARD env (set externally) ; default = card ON
+    # so the pre-accept has stance_ cards to work with — the true amortized cost.
     from benchmarks.obliq_bench.event_step import build
     mem, question, gold = build(args.track, args.query_id, args.bg)
     gold = set(gold)
