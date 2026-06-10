@@ -2704,6 +2704,8 @@ class Memory:
         # and are NEVER overturned (recall-first : accepting more never costs
         # recall). Degenerate sets (<4) skip the stage.
         pre_accept: set = set()
+        sims = None                              # per-candidate prop-similarity
+        mu = 0.0                                 # band centre (mean of sims)
         if len(cands) >= 4 and getattr(self, "encoder", None):
             try:
                 from metacog.geometry import cosine, effective_embedding
@@ -2723,7 +2725,7 @@ class Memory:
                 sd = (sum((s - mu) ** 2 for s in sims) / len(sims)) ** 0.5
                 pre_accept = {i for i, s in enumerate(sims) if s >= mu + sd}
             except Exception:
-                pre_accept = set()
+                pre_accept, sims = set(), None
         rest = [i for i in range(len(cands)) if i not in pre_accept]
         labels = ["relevant"] * len(cands)
         if not rest:
@@ -2781,10 +2783,18 @@ class Memory:
         # a per-item pass restricted to the rejects costs ∝ |rejected| (small)
         # and recovers most of the per-item recall — recall-first, an accept is
         # never overturned.
+        # SECOND OPINION on the AMBIGUOUS band only : a batch-reject whose
+        # embedding similarity is at/above the band centre (mu) is near the cut
+        # and worth a live per-item re-read ; a reject far below mu is a clear
+        # distractor — trusting the batch there spends no LLM and costs no recall
+        # (those are not gold). When sims is unavailable, fall back to all.
         if second_opinion and any(lab == "irrelevant" for lab in labels):
             for i, (p, lab) in enumerate(zip(cands, labels)):
-                if lab == "irrelevant":
-                    labels[i] = self._judge_one(prop, p)
+                if lab != "irrelevant":
+                    continue
+                if sims is not None and sims[i] < mu:
+                    continue                     # clear-low reject : trust it
+                labels[i] = self._judge_one(prop, p)
         return labels
 
     def _judge_relevance(self, query: str, cands: Sequence[Point],
