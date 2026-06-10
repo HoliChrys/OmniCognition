@@ -2670,7 +2670,8 @@ class Memory:
     def oblique_labels(self, query: str, cands: Sequence[Point],
                        collected: Optional[Sequence[Point]] = None,
                        proposition: Optional[str] = None,
-                       per_item="auto") -> List[str]:
+                       per_item="auto", second_opinion: bool = True
+                       ) -> List[str]:
         """OBLIQUE-aware relevance labels — test each candidate against the
         request's distilled PROPOSITION (the specific stance), not generic
         relevance.
@@ -2780,7 +2781,7 @@ class Memory:
         # a per-item pass restricted to the rejects costs ∝ |rejected| (small)
         # and recovers most of the per-item recall — recall-first, an accept is
         # never overturned.
-        if any(lab == "irrelevant" for lab in labels):
+        if second_opinion and any(lab == "irrelevant" for lab in labels):
             for i, (p, lab) in enumerate(zip(cands, labels)):
                 if lab == "irrelevant":
                     labels[i] = self._judge_one(prop, p)

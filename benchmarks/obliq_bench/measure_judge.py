@@ -88,6 +88,14 @@ def main():
     wall_fn = time.time() - t0
     s_fn = mem.llm.snap()
 
+    # ---- C : batch-only (best case : pre-accept + 1 batch, NO 2nd opinion) -
+    mem.llm.reset()
+    t0 = time.time()
+    lab_bo = mem.oblique_labels(question, cands, proposition=prop,
+                                per_item=False, second_opinion=False)
+    wall_bo = time.time() - t0
+    s_bo = mem.llm.snap()
+
     def row(name, s, wall, lab):
         print("  %-10s calls=%-4d tok_in=%-6d tok_out=%-5d llm_s=%-5s "
               "wall_s=%-5.1f  gold_kept=%d/%d" % (
@@ -97,13 +105,20 @@ def main():
     print("\n  RESULT (same candidates, same proposition) :")
     row("per-item", s_pi, wall_pi, lab_pi)
     row("funnel", s_fn, wall_fn, lab_fn)
+    row("batch-only", s_bo, wall_bo, lab_bo)
 
     def ratio(a, b):
         return "%.1fx" % (a / b) if b else "inf"
-    print("\n  GAIN funnel vs per-item : calls %s | tok_out %s | llm_time %s" % (
+    print("\n  GAIN funnel     vs per-item : calls %s | tok_in %s | tok_out %s | llm_time %s" % (
         ratio(s_pi["calls"], max(1, s_fn["calls"])),
+        ratio(s_pi["tok_in"], max(1, s_fn["tok_in"])),
         ratio(s_pi["tok_out"], max(1, s_fn["tok_out"])),
         ratio(s_pi["secs"], max(0.1, s_fn["secs"]))))
+    print("  GAIN batch-only vs per-item : calls %s | tok_in %s | tok_out %s | llm_time %s" % (
+        ratio(s_pi["calls"], max(1, s_bo["calls"])),
+        ratio(s_pi["tok_in"], max(1, s_bo["tok_in"])),
+        ratio(s_pi["tok_out"], max(1, s_bo["tok_out"])),
+        ratio(s_pi["secs"], max(0.1, s_bo["secs"]))))
 
 
 if __name__ == "__main__":
