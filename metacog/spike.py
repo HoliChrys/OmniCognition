@@ -189,6 +189,72 @@ def chasles_path(start: Point, memory: "Memory",
 # ---------------------------------------------------------------------------
 
 
+def _resolve_and_promote(path: List[Point], llm: Any, encoder: Any,
+                         t_now: float, memory: "Memory"):
+    """Shared Chasles resolution : reject cross-kind paths, collapse the
+    intermediates (start/end as anchors) into a shortcut child, promote it to a
+    reusable TOOL when the chain was a tool/action workflow, and append the child
+    to the cloud. Returns the CollisionResult (with .child / .event) or None when
+    the path is cross-kind or resolve_collision declines. No refractory here —
+    the caller owns the reset (n_spike for the in-memory scan ; the logged
+    collision_event for the SQL trigger)."""
+    from metacog.collision import resolve_collision
+    if len({p.kind for p in path}) != 1:
+        return None                                      # cross-kind paths reject
+    intermediates = path[1:-1]                           # guaranteed >= 2
+    anchors = [path[0], path[-1]]
+    result = resolve_collision(
+        intermediates=intermediates, anchors=anchors,
+        llm=llm, encoder=encoder, t_now=t_now,
+    )
+    if result is None:
+        return None
+    # A compressed WORKFLOW : if the chain was made of tool/action steps,
+    # promote the shortcut child into a reusable TOOL node carrying the union of
+    # the path's tool genre/context tags — so the optimized (fewer-step)
+    # workflow becomes a first-class capability the walk can find and reuse, not
+    # just a geometric shortcut.
+    try:
+        from metacog.skills import TOOL_TAG, is_tool
+        if any(is_tool(n) for n in path):
+            ctx = {t for n in path for t in n.tags
+                   if t == TOOL_TAG or t.startswith("tool_")
+                   or not t.startswith(("ref:", "action", "fact", "thought"))}
+            result.child.add_tag(TOOL_TAG, "tool_workflow", *sorted(ctx))
+    except Exception:
+        pass
+    memory.points.append(result.child)
+    return result
+
+
+def auto_compress_chasles_sql(memory: "Memory", llm: Any,
+                              encoder: Any) -> List["CollisionEvent"]:
+    """SQL-driven Chasles : the trigger is a QUERY. Reads
+    `memory.chasles_path_candidates()` (frequently-travelled, refractory-clear
+    paths from the journal), maps each signature back to live Points, and
+    collapses it via the shared resolver. No n_spike reset — the refractory is
+    the logged collision_event (Memory.compress_chasles persists it right after,
+    so the next query excludes this path). Candidates whose nodes were merged /
+    dropped are skipped. Returns the CollisionEvents."""
+    t_now = memory._now() if hasattr(memory, "_now") else 0.0
+    by_id = {p.id: p for p in memory.points}
+    events: List["CollisionEvent"] = []
+    fired: set = set()
+    for cand in memory.chasles_path_candidates(min_len=4, min_freq=2):
+        ids = [cand["start_id"], *cand["intermediates"], cand["end_id"]]
+        if any(i in fired for i in ids):
+            continue                                     # node already consumed
+        path = [by_id.get(i) for i in ids]
+        if any(p is None for p in path):
+            continue                                     # a node no longer exists
+        result = _resolve_and_promote(path, llm, encoder, t_now, memory)
+        if result is None:
+            continue
+        fired.update(ids)
+        events.append(result.event)
+    return events
+
+
 def auto_compress_chasles(memory: "Memory", llm: Any,
                           encoder: Any) -> List["CollisionEvent"]:
     """Detect spike-driven Chasles paths and compress them.
@@ -204,8 +270,6 @@ def auto_compress_chasles(memory: "Memory", llm: Any,
     and may form a valid path on the next compress_chasles call.
 
     Returns the list of CollisionEvent records (one per firing)."""
-    from metacog.collision import resolve_collision
-
     t_now = memory._now() if hasattr(memory, "_now") else 0.0
     events: List["CollisionEvent"] = []
     fired: set = set()
@@ -220,31 +284,9 @@ def auto_compress_chasles(memory: "Memory", llm: Any,
         path = chasles_path(start, memory)
         if len(path) < 4:
             continue                                     # cancel, no reset
-        if len({p.kind for p in path}) != 1:
-            continue                                     # cross-kind paths reject
-        intermediates = path[1:-1]                       # guaranteed >= 2
-        anchors = [path[0], path[-1]]
-        result = resolve_collision(
-            intermediates=intermediates, anchors=anchors,
-            llm=llm, encoder=encoder, t_now=t_now,
-        )
+        result = _resolve_and_promote(path, llm, encoder, t_now, memory)
         if result is None:
             continue
-        # A compressed WORKFLOW : if the chain was made of tool/action steps,
-        # promote the shortcut child into a reusable TOOL node carrying the
-        # union of the path's tool genre/context tags — so the optimized
-        # (fewer-step) workflow becomes a first-class capability the walk can
-        # find and reuse, not just a geometric shortcut.
-        try:
-            from metacog.skills import TOOL_TAG, is_tool
-            if any(is_tool(n) for n in path):
-                ctx = {t for n in path for t in n.tags
-                       if t == TOOL_TAG or t.startswith("tool_")
-                       or not t.startswith(("ref:", "action", "fact", "thought"))}
-                result.child.add_tag(TOOL_TAG, "tool_workflow", *sorted(ctx))
-        except Exception:
-            pass
-        memory.points.append(result.child)
         for node in path:                                # refractory reset
             node.n_spike = 0
             fired.add(node.id)

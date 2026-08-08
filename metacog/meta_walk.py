@@ -1716,6 +1716,7 @@ class MetaWalker:
         self._action_star_chain: List[Point] = []
         self._stage_idx = 0
         self._done = False
+        self._path_logged = False
         self._generated_ids: List[str] = []
         # MAP-REDUCE accumulator : the successively-collected set of
         # ON-TARGET facts (relevant/partial/contradicts per Chain-of-Note)
@@ -1964,6 +1965,37 @@ class MetaWalker:
         return True
 
     def step(self) -> StageOutput:
+        """Advance one stage and return the StageOutput. Sets done=True on the
+        returned output when the walk cannot continue further. Thin wrapper over
+        `_step_impl` that, once the walk finalises, records the TRAVERSED PATH
+        (fact + action chains) as first-class units in the journal so the SQL
+        Chasles trigger (`chasles_path_candidates`) sees how often each path is
+        taken. Runs through every caller — generator, run-to-done, direct step
+        loops — so no walk escapes the feed."""
+        out = self._step_impl()
+        if out.done and not self._path_logged:
+            self._path_logged = True
+            self._log_traversed_path()
+        return out
+
+    def _log_traversed_path(self) -> None:
+        """Log the fact/action star chains as traversed paths. `with_hops=False`
+        — record_hop already logged each hop during the walk, so re-logging them
+        would double-count the per-node spike. Commit-only and failure-safe."""
+        if not self.commit:
+            return
+        log_path = getattr(self.memory, "log_path", None)
+        if log_path is None:
+            return
+        try:
+            for chain in (self._fact_star_chain, self._action_star_chain):
+                ids = [p.id for p in chain if p is not None]
+                if len(ids) >= 2:
+                    log_path(ids, with_hops=False)
+        except Exception:
+            pass
+
+    def _step_impl(self) -> StageOutput:
         """Advance one stage and return the StageOutput. Sets done=True
         on the returned output when the walk cannot continue further."""
         if self._done:

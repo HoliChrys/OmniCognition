@@ -3156,11 +3156,13 @@ class Memory:
         self.reindex_tags()
         return {"refined_points": refined_points, "tags_added": added}
 
-    def log_path(self, node_ids: Sequence[str],
-                 t: Optional[float] = None) -> None:
+    def log_path(self, node_ids: Sequence[str], t: Optional[float] = None,
+                 with_hops: bool = True) -> None:
         """Record a traversed path so 'this path is often taken' becomes a DB
-        query (`chasles_path_candidates`). Also logs each constituent hop so the
-        per-node spike view (`effective_spike`) stays consistent. No-op without a
+        query (`chasles_path_candidates`). With `with_hops` (default) also logs
+        each constituent hop so the per-node spike view (`effective_spike`) stays
+        consistent — set it False when the caller already recorded the hops
+        (e.g. the walk's record_hop) to avoid double-counting. No-op without a
         journal ; failure-safe."""
         if self.journal is None:
             return
@@ -3170,8 +3172,9 @@ class Memory:
         ts = self._now(t)
         try:
             self.journal.log_path(ids, ts=ts)
-            for src, dst in zip(ids, ids[1:]):
-                self.journal.log_hop(src, dst, ts=ts)
+            if with_hops:
+                for src, dst in zip(ids, ids[1:]):
+                    self.journal.log_hop(src, dst, ts=ts)
         except Exception:
             pass
 
@@ -3191,8 +3194,16 @@ class Memory:
         end) triggers resolve_collision on the intermediates with start /
         end as anchors. Reset n_spike to 0 on every node of a fired path
         (refractory period). Returns the list of CollisionEvent dicts."""
-        from metacog.spike import auto_compress_chasles
-        events = auto_compress_chasles(self, self.llm, self.encoder)
+        # SQL-driven trigger when a journal is present : the frequently-travelled
+        # paths come from a query (chasles_path_candidates) — the DB is the
+        # driver, like lateral. Falls back to the in-memory n_spike scan
+        # otherwise. The logged collision_events below ARM the SQL refractory.
+        if self.journal is not None:
+            from metacog.spike import auto_compress_chasles_sql
+            events = auto_compress_chasles_sql(self, self.llm, self.encoder)
+        else:
+            from metacog.spike import auto_compress_chasles
+            events = auto_compress_chasles(self, self.llm, self.encoder)
         self._journal_collisions("chasles", events)
         return [
             {
