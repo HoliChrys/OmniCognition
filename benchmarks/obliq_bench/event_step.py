@@ -232,16 +232,22 @@ def main() -> None:
 
     # ---- JOURNAL (SQLite) : measure the DB-driven substrate ----------------
     if mem.journal is not None:
+        # FRESH bag + judge OFF : isolate the JOURNAL plumbing (retrieval logging
+        # -> access_events -> SQL co-retrieval), independent of the bag the event
+        # channel above already filled. judge=False keeps it a pure DB-path check.
         t0 = time.time()
-        res = mem.assemble_set(question, max_rounds=3)
+        res = mem.assemble_set(question, bag="journal_probe", judge=False,
+                               auto_route=False, max_rounds=3)
         n_ret, n_acc = mem.journal.counts()
         print("  [9] JOURNAL after assemble_set (%.1fs): %d retrievals, "
-              "%d access_events, bag=%d" % (
+              "%d access_events, probe_bag=%d" % (
                   time.time() - t0, n_ret, n_acc, res["size"]))
-        seeds = sorted(gold_set)[:1] or [sorted({r for r in gold_set})[0]]
-        if seeds:
-            cor = mem.co_retrieved(seeds, k=6)
-            print("        SQL co-retrieved with %s : %s" % (seeds, cor))
+        # Co-retrieval seeded from a gold id (it should now co-occur with other
+        # surfaced nodes in the logged access_events).
+        if gold_set:
+            seed = sorted(gold_set)[0]
+            cor = mem.co_retrieved([seed], k=6)
+            print("        SQL co-retrieved with gold %s : %s" % (seed, cor[:6]))
         slp = mem.sleep()
         print("        after sleep(): fission=%d chasles=%d lateral=%d "
               "(collision_events=%d)" % (
