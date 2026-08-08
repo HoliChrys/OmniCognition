@@ -256,14 +256,21 @@ class Journal:
         ).fetchall()
         return [float(r["ts"]) for r in rows]
 
-    def useful_retrievals(self, min_score: int = 2
+    def useful_retrievals(self, min_score: int = 2,
+                          max_score: Optional[int] = None
                           ) -> List[Tuple[int, str, List[str]]]:
-        """Retrievals whose usefulness score >= min_score — the training set for
-        a decay-fit. Returns [(retrieval_id, query_text, returned_node_ids)]."""
+        """Scored retrievals in [min_score, max_score] — the decay-fit training
+        set. min_score=2 (default) = the useful positives ; min_score=0,
+        max_score=0 = the useless negatives. Returns [(retrieval_id, query_text,
+        returned_node_ids)]."""
+        clause = "useful IS NOT NULL AND useful >= ?"
+        params: List[int] = [min_score]
+        if max_score is not None:
+            clause += " AND useful <= ?"
+            params.append(max_score)
         rows = self.conn.execute(
-            "SELECT id, query_text, returned_node_ids FROM retrievals "
-            "WHERE useful IS NOT NULL AND useful >= ? ORDER BY id ASC",
-            (min_score,),
+            f"SELECT id, query_text, returned_node_ids FROM retrievals "
+            f"WHERE {clause} ORDER BY id ASC", params,
         ).fetchall()
         return [(int(r["id"]), r["query_text"] or "",
                  json.loads(r["returned_node_ids"] or "[]")) for r in rows]

@@ -236,6 +236,10 @@ class Memory:
     # in-memory lateral ledger remains the only co-retrieval source). Holds a
     # live sqlite connection : shared-by-reference on snapshot, never pickled.
     journal: Any = None
+    # Anderson-Schooler decay exponent — the ONE learned hyperparameter (fitted
+    # by fit_decay() from the journal's mark_useful labels + access history).
+    # Persisted with the cloud. 0.5 = the human-memory-literature default.
+    decay_exponent: float = 0.5
     # Episodic conversation index : the id of the last message ingested per
     # (user, session), so successive messages chain via sequence_prev and a
     # session reads back in order. Continuous indexation feeds this.
@@ -3254,6 +3258,46 @@ class Memory:
         if self.journal is not None:
             self.journal.mark_useful(retrieval_id, score)
 
+    def need_odds(self, node_id: str, now: Optional[float] = None) -> float:
+        """Anderson-Schooler need-odds for a node — the power-law of its access
+        ages (journal history) under the fitted `decay_exponent`. 0.0 without a
+        journal or with no access history."""
+        if self.journal is None:
+            return 0.0
+        from metacog.need_odds import need_odds as _no
+        return _no(self.journal.access_timestamps(node_id),
+                   self._now(now), self.decay_exponent)
+
+    def fit_decay(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Fit the decay exponent from the journal (step 4 : the closed L3 loop).
+        Positives = nodes served in useful>=2 retrievals ; negatives = nodes
+        served in useful==0 retrievals ; the exponent that best separates them
+        by need-odds AUC is stored in `self.decay_exponent`. No-op (keeps the
+        current exponent) without a journal or without both classes present."""
+        base = {"exponent": self.decay_exponent, "auc": 0.5,
+                "n_pos": 0, "n_neg": 0}
+        if self.journal is None:
+            return base
+        from metacog.need_odds import fit_exponent
+        pos_ids: set = set()
+        for _rid, _q, ids in self.journal.useful_retrievals(min_score=2):
+            pos_ids.update(ids)
+        neg_ids: set = set()
+        for _rid, _q, ids in self.journal.useful_retrievals(min_score=0,
+                                                            max_score=0):
+            neg_ids.update(ids)
+        overlap = pos_ids & neg_ids            # ambiguous : served both useful & not
+        pos_ids -= overlap
+        neg_ids -= overlap
+        if not pos_ids or not neg_ids:
+            return base
+        t = self._now(now)
+        pos_h = [self.journal.access_timestamps(i) for i in pos_ids]
+        neg_h = [self.journal.access_timestamps(i) for i in neg_ids]
+        res = fit_exponent(pos_h, neg_h, t)
+        self.decay_exponent = float(res["exponent"])
+        return res
+
     def lateral_collapse(self, t: Optional[float] = None) -> Dict[str, Any]:
         """LATERAL collision : nodes that the co-retrieval ledger shows to
         be functionally redundant (always surfaced together by DIVERSE
@@ -3585,6 +3629,7 @@ class Memory:
             "conversation_log": self.conversation_log,
             "_t_clock": self._t_clock,
             "_spike_total_hops": self._spike_total_hops,
+            "decay_exponent": self.decay_exponent,
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -3604,6 +3649,7 @@ class Memory:
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)
         self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
+        self.decay_exponent = snapshot.get("decay_exponent", 0.5)
         # Rebuild the EVENT-hub registry from the restored points (it is not
         # serialised — the points carry the canonical event:type tags).
         self._event_registry = {}
