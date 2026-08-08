@@ -107,10 +107,18 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     if jspec:
         from metacog.journal import Journal
         journal = Journal(":memory:" if jspec in ("1", "mem") else jspec)
+    # OPT-IN local cross-encoder (jina) for the oblique judge's funnel :
+    # OBLIQ_RERANK=1 wires CrossEncoderReranker so the tri-band pre-filter scores
+    # (proposition, doc) pairs jointly for zero LLM tokens. Needs fastembed +
+    # a one-time model download.
+    reranker = None
+    if os.environ.get("OBLIQ_RERANK"):
+        from metacog.defaults import CrossEncoderReranker
+        reranker = CrossEncoderReranker()
     mem = Memory(encoder=_Enc(), llm=llm,
                  doc_card_extractor=card,
                  event_extractor=LLMEventExtractor(llm),
-                 tone_reading=True, journal=journal)
+                 tone_reading=True, journal=journal, reranker=reranker)
     t0 = time.time()
     for cid in keep:
         mem.ingest(corpus[cid][:500], kind="FACT", id=cid)
@@ -255,6 +263,33 @@ def main() -> None:
                   len(mem.collision_history("chasles")),
                   slp.get("lateral_collided_groups", 0),
                   len(mem.collision_history())))
+
+    # ---- CROSS-ENCODER (jina) funnel : the mnema token lever ----------------
+    if getattr(mem, "reranker", None) is not None:
+        from metacog.epistemic import PointKind
+        prop = mem.distill_proposition(question)
+        cands = [p for p in mem.points
+                 if p.kind is PointKind.FACT and not mem._is_derived(p.id)]
+        scores = mem._proposition_scores(prop, cands)
+        mu = sum(scores) / len(scores)
+        sd = (sum((s - mu) ** 2 for s in scores) / len(scores)) ** 0.5
+        hi = sum(1 for s in scores if s >= mu + sd)
+        lo = sum(1 for s in scores if s <= mu - sd)
+        mid = len(scores) - hi - lo
+        print("  [10] JINA cross-encoder funnel on %d cands (prop=%r):" % (
+            len(cands), prop[:60]))
+        print("        bands  pre-accept=%d  auto-reject=%d  batch(middle)=%d"
+              "   (batch shrinks to %.0f%% of cands)" % (
+                  hi, lo, mid, 100.0 * mid / max(1, len(cands))))
+        n0 = mem.llm.n_calls
+        labels = mem.oblique_labels(question, cands, proposition=prop,
+                                    per_item=False)
+        rel = sum(1 for x in labels if x == "relevant")
+        goldc = sum(1 for p, x in zip(cands, labels)
+                    if x == "relevant" and p.id in gold_set)
+        print("        judged relevant=%d/%d (goldᶜ=%d/%d)  LLM calls for "
+              "the whole funnel=%d" % (
+                  rel, len(cands), goldc, len(gold_set), mem.llm.n_calls - n0))
 
 
 if __name__ == "__main__":
