@@ -70,6 +70,18 @@ CREATE TABLE IF NOT EXISTS collision_events (
 CREATE INDEX IF NOT EXISTS idx_collision_kind  ON collision_events(kind);
 CREATE INDEX IF NOT EXISTS idx_collision_child ON collision_events(child_id);
 
+CREATE TABLE IF NOT EXISTS path_traversals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    signature     TEXT NOT NULL,      -- 'A>B>C>D' : direction-preserving, the group key
+    start_id      TEXT NOT NULL,      -- Chasles anchor (from)
+    end_id        TEXT NOT NULL,      -- Chasles anchor (to)
+    intermediates TEXT NOT NULL,      -- JSON array [B, C] : what a shortcut absorbs
+    length        INTEGER NOT NULL,   -- node count (start + intermediates + end)
+    ts            REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paths_sig ON path_traversals(signature);
+CREATE INDEX IF NOT EXISTS idx_paths_len ON path_traversals(length);
+
 CREATE TABLE IF NOT EXISTS tags (
     node_id  TEXT NOT NULL,
     tag      TEXT NOT NULL,                          -- hierarchical: a:b:c
@@ -137,6 +149,26 @@ class Journal:
             (str(src_id), str(dst_id), ts),
         )
         self.conn.commit()
+
+    def log_path(self, node_ids: Sequence[str],
+                 ts: Optional[float] = None) -> Optional[int]:
+        """Record one TRAVERSED path (>= 2 nodes) as a first-class, countable
+        unit — the Chasles relation is about a *path*, not a single hop. The
+        `signature` ('A>B>C>D') is the group key : how often the same path is
+        travelled becomes a plain `GROUP BY signature HAVING COUNT(*) >= k`
+        query. Append-only ; returns the row id (None if < 2 nodes)."""
+        ids = [str(i) for i in node_ids]
+        if len(ids) < 2:
+            return None
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO path_traversals(signature, start_id, end_id, "
+            "intermediates, length, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (">".join(ids), ids[0], ids[-1], json.dumps(ids[1:-1]),
+             len(ids), ts),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
 
     def log_collision_event(self, kind: str, *, child_id: Optional[str],
                             parent_ids: Sequence[str],
@@ -222,6 +254,53 @@ class Journal:
             (nid, nid, quoted, quoted),
         ).fetchone()
         return int(row["c"])
+
+    def frequent_paths(self, min_len: int = 4, min_freq: int = 2,
+                       since_ts: float = 0.0) -> List[dict]:
+        """Paths travelled >= `min_freq` times, `min_len`+ nodes long, after
+        `since_ts` — the raw 'this path is often taken' query (no refractory).
+        `min_len=4` = start + >=2 intermediates + end, matching compress_chasles.
+        Most-travelled first. Each row is a Chasles candidate."""
+        rows = self.conn.execute(
+            "SELECT signature, start_id, end_id, intermediates, length, "
+            "COUNT(*) AS freq, MAX(ts) AS last_ts FROM path_traversals "
+            "WHERE length >= ? AND ts > ? GROUP BY signature "
+            "HAVING freq >= ? ORDER BY freq DESC, signature ASC",
+            (min_len, since_ts, min_freq),
+        ).fetchall()
+        return [self._path_row(r) for r in rows]
+
+    def chasles_candidates(self, min_len: int = 4,
+                           min_freq: int = 2) -> List[dict]:
+        """The SQL Chasles TRIGGER : frequently-travelled paths whose traversals
+        post-date the last Chasles fire for their OWN start/end anchors
+        (per-signature append-only refractory — nothing is mutated, the reset is
+        derived from collision_events like `effective_spike`). Just query this to
+        know which paths to collapse into a shortcut."""
+        rows = self.conn.execute(
+            "SELECT signature, start_id, end_id, intermediates, length, "
+            "COUNT(*) AS freq, MAX(ts) AS last_ts FROM path_traversals p "
+            "WHERE length >= ? AND ts > COALESCE((SELECT MAX(ts) FROM "
+            "collision_events c WHERE c.kind = 'chasles' "
+            "AND instr(c.anchor_ids, '\"'||p.start_id||'\"') > 0 "
+            "AND instr(c.anchor_ids, '\"'||p.end_id||'\"') > 0), 0) "
+            "GROUP BY signature HAVING freq >= ? "
+            "ORDER BY freq DESC, signature ASC",
+            (min_len, min_freq),
+        ).fetchall()
+        return [self._path_row(r) for r in rows]
+
+    @staticmethod
+    def _path_row(r) -> dict:
+        return {
+            "signature": r["signature"],
+            "start_id": r["start_id"],
+            "end_id": r["end_id"],
+            "intermediates": json.loads(r["intermediates"]),
+            "length": int(r["length"]),
+            "freq": int(r["freq"]),
+            "last_ts": r["last_ts"],
+        }
 
     def co_retrieved_pairs(self, window: Optional[int] = None
                            ) -> List[Tuple[Tuple[str, str], int]]:

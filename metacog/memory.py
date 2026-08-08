@@ -3156,6 +3156,34 @@ class Memory:
         self.reindex_tags()
         return {"refined_points": refined_points, "tags_added": added}
 
+    def log_path(self, node_ids: Sequence[str],
+                 t: Optional[float] = None) -> None:
+        """Record a traversed path so 'this path is often taken' becomes a DB
+        query (`chasles_path_candidates`). Also logs each constituent hop so the
+        per-node spike view (`effective_spike`) stays consistent. No-op without a
+        journal ; failure-safe."""
+        if self.journal is None:
+            return
+        ids = [str(i) for i in node_ids]
+        if len(ids) < 2:
+            return
+        ts = self._now(t)
+        try:
+            self.journal.log_path(ids, ts=ts)
+            for src, dst in zip(ids, ids[1:]):
+                self.journal.log_hop(src, dst, ts=ts)
+        except Exception:
+            pass
+
+    def chasles_path_candidates(self, min_len: int = 4,
+                                min_freq: int = 2) -> List[Dict[str, Any]]:
+        """The SQL Chasles trigger surfaced on Memory : frequently-travelled,
+        refractory-clear paths ready to collapse into a start->end shortcut.
+        [] without a journal — callers fall back to the in-memory n_spike scan."""
+        if self.journal is None:
+            return []
+        return self.journal.chasles_candidates(min_len=min_len, min_freq=min_freq)
+
     def compress_chasles(self) -> List[Dict[str, Any]]:
         """Auto-detect spike-driven Chasles paths and compress them.
 
