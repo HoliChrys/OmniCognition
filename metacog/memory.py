@@ -3152,6 +3152,8 @@ class Memory:
                 if "refined" not in p.tags:
                     p.tags.append("refined")
                 refined_points += 1
+        # Sync the SQL hierarchical-tag index with the freshly-crystallized tags.
+        self.reindex_tags()
         return {"refined_points": refined_points, "tags_added": added}
 
     def compress_chasles(self) -> List[Dict[str, Any]]:
@@ -3297,6 +3299,34 @@ class Memory:
         res = fit_exponent(pos_h, neg_h, t)
         self.decay_exponent = float(res["exponent"])
         return res
+
+    def reindex_tags(self) -> int:
+        """Sync the journal's SQL hierarchical-tag index from the current points
+        (idempotent : INSERT OR IGNORE). Returns the number of points indexed.
+        No-op without a journal. Called after refine_tags ; callers can invoke
+        it to backfill after a bulk ingest."""
+        if self.journal is None:
+            return 0
+        n = 0
+        for p in self.points:
+            if p.tags:
+                self.journal.log_tags(p.id, p.tags)
+                n += 1
+        return n
+
+    def tag_scoped(self, tag: str, hierarchical: bool = True) -> List[Point]:
+        """Points carrying `tag` via the SQL tag index — hierarchical ANCESTOR
+        match by default (querying 'health' returns 'health:condition:x' nodes).
+        [] without a journal."""
+        if self.journal is None:
+            return []
+        ids = set(self.journal.nodes_with_tag(tag, hierarchical=hierarchical))
+        return [p for p in self.points if p.id in ids]
+
+    def tag_glossary_sql(self) -> List[str]:
+        """The hierarchical tag glossary from the journal (depth-ordered SQL).
+        [] without a journal."""
+        return self.journal.tag_glossary() if self.journal is not None else []
 
     def lateral_collapse(self, t: Optional[float] = None) -> Dict[str, Any]:
         """LATERAL collision : nodes that the co-retrieval ledger shows to

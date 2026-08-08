@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS collision_events (
 );
 CREATE INDEX IF NOT EXISTS idx_collision_kind  ON collision_events(kind);
 CREATE INDEX IF NOT EXISTS idx_collision_child ON collision_events(child_id);
+
+CREATE TABLE IF NOT EXISTS tags (
+    node_id  TEXT NOT NULL,
+    tag      TEXT NOT NULL,                          -- hierarchical: a:b:c
+    depth    INTEGER NOT NULL,                        -- number of ':' (sort key)
+    PRIMARY KEY (node_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_tags_tag   ON tags(tag);
+CREATE INDEX IF NOT EXISTS idx_tags_depth ON tags(depth);
 """
 
 
@@ -149,7 +158,44 @@ class Journal:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    def log_tags(self, node_id: str, tags: Sequence[str]) -> None:
+        """Index a node's hierarchical tags (idempotent). Empty/None tags are
+        skipped ; `depth` (the `:` count) is stored as the glossary sort key."""
+        rows = [(str(node_id), t, t.count(":"))
+                for t in (tags or []) if isinstance(t, str) and t]
+        if rows:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO tags(node_id, tag, depth) VALUES (?, ?, ?)",
+                rows,
+            )
+            self.conn.commit()
+
     # -- read ----------------------------------------------------------------
+
+    def nodes_with_tag(self, tag: str, hierarchical: bool = True) -> List[str]:
+        """Node ids carrying `tag`. With `hierarchical` (default) the tag matches
+        as an ANCESTOR too — querying 'health' returns nodes tagged
+        'health:condition:x' (SQL : tag = ? OR tag LIKE ?||':%'). Sorted."""
+        tag = str(tag)
+        if hierarchical:
+            rows = self.conn.execute(
+                "SELECT DISTINCT node_id FROM tags WHERE tag = ? OR tag LIKE ? "
+                "ORDER BY node_id ASC", (tag, tag + ":%"),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT DISTINCT node_id FROM tags WHERE tag = ? ORDER BY node_id",
+                (tag,),
+            ).fetchall()
+        return [r["node_id"] for r in rows]
+
+    def tag_glossary(self) -> List[str]:
+        """Distinct tags ordered by hierarchy DEPTH (shallowest first) then
+        alphabetically — the SQL hierarchical tag index / glossary."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT tag, depth FROM tags ORDER BY depth ASC, tag ASC"
+        ).fetchall()
+        return [r["tag"] for r in rows]
 
     def hop_target_counts(self) -> List[Tuple[str, int]]:
         """(dst_id, hop_count) most-hopped-to first — the SQL n_spike analogue
