@@ -47,6 +47,28 @@ CREATE TABLE IF NOT EXISTS access_events (
 );
 CREATE INDEX IF NOT EXISTS idx_access_retrieval ON access_events(retrieval_id);
 CREATE INDEX IF NOT EXISTS idx_access_node      ON access_events(node_id);
+
+CREATE TABLE IF NOT EXISTS hops (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_id   TEXT NOT NULL,                          -- from node
+    dst_id   TEXT NOT NULL,                          -- to node (accumulates spike)
+    ts       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hops_src ON hops(src_id);
+CREATE INDEX IF NOT EXISTS idx_hops_dst ON hops(dst_id);
+
+CREATE TABLE IF NOT EXISTS collision_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind              TEXT NOT NULL,                  -- 'fission' | 'chasles' | 'lateral'
+    child_id          TEXT,                           -- the keeper / shortcut / common child
+    parent_ids        TEXT NOT NULL,                  -- JSON array (the collided / intermediates)
+    anchor_ids        TEXT NOT NULL,                  -- JSON array (boundaries ; [] for proximity)
+    trigger_distance  REAL,
+    threshold         REAL,
+    ts                REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_collision_kind  ON collision_events(kind);
+CREATE INDEX IF NOT EXISTS idx_collision_child ON collision_events(child_id);
 """
 
 
@@ -95,7 +117,76 @@ class Journal:
         )
         self.conn.commit()
 
+    def log_hop(self, src_id: str, dst_id: str,
+                ts: Optional[float] = None) -> None:
+        """Record one multi-hop transition src → dst (dst accumulates spike
+        energy). The Chasles trigger is then SQL-derivable : `hop_target_counts`
+        is the n_spike analogue, `modal_next` follows the modal path."""
+        ts = time.time() if ts is None else ts
+        self.conn.execute(
+            "INSERT INTO hops(src_id, dst_id, ts) VALUES (?, ?, ?)",
+            (str(src_id), str(dst_id), ts),
+        )
+        self.conn.commit()
+
+    def log_collision_event(self, kind: str, *, child_id: Optional[str],
+                            parent_ids: Sequence[str],
+                            anchor_ids: Sequence[str] = (),
+                            trigger_distance: Optional[float] = None,
+                            threshold: Optional[float] = None,
+                            ts: Optional[float] = None) -> int:
+        """Append one collision/compression event to the audit log (mnema's
+        CollisionEvent → SQL). `kind` ∈ {'fission', 'chasles', 'lateral'}.
+        Returns the new event id."""
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO collision_events(kind, child_id, parent_ids, anchor_ids,"
+            " trigger_distance, threshold, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (kind, child_id, json.dumps([str(i) for i in parent_ids]),
+             json.dumps([str(i) for i in anchor_ids]),
+             trigger_distance, threshold, ts),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
     # -- read ----------------------------------------------------------------
+
+    def hop_target_counts(self) -> List[Tuple[str, int]]:
+        """(dst_id, hop_count) most-hopped-to first — the SQL n_spike analogue
+        (a node's accumulated activation energy)."""
+        rows = self.conn.execute(
+            "SELECT dst_id, COUNT(*) AS c FROM hops GROUP BY dst_id "
+            "ORDER BY c DESC, dst_id ASC"
+        ).fetchall()
+        return [(r["dst_id"], int(r["c"])) for r in rows]
+
+    def modal_next(self, src_id: str) -> Optional[str]:
+        """The most frequent successor of `src_id` in the hop log — the modal
+        step a SQL-driven `chasles_path` follows. None if src never hopped."""
+        row = self.conn.execute(
+            "SELECT dst_id FROM hops WHERE src_id = ? "
+            "GROUP BY dst_id ORDER BY COUNT(*) DESC, dst_id ASC LIMIT 1",
+            (str(src_id),),
+        ).fetchone()
+        return row["dst_id"] if row is not None else None
+
+    def collision_events(self, kind: Optional[str] = None) -> List[dict]:
+        """The collision/compression audit trail, oldest first. Filter by `kind`
+        ('fission' | 'chasles' | 'lateral') or None for all."""
+        if kind is None:
+            rows = self.conn.execute(
+                "SELECT * FROM collision_events ORDER BY id ASC").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM collision_events WHERE kind = ? ORDER BY id ASC",
+                (kind,)).fetchall()
+        return [{
+            "id": int(r["id"]), "kind": r["kind"], "child_id": r["child_id"],
+            "parent_ids": json.loads(r["parent_ids"] or "[]"),
+            "anchor_ids": json.loads(r["anchor_ids"] or "[]"),
+            "trigger_distance": r["trigger_distance"],
+            "threshold": r["threshold"], "ts": float(r["ts"]),
+        } for r in rows]
 
     def find_co_retrieved(self, seed_node_ids: Sequence[str],
                           k: int = 7) -> List[Tuple[str, int]]:

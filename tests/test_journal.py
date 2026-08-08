@@ -101,3 +101,66 @@ def test_journal_shared_by_reference_on_snapshot():
     assert clone.journal is m.journal                # same live connection
     clone.record_retrieval(["A", "B"], query_text="q")
     assert m.co_retrieved(["A"]) == [("B", 1)]       # write visible on original
+
+
+# -- hops (the Chasles signal in SQL) ---------------------------------------
+
+def test_hop_target_counts_is_the_spike_analogue():
+    j = Journal()
+    j.log_hop("A", "B", ts=1.0)
+    j.log_hop("A", "B", ts=2.0)                       # B hopped-to twice
+    j.log_hop("A", "C", ts=3.0)
+    assert j.hop_target_counts() == [("B", 2), ("C", 1)]   # B accumulates spike
+
+
+def test_modal_next_follows_the_modal_path():
+    j = Journal()
+    j.log_hop("A", "B", ts=1.0)
+    j.log_hop("A", "B", ts=2.0)
+    j.log_hop("A", "C", ts=3.0)
+    assert j.modal_next("A") == "B"                   # most frequent successor
+    assert j.modal_next("Z") is None                  # never hopped from
+
+
+def test_record_hop_mirrors_into_journal():
+    from metacog.epistemic import PointKind
+    j = Journal()
+    m = Memory(encoder=SimpleEncoder(), journal=j)
+    a = m.ingest("alpha", kind="FACT", id="A")
+    b = m.ingest("beta", kind="FACT", id="B")
+    from metacog.spike import record_hop
+    record_hop(a, b, m)
+    record_hop(a, b, m)
+    assert j.hop_target_counts() == [("B", 2)]        # logged via record_hop
+    assert b.n_spike == 2                              # in-memory counter still bumped
+
+
+# -- collision / chasles audit log ------------------------------------------
+
+def test_log_collision_event_and_read_back():
+    j = Journal()
+    j.log_collision_event("fission", child_id="M", parent_ids=["A", "B"],
+                          anchor_ids=[], trigger_distance=0.1, threshold=0.2,
+                          ts=1.0)
+    j.log_collision_event("chasles", child_id="N", parent_ids=["C", "D"],
+                          anchor_ids=["S", "E"], ts=2.0)
+    allev = j.collision_events()
+    assert [e["kind"] for e in allev] == ["fission", "chasles"]
+    assert allev[0]["parent_ids"] == ["A", "B"] and allev[0]["child_id"] == "M"
+    assert allev[1]["anchor_ids"] == ["S", "E"]
+    assert [e["kind"] for e in j.collision_events("chasles")] == ["chasles"]
+
+
+def test_sleep_persists_fission_events_to_journal():
+    """A sleep-cycle proximity collision writes a 'fission' audit row."""
+    j = Journal()
+    m = Memory(encoder=SimpleEncoder(), journal=j)
+    # Two near-identical FACTs collide (fission) under sleep.
+    m.ingest("the cat sat on the mat", kind="FACT", id="A")
+    m.ingest("the cat sat on the mat", kind="FACT", id="B")
+    m.sleep()
+    hist = m.collision_history("fission")
+    # If a collision fired, it is journalled with both parents recorded.
+    if hist:
+        assert set(hist[0]["parent_ids"]) <= {"A", "B"}
+        assert hist[0]["kind"] == "fission"

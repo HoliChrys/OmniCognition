@@ -67,6 +67,14 @@ def record_hop(prev: Point, curr: Point, memory: "Memory") -> None:
     if tag not in prev.tags:
         prev.tags.append(tag)
     memory._spike_total_hops += 1
+    # Mirror the hop into the append-only journal (the SQL-derivable Chasles
+    # signal : hop_target_counts is the n_spike analogue). Failure-safe.
+    journal = getattr(memory, "journal", None)
+    if journal is not None:
+        try:
+            journal.log_hop(prev.id, curr.id)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

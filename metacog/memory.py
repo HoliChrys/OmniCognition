@@ -3090,6 +3090,7 @@ class Memory:
             "new_children_ids": [p.id for p in report.new_children],
             "aborted_for_cascade_limit": report.aborted_for_cascade_limit,
         }
+        self._journal_collisions("fission", report.resolved)
         lat = self.lateral_collapse(t_now)
         out["lateral_collided_groups"] = lat["collided_groups"]
         out["lateral_aliases"] = lat["aliases"]
@@ -3155,6 +3156,7 @@ class Memory:
         (refractory period). Returns the list of CollisionEvent dicts."""
         from metacog.spike import auto_compress_chasles
         events = auto_compress_chasles(self, self.llm, self.encoder)
+        self._journal_collisions("chasles", events)
         return [
             {
                 "child_id": ev.child_id,
@@ -3164,6 +3166,31 @@ class Memory:
             }
             for ev in events
         ]
+
+    def _journal_collisions(self, kind: str, events: Sequence[Any]) -> None:
+        """Persist CollisionEvents to the append-only journal audit log (mnema
+        model). No-op when no journal is configured ; failure-safe."""
+        if self.journal is None or not events:
+            return
+        for ev in events:
+            try:
+                self.journal.log_collision_event(
+                    kind, child_id=ev.child_id,
+                    parent_ids=list(ev.parent_ids),
+                    anchor_ids=list(ev.anchor_ids),
+                    trigger_distance=getattr(ev, "trigger_distance", None),
+                    threshold=getattr(ev, "threshold", None),
+                    ts=getattr(ev, "timestamp", None),
+                )
+            except Exception:
+                pass
+
+    def collision_history(self, kind: Optional[str] = None) -> List[dict]:
+        """The collision/compression audit trail from the journal (fission /
+        chasles / lateral, or all). [] when no journal."""
+        if self.journal is None:
+            return []
+        return self.journal.collision_events(kind)
 
     def consolidate_duplicates(self, t: Optional[float] = None) -> Dict[str, Any]:
         """True-merge deduplication : same-kind points carrying the SAME
