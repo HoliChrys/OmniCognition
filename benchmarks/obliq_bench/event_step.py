@@ -65,7 +65,14 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     from metacog.memory import Memory
     from metacog.llm import ClaudeLLM
     from metacog.event_extractor import LLMEventExtractor
-    from benchmarks.locomo.encoders import SemanticEncoder
+    # Encoder : SemanticEncoder by default ; OBLIQ_SIMPLE_ENC=1 swaps in the
+    # dependency-free SimpleEncoder (no torch / no model download) to check the
+    # DB/collision PATHS in constrained envs — retrieval quality drops but the
+    # journal / co-retrieval / lateral / Chasles paths are exercised identically.
+    if os.environ.get("OBLIQ_SIMPLE_ENC"):
+        from metacog.defaults import SimpleEncoder as _Enc
+    else:
+        from benchmarks.locomo.encoders import SemanticEncoder as _Enc
 
     queries, qrels = _load_queries(track), _load_qrels(track)
     if query_id not in queries:
@@ -100,7 +107,7 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     if jspec:
         from metacog.journal import Journal
         journal = Journal(":memory:" if jspec in ("1", "mem") else jspec)
-    mem = Memory(encoder=SemanticEncoder(), llm=llm,
+    mem = Memory(encoder=_Enc(), llm=llm,
                  doc_card_extractor=card,
                  event_extractor=LLMEventExtractor(llm),
                  tone_reading=True, journal=journal)
