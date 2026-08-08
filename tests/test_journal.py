@@ -151,6 +151,62 @@ def test_log_collision_event_and_read_back():
     assert [e["kind"] for e in j.collision_events("chasles")] == ["chasles"]
 
 
+def test_effective_spike_is_refractory_via_event_log():
+    """effective_spike counts hops AFTER the node's last Chasles fire — the
+    append-only refractory (no counter reset needed)."""
+    j = Journal()
+    j.log_hop("A", "M", ts=1.0)
+    j.log_hop("A", "M", ts=2.0)
+    assert j.effective_spike("M") == 2                # both hops count
+    j.log_collision_event("chasles", child_id="M", parent_ids=["M"],
+                          anchor_ids=[], ts=3.0)      # M fired at t=3
+    assert j.effective_spike("M") == 0                # hops before the fire drop
+    j.log_hop("A", "M", ts=4.0)                       # a fresh hop after the fire
+    assert j.effective_spike("M") == 1               # only the post-fire hop
+
+
+def test_spike_count_reads_journal_when_present():
+    from metacog.epistemic import PointKind
+    from metacog.spike import spike_count
+    j = Journal()
+    m = Memory(encoder=SimpleEncoder(), journal=j)
+    a = m.ingest("alpha", kind="FACT", id="A")
+    b = m.ingest("beta", kind="FACT", id="B")
+    from metacog.spike import record_hop
+    record_hop(a, b, m)
+    record_hop(a, b, m)
+    assert spike_count(b, m) == 2                     # from the SQL journal
+    # No journal -> falls back to the in-memory counter.
+    m2 = Memory(encoder=SimpleEncoder())
+    c = m2.ingest("gamma", kind="FACT", id="C")
+    c.n_spike = 5
+    assert spike_count(c, m2) == 5
+
+
+def test_co_retrieved_pairs_window():
+    j = Journal()
+    j.log_retrieval("q", ["A", "B", "C"], ts=1.0)    # ranks A=0,B=1,C=2
+    full = dict(j.co_retrieved_pairs())              # any distance
+    assert full[("A", "B")] == 1 and full[("A", "C")] == 1
+    win1 = dict(j.co_retrieved_pairs(window=1))       # adjacent only
+    assert ("A", "C") not in win1                     # rank distance 2 > 1
+    assert win1[("A", "B")] == 1 and win1[("B", "C")] == 1
+
+
+def test_lateral_collapse_sources_from_journal():
+    """With a journal, lateral_collapse builds its ledger from SQL co-retrieval
+    (not the in-memory ledger)."""
+    j = Journal()
+    m = Memory(encoder=SimpleEncoder(), journal=j)
+    # No in-memory ledger recorded, but the journal has co-retrieval history.
+    for _ in range(6):
+        m.record_retrieval(["A", "B"], query_text="q")
+    ledger = m._ledger_from_journal()
+    from metacog.lateral import _pair_key
+    assert ledger.weight[_pair_key("A", "B")] == 6.0  # SQL-sourced weight
+    assert m._lateral_ledger is None                  # in-memory ledger untouched
+
+
 def test_sleep_persists_fission_events_to_journal():
     """A sleep-cycle proximity collision writes a 'fission' audit row."""
     j = Journal()

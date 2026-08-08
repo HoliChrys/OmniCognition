@@ -160,6 +160,44 @@ class Journal:
         ).fetchall()
         return [(r["dst_id"], int(r["c"])) for r in rows]
 
+    def effective_spike(self, node_id: str) -> int:
+        """Refractory-aware spike count : hops landing on `node_id` AFTER its
+        last Chasles fire (a compression event that included it as child /
+        intermediate / anchor). Append-only refractory — the 'reset' is derived
+        from the last-fire timestamp, nothing is mutated. This is the SQL n_spike
+        the Chasles trigger reads."""
+        nid = str(node_id)
+        quoted = f'"{nid}"'
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM hops WHERE dst_id = ? AND ts > COALESCE(("
+            "  SELECT MAX(ts) FROM collision_events WHERE kind = 'chasles' AND ("
+            "    child_id = ? OR instr(parent_ids, ?) > 0 "
+            "    OR instr(anchor_ids, ?) > 0)), 0)",
+            (nid, nid, quoted, quoted),
+        ).fetchone()
+        return int(row["c"])
+
+    def co_retrieved_pairs(self, window: Optional[int] = None
+                           ) -> List[Tuple[Tuple[str, str], int]]:
+        """All co-retrieved pairs (a < b) with their co-occurrence count — the
+        SQL self-join that feeds lateral collision. `window` (rank distance) None
+        = any two nodes in the same retrieval (mnema-style) ; an int restricts to
+        pairs within that many ranks (parity with the in-memory adjacency ledger).
+        Returns [((a, b), cooc)]."""
+        sql = (
+            "SELECT a.node_id AS x, b.node_id AS y, COUNT(*) AS cooc "
+            "FROM access_events a "
+            "JOIN access_events b ON a.retrieval_id = b.retrieval_id "
+            "AND a.node_id < b.node_id "
+        )
+        params: tuple = ()
+        if window is not None:
+            sql += "AND ABS(a.rank - b.rank) <= ? "
+            params = (window,)
+        sql += "GROUP BY a.node_id, b.node_id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [((r["x"], r["y"]), int(r["cooc"])) for r in rows]
+
     def modal_next(self, src_id: str) -> Optional[str]:
         """The most frequent successor of `src_id` in the hop log — the modal
         step a SQL-driven `chasles_path` follows. None if src never hopped."""

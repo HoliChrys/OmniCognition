@@ -3259,11 +3259,15 @@ class Memory:
         map) so dropped ids still resolve. No-op when disabled or below
         the gate."""
         t_now = self._now(t)
-        if self._lateral_ledger is None:
+        # Ledger SOURCE : the SQL journal when present (co-retrieval computed
+        # from access_events — the DB is the driver), else the in-memory ledger.
+        ledger = (self._ledger_from_journal() if self.journal is not None
+                  else self._lateral_ledger)
+        if ledger is None:
             return {"collided_groups": 0, "aliases": {}, "n_points": len(self.points)}
         from metacog.lateral import lateral_collapse as _collapse
         report = _collapse(
-            self.points, self._lateral_ledger, self.encoder, t_now,
+            self.points, ledger, self.encoder, t_now,
         )
         for absorbed, keeper in report.aliases.items():
             self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
@@ -3272,6 +3276,19 @@ class Memory:
             "aliases": dict(report.aliases),
             "n_points": len(self.points),
         }
+
+    def _ledger_from_journal(self, window: int = 2):
+        """Build a LateralLedger from the SQL journal's co-retrieval — so lateral
+        collision is driven by access_events, not the in-memory ledger. Pair
+        weights are raw co-occurrence counts (`window`-adjacent, parity with the
+        in-memory adjacency span). Reuses the existing detection unchanged."""
+        from metacog.lateral import LateralLedger, _pair_key
+        ledger = LateralLedger()
+        for (a, b), cooc in self.journal.co_retrieved_pairs(window=window):
+            ledger.weight[_pair_key(a, b)] = float(cooc)
+            ledger.total_weight += float(cooc)
+        ledger.n_events = self.journal.counts()[0]
+        return ledger
 
     def record_action_generation(
         self, action: Point, query_emb: Optional[Sequence[float]],

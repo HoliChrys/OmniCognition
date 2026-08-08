@@ -101,9 +101,22 @@ def spike_threshold(memory: "Memory") -> float:
     return lam + lam ** 0.5
 
 
+def spike_count(point: Point, memory: "Memory") -> int:
+    """The point's spike count. When a journal is configured it is the SQL
+    refractory-aware `effective_spike` (hops since the node's last Chasles fire)
+    — the DB is the source of truth ; else the in-memory `n_spike` counter."""
+    journal = getattr(memory, "journal", None)
+    if journal is not None:
+        try:
+            return journal.effective_spike(point.id)
+        except Exception:
+            pass
+    return point.n_spike
+
+
 def is_spiking(point: Point, memory: "Memory") -> bool:
     """True when the point's spike count is statistically significant."""
-    return point.n_spike > spike_threshold(memory)
+    return spike_count(point, memory) > spike_threshold(memory)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +171,7 @@ def chasles_path(start: Point, memory: "Memory",
         nodes = [by_id[r] for r in ref_ids if r in by_id]
         if not nodes:
             break
-        spikes = [n.n_spike for n in nodes]
+        spikes = [spike_count(n, memory) for n in nodes]
         if not concentrated(spikes):
             break
         next_node = nodes[spikes.index(max(spikes))]
