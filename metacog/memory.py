@@ -23,7 +23,7 @@ import time
 import uuid
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from metacog.audit import audit, assert_no_laundering, inputs_of_A
 from metacog.collision import merge_duplicates, sleep_cycle_collisions
@@ -229,6 +229,13 @@ class Memory:
     # how far the distiller has consumed the ledger.
     _resolution_ledger: List[dict] = field(default_factory=list)
     _distill_cursor: int = 0
+    # Append-only usage JOURNAL (metacog.journal.Journal, SQLite) — the mnema
+    # access-log model. When set, every retrieval is logged (retrievals +
+    # access_events) so co-retrieval is computed in SQL on demand (edgeless)
+    # and mark_useful / decay-fit have their supervised history. None = off (the
+    # in-memory lateral ledger remains the only co-retrieval source). Holds a
+    # live sqlite connection : shared-by-reference on snapshot, never pickled.
+    journal: Any = None
     # Episodic conversation index : the id of the last message ingested per
     # (user, session), so successive messages chain via sequence_prev and a
     # session reads back in order. Continuous indexation feeds this.
@@ -268,8 +275,8 @@ class Memory:
         # Seed the deepcopy memo with the shared resources keyed by id, so
         # deepcopy returns them as-is (shared) instead of cloning them.
         memo: Dict[int, Any] = {}
-        for name in ("encoder", "reranker", "llm", "executor", "extractor",
-                     "entity_extractor", "atomic_extractor"):
+        for name in ("encoder", "reranker", "journal", "llm", "executor",
+                     "extractor", "entity_extractor", "atomic_extractor"):
             obj = getattr(self, name, None)
             if obj is not None:
                 memo[id(obj)] = obj
@@ -3176,20 +3183,46 @@ class Memory:
         }
 
     def record_retrieval(
-        self, ranked_ids: Sequence[str], query_emb: Optional[Sequence[float]] = None,
-    ) -> None:
-        """Fold one retrieval's ranked result ids into the lateral
-        co-retrieval ledger. No-op unless `lateral_enabled`. Cheap
-        (O(k·window)) so it can sit on the retrieval hot path."""
-        if not self.lateral_enabled:
-            return
-        from metacog.lateral import LateralLedger, record_coretrieval
-        if self._lateral_ledger is None:
-            self._lateral_ledger = LateralLedger()
-        record_coretrieval(
-            self._lateral_ledger, list(ranked_ids),
-            tuple(query_emb) if query_emb is not None else None,
-        )
+        self, ranked_ids: Sequence[str],
+        query_emb: Optional[Sequence[float]] = None,
+        query_text: str = "",
+    ) -> Optional[int]:
+        """Fold one retrieval into (a) the append-only SQL JOURNAL when present —
+        the mnema access-log, source of SQL co-retrieval + mark_useful/decay —
+        and (b) the in-memory lateral ledger (gated on `lateral_enabled`). Both
+        are cheap (O(k·window)) so this sits on the retrieval hot path. Returns
+        the journal retrieval_id (the handle for a later `mark_useful`), or None
+        when no journal is configured."""
+        rid: Optional[int] = None
+        if self.journal is not None:
+            try:
+                rid = self.journal.log_retrieval(query_text, list(ranked_ids))
+            except Exception:
+                rid = None
+        if self.lateral_enabled:
+            from metacog.lateral import LateralLedger, record_coretrieval
+            if self._lateral_ledger is None:
+                self._lateral_ledger = LateralLedger()
+            record_coretrieval(
+                self._lateral_ledger, list(ranked_ids),
+                tuple(query_emb) if query_emb is not None else None,
+            )
+        return rid
+
+    def co_retrieved(self, seed_ids: Sequence[str], k: int = 7
+                     ) -> List[Tuple[str, int]]:
+        """Nodes historically surfaced TOGETHER with the seeds, computed in SQL
+        from the journal (edgeless spreading-activation ; never touches
+        embeddings). Returns [(node_id, cooc_count)] ; [] when no journal."""
+        if self.journal is None:
+            return []
+        return self.journal.find_co_retrieved(list(seed_ids), k=k)
+
+    def mark_useful(self, retrieval_id: int, score: int) -> None:
+        """Score a past retrieval 0/1/2 in the journal — the supervised label a
+        decay-fit consumes. No-op when no journal is configured."""
+        if self.journal is not None:
+            self.journal.mark_useful(retrieval_id, score)
 
     def lateral_collapse(self, t: Optional[float] = None) -> Dict[str, Any]:
         """LATERAL collision : nodes that the co-retrieval ledger shows to
