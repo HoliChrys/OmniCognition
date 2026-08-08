@@ -2928,6 +2928,9 @@ class Memory:
                 if not cand:
                     continue
                 surfaced += len(cand)
+                # Log this surfaced set to the journal (access_events) — feeds
+                # SQL co-retrieval / lateral collision. No-op without a journal.
+                self.record_retrieval([p.id for p in cand], query_text=query)
                 if judge:
                     bag_ids = set(self._bag_ref(bag))
                     collected = [p for p in self.points if p.id in bag_ids]

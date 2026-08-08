@@ -151,6 +151,22 @@ def test_log_collision_event_and_read_back():
     assert [e["kind"] for e in j.collision_events("chasles")] == ["chasles"]
 
 
+def test_assemble_set_populates_journal_organically():
+    """The wired path : assemble_set logs each surfaced set to the journal, so
+    co-retrieval accrues without any explicit record_retrieval call."""
+    j = Journal()
+    m = Memory(encoder=SimpleEncoder(), journal=j)
+    m.ingest("iran strike on the refinery", kind="FACT", id="A")
+    m.ingest("iran refinery oil market", kind="FACT", id="B")
+    m.ingest("a totally unrelated cake recipe", kind="FACT", id="C")
+    m.assemble_set("iran refinery", judge=False, auto_route=False, max_rounds=2)
+    n_ret, n_acc = j.counts()
+    assert n_ret > 0 and n_acc > 0                    # retrievals were logged
+    # A and B co-surface on the refinery query ; C should not ride with them.
+    cor = dict(m.co_retrieved(["A"]))
+    assert "B" in cor and "C" not in cor
+
+
 def test_effective_spike_is_refractory_via_event_log():
     """effective_spike counts hops AFTER the node's last Chasles fire — the
     append-only refractory (no counter reset needed)."""

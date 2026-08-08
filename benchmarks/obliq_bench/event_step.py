@@ -91,10 +91,19 @@ def build(track: str, query_id: str, bg: int, *, seed: int = 0):
     # phases 3/4 gracefully no-op (no stance_/dq_ artifacts). Default: card ON.
     from metacog.doc_card import DocCardExtractor
     card = None if os.environ.get("OBLIQ_NO_CARD") else DocCardExtractor(llm)
+    # OPT-IN append-only JOURNAL (SQLite) : OBLIQ_JOURNAL=<path> for a file, or
+    # "1"/"mem" for an in-memory journal. When set, every assemble_set round
+    # logs its surfaced set (access_events) so co-retrieval / lateral collision /
+    # Chasles are SQL-driven and measurable. Unset = current behaviour.
+    journal = None
+    jspec = os.environ.get("OBLIQ_JOURNAL")
+    if jspec:
+        from metacog.journal import Journal
+        journal = Journal(":memory:" if jspec in ("1", "mem") else jspec)
     mem = Memory(encoder=SemanticEncoder(), llm=llm,
                  doc_card_extractor=card,
                  event_extractor=LLMEventExtractor(llm),
-                 tone_reading=True)
+                 tone_reading=True, journal=journal)
     t0 = time.time()
     for cid in keep:
         mem.ingest(corpus[cid][:500], kind="FACT", id=cid)
@@ -213,6 +222,26 @@ def main() -> None:
         print("  [8] WALK after ACTION BRIDGE (id=%s)     recall=%.3f (%d/%d)"
               "  Δvs[7]=%+d  (marginal bridge effect)" % (
                   aid, _recall(walk_post, gold_set), pw, len(gold), pw - mw))
+
+    # ---- JOURNAL (SQLite) : measure the DB-driven substrate ----------------
+    if mem.journal is not None:
+        t0 = time.time()
+        res = mem.assemble_set(question, max_rounds=3)
+        n_ret, n_acc = mem.journal.counts()
+        print("  [9] JOURNAL after assemble_set (%.1fs): %d retrievals, "
+              "%d access_events, bag=%d" % (
+                  time.time() - t0, n_ret, n_acc, res["size"]))
+        seeds = sorted(gold_set)[:1] or [sorted({r for r in gold_set})[0]]
+        if seeds:
+            cor = mem.co_retrieved(seeds, k=6)
+            print("        SQL co-retrieved with %s : %s" % (seeds, cor))
+        slp = mem.sleep()
+        print("        after sleep(): fission=%d chasles=%d lateral=%d "
+              "(collision_events=%d)" % (
+                  slp.get("resolved_count", 0),
+                  len(mem.collision_history("chasles")),
+                  slp.get("lateral_collided_groups", 0),
+                  len(mem.collision_history())))
 
 
 if __name__ == "__main__":
