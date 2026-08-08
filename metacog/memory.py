@@ -236,6 +236,12 @@ class Memory:
     # in-memory lateral ledger remains the only co-retrieval source). Holds a
     # live sqlite connection : shared-by-reference on snapshot, never pickled.
     journal: Any = None
+    # Path to a PERSISTENT journal SQLite file, so the SQL triggers (co-retrieval
+    # / lateral / Chasles / tag index / decay history) survive restarts. Opened
+    # in __post_init__ when `journal` is not already set. The sentinel "auto"
+    # derives "<storage_path>.journal.db" (requires storage_path). None = no
+    # persistent journal (the in-memory `journal` field, if any, still applies).
+    journal_path: Optional[str] = None
     # Anderson-Schooler decay exponent — the ONE learned hyperparameter (fitted
     # by fit_decay() from the journal's mark_useful labels + access history).
     # Persisted with the cloud. 0.5 = the human-memory-literature default.
@@ -246,11 +252,31 @@ class Memory:
     _session_msg_chain: Dict[tuple, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._open_persistent_journal()
         if self.storage_path:
             try:
                 self.load()
             except FileNotFoundError:
                 pass  # first run
+
+    def _open_persistent_journal(self) -> None:
+        """Attach a persistent Journal from `journal_path` so the SQL triggers
+        outlive the process. No-op when a journal is already set or no path is
+        configured. "auto" -> "<storage_path>.journal.db". Failure-safe : a
+        journal that cannot be opened leaves the memory journal-less (fallbacks
+        apply) rather than breaking construction."""
+        if self.journal is not None or not self.journal_path:
+            return
+        path = self.journal_path
+        if path == "auto":
+            if not self.storage_path:
+                return                      # nothing to derive from
+            path = f"{self.storage_path}.journal.db"
+        try:
+            from metacog.journal import Journal
+            self.journal = Journal(path)
+        except Exception:
+            self.journal = None
 
     # ------------------------------------------------------------------
     # Isolation

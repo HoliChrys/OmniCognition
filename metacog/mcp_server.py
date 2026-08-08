@@ -82,7 +82,11 @@ def build_app(
         ),
     )
     if memory is None:
-        memory = Memory(storage_path=storage_path)
+        # Attach a PERSISTENT journal ("<storage_path>.journal.db") so the SQL
+        # triggers (co-retrieval / lateral / Chasles / tag index / decay
+        # history) survive restarts. "auto" is a no-op when storage_path is None
+        # (ephemeral in-memory server) -> falls back to no journal.
+        memory = Memory(storage_path=storage_path, journal_path="auto")
 
     walkers = WalkerRegistry()
 
