@@ -130,6 +130,13 @@ class Memory:
     """High-level service object that orchestrates the whole pipeline."""
 
     encoder: Any = field(default_factory=SimpleEncoder)
+    # Optional LOCAL cross-encoder reranker (mnema's token lever). When set, the
+    # oblique judge's pre-filter scores (proposition, doc) pairs JOINTLY for ZERO
+    # LLM tokens — precise enough to gate a third band (clear-low -> rejected
+    # without an LLM call), so only the ambiguous middle reaches the batch judge.
+    # None = the bi-encoder cosine pre-accept (blunter ; pre-accept only, never
+    # auto-reject). Any object with `rerank(query, docs) -> list[float]` fits.
+    reranker: Any = None
     llm: Any = field(default_factory=ClaudeLLM)
     executor: Any = field(default_factory=NoOpExecutor)
     extractor: Any = field(default_factory=SimpleKeywordExtractor)
@@ -261,7 +268,7 @@ class Memory:
         # Seed the deepcopy memo with the shared resources keyed by id, so
         # deepcopy returns them as-is (shared) instead of cloning them.
         memo: Dict[int, Any] = {}
-        for name in ("encoder", "llm", "executor", "extractor",
+        for name in ("encoder", "reranker", "llm", "executor", "extractor",
                      "entity_extractor", "atomic_extractor"):
             obj = getattr(self, name, None)
             if obj is not None:
@@ -2667,6 +2674,45 @@ class Memory:
         tail = out.lower().rsplit("verdict", 1)[-1]
         return "irrelevant" if "irrelevant" in tail else "relevant"
 
+    def _judge_text(self, p: Point) -> str:
+        """The text handed to the cross-encoder for a candidate : surface +
+        its INTENDED gloss + STANCE so ironic/oblique items expose their real
+        meaning to the reranker (else it would score the literal surface)."""
+        txt = (p.content or "")[:200]
+        g = self.gloss_of(p.id)
+        if g:
+            txt += f" [intended: {g[:120]}]"
+        s = self.stance_of(p.id)
+        if s:
+            txt += f" [stance: {s[:100]}]"
+        return txt
+
+    def _proposition_scores(self, prop: str,
+                            cands: Sequence[Point]) -> List[float]:
+        """Per-candidate relevance-to-proposition score, higher = more relevant.
+
+        Cross-encoder backend (`self.reranker`) when present : scores the
+        (prop, doc) pairs JOINTLY — the precise, zero-token judge. Else the
+        bi-encoder cosine (max over the doc and its stance/gloss cards) — the
+        blunt fallback."""
+        rr = getattr(self, "reranker", None)
+        if rr is not None:
+            docs = [self._judge_text(p) for p in cands]
+            return [float(s) for s in rr.rerank(prop, docs)]
+        from metacog.geometry import cosine, effective_embedding
+        pv = self.encoder.encode(prop)
+        t = self._now()
+        by_id = {p.id: p for p in self.points}
+        out: List[float] = []
+        for p in cands:
+            best = cosine(pv, effective_embedding(p, t))
+            for did in (f"stance_{p.id}", f"gloss_{p.id}"):
+                dp = by_id.get(did)
+                if dp is not None:
+                    best = max(best, cosine(pv, effective_embedding(dp, t)))
+            out.append(best)
+        return out
+
     def oblique_labels(self, query: str, cands: Sequence[Point],
                        collected: Optional[Sequence[Point]] = None,
                        proposition: Optional[str] = None,
@@ -2696,38 +2742,41 @@ class Memory:
             return [self._judge_one(prop, p) for p in cands]
         prop = proposition or self.distill_proposition(query)
 
-        # FUNNEL stage (a) — Phase 3 : embedding pre-accept against the
-        # PROPOSITION. Each candidate scores max-cos(prop, doc | its stance
-        # card | its gloss) ; the acceptance threshold is EMERGENT — mean + std
-        # of THIS candidate set's own similarities (a statistical property of
-        # the data, not a tuned constant). Pre-accepted items skip the batch
-        # and are NEVER overturned (recall-first : accepting more never costs
-        # recall). Degenerate sets (<4) skip the stage.
+        # FUNNEL stage (a) — proposition-relevance PRE-FILTER. The candidate
+        # scores come from `_proposition_scores` : a local CROSS-ENCODER when one
+        # is wired in (joint (prop, doc) scoring — precise, zero LLM tokens ; the
+        # mnema lever) else the bi-encoder cosine (blunt fallback). The bands are
+        # EMERGENT — mean ± std of THIS set's own scores (a statistical property
+        # of the data, not a tuned constant) :
+        #   * HIGH  (s >= mu+sd) : pre-accepted, skip the batch, NEVER overturned
+        #                          (recall-first — accepting more never costs recall).
+        #   * LOW   (s <= mu-sd) : auto-rejected WITHOUT an LLM call — but ONLY
+        #                          under the cross-encoder (precise enough to reject
+        #                          on) ; the bi-encoder is too blunt, so it only
+        #                          ever pre-accepts. THIS is where the batch shrinks.
+        #   * MIDDLE             : the ambiguous / oblique tail -> batch judge.
+        # Degenerate sets (<4) skip the stage entirely.
         pre_accept: set = set()
-        sims = None                              # per-candidate prop-similarity
+        auto_reject: set = set()
+        sims = None                              # per-candidate prop-score
         mu = 0.0                                 # band centre (mean of sims)
-        if len(cands) >= 4 and getattr(self, "encoder", None):
+        if len(cands) >= 4:
             try:
-                from metacog.geometry import cosine, effective_embedding
-                pv = self.encoder.encode(prop)
-                t = self._now()
-                by_id = {p.id: p for p in self.points}
-                sims = []
-                for p in cands:
-                    best = cosine(pv, effective_embedding(p, t))
-                    for did in (f"stance_{p.id}", f"gloss_{p.id}"):
-                        dp = by_id.get(did)
-                        if dp is not None:
-                            best = max(best, cosine(
-                                pv, effective_embedding(dp, t)))
-                    sims.append(best)
+                sims = self._proposition_scores(prop, cands)
+            except Exception:
+                sims = None
+            if sims is not None:
                 mu = sum(sims) / len(sims)
                 sd = (sum((s - mu) ** 2 for s in sims) / len(sims)) ** 0.5
                 pre_accept = {i for i, s in enumerate(sims) if s >= mu + sd}
-            except Exception:
-                pre_accept, sims = set(), None
-        rest = [i for i in range(len(cands)) if i not in pre_accept]
+                if getattr(self, "reranker", None) is not None:
+                    auto_reject = {i for i, s in enumerate(sims)
+                                   if s <= mu - sd and i not in pre_accept}
+        rest = [i for i in range(len(cands))
+                if i not in pre_accept and i not in auto_reject]
         labels = ["relevant"] * len(cands)
+        for i in auto_reject:
+            labels[i] = "irrelevant"             # cross-encoder clear-low : no LLM
         if not rest:
             return labels
 

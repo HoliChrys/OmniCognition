@@ -51,6 +51,32 @@ class SimpleEncoder:
         return tuple(x / norm for x in acc)
 
 
+class CrossEncoderReranker:
+    """Optional LOCAL cross-encoder for the oblique judge's pre-filter.
+
+    Unlike the bi-encoder (SimpleEncoder / any embedder), which encodes the
+    query and each doc SEPARATELY into fixed vectors and compares by cosine, a
+    cross-encoder feeds the (query, doc) pair JOINTLY through the model, so its
+    attention makes every query token interact with every doc token. It answers
+    "does THIS doc take THIS stance?", not just "same topic?" — and it does so
+    for ZERO LLM tokens (small ONNX model on CPU). That is mnema's token lever :
+    the relevance judgment leaves the LLM entirely for the confident cases.
+
+    Backed by fastembed ; imported LAZILY so nothing pays the cost unless a
+    reranker is actually wired into Memory(reranker=...). `rerank` returns one
+    score per doc (higher = more relevant), aligned to `docs`."""
+
+    def __init__(self, model_name: str =
+                 "jinaai/jina-reranker-v2-base-multilingual") -> None:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+        self._model = TextCrossEncoder(model_name=model_name)
+
+    def rerank(self, query: str, docs: List[str]) -> List[float]:
+        if not docs:
+            return []
+        return [float(s) for s in self._model.rerank(query, docs)]
+
+
 class NoOpExecutor:
     """Default ACTION executor : returns SUCCESS with an echo. Override
     for real-world side effects (web search, shell, API calls, etc.)."""
