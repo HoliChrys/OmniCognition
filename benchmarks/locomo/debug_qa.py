@@ -51,6 +51,17 @@ REPL commands
   restore [name]            rewind to a checkpoint and try another path
   msgs                      list the live conversation messages
   reset                     clear the accumulated retrieved-id set
+
+  --- SQL journal workflow (the DB-driven triggers) ---
+  journal                   snapshot the append-only journal (row counts,
+                            hops, frequent paths, collision kinds)
+  paths [min_freq]          Chasles candidates BY QUERY : frequently-travelled
+                            paths ready to collapse into a shortcut
+  chasles                   fire compress_chasles (SQL-driven with a journal)
+                            and show the resulting shortcut events
+  tags [tag]                hierarchical tag index : ancestor query on <tag>,
+                            or the depth-ordered glossary when omitted
+
   help                      this list
   quit / q!                 exit
 
@@ -504,6 +515,62 @@ class QADebugger:
                                 else getattr(b, "type", "?") for b in c)
             print(f"    [{i}] {m['role']:9s} {tag}")
 
+    # --- SQL journal workflow inspectors (no-op without a journal) ---
+    def _need_journal(self) -> bool:
+        if getattr(self.memory, "journal", None) is None:
+            print("  (no journal on this memory — SQL triggers are off)")
+            return False
+        return True
+
+    def cmd_journal(self, *_):
+        """Snapshot the append-only journal : row counts per table."""
+        if not self._need_journal():
+            return
+        j = self.memory.journal
+        n_ret, n_acc = j.counts() if hasattr(j, "counts") else (None, None)
+        print(f"\n  journal @ {j.path}")
+        print(f"    retrievals={n_ret}  access_events={n_acc}")
+        print(f"    hops -> {j.hop_target_counts()[:5]}")
+        print(f"    frequent_paths(>=2) -> "
+              f"{[(r['signature'], r['freq']) for r in j.frequent_paths(min_len=4, min_freq=2)][:5]}")
+        print(f"    collisions -> {[e['kind'] for e in j.collision_events()][-5:]}")
+
+    def cmd_paths(self, arg: str):
+        """Frequently-travelled paths (the Chasles candidates by query).
+        Optional arg: min_freq (default 2)."""
+        if not self._need_journal():
+            return
+        mf = int(arg) if arg.strip().isdigit() else 2
+        cands = self.memory.chasles_path_candidates(min_freq=mf)
+        print(f"\n  chasles_path_candidates(min_freq={mf}) -> {len(cands)}")
+        for c in cands[:10]:
+            print(f"    {c['signature']}  freq={c['freq']}  "
+                  f"absorb={c['intermediates']}")
+
+    def cmd_chasles(self, *_):
+        """Fire the Chasles compression (SQL-driven when a journal is present)
+        and show the resulting shortcut events."""
+        events = self.memory.compress_chasles()
+        print(f"\n  compress_chasles -> {len(events)} shortcut(s)")
+        for e in events:
+            print(f"    child={e['child_id']}  absorbed={e['parent_ids']}  "
+                  f"anchors={e['anchor_ids']}")
+
+    def cmd_tags(self, arg: str):
+        """Hierarchical tag index. Arg: a tag to run the ancestor query on;
+        empty = print the depth-ordered glossary."""
+        if not self._need_journal():
+            return
+        self.memory.reindex_tags()
+        if arg.strip():
+            hits = [p.id for p in self.memory.tag_scoped(arg.strip())]
+            print(f"\n  tag_scoped({arg.strip()!r}) -> {hits[:20]}")
+        else:
+            gloss = self.memory.tag_glossary_sql()
+            print(f"\n  glossary ({len(gloss)} tags, depth-ordered):")
+            for t in gloss[:30]:
+                print(f"    {t}")
+
     def cmd_help(self, *_):
         print(__doc__[__doc__.index("REPL commands"):])
 
@@ -523,6 +590,9 @@ class QADebugger:
             "checkpoint": self.cmd_checkpoint, "cp": self.cmd_checkpoint,
             "restore": self.cmd_restore, "say": self.cmd_say,
             "msgs": self.cmd_msgs,
+            # SQL journal workflow inspectors (new actions)
+            "journal": self.cmd_journal, "paths": self.cmd_paths,
+            "chasles": self.cmd_chasles, "tags": self.cmd_tags,
         }
         asyncc = {
             "tools": self.cmd_tools, "presearch": self.cmd_presearch,
