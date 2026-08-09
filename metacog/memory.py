@@ -3325,6 +3325,27 @@ class Memory:
         if self.journal is not None:
             self.journal.mark_useful(retrieval_id, score)
 
+    def score_retrievals(self, retrieval_ids: Sequence[int],
+                         used_ids: Sequence[str]) -> List[Tuple[int, int]]:
+        """Auto-label past retrievals from what was ACTUALLY used downstream —
+        the supervised signal fit_decay needs (closing the L3 loop without a
+        human). For each retrieval, score = 2 if >= 2 of its returned ids were
+        used, 1 if exactly one, 0 if none (a genuine useless negative). Returns
+        [(retrieval_id, score)]. No-op ([]) without a journal."""
+        if self.journal is None:
+            return []
+        used = {str(i) for i in used_ids}
+        out: List[Tuple[int, int]] = []
+        for rid in retrieval_ids:
+            if rid is None:
+                continue
+            returned = self.journal.retrieval_returned_ids(rid)
+            overlap = len(used.intersection(returned))
+            score = 2 if overlap >= 2 else (1 if overlap == 1 else 0)
+            self.journal.mark_useful(rid, score)
+            out.append((int(rid), score))
+        return out
+
     def need_odds(self, node_id: str, now: Optional[float] = None) -> float:
         """Anderson-Schooler need-odds for a node — the power-law of its access
         ages (journal history) under the fitted `decay_exponent`. 0.0 without a

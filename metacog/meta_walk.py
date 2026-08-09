@@ -1717,6 +1717,7 @@ class MetaWalker:
         self._stage_idx = 0
         self._done = False
         self._path_logged = False
+        self._retrieval_ids: List[int] = []          # journal rids to score at end
         self._generated_ids: List[str] = []
         # MAP-REDUCE accumulator : the successively-collected set of
         # ON-TARGET facts (relevant/partial/contradicts per Chain-of-Note)
@@ -1976,7 +1977,24 @@ class MetaWalker:
         if out.done and not self._path_logged:
             self._path_logged = True
             self._log_traversed_path()
+            self._score_retrievals_by_usage()
         return out
+
+    def _score_retrievals_by_usage(self) -> None:
+        """Close the feedback loop : label this walk's retrievals by what it
+        actually USED (the fact-star chain) so fit_decay has supervision. A
+        retrieval whose facts ended up chosen is useful ; one whose facts were
+        all dropped is a genuine negative. Commit-only, failure-safe."""
+        if not self.commit or not self._retrieval_ids:
+            return
+        scorer = getattr(self.memory, "score_retrievals", None)
+        if scorer is None:
+            return
+        try:
+            used = [p.id for p in self._fact_star_chain if p is not None]
+            scorer(self._retrieval_ids, used)
+        except Exception:
+            pass
 
     def _log_traversed_path(self) -> None:
         """Log the fact/action star chains as traversed paths. `with_hops=False`
@@ -2152,7 +2170,9 @@ class MetaWalker:
         # collision enabled. Recorded only for committed (live) walks so
         # isolated benchmark walks stay side-effect-free.
         if self.commit and hasattr(self.memory, "record_retrieval"):
-            self.memory.record_retrieval([f.id for f in facts], seed_emb)
+            rid = self.memory.record_retrieval([f.id for f in facts], seed_emb)
+            if rid is not None:
+                self._retrieval_ids.append(rid)
 
         # Calibrate the walk-local σ threshold once from stage-0 facts.
         # median + std of pairwise cosine distances between the initial

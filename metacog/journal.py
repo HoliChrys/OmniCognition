@@ -372,6 +372,15 @@ class Journal:
         rows = self.conn.execute(sql, (*seeds, *seeds, k)).fetchall()
         return [(r["node_id"], int(r["cooc"])) for r in rows]
 
+    def retrieval_returned_ids(self, retrieval_id: int) -> List[str]:
+        """The node ids a past retrieval returned (rank order) — used to score it
+        useful once we learn which of them were actually used."""
+        rows = self.conn.execute(
+            "SELECT node_id FROM access_events WHERE retrieval_id = ? "
+            "ORDER BY rank ASC", (int(retrieval_id),),
+        ).fetchall()
+        return [r["node_id"] for r in rows]
+
     def access_timestamps(self, node_id: str) -> List[float]:
         """Every access ts for a node, ascending — the raw history a need-odds
         power-law decay would sum over."""

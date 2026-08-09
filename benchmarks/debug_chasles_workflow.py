@@ -105,6 +105,22 @@ def step_coretr(p: _Probe):
     p.check("co-retrieval finds P1", "P1" in ids, str(co))
 
 
+def step_feedback(p: _Probe):
+    """Concept A : auto-label retrievals by what was USED downstream, then
+    fit_decay -> the L3 loop closes without a human."""
+    # R1 : returned P0,P1,P2 ; two of them used -> useful=2 (positives)
+    r1 = p.mem.record_retrieval(["P0", "P1", "P2"], query_text="fb-useful")
+    # R2 : returned D0,D1 ; none used -> useless=0 (negatives, disjoint from R1)
+    r2 = p.mem.record_retrieval(["D0", "D1"], query_text="fb-useless")
+    scored = p.mem.score_retrievals([r1, r2], used_ids=["P0", "P1"])
+    p.check("labels produced (2 and 0)",
+            sorted(s for _, s in scored) == [0, 2], str(scored))
+    res = p.mem.fit_decay()
+    p.check("fit_decay now has both classes",
+            res["n_pos"] > 0 and res["n_neg"] > 0,
+            f"n_pos={res['n_pos']} n_neg={res['n_neg']} exponent={res['exponent']:.3f}")
+
+
 def step_lateral(p: _Probe):
     """lateral_collapse runs off the SQL ledger when a journal is present
     (informational on a tiny cloud — it is gated on a large tag-rich cloud)."""
@@ -162,6 +178,7 @@ STEPS = [
     ("walk", step_walk),
     ("spike", step_spike),
     ("coretr", step_coretr),
+    ("feedback", step_feedback),
     ("lateral", step_lateral),
     ("tags", step_tags),
     ("chasles", step_chasles),
