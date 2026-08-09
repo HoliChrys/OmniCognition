@@ -13,14 +13,51 @@ import tempfile
 
 from metacog.defaults import SimpleEncoder
 from metacog.epistemic import EpistemicState
+from metacog.journal import Journal
 from metacog.memory import Memory
 
 
-def _mem():
-    m = Memory(encoder=SimpleEncoder())
+def _mem(journal=False):
+    m = Memory(encoder=SimpleEncoder(), journal=Journal() if journal else None)
     for kw in ("apple", "banana", "cherry", "date"):
         m.ingest(f"a fact about {kw}", kind="FACT", id=kw)
     return m
+
+
+def test_forget_logs_a_db_event_for_the_latent_merge():
+    m = _mem(journal=True)
+    m.forget_node("apple", reason="superseded by banana", superseded_by="banana")
+    pending = m.journal.pending_forgets()
+    assert len(pending) == 1
+    assert pending[0]["node_id"] == "apple"
+    assert pending[0]["superseded_by"] == "banana"
+
+
+def test_latent_merge_aliases_superseded_and_marks_done():
+    m = _mem(journal=True)
+    m.forget_node("apple", reason="superseded by banana", superseded_by="banana")
+    out = m.merge_forgotten()
+    assert out["merged"] == 1 and out["aliased"] == ["apple"]
+    assert m.resolve_alias("apple") == "banana"          # references redirect
+    assert m.journal.pending_forgets() == []              # marked merged
+    # idempotent : nothing left to merge
+    assert m.merge_forgotten()["merged"] == 0
+
+
+def test_forget_without_successor_invalidates_but_no_alias():
+    m = _mem(journal=True)
+    m.forget_node("apple", reason="user corrected")       # no superseded_by
+    out = m.merge_forgotten()
+    assert out["merged"] == 1 and out["aliased"] == []    # invalidated, not aliased
+    assert m.resolve_alias("apple") == "apple"
+
+
+def test_sleep_runs_the_latent_merge():
+    m = _mem(journal=True)
+    m.forget_node("apple", reason="superseded by banana", superseded_by="banana")
+    out = m.sleep()
+    assert out.get("forget_merged") == 1
+    assert m.resolve_alias("apple") == "banana"
 
 
 def test_forget_soft_invalidates_append_only():

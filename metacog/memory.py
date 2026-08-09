@@ -1019,12 +1019,16 @@ class Memory:
                     invalidated.append(p.id)
         return invalidated
 
-    def forget_node(self, node_id: str, reason: str) -> Dict[str, Any]:
+    def forget_node(self, node_id: str, reason: str,
+                    superseded_by: Optional[str] = None) -> Dict[str, Any]:
         """Explicit, on-demand soft-invalidation of ONE node (mnema's `forget`).
         Append-only : the node is never deleted, its state is set INVALID so it
         drops out of retrieval / the walk, tagged 'invalidated', and the `reason`
-        (required, e.g. 'superseded by X' / 'user corrected') is kept in an
-        append-only forget log. Returns {forgotten, reason} or {forgotten: None}."""
+        (required, e.g. 'superseded by X' / 'user corrected') is kept both in an
+        append-only in-memory log AND as a DB event (`forget_events`) so the
+        LATENT merge in sleep can consume it. `superseded_by` (optional) names the
+        successor node the forgotten one should merge into. Returns
+        {forgotten, reason} or {forgotten: None}."""
         from metacog.epistemic import EpistemicState
         if not reason or not str(reason).strip():
             return {"forgotten": None, "error": "reason required"}
@@ -1038,7 +1042,35 @@ class Memory:
             self._forget_log = []
         self._forget_log.append(
             {"id": node_id, "reason": str(reason), "t": self._now()})
-        return {"forgotten": node_id, "reason": str(reason)}
+        # DB event : lets the offline merge in sleep pick it up (no-op w/o journal)
+        if self.journal is not None:
+            try:
+                self.journal.log_forget(node_id, str(reason), superseded_by,
+                                        self._now())
+            except Exception:
+                pass
+        return {"forgotten": node_id, "reason": str(reason),
+                "superseded_by": superseded_by}
+
+    def merge_forgotten(self) -> Dict[str, Any]:
+        """LATENT merge : consume pending forget events from the DB and, for each
+        one that names a `superseded_by` successor, redirect the forgotten node's
+        alias to it (references now resolve to the successor — the same alias
+        mechanism lateral collision uses). Every pending event is then marked
+        merged (idempotent). No-op without a journal. Runs offline in sleep, so it
+        never touches the query path."""
+        if self.journal is None:
+            return {"merged": 0, "aliased": []}
+        aliased: List[str] = []
+        pending = self.journal.pending_forgets()
+        for ev in pending:
+            succ = ev.get("superseded_by")
+            if succ:
+                keeper = self._merge_aliases.get(succ, succ)
+                self._merge_aliases[ev["node_id"]] = keeper
+                aliased.append(ev["node_id"])
+            self.journal.mark_forget_merged(ev["id"])
+        return {"merged": len(pending), "aliased": aliased}
 
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
@@ -3224,6 +3256,12 @@ class Memory:
         # path). Opt-in (forget_enabled) ; conservative + emergent. No-op off.
         if self.forget_enabled:
             out["forgotten"] = self.forget(t_now, apply=True)["forgotten"]
+        # LATENT merge : consume pending explicit-forget events (superseded->alias)
+        # from the DB. Offline, so it never touches the query path. No-op off DB.
+        merged = self.merge_forgotten()
+        if merged["merged"]:
+            out["forget_merged"] = merged["merged"]
+            out["forget_aliased"] = merged["aliased"]
         # LATENT skill distiller : replay resolutions recorded since the
         # last sleep and crystallize theoretical tools linked to their
         # explicating facts. Opt-in (skills_enabled), idempotent.

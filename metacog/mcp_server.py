@@ -298,12 +298,15 @@ def build_app(
         return memory.update_tool(tool_id, content=content, how=how)
 
     @app.tool()
-    def forget(node_id: str, reason: str) -> dict:
+    def forget(node_id: str, reason: str,
+               superseded_by: Optional[str] = None) -> dict:
         """Soft-invalidate ONE memory node (append-only : never deleted, just
         marked invalid so it stops surfacing). `reason` is required, e.g.
-        'superseded by node X' or 'user corrected'. The explicit on-demand
-        correction — distinct from the autonomic decay-forgetting in sleep."""
-        return memory.forget_node(node_id, reason)
+        'superseded by node X' or 'user corrected'. `superseded_by` (optional)
+        names the successor node to merge into during the next latent sleep. The
+        explicit on-demand correction — distinct from the autonomic
+        decay-forgetting in sleep."""
+        return memory.forget_node(node_id, reason, superseded_by=superseded_by)
 
     @app.tool()
     def mark_useful(retrieval_id: int, score: int) -> dict:

@@ -90,6 +90,17 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS idx_tags_tag   ON tags(tag);
 CREATE INDEX IF NOT EXISTS idx_tags_depth ON tags(depth);
+
+CREATE TABLE IF NOT EXISTS forget_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id       TEXT NOT NULL,                     -- the soft-invalidated node
+    reason        TEXT NOT NULL,                     -- 'superseded by X' / 'user corrected'
+    superseded_by TEXT,                              -- successor to merge into (nullable)
+    ts            REAL NOT NULL,
+    merged        INTEGER NOT NULL DEFAULT 0         -- 0 = pending latent merge, 1 = done
+);
+CREATE INDEX IF NOT EXISTS idx_forget_node   ON forget_events(node_id);
+CREATE INDEX IF NOT EXISTS idx_forget_merged ON forget_events(merged);
 """
 
 
@@ -201,6 +212,38 @@ class Journal:
                 rows,
             )
             self.conn.commit()
+
+    def log_forget(self, node_id: str, reason: str,
+                   superseded_by: Optional[str] = None,
+                   ts: Optional[float] = None) -> int:
+        """Record a soft-invalidation as a DB event so the LATENT merge can
+        consume it later (merged=0 until processed). Returns the event id."""
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO forget_events(node_id, reason, superseded_by, ts, merged)"
+            " VALUES (?, ?, ?, ?, 0)",
+            (str(node_id), str(reason),
+             None if superseded_by is None else str(superseded_by), ts),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def pending_forgets(self) -> List[dict]:
+        """Forget events not yet processed by the latent merge (merged=0),
+        oldest first. The offline merge reads these, acts, then marks them."""
+        rows = self.conn.execute(
+            "SELECT id, node_id, reason, superseded_by, ts FROM forget_events "
+            "WHERE merged = 0 ORDER BY id ASC"
+        ).fetchall()
+        return [{"id": r["id"], "node_id": r["node_id"], "reason": r["reason"],
+                 "superseded_by": r["superseded_by"], "ts": r["ts"]}
+                for r in rows]
+
+    def mark_forget_merged(self, event_id: int) -> None:
+        """Mark a forget event as processed by the latent merge (idempotent)."""
+        self.conn.execute(
+            "UPDATE forget_events SET merged = 1 WHERE id = ?", (int(event_id),))
+        self.conn.commit()
 
     # -- read ----------------------------------------------------------------
 

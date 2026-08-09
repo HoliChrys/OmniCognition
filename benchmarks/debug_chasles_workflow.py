@@ -250,11 +250,12 @@ def step_forget_explicit(p: _Probe):
     """mnema's `forget(node_id, reason)` — explicit on-demand soft-invalidation,
     distinct from the autonomic decay-forget pass. Append-only, hides the node."""
     from metacog.epistemic import EpistemicState
-    m = Memory(encoder=SimpleEncoder())
+    m = Memory(encoder=SimpleEncoder(), journal=Journal())
     for kw in ("apple", "banana", "cherry", "date"):
         m.ingest(f"a fact about {kw}", kind="FACT", id=kw)
     p.check("reason required", m.forget_node("apple", reason="")["forgotten"] is None)
-    out = m.forget_node("apple", reason="superseded by banana")
+    out = m.forget_node("apple", reason="superseded by banana",
+                        superseded_by="banana")
     p.check("soft-invalidated (append-only)",
             out["forgotten"] == "apple"
             and any(q.id == "apple" for q in m.points))
@@ -263,6 +264,12 @@ def step_forget_explicit(p: _Probe):
             is EpistemicState.INVALID)
     p.check("drops out of retrieve",
             "apple" not in [h["id"] for h in m.retrieve("a fact about apple", k=4)])
+    # the forget is a DB event -> the latent merge can consume it
+    p.check("logged as a pending DB event", len(m.journal.pending_forgets()) == 1)
+    merged = m.merge_forgotten()
+    p.check("latent merge redirects the alias",
+            merged["aliased"] == ["apple"] and m.resolve_alias("apple") == "banana")
+    p.check("event marked merged", m.journal.pending_forgets() == [])
 
 
 def step_abstain(p: _Probe):
