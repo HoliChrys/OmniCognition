@@ -88,9 +88,56 @@ def test_ingest_from_wiki_feeds_rag_with_doc_context():
     assert f"[[{nid}]]" in m.wiki_doc("doc:h")
 
 
+# -- OKF EAV index : functional queries, schema recovery, no migrations -------
+
+def test_eav_index_makes_frontmatter_queryable():
+    m = _mem()
+    m.feed_wiki("doc:h", "Health", ["A", "B"], type="topic")
+    # query by ANY frontmatter field — the "functional" part OKF lacks natively
+    assert m.wiki_where("type", "topic") == ["doc:h"]
+    assert m.wiki_where("tags", "health:fatigue") == ["doc:h"]
+    assert m.wiki_where("refs", "A") == ["doc:h"]
+    assert m.wiki_where("title", "Health") == ["doc:h"]
+    assert m.wiki_where("refs", "ZZZ") == []            # absent value
+
+
+def test_schema_is_recovered_from_data_no_registry():
+    m = _mem()
+    m.feed_wiki("doc:h", "Health", ["A", "B"], type="topic")
+    m.feed_wiki("doc:x", "Other", ["A"], type="metric")
+    schema = m.okf_schema()
+    assert set(schema["topic"]) >= {"type", "title", "tags", "refs", "timestamp"}
+    assert "metric" in schema                            # per-type keys, derived
+
+
+def test_eav_reindexes_on_merge():
+    m = _mem()
+    m.feed_wiki("doc:h", "Health", ["A", "B"], type="topic")
+    assert set(m.wiki_where("refs")) == {"doc:h"}        # has refs
+    m.forget_node("A", reason="superseded by B", superseded_by="B")
+    m.merge_forgotten()
+    m.reconcile_wiki()
+    assert m.wiki_where("refs", "A") == []               # old ref gone from index
+    assert m.wiki_where("refs", "B") == ["doc:h"]        # points to successor
+
+
+def test_import_external_okf_doc():
+    m = Memory(encoder=SimpleEncoder(), journal=Journal())
+    m.ingest("some fact", kind="FACT", id="N1")
+    md = ("---\ntype: runbook\ntitle: Deploy\ntags:\n- ops:deploy\n"
+          "refs:\n- N1\n---\n\n- step one [[N1]]\n")
+    out = m.import_okf("doc:deploy", md)
+    assert out["type"] == "runbook" and "N1" in out["refs"]
+    assert m.wiki_where("type", "runbook") == ["doc:deploy"]
+    assert m.wiki_where("tags", "ops:deploy") == ["doc:deploy"]
+    assert "runbook" in m.okf_schema()
+
+
 def test_wiki_noop_without_journal():
     m = Memory(encoder=SimpleEncoder())
     assert m.feed_wiki("d", "t", ["A"])["doc_id"] is None
     assert m.wiki_doc("d") is None
     assert m.reconcile_wiki() == {"remapped": 0, "stale": 0}
     assert m.ingest_from_wiki("d", "x")["node_id"] is None
+    assert m.wiki_where("type", "topic") == [] and m.okf_schema() == {}
+    assert m.import_okf("d", "---\ntype: x\n---\n")["doc_id"] is None

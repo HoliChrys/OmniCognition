@@ -1107,6 +1107,7 @@ class Memory:
         self.journal.upsert_wiki_doc(doc_id, type, title, tags, body, ts)
         refs = list(dict.fromkeys(ids + _w.body_refs(body)))   # links = union
         self.journal.set_wiki_refs(doc_id, refs)
+        self._reindex_okf(doc_id)
         return {"doc_id": doc_id, "refs": refs, "tags": tags}
 
     def wiki_doc(self, doc_id: str) -> Optional[str]:
@@ -1151,6 +1152,7 @@ class Memory:
                     mapping[nid] = resolved
                     remapped += 1
                     nid = resolved
+                    self._reindex_okf(doc_id)          # refs changed -> reindex
                 p = id2p.get(nid)
                 gone = (p is None or p.state in (EpistemicState.INVALID,
                                                  EpistemicState.DEPRECATED))
@@ -1188,7 +1190,58 @@ class Memory:
         new_body = doc["body"].rstrip() + f"\n- {text.strip()} [[{p.id}]]"
         self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"],
                                      doc["tags"], new_body, self._now())
+        self._reindex_okf(doc_id)
         return {"node_id": p.id}
+
+    def _reindex_okf(self, doc_id: str) -> None:
+        """Rebuild a doc's EAV frontmatter index (type/title/tags/refs/timestamp)
+        from its live row + link table. Called whenever the doc/refs change."""
+        if self.journal is None:
+            return
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        self.journal.index_okf_fields(doc_id, doc["type"], {
+            "type": doc["type"], "title": doc["title"], "tags": doc["tags"],
+            "refs": refs, "timestamp": doc["ts"],
+        })
+
+    def wiki_where(self, key: str,
+                   value: Optional[str] = None) -> List[str]:
+        """Query the OKF EAV index : doc ids having frontmatter field `key`
+        (= `value` if given). e.g. wiki_where('tags', 'health:fatigue') or
+        wiki_where('refs', node_id). [] without a journal."""
+        if self.journal is None:
+            return []
+        return self.journal.okf_docs_where(key, value)
+
+    def okf_schema(self) -> Dict[str, List[str]]:
+        """The recovered OKF schema — {type: [frontmatter keys]} derived from the
+        indexed data (no registry, no migrations). {} without a journal."""
+        return self.journal.okf_schema() if self.journal is not None else {}
+
+    def okf_fields(self, doc_id: str) -> Dict[str, List[str]]:
+        """All indexed frontmatter fields of a doc, {key: [values]}."""
+        return self.journal.okf_fields_of(doc_id) if self.journal is not None else {}
+
+    def import_okf(self, doc_id: str, markdown: str) -> Dict[str, Any]:
+        """Consume an EXTERNAL OKF doc : parse its frontmatter + body, store it,
+        link its refs (frontmatter + body `[[…]]`), and index its fields — so a
+        hand-written / third-party OKF bundle becomes queryable and evolves with
+        the RAG. No-op without a journal."""
+        if self.journal is None:
+            return {"doc_id": None}
+        from metacog import wiki as _w
+        d = _w.parse_okf(markdown)
+        ts = d.get("timestamp")
+        ts = self._now() if ts is None else float(ts)
+        self.journal.upsert_wiki_doc(doc_id, d["type"], d["title"], d["tags"],
+                                     d["body"], ts)
+        refs = list(dict.fromkeys(list(d["refs"]) + _w.body_refs(d["body"])))
+        self.journal.set_wiki_refs(doc_id, refs)
+        self._reindex_okf(doc_id)
+        return {"doc_id": doc_id, "type": d["type"], "refs": refs}
 
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",

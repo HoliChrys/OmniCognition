@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS wiki_refs (
 );
 CREATE INDEX IF NOT EXISTS idx_wikiref_node ON wiki_refs(node_id);
 CREATE INDEX IF NOT EXISTS idx_wikiref_doc  ON wiki_refs(doc_id);
+
+CREATE TABLE IF NOT EXISTS okf_fields (
+    doc_id TEXT NOT NULL,
+    type   TEXT NOT NULL,                          -- the OKF concept type
+    key    TEXT NOT NULL,                          -- a frontmatter field name
+    value  TEXT NOT NULL,                          -- one value (list items = rows)
+    PRIMARY KEY (doc_id, key, value)
+);
+CREATE INDEX IF NOT EXISTS idx_okf_kv   ON okf_fields(key, value);
+CREATE INDEX IF NOT EXISTS idx_okf_type ON okf_fields(type);
 """
 
 
@@ -329,6 +339,66 @@ class Journal:
         rows = self.conn.execute(
             "SELECT doc_id FROM wiki_docs ORDER BY doc_id").fetchall()
         return [r["doc_id"] for r in rows]
+
+    # -- OKF EAV field index (schema-less ; no migrations) --------------------
+
+    def index_okf_fields(self, doc_id: str, type: str, fields: dict) -> None:
+        """(Re)index a doc's OKF frontmatter as flat (key, value) rows — every
+        field queryable, list items exploded to one row each, no schema/migration.
+        Replaces any prior rows for the doc."""
+        self.conn.execute("DELETE FROM okf_fields WHERE doc_id = ?", (str(doc_id),))
+        rows = []
+        for key, val in (fields or {}).items():
+            if val is None:
+                continue
+            vals = val if isinstance(val, (list, tuple)) else [val]
+            for v in vals:
+                rows.append((str(doc_id), str(type), str(key), str(v)))
+        if rows:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO okf_fields(doc_id, type, key, value) "
+                "VALUES (?, ?, ?, ?)", rows)
+        self.conn.commit()
+
+    def okf_docs_where(self, key: str, value: Optional[str] = None) -> List[str]:
+        """Doc ids having field `key` (= `value` if given) — querying the EAV
+        index by any frontmatter field, no fixed schema needed."""
+        if value is None:
+            rows = self.conn.execute(
+                "SELECT DISTINCT doc_id FROM okf_fields WHERE key = ? "
+                "ORDER BY doc_id", (str(key),)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT DISTINCT doc_id FROM okf_fields WHERE key = ? AND value = ? "
+                "ORDER BY doc_id", (str(key), str(value))).fetchall()
+        return [r["doc_id"] for r in rows]
+
+    def okf_fields_of(self, doc_id: str) -> dict:
+        """All indexed frontmatter fields of a doc, {key: [values]}."""
+        rows = self.conn.execute(
+            "SELECT key, value FROM okf_fields WHERE doc_id = ? ORDER BY key",
+            (str(doc_id),)).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["key"], []).append(r["value"])
+        return out
+
+    def okf_schema(self) -> dict:
+        """The RECOVERED schema, derived from the data (no registry) : the set of
+        frontmatter keys seen per type, {type: [keys]}. This is how you get the
+        schema back out of a schema-less OKF bundle."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT type, key FROM okf_fields ORDER BY type, key"
+        ).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["type"], []).append(r["key"])
+        return out
+
+    def okf_types(self) -> List[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT type FROM okf_fields ORDER BY type").fetchall()
+        return [r["type"] for r in rows]
 
     # -- read ----------------------------------------------------------------
 
