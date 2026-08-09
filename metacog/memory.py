@@ -251,6 +251,14 @@ class Memory:
     # under `decay_exponent`. 0.0 = OFF (pure base ; mnema's default) ; 1.0 =
     # pure need-odds. Only applied when > 0 AND a journal is present.
     recency_weight: float = 0.0
+    # ACT-R associative spreading via the JOURNAL co-retrieval log (distinct from
+    # the geometric `use_spreading`, which spreads over embedding manifold
+    # neighbours). The base top hits are seeds ; nodes historically co-retrieved
+    # with them are boosted, and capped missed neighbours are injected — surfaces
+    # associatively-relevant nodes the cosine missed (the oblique win). 0.0 = OFF.
+    # Applied only when > 0 AND a journal is present. A popularity loop : keep the
+    # weight modest and validate recall before raising it.
+    spreading_weight: float = 0.0
     # Episodic conversation index : the id of the last message ingested per
     # (user, session), so successive messages chain via sequence_prev and a
     # session reads back in order. Continuous indexation feeds this.
@@ -2245,6 +2253,25 @@ class Memory:
                             self.recency_weight)
             results = sorted(zip(blended, pts), key=lambda sp: sp[0],
                              reverse=True)
+        # ACT-R associative spreading : the base top hits activate nodes they
+        # were historically co-retrieved with (journal). Boost co-hits already
+        # present, inject capped missed neighbours. OFF unless spreading_weight
+        # > 0 and a journal is present -> default candidate set untouched.
+        if self.spreading_weight > 0.0 and self.journal is not None and results:
+            seeds = [p.id for _, p in results[:3]]
+            co = dict(self.journal.find_co_retrieved(seeds, k=2 * k))
+            if co:
+                mx = max(co.values()) or 1
+                pt_by_id = {p.id: p for p in self.points}
+                cur = {p.id: [s, p] for s, p in results}
+                for nid, cooc in co.items():
+                    spread = self.spreading_weight * (cooc / mx)
+                    if nid in cur:
+                        cur[nid][0] += spread
+                    elif nid in pt_by_id:
+                        cur[nid] = [spread, pt_by_id[nid]]   # missed neighbour
+                results = sorted(((s, p) for s, p in cur.values()),
+                                 key=lambda sp: sp[0], reverse=True)[:k]
         return [
             {
                 "id": p.id,

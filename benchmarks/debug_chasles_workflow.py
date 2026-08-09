@@ -149,6 +149,25 @@ def step_lateral(p: _Probe):
             f"groups={rep.get('collided_groups')}")
 
 
+def step_spreading(p: _Probe):
+    """Concept C : associative spreading via the co-retrieval log. A node the
+    cosine misses gets INJECTED because it was historically co-retrieved with a
+    seed. OFF by default (candidate set identical)."""
+    q = "shared common topic"
+    base = [h["id"] for h in p.mem.retrieve(q, k=3)]
+    seed = base[0]
+    missed = "D1"                                      # far from q in embedding
+    p.check("target is cosine-missed", missed not in base, f"base={base}")
+    # forge an association : seed and D1 keep being co-retrieved together
+    for _ in range(5):
+        p.mem.record_retrieval([seed, missed], query_text="assoc")
+    p.mem.spreading_weight = 1.0
+    ranked = [h["id"] for h in p.mem.retrieve(q, k=3)]
+    p.mem.spreading_weight = 0.0                       # restore
+    p.check("association injects the missed node", missed in ranked,
+            f"base={base} -> spread={ranked}")
+
+
 def step_tags(p: _Probe):
     """Hierarchical tag index in SQL : ancestor query + glossary."""
     p.by_id["P0"].tags.append("health:condition:macrodactyly")
@@ -200,6 +219,7 @@ STEPS = [
     ("coretr", step_coretr),
     ("feedback", step_feedback),
     ("needodds", step_needodds),
+    ("spreading", step_spreading),
     ("lateral", step_lateral),
     ("tags", step_tags),
     ("chasles", step_chasles),
