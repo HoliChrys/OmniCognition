@@ -163,14 +163,11 @@ def main(argv=None):
     mem.spreading_weight = 0.0
 
     print("\n(Controlled probe with the real MiniLM encoder — mechanism efficacy,"
-          "\n not a LoCoMo/OBLIQ score. On a NEUTRAL probe with roughly-uniform"
-          "\n access history both levers tend to DEGRADE recall — empirically"
-          "\n confirming the default-OFF choice. They target specific regimes"
-          "\n (skewed access for need-odds ; genuine associative bridges for"
-          "\n spreading) ; a real-dataset sweep is needed to find where they pay"
-          "\n off. Note: need_odds.blend squashes the base cosine through a"
-          "\n sigmoid, which compresses discriminative cosine gaps — a likely"
-          "\n reason small weights swing recall so hard here.)\n")
+          "\n not a LoCoMo/OBLIQ score. With the min-max blend, need-odds has a"
+          "\n beneficial LOW-weight regime here (recency_weight~0.2 tends to beat"
+          "\n baseline) but over-steers at high weight. Spreading still degrades"
+          "\n on a neutral probe — it needs genuine associative bridges (see the"
+          "\n --favorable regime probe). Default-OFF remains the safe choice.)\n")
     return 0
 
 

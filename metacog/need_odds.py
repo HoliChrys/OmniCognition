@@ -79,26 +79,34 @@ def fit_exponent(
             "n_pos": len(pos_histories), "n_neg": len(neg_histories)}
 
 
-def _sigmoid(x: float) -> float:
-    import math
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return e / (1.0 + e)
+def _minmax(xs: Sequence[float]) -> List[float]:
+    """Min-max normalize to [0,1], PRESERVING the relative spacing of the values
+    (unlike a sigmoid, which compresses them). All-equal -> all 0.0 (no signal)."""
+    xs = list(xs)
+    if not xs:
+        return []
+    lo, hi = min(xs), max(xs)
+    if hi <= lo:
+        return [0.0 for _ in xs]
+    span = hi - lo
+    return [(x - lo) / span for x in xs]
 
 
 def blend(base_scores: Sequence[float], need_values: Sequence[float],
           recency_weight: float) -> List[float]:
     """Convex mix of a base relevance score and the need-odds modulator.
-    recency_weight 0.0 → pure base ; 1.0 → pure need-odds. Base is squashed
-    through a sigmoid, need-odds min-max normalized, so the two live in [0,1]
-    before combining (mnema's blend_scores)."""
+    recency_weight 0.0 → pure base ; 1.0 → pure need-odds. BOTH sides are
+    min-max normalized over the candidate set so they live in [0,1] while
+    keeping their internal spacing — a dominant base hit stays near 1.0 and
+    resists being flipped, while near-tied candidates are the ones need-odds can
+    reorder. (Earlier this squashed the base through a sigmoid, which crushed the
+    discriminative cosine gaps and let tiny weights swing the ranking; calibration
+    showed that degrades recall.)"""
     if not 0.0 <= recency_weight <= 1.0:
         raise ValueError(f"recency_weight must be in [0,1], got {recency_weight}")
-    base = [_sigmoid(s) for s in base_scores]
+    base = _minmax(base_scores)
     if recency_weight == 0.0 or not need_values:
         return base
-    mx = max(need_values)
-    need = [(v / mx) if mx > 0 else 0.0 for v in need_values]
+    need = _minmax(need_values)
     return [(1.0 - recency_weight) * b + recency_weight * n
             for b, n in zip(base, need)]
