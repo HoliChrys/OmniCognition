@@ -101,6 +101,23 @@ CREATE TABLE IF NOT EXISTS forget_events (
 );
 CREATE INDEX IF NOT EXISTS idx_forget_node   ON forget_events(node_id);
 CREATE INDEX IF NOT EXISTS idx_forget_merged ON forget_events(merged);
+
+CREATE TABLE IF NOT EXISTS wiki_docs (
+    doc_id  TEXT PRIMARY KEY,
+    type    TEXT NOT NULL,
+    title   TEXT NOT NULL,
+    tags    TEXT NOT NULL,                        -- JSON array
+    body    TEXT NOT NULL,                        -- markdown (inline [[refs]]/#tags)
+    ts      REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wiki_refs (
+    doc_id  TEXT NOT NULL,
+    node_id TEXT NOT NULL,                         -- a RAG node this doc cites
+    stale   INTEGER NOT NULL DEFAULT 0,            -- 1 = target gone/invalid
+    PRIMARY KEY (doc_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wikiref_node ON wiki_refs(node_id);
+CREATE INDEX IF NOT EXISTS idx_wikiref_doc  ON wiki_refs(doc_id);
 """
 
 
@@ -244,6 +261,74 @@ class Journal:
         self.conn.execute(
             "UPDATE forget_events SET merged = 1 WHERE id = ?", (int(event_id),))
         self.conn.commit()
+
+    # -- wiki layer (OKF docs <-> RAG nodes) ---------------------------------
+
+    def upsert_wiki_doc(self, doc_id: str, type: str, title: str,
+                        tags: Sequence[str], body: str,
+                        ts: Optional[float] = None) -> None:
+        """Create or replace a wiki doc's content (frontmatter + body)."""
+        ts = time.time() if ts is None else ts
+        self.conn.execute(
+            "INSERT INTO wiki_docs(doc_id, type, title, tags, body, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET "
+            "type=excluded.type, title=excluded.title, tags=excluded.tags, "
+            "body=excluded.body, ts=excluded.ts",
+            (str(doc_id), type, title, json.dumps(list(tags)), body, ts),
+        )
+        self.conn.commit()
+
+    def get_wiki_doc(self, doc_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT doc_id, type, title, tags, body, ts FROM wiki_docs "
+            "WHERE doc_id = ?", (str(doc_id),)).fetchone()
+        if row is None:
+            return None
+        return {"doc_id": row["doc_id"], "type": row["type"],
+                "title": row["title"], "tags": json.loads(row["tags"]),
+                "body": row["body"], "ts": row["ts"]}
+
+    def set_wiki_refs(self, doc_id: str, node_ids: Sequence[str]) -> None:
+        """Replace a doc's node refs (the canonical wiki<->node links)."""
+        self.conn.execute("DELETE FROM wiki_refs WHERE doc_id = ?", (str(doc_id),))
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO wiki_refs(doc_id, node_id, stale) "
+            "VALUES (?, ?, 0)", [(str(doc_id), str(n)) for n in node_ids])
+        self.conn.commit()
+
+    def wiki_refs_for_doc(self, doc_id: str) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT node_id, stale FROM wiki_refs WHERE doc_id = ? "
+            "ORDER BY node_id", (str(doc_id),)).fetchall()
+        return [{"node_id": r["node_id"], "stale": bool(r["stale"])} for r in rows]
+
+    def docs_referencing(self, node_id: str) -> List[str]:
+        """Reverse link : which wiki docs cite this node (the RAG->wiki edge)."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT doc_id FROM wiki_refs WHERE node_id = ? "
+            "ORDER BY doc_id", (str(node_id),)).fetchall()
+        return [r["doc_id"] for r in rows]
+
+    def remap_wiki_ref(self, doc_id: str, old: str, new: str) -> None:
+        """Redirect a ref old->new (a merged node) ; clears any stale flag."""
+        self.conn.execute("DELETE FROM wiki_refs WHERE doc_id = ? AND node_id = ?",
+                          (str(doc_id), str(old)))
+        self.conn.execute(
+            "INSERT OR IGNORE INTO wiki_refs(doc_id, node_id, stale) "
+            "VALUES (?, ?, 0)", (str(doc_id), str(new)))
+        self.conn.commit()
+
+    def mark_wiki_ref_stale(self, doc_id: str, node_id: str,
+                            stale: bool = True) -> None:
+        self.conn.execute(
+            "UPDATE wiki_refs SET stale = ? WHERE doc_id = ? AND node_id = ?",
+            (1 if stale else 0, str(doc_id), str(node_id)))
+        self.conn.commit()
+
+    def all_wiki_doc_ids(self) -> List[str]:
+        rows = self.conn.execute(
+            "SELECT doc_id FROM wiki_docs ORDER BY doc_id").fetchall()
+        return [r["doc_id"] for r in rows]
 
     # -- read ----------------------------------------------------------------
 

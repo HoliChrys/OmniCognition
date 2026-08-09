@@ -1072,6 +1072,124 @@ class Memory:
             self.journal.mark_forget_merged(ev["id"])
         return {"merged": len(pending), "aliased": aliased}
 
+    # ------------------------------------------------------------------
+    # OKF wiki — a bidirectional, continuously-evolving RAG extension
+    # ------------------------------------------------------------------
+
+    def feed_wiki(self, doc_id: str, title: str, node_ids: Sequence[str], *,
+                  type: str = "note", body: Optional[str] = None,
+                  t: Optional[float] = None) -> Dict[str, Any]:
+        """RAG -> wiki : build/update an OKF doc from RAG nodes. The node refs go
+        in BOTH the frontmatter (`refs:`) and inline in the body (`[[node_id]]`),
+        the union of their knowledge tags go in the frontmatter AND inline
+        (`#tag`), and the wiki<->node links are stored in the DB. Ids are resolved
+        to their live canonical node first. No-op without a journal."""
+        if self.journal is None:
+            return {"doc_id": None}
+        from metacog import wiki as _w
+        id2p = {p.id: p for p in self.points}
+        ids: List[str] = []
+        for nid in node_ids:
+            r = self.resolve_alias(str(nid))
+            if r not in ids:
+                ids.append(r)
+        tags: List[str] = []
+        for nid in ids:
+            p = id2p.get(nid)
+            for tg in (_w.context_tags(p.tags) if p else []):
+                if tg not in tags:
+                    tags.append(tg)
+        if body is None:
+            items = [(nid, (id2p[nid].content if nid in id2p else nid))
+                     for nid in ids]
+            body = _w.default_body(items, tags)
+        ts = self._now(t)
+        self.journal.upsert_wiki_doc(doc_id, type, title, tags, body, ts)
+        refs = list(dict.fromkeys(ids + _w.body_refs(body)))   # links = union
+        self.journal.set_wiki_refs(doc_id, refs)
+        return {"doc_id": doc_id, "refs": refs, "tags": tags}
+
+    def wiki_doc(self, doc_id: str) -> Optional[str]:
+        """Render the current OKF markdown (frontmatter refs from the live link
+        table). None if absent / no journal."""
+        if self.journal is None:
+            return None
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return None
+        from metacog import wiki as _w
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        return _w.render_okf(type=doc["type"], title=doc["title"],
+                             tags=doc["tags"], refs=refs, body=doc["body"],
+                             timestamp=doc["ts"])
+
+    def docs_for_node(self, node_id: str) -> List[str]:
+        """Which wiki docs cite this node (RAG->wiki reverse link). [] w/o journal."""
+        if self.journal is None:
+            return []
+        return self.journal.docs_referencing(self.resolve_alias(str(node_id)))
+
+    def reconcile_wiki(self) -> Dict[str, Any]:
+        """RAG -> wiki sync (offline, in sleep). For every wiki ref: follow merges
+        (`resolve_alias`) and rewrite old->new in BOTH the DB links and the body
+        `[[…]]`; flag refs whose target is gone or INVALID as stale so the doc is
+        known to need revision. No-op without a journal."""
+        if self.journal is None:
+            return {"remapped": 0, "stale": 0}
+        from metacog import wiki as _w
+        from metacog.epistemic import EpistemicState
+        id2p = {p.id: p for p in self.points}
+        remapped = stale = 0
+        for doc_id in self.journal.all_wiki_doc_ids():
+            doc = self.journal.get_wiki_doc(doc_id)
+            mapping: Dict[str, str] = {}
+            for r in self.journal.wiki_refs_for_doc(doc_id):
+                nid = r["node_id"]
+                resolved = self.resolve_alias(nid)
+                if resolved != nid:                    # node merged -> redirect
+                    self.journal.remap_wiki_ref(doc_id, nid, resolved)
+                    mapping[nid] = resolved
+                    remapped += 1
+                    nid = resolved
+                p = id2p.get(nid)
+                gone = (p is None or p.state in (EpistemicState.INVALID,
+                                                 EpistemicState.DEPRECATED))
+                if gone:
+                    self.journal.mark_wiki_ref_stale(doc_id, nid, True)
+                    stale += 1
+                elif r["stale"]:
+                    self.journal.mark_wiki_ref_stale(doc_id, nid, False)
+            if mapping:
+                nb = _w.rewrite_body_refs(doc["body"], mapping)
+                if nb != doc["body"]:
+                    self.journal.upsert_wiki_doc(doc_id, doc["type"],
+                                                 doc["title"], doc["tags"], nb,
+                                                 self._now())
+        return {"remapped": remapped, "stale": stale}
+
+    def ingest_from_wiki(self, doc_id: str, text: str, *,
+                         kind: str = "FACT") -> Dict[str, Any]:
+        """wiki -> RAG : a wiki edit adds prose; ingest it as a NEW node carrying
+        the doc's tags as CONTEXT, and link it back into the doc (a new ref +
+        inline `[[…]]`). Returns {node_id}. No-op without a journal / doc."""
+        if self.journal is None:
+            return {"node_id": None}
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"node_id": None}
+        p = self.ingest(text, kind=kind)
+        for tg in doc["tags"]:                          # carry the doc's context
+            if tg not in p.tags:
+                p.tags.append(tg)
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        if p.id not in refs:
+            refs.append(p.id)
+        self.journal.set_wiki_refs(doc_id, refs)
+        new_body = doc["body"].rstrip() + f"\n- {text.strip()} [[{p.id}]]"
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"],
+                                     doc["tags"], new_body, self._now())
+        return {"node_id": p.id}
+
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
         "over", "into", "this", "that", "their", "his", "her", "its", "new",
@@ -3262,6 +3380,12 @@ class Memory:
         if merged["merged"]:
             out["forget_merged"] = merged["merged"]
             out["forget_aliased"] = merged["aliased"]
+        # RAG -> wiki sync : rewrite refs of nodes that merged, flag stale ones.
+        # Runs AFTER merge_forgotten so the aliases are set. No-op without a wiki.
+        wr = self.reconcile_wiki()
+        if wr["remapped"] or wr["stale"]:
+            out["wiki_remapped"] = wr["remapped"]
+            out["wiki_stale"] = wr["stale"]
         # LATENT skill distiller : replay resolutions recorded since the
         # last sleep and crystallize theoretical tools linked to their
         # explicating facts. Opt-in (skills_enabled), idempotent.
