@@ -293,7 +293,12 @@ def synthesize_tool(
     content = how or when or name
     # Keywords : the grounding scope PLUS the tool's own name tokens, so the
     # walk matches it both on the task domain and on the capability name.
-    kws = list(dict.fromkeys([w for w in name.split("_") if w] + scope_kw))[:8]
+    # Scope (query-derived) leads, THEN the name words : position-weighted
+    # embedding weights early keywords most, and a reuse lookup extracts its
+    # keywords from the query the same way — so the scope must lead for the
+    # match to align. Name-first would displace the scope and make even an
+    # identical query miss the capability cache.
+    kws = list(dict.fromkeys(scope_kw + [w for w in name.split("_") if w]))[:8]
     kw_emb = (position_weighted_keyword_embedding(kws, encoder)
               if kws and encoder is not None else None)
 
@@ -371,7 +376,12 @@ def synthesize_tool_from_intent(
             elif ls.upper().startswith("HOW:"):
                 content = ls.split(":", 1)[1].strip() or content
 
-    kws = list(dict.fromkeys([w for w in name.split("_") if w] + scope_kw))[:8]
+    # Scope (query-derived) leads, THEN the name words : position-weighted
+    # embedding weights early keywords most, and a reuse lookup extracts its
+    # keywords from the query the same way — so the scope must lead for the
+    # match to align. Name-first would displace the scope and make even an
+    # identical query miss the capability cache.
+    kws = list(dict.fromkeys(scope_kw + [w for w in name.split("_") if w]))[:8]
     kw_emb = (position_weighted_keyword_embedding(kws, encoder)
               if kws and encoder is not None else None)
     tid = tool_id or f"tool_{name}@{t_now:.3f}"
@@ -510,6 +520,8 @@ def match_tool(
     best: Optional[Tuple[Point, float]] = None
     for p in points:
         if not is_tool(p) or p.keywords_embedding is None:
+            continue
+        if "deprecated" in (p.tags or []):          # retired -> not reusable
             continue
         s = cosine(query_emb, p.keywords_embedding)
         if s >= threshold and (best is None or s > best[1]):

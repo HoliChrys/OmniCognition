@@ -63,6 +63,7 @@ def bm25_score(
     *,
     k_pool: int = 14,
     query_keywords: Optional[List[str]] = None,
+    text_index=None,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Score points against the query and return the top k_pool by BM25.
 
@@ -80,16 +81,23 @@ def bm25_score(
 
     # Index on raw content: always content-first, keywords appended for
     # morphological coverage (stem variants the content tokeniser misses).
+    # With a `text_index` (Phase 2) the per-doc token lists are memoized at
+    # first touch instead of re-tokenized+re-stemmed on every query — the
+    # produced lists are byte-for-byte identical (see text_index.bm25_doc).
     docs: List[List[str]] = []
-    for p in points:
-        content_tokens = stem_tokens(tokenize(p.content or "")[:40])
-        if p.keywords:
-            kw_tokens = stem_tokens([kw.lower() for kw in p.keywords])
-            content_set = set(content_tokens)
-            extra_kw = [t for t in kw_tokens if t not in content_set]
-            docs.append(content_tokens + extra_kw[:8])
-        else:
-            docs.append(content_tokens)
+    if text_index is not None:
+        for p in points:
+            docs.append(text_index.bm25_doc(p))
+    else:
+        for p in points:
+            content_tokens = stem_tokens(tokenize(p.content or "")[:40])
+            if p.keywords:
+                kw_tokens = stem_tokens([kw.lower() for kw in p.keywords])
+                content_set = set(content_tokens)
+                extra_kw = [t for t in kw_tokens if t not in content_set]
+                docs.append(content_tokens + extra_kw[:8])
+            else:
+                docs.append(content_tokens)
 
     non_empty = sum(1 for d in docs if d)
     if non_empty == 0:

@@ -65,6 +65,22 @@ def decay_factor(t_now: float, t_last_obs: float) -> float:
     return 1.0 / (1.0 + dt)
 
 
+# ---- Phase-5 geometric cache (docs/ingest_index_plan.md) -------------------
+# GEO_EPOCH counts STRUCTURAL mutations of the manifold (apply_pull). The
+# spread-threshold cache below reuses the O(n²) emergent statistic only while
+# the epoch and the candidate subset are unchanged ; any pull / ingest /
+# removal / different subset falls back to the EXACT recompute — correctness
+# never degrades on structural change. Only pure-decay drift between hits is
+# accepted (uniform, slow, over a robust median−σ statistic).
+GEO_EPOCH: int = 0
+_SPREAD_THR_CACHE: dict = {}
+
+
+def clear_geo_cache() -> None:
+    """Drop cached geometric statistics (sleep()/load() rebuild path)."""
+    _SPREAD_THR_CACHE.clear()
+
+
 def effective_embedding(point: "Point", t_now: float) -> Vector:  # noqa: F821
     """orig + active(decayed by elapsed time) + latent.
 
@@ -131,6 +147,8 @@ def apply_pull(
     differs, and pushed apart pulls them along the keyword axis
     rather than the noisy content axis.
     """
+    global GEO_EPOCH
+    GEO_EPOCH += 1
     # Lazy-refresh i's stored active (we're going to mutate it)
     decay_i = decay_factor(t_now, point_i.t_last_obs)
     point_i.delta_active = vec_scale(point_i.delta_active, decay_i)
@@ -339,20 +357,29 @@ def geometric_spread(
         return []
 
     # Emergent threshold over keyword-embedding distances (same statistic
-    # as collision_threshold : median − σ).
+    # as collision_threshold : median − σ). The O(n²) pairwise statistic is
+    # CACHED on (subset ids, GEO_EPOCH) — Phase 5 : reused only while no pull
+    # touched the manifold and the subset is identical ; any structural change
+    # falls back to this exact recompute.
     embs = {p.id: effective_keyword_embedding(p, t_now) for p in all_points}
-    dists: List[float] = []
     pts = list(all_points)
-    for i in range(len(pts)):
-        for j in range(i + 1, len(pts)):
-            dists.append(distance(embs[pts[i].id], embs[pts[j].id]))
-    if not dists:
-        return []
-    dists.sort()
-    median = dists[len(dists) // 2]
-    mean = sum(dists) / len(dists)
-    sigma = math.sqrt(sum((d - mean) ** 2 for d in dists) / len(dists))
-    threshold = max(0.0, median - sigma)
+    cache_key = (len(pts), hash(tuple(p.id for p in pts)))
+    hit = _SPREAD_THR_CACHE.get(cache_key)
+    if hit is not None and hit[0] == GEO_EPOCH:
+        threshold = hit[1]
+    else:
+        dists: List[float] = []
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                dists.append(distance(embs[pts[i].id], embs[pts[j].id]))
+        if not dists:
+            return []
+        dists.sort()
+        median = dists[len(dists) // 2]
+        mean = sum(dists) / len(dists)
+        sigma = math.sqrt(sum((d - mean) ** 2 for d in dists) / len(dists))
+        threshold = max(0.0, median - sigma)
+        _SPREAD_THR_CACHE[cache_key] = (GEO_EPOCH, threshold)
 
     seed_ids = {p.id for p in seed_points}
     found: dict[str, float] = {}
@@ -388,6 +415,7 @@ def retrieve_hybrid(
     rrf_k: int = 60,
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
     restrict_kind: Optional["PointKind"] = None,  # noqa: F821
+    text_index=None,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -462,6 +490,7 @@ def retrieve_hybrid(
     bm25_pool = bm25_score(
         query_text, points, k_pool=pool_per_signal,
         query_keywords=query_kw or None,
+        text_index=text_index,
     )
 
     # Phase 2b — fuzzy lexical (Levenshtein) : recovers morphological /

@@ -31,8 +31,6 @@ import os
 import sys
 from typing import List, Optional
 
-from mcp.server.fastmcp import FastMCP
-
 from metacog.memory import Memory
 
 # Hard cap on facts returned by walk_start : a deep walk can retrieve 100+
@@ -51,17 +49,66 @@ _MAX_RETURNED_FACTS = 20
 _ANCHOR_ALPHA = 0.5
 
 
+def _resolve_lever(arg: Optional[float], env_name: str) -> Optional[float]:
+    """Resolve an ACT-R ranking lever : explicit arg wins, else the env var,
+    else None (leave the memory's own value untouched). Pure + mcp-free so it
+    is unit-testable without the FastMCP dependency."""
+    if arg is not None:
+        return arg
+    raw = os.environ.get(env_name)
+    return float(raw) if raw not in (None, "") else None
+
+
+def _install_surface_gate(app, exposed) -> None:
+    """Wrap `app.tool` so only tools whose name is in `exposed` are REGISTERED on
+    the MCP ; unexposed ones are returned undecorated (still callable internally).
+    `exposed=None` -> no gate (expose all). Kept module-level + mcp-free so the
+    gating logic is unit-testable with a fake app (the real FastMCP is absent in
+    this environment)."""
+    if exposed is None:
+        return
+    raw_tool = app.tool
+
+    def gated_tool(*a, **kw):
+        deco = raw_tool(*a, **kw)
+
+        def wrap(fn):
+            return deco(fn) if fn.__name__ in exposed else fn
+        return wrap
+
+    app.tool = gated_tool
+
+
 def build_app(
     storage_path: Optional[str] = None,
     memory: Optional[Memory] = None,
+    recency_weight: Optional[float] = None,
+    spreading_weight: Optional[float] = None,
+    surface: Optional[str] = None,
 ) -> FastMCP:
     """Build the metacog MCP app.
 
     `memory` lets a caller inject an already-populated Memory (e.g. a
     benchmark conversation pre-ingested in-process) instead of creating
     an empty one. When omitted, a fresh Memory(storage_path=…) is used.
+
+    `recency_weight` / `spreading_weight` enable the ACT-R ranking levers
+    (need-odds base-level / co-retrieval spreading) in production. Both are OFF
+    by default. Resolution order per lever : explicit arg > env var
+    (METACOG_RECENCY_WEIGHT / METACOG_SPREADING_WEIGHT) > the memory's own value
+    (untouched) — so a deploy can turn them on without code changes, and an
+    injected memory keeps its settings unless one is explicitly given.
+
+    `surface` restricts which tools are EXPOSED on the MCP : "all" (default,
+    every tool), "external" (a powerful external agent : feed / ask / manage its
+    own tools / observe), "external_light" (feed + ask), or "canonical" (the
+    primitives). Resolution : arg > env METACOG_SURFACE > "all". Unexposed tools
+    stay callable internally — they only leave the external surface, so the agent
+    that drives the MCP sees a small, purposeful toolset instead of all 40.
     """
     from metacog.meta_walk import MetaWalker, WalkerRegistry, _NEIGHBOUR_GATE
+    from mcp.server.fastmcp import FastMCP
+    from metacog.canonical_tools import surface_tools
 
     app = FastMCP(
         "metacog",
@@ -81,8 +128,28 @@ def build_app(
             "tool keeps a bidirectional link back to it."
         ),
     )
+
+    # Gate which @app.tool()s are REGISTERED on the MCP surface. Wrap app.tool
+    # once ; a tool whose name is not exposed is left unregistered (but still a
+    # local callable used internally). "all" -> no restriction.
+    _surface = surface or os.environ.get("METACOG_SURFACE") or "all"
+    _install_surface_gate(app, surface_tools(_surface))
+
     if memory is None:
-        memory = Memory(storage_path=storage_path)
+        # Attach a PERSISTENT journal ("<storage_path>.journal.db") so the SQL
+        # triggers (co-retrieval / lateral / Chasles / tag index / decay
+        # history) survive restarts. "auto" is a no-op when storage_path is None
+        # (ephemeral in-memory server) -> falls back to no journal.
+        memory = Memory(storage_path=storage_path, journal_path="auto")
+
+    # Apply the ACT-R ranking levers (arg > env > leave as-is). Only assigned
+    # when explicitly provided, so an injected memory's own weights survive.
+    _rw = _resolve_lever(recency_weight, "METACOG_RECENCY_WEIGHT")
+    if _rw is not None:
+        memory.recency_weight = _rw
+    _sw = _resolve_lever(spreading_weight, "METACOG_SPREADING_WEIGHT")
+    if _sw is not None:
+        memory.spreading_weight = _sw
 
     walkers = WalkerRegistry()
 
@@ -167,6 +234,7 @@ def build_app(
         use_lineage: bool = True,
         use_spreading: bool = True,
         prefer_kind: Optional[str] = None,
+        abstain: bool = False,
     ) -> List[dict]:
         """Retrieve top-k points for a query.
 
@@ -187,11 +255,78 @@ def build_app(
         k is capped at 7 (the system's retrieval budget).
         """
         k = min(max(1, k), 7)
-        return memory.retrieve(
+        results = memory.retrieve(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
+            abstain=abstain,
         )
+        if abstain and not results:
+            return [{"abstained": True,
+                     "note": "no chunk sufficiently activated — retrieval failed"}]
+        # Log the retrieval (mnema access-log) and hand back a retrieval_id
+        # handle so the agent can later mark_useful(...) on it — the supervised
+        # feedback that calibrates decay. Failure-safe / no-op without a journal.
+        try:
+            rid = memory.record_retrieval(
+                [r["id"] for r in results], query_text=query)
+            if rid is not None:
+                for r in results:
+                    r["retrieval_id"] = rid
+        except Exception:
+            pass
+        return results
+
+    @app.tool()
+    def retire_tool(tool_id: str, hard: bool = False) -> dict:
+        """Retire a generated tool. Soft (default) deprecates it so it stops
+        being reused ; hard removes it. The removal half of the tool lifecycle."""
+        return memory.retire_tool(tool_id, hard=hard)
+
+    @app.tool()
+    def report_tool(tool_id: str, ok: bool) -> dict:
+        """Report a tool's outcome from real use : ok=True reinforces it,
+        ok=False records a failure and auto-retires it after repeated failures.
+        The feedback half of the tool lifecycle."""
+        return memory.report_tool(tool_id, ok)
+
+    @app.tool()
+    def update_tool(tool_id: str, content: Optional[str] = None,
+                    how: Optional[str] = None) -> dict:
+        """Correct a tool's body (re-embedded ; revives it if it was
+        deprecated). The correction half of the tool lifecycle."""
+        return memory.update_tool(tool_id, content=content, how=how)
+
+    @app.tool()
+    def relate(node_ids: List[str], k: int = 5) -> List[dict]:
+        """Find memories historically CO-RETRIEVED with the given node ids —
+        edgeless spreading activation over the access graph (mnema's `relate`).
+        Seed with ids from a `retrieve` result to surface associatively-linked
+        nodes the cosine misses. [] without a journal."""
+        return [{"id": nid, "cooc": c}
+                for nid, c in memory.co_retrieved([str(i) for i in node_ids], k=k)]
+
+    @app.tool()
+    def forget(node_id: str, reason: str,
+               superseded_by: Optional[str] = None) -> dict:
+        """Soft-invalidate ONE memory node (append-only : never deleted, just
+        marked invalid so it stops surfacing). `reason` is required, e.g.
+        'superseded by node X' or 'user corrected'. `superseded_by` (optional)
+        names the successor node to merge into during the next latent sleep. The
+        explicit on-demand correction — distinct from the autonomic
+        decay-forgetting in sleep."""
+        return memory.forget_node(node_id, reason, superseded_by=superseded_by)
+
+    @app.tool()
+    def mark_useful(retrieval_id: int, score: int) -> dict:
+        """Rate a past retrieval : 0 (useless) / 1 / 2 (useful). This is the
+        supervised feedback that calibrates the decay exponent (re-fit on the
+        next sleep). Get `retrieval_id` from a `retrieve` result. No-op without
+        a journal."""
+        if score not in (0, 1, 2):
+            return {"error": "score must be 0, 1 or 2", "score": score}
+        memory.mark_useful(retrieval_id, score)
+        return {"retrieval_id": retrieval_id, "score": score, "recorded": True}
 
     # ----------------------------------------------------------------
     # Meta-cognitive walk — streaming, step-by-step
@@ -207,6 +342,7 @@ def build_app(
         observator_id: str = "",
         user_id: str = "",
         session_id: str = "",
+        date_tags: Optional[List[str]] = None,
     ) -> dict:
         """Run a COMPLETE meta-cognitive walk and return its result.
 
@@ -249,6 +385,16 @@ def build_app(
         # get a retrieval rank boost, alongside the free semantic query.
         section = {f"{k}:{v}" for k, v in
                    (("user", user_id), ("session", session_id)) if v} or None
+        # TEMPORAL HARD-SCOPE : a question that names a period ("during April
+        # 2022") passes its deterministic date tags here ; the walk is then
+        # restricted to turns of that period (restrict_ids), so it cannot drift
+        # to another month (the conv-47 "girlfriend in April -> September" bug).
+        restrict_ids = None
+        if date_tags:
+            from metacog.tags import filter_points
+            ids = filter_points(memory.points, list(date_tags), mode="exact")
+            if ids:
+                restrict_ids = ids
         walker = MetaWalker(
             query, memory,
             n_stages=max(1, n_stages),
@@ -257,6 +403,7 @@ def build_app(
             commit=commit,
             observator_id=observator_id or None,
             section_filter=section,
+            restrict_ids=restrict_ids,
         )
         walk_id = walkers.open(walker)
         # Loop the walk to completion : depth is the walk's own
@@ -399,6 +546,65 @@ def build_app(
         )
 
     @app.tool()
+    def scoped_list(
+        tags: Optional[list] = None, event_id: Optional[str] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        kind: Optional[str] = None, match: str = "exact",
+    ) -> dict:
+        """NON-kNN FILTERED LISTING — the 'refer an exhaustive set' query. When
+        the walk sees the input relates to an EVENT, launch this to get EVERY
+        node matching the parameters (a scan, not a similarity top-k) : by
+        `event_id` (the gravitating cluster), inclusive `date_from`/`date_to`
+        (YYYY-MM-DD), hierarchical `tags`, and `kind`. Ordered by event date.
+        Returns the exhaustive list + ids."""
+        pts = memory.filter_list(
+            tags=list(tags) if tags else None, match=str(match or "exact"),
+            event_id=event_id, date_from=date_from, date_to=date_to, kind=kind)
+        return {"count": len(pts),
+                "items": [{"id": p.id, "content": p.content[:200]} for p in pts],
+                "ids": [p.id for p in pts]}
+
+    @app.tool()
+    def search_nodes(
+        query: str, mode: str = "sim", on: str = "both",
+        event_id: Optional[str] = None, tags: Optional[list] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        bag: str = "default", k: int = 10,
+    ) -> dict:
+        """Tri-modal relevance search over a FILTERED node pool — WITHOUT
+        REPLACEMENT. The loop for assembling an exhaustive set : presearch finds
+        the context events, then call this to draw candidates from the filtered
+        pool (`event_id` / `tags` / date), ranked by `mode` (sim | regex |
+        fuzzy) over `on` (content | tags | both). Nodes already in `bag` are
+        EXCLUDED, so each call returns only NEW candidates. Judge them, then
+        `collect(ids, bag)` the relevant ones — and call again ; the pool shrinks
+        until exhausted (drawing without replacement)."""
+        pts = memory.search_nodes(
+            query, mode=str(mode or "sim"), on=str(on or "both"),
+            event_id=event_id, tags=list(tags) if tags else None,
+            date_from=date_from, date_to=date_to, exclude_bag=bag, k=max(1, k))
+        return {"count": len(pts),
+                "items": [{"id": p.id, "content": p.content[:200],
+                           "tags": list(p.tags)[:12]} for p in pts]}
+
+    @app.tool()
+    def assemble_set(
+        query: str, event_id: Optional[str] = None, tags: Optional[list] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        on: str = "both", bag: str = "default", max_rounds: int = 6, k: int = 10,
+    ) -> dict:
+        """ASSEMBLE an exhaustive set in one call — the orchestrated relevance
+        loop. Scopes to the event (`event_id`/`tags`, else auto-routed from the
+        query), then loops sim→fuzzy→regex `search_nodes` over content+tags,
+        judges relevance, and collects the hits into `bag` WITHOUT REPLACEMENT
+        until the pool yields nothing new. Returns the bag + per-round adds; read
+        it back with `bag(name)` / render with `bag_render`."""
+        return memory.assemble_set(
+            query, event_id=event_id, tags=list(tags) if tags else None,
+            date_from=date_from, date_to=date_to, on=str(on or "both"),
+            bag=str(bag or "default"), max_rounds=max(1, max_rounds), k=max(1, k))
+
+    @app.tool()
     def list_tags() -> dict:
         """Return the GLOSSARY of tag NAMESPACES across the whole memory.
 
@@ -440,7 +646,15 @@ def build_app(
                                       satisfying ALL these tags under `match`
                                       are searched. Same tri-modal semantics
                                       as `scoped_answer`.
-        match          : str        — "exact" | "fuzzy" | "regex".
+        match          : str        — "exact" | "fuzzy" | "regex" | "semantic".
+                                      "semantic" treats each `tags` entry as a
+                                      MEANING seed (not a literal tag): it is
+                                      resolved through the segment embedding
+                                      index to the closest glossary namespaces,
+                                      then those are OR-scoped. So tags=["weight
+                                      problem"] scopes on health:condition /
+                                      activity:exercise even with no shared
+                                      characters.
         observator_id  : str        — optional Level-1 community lens.
 
         Returns `{"results": [{"query", "hits": [{"id","content","score",
@@ -449,7 +663,30 @@ def build_app(
         from metacog.tags import filter_points
         qs = [str(q) for q in (queries or []) if q]
         tagset = list(tags or [])
-        if tagset:
+        if tagset and match == "semantic":
+            # MEANING-scoped : resolve each seed phrase to concrete glossary
+            # namespaces via the cached segment index, then OR them (a point
+            # in ANY resolved namespace is in scope).
+            from metacog.tag_index import TagIndex
+            idx = getattr(memory, "_tag_index_cache", None)
+            if idx is None:
+                idx = TagIndex(memory.encoder)
+                try:
+                    memory._tag_index_cache = idx
+                except Exception:
+                    pass
+            idx.build(memory.points)
+            resolved: list = []
+            for seed in tagset:
+                for r in idx.search(seed, memory.points, k=3):
+                    for ns in r["namespaces"]:
+                        if ns not in resolved:
+                            resolved.append(ns)
+            allowed: set = set()
+            for ns in resolved:
+                allowed |= filter_points(memory.points, [ns], mode="exact")
+            scope = [p for p in memory.points if p.id in allowed]
+        elif tagset:
             allowed = filter_points(memory.points, tagset, mode=match)
             scope = [p for p in memory.points if p.id in allowed]
         else:
@@ -491,7 +728,7 @@ def build_app(
     @app.tool()
     def clue_search(
         question: str, k_per_clue: int = 3, n_clues: int = 6,
-        observator_id: str = "",
+        observator_id: str = "", auto_scope: bool = True,
     ) -> dict:
         """INFERENCE-question expander. For a question whose answer is never
         stated directly ("What might John's financial status be?"), the
@@ -518,20 +755,91 @@ def build_app(
                     "note": "no clues generated (no usable LLM?)"}
         k = max(1, int(k_per_clue))
         tag_by_id = {p.id: list(p.tags) for p in memory.points}
+        # AUTO-SCOPE (semantic) — close the inference loop. The clues ARE the
+        # answer-space ("I should lose weight", "took up running"); resolve
+        # them + the question through the segment index to hierarchical tag
+        # NAMESPACES (health:condition, activity:exercise) and narrow the
+        # per-clue retrieval to those. This is the handle that surfaces an
+        # oblique aside whose own words ("fingers too big", "bowling") never
+        # match the question. No-op when the memory has not been tag-refined
+        # (no resolution) or when the scope would be the whole cloud / too
+        # small — it degrades to full-memory clue retrieval, never narrows
+        # away recall.
+        scope_points = None
+        scope_namespaces: list = []
+        if auto_scope:
+            try:
+                from metacog.tag_index import TagIndex
+                from metacog.tags import filter_points
+                idx = getattr(memory, "_tag_index_cache", None)
+                if idx is None:
+                    idx = TagIndex(memory.encoder)
+                    try:
+                        memory._tag_index_cache = idx
+                    except Exception:
+                        pass
+                idx.build(memory.points)
+                # BROAD semantic union : keeps the wide net (health:condition)
+                # an oblique-leaf question (obesity -> macrodactyly turn) needs.
+                # NOTE: TagNavigator offers an LLM-driven hierarchical descent
+                # that resolves to tight, discriminative leaves
+                # (location -> location:geography:stamford) — better for
+                # precise-entity inference, but it would prune away the
+                # unexpected oblique leaf here, so it is kept as a separate
+                # capability rather than the default scope.
+                resolved: list = []
+                for seed in [question] + clues:
+                    for r in idx.search(seed, memory.points, k=2):
+                        for ns in r["namespaces"]:
+                            if ":" in ns and ns not in resolved:
+                                resolved.append(ns)
+                allowed: set = set()
+                for ns in resolved:
+                    allowed |= filter_points(memory.points, [ns], mode="exact")
+                if allowed and 2 * k <= len(allowed) < len(memory.points):
+                    scope_points = [p for p in memory.points if p.id in allowed]
+                    scope_namespaces = resolved
+            except Exception:
+                scope_points = None
         per_clue = []
         merged: dict = {}              # id -> best hit (highest score)
-        for c in clues:
-            hits = memory.retrieve(c, k=k, observator_id=observator_id or None)
-            trimmed = [
-                {"id": h["id"], "content": h["content"], "score": h["score"],
-                 "kind": h["kind"], "tags": tag_by_id.get(h["id"], [])}
-                for h in hits
-            ]
-            per_clue.append({"clue": c, "hits": trimmed, "n_hits": len(trimmed)})
-            for h in trimmed:
-                cur = merged.get(h["id"])
-                if cur is None or h["score"] > cur["score"]:
-                    merged[h["id"]] = h
+        _orig_pts = memory.points
+        try:
+            if scope_points is not None:
+                memory.points = scope_points
+            probe_clues = list(clues)
+            if scope_points is not None and scope_namespaces:
+                # DETERMINISTIC answer-space probe from the resolved namespace
+                # PATHS (health / condition / overweight / exercise) + the
+                # question. Independent of the stochastic clue brainstorm — so
+                # the oblique aside surfaces even when the LLM clues miss its
+                # branch. The namespace words ARE the answer-space vocabulary
+                # the question semantically resolved to.
+                probe_terms: list = []
+                for ns in scope_namespaces:
+                    for seg in ns.split(":"):
+                        s = seg.replace("_", " ").replace("-", " ")
+                        if s and s not in probe_terms:
+                            probe_terms.append(s)
+                probe = (question + " " + " ".join(probe_terms)).strip()
+                if probe:
+                    probe_clues.append(probe)
+            for c in probe_clues:
+                hits = memory.retrieve(
+                    c, k=k, observator_id=observator_id or None)
+                trimmed = [
+                    {"id": h["id"], "content": h["content"], "score": h["score"],
+                     "kind": h["kind"], "tags": tag_by_id.get(h["id"], [])}
+                    for h in hits
+                ]
+                per_clue.append(
+                    {"clue": c, "hits": trimmed, "n_hits": len(trimmed)})
+                for h in trimmed:
+                    cur = merged.get(h["id"])
+                    if cur is None or h["score"] > cur["score"]:
+                        merged[h["id"]] = h
+        finally:
+            memory.points = _orig_pts
         merged_list = sorted(merged.values(), key=lambda h: -h["score"])
         # LINEAGE BRIDGE — the clues often land on the SPACED neighbours of
         # the real aside (kids/family clues hit D5:3 and D5:6, the gold D5:5
@@ -597,7 +905,74 @@ def build_app(
                 seen_c.add(h["id"])
                 cum_ids.append(h["id"])
         return {"clues": clues, "results": per_clue, "merged": merged_list,
-                "neighbor_possibilities": nbrs, "fact_ids_cumulative": cum_ids}
+                "neighbor_possibilities": nbrs, "fact_ids_cumulative": cum_ids,
+                "scope_namespaces": scope_namespaces}
+
+    @app.tool()
+    def collect(ids: List[str], bag: str = "default",
+                description: Optional[str] = None) -> dict:
+        """RETRIEVE-mode bag. For a 'find all / list every …' task, ADD the node
+        ids you judge relevant to a NAMED bag — call this at EACH step as you find
+        matches, accumulating the exhaustive set. Use distinct `bag` names to keep
+        SEPARATE lists (a map of lists you can later inject at different places);
+        pass a `description` so you remember what each bag holds. The final answer
+        renders the bag(s) as list(s). Returns the bag size + ids just added."""
+        b = bag or "default"
+        before = len(memory.bag_items(bag=b))
+        size = memory.bag_add([str(i) for i in (ids or [])], bag=b,
+                              description=description)
+        return {"bag": b, "bag_size": size, "added": size - before}
+
+    @app.tool()
+    def bag(name: str = "default") -> dict:
+        """Show ONE named bag : its description, schema, and the collected node
+        refs + content — review what a list holds before deciding how to use it."""
+        meta = memory.bag_meta(name)
+        items = memory.bag_items(bag=name)
+        return {"name": name, "size": meta["size"],
+                "description": meta["description"], "schema": meta["schema"],
+                "items": [{"id": i, "content": c[:160]} for i, c in items]}
+
+    @app.tool()
+    def bags() -> dict:
+        """OVERVIEW of every non-empty bag — name, size, description, schema,
+        sample ids. Read this to DECIDE which list(s) to surface in the answer
+        and how to render each (the map of lists at your disposal)."""
+        return {"bags": memory.bag_overview()}
+
+    @app.tool()
+    def bag_render(name: str = "default", strategy: str = "auto",
+                   placement: str = "auto") -> dict:
+        """Render a named bag for the answer. `strategy`: raw | extract |
+        interpret | mapreduce | auto. `placement`: inject | bare | auto. Returns
+        the rendered text you can drop into your reply."""
+        from metacog.bag_render import render_bag
+        items = memory.bag_items(bag=name)
+        text = render_bag("", items, memory.llm, strategy=strategy,
+                          placement=placement)
+        return {"name": name, "size": len(items), "rendered": text}
+
+    @app.tool()
+    def event_search(query: str, k_per_slot: int = 5) -> dict:
+        """EVENT-schema retrieval. For a question ABOUT AN EVENT ("what were the
+        casualties of the border war?", "how did the trip go?"), detect the
+        event TYPE, then gather its facts EXHAUSTIVELY by its recurrent schema :
+        one sub-question PER SLOT of the type (belligerents, territory, timeline,
+        casualties, … for a war), partitioning the facts that gravitate to the
+        event's hub. A CORE slot with no fact is reported as a GAP. This covers
+        ALL the latent sub-questions of the event type by construction — use it
+        instead of guessing, when the question targets an event.
+
+        Returns `{event:{name,etype,via}, slots, core, cluster_size,
+        filled:{slot:[hits]}, gaps:[…], new_slots:[…], fact_ids}` or
+        `{"event": null}` when the question is not about an event (then use
+        walk_start / clue_search)."""
+        from metacog.event_schema import event_search as _evsearch
+        res = _evsearch(memory, query, k_per_slot=max(1, int(k_per_slot)))
+        if res is None:
+            return {"event": None,
+                    "note": "not an event question; use walk_start/clue_search"}
+        return res
 
     @app.tool()
     def reason(query: str, with_executor: bool = True, apply_compression: bool = True) -> dict:

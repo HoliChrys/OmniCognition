@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import time
 import uuid
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from metacog.audit import audit, assert_no_laundering, inputs_of_A
 from metacog.collision import merge_duplicates, sleep_cycle_collisions
@@ -63,6 +64,65 @@ from metacog.observator import (
     spawn_observators_from_polarization,
 )
 from metacog.reasoning import ReasoningTrajectory, reason
+from metacog.text_index import TextIndex, raw_token_set
+
+
+_MONTHS = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12",
+}
+
+
+def _session_date_tags(content: str) -> List[str]:
+    """Deterministic date tags from a turn's leading "[<date>]" prefix.
+
+    Every LoCoMo turn (and any dated ingest) carries its session date in a
+    bracket prefix — "[20 April 2022] Speaker: text". That date is STRUCTURED
+    metadata, so it must be tagged deterministically on EVERY turn, not left to
+    the LLM keyword/entity extractor (which silently skips it on most turns, so
+    a date-scoped search misses them). Returns the hierarchical date tags
+    `time:year:2022`, `time:month:april`, `time:date:2022-04-20`. Empty when no
+    parseable date prefix. Edge-free : these are labels, never relations."""
+    m = re.match(r"\s*\[([^\]]+)\]", content or "")
+    if not m:
+        return []
+    inner = m.group(1)
+    dm = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", inner)   # 20 April 2022
+    if dm:
+        day, mon, year = dm.group(1), dm.group(2).lower(), dm.group(3)
+    else:
+        dm = re.search(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", inner)  # April 20, 2022
+        if not dm:
+            return []
+        mon, day, year = dm.group(1).lower(), dm.group(2), dm.group(3)
+    if mon not in _MONTHS:
+        return []
+    return [
+        f"time:year:{year}",
+        f"time:month:{mon}",
+        f"time:date:{year}-{_MONTHS[mon]}-{int(day):02d}",
+    ]
+
+
+def query_date_tags(question: str) -> List[str]:
+    """Deterministic date-CONSTRAINT tags from a QUESTION, e.g. "during April
+    2022" -> ['time:month:april', 'time:year:2022'] ; "in 2022" -> ['time:year:
+    2022'] ; "in July" -> ['time:month:july']. This is the temporal anchor: a
+    question that names a period should scope retrieval to that period's turns
+    (the deterministic ingest date tags), so a walk cannot drift to another
+    month. Sourced from the ORIGINAL question, it stays fixed across the
+    agent's reformulated walks. Empty when the question names no period."""
+    q = (question or "").lower()
+    tags: List[str] = []
+    for mon in _MONTHS:
+        if re.search(r"\b" + mon + r"\b", q):
+            tags.append(f"time:month:{mon}")
+            break
+    ym = re.search(r"\b(19|20)\d{2}\b", q)
+    if ym:
+        tags.append(f"time:year:{ym.group(0)}")
+    return tags
 
 
 @dataclass
@@ -70,6 +130,13 @@ class Memory:
     """High-level service object that orchestrates the whole pipeline."""
 
     encoder: Any = field(default_factory=SimpleEncoder)
+    # Optional LOCAL cross-encoder reranker (mnema's token lever). When set, the
+    # oblique judge's pre-filter scores (proposition, doc) pairs JOINTLY for ZERO
+    # LLM tokens — precise enough to gate a third band (clear-low -> rejected
+    # without an LLM call), so only the ambiguous middle reaches the batch judge.
+    # None = the bi-encoder cosine pre-accept (blunter ; pre-accept only, never
+    # auto-reject). Any object with `rerank(query, docs) -> list[float]` fits.
+    reranker: Any = None
     llm: Any = field(default_factory=ClaudeLLM)
     executor: Any = field(default_factory=NoOpExecutor)
     extractor: Any = field(default_factory=SimpleKeywordExtractor)
@@ -82,6 +149,10 @@ class Memory:
     # GENERATOR) that act as retrieval handles ; retrieval resolves an
     # atomic hit back to its source turn (dia_id) and dedups.
     atomic_extractor: Any = None
+    # Opt-in LLM EVENT detector. When set, each ingested FACT is scanned for a
+    # notable event ; a PointKind.EVENT hub is created/deduped (ingest_event)
+    # and the turn gravitates onto it. None = current behavior unchanged.
+    event_extractor: Any = None
     storage_path: Optional[str] = None
 
     points: List[Point] = field(default_factory=list)
@@ -89,6 +160,17 @@ class Memory:
     conversation_log: ConversationLog = field(default_factory=ConversationLog)
     # atomic-fact id -> source turn id (for retrieval resolution).
     _atom_parent: Dict[str, str] = field(default_factory=dict)
+    # EVENT hub registry : "<type>::<name>" -> event_id, for resolution/dedup
+    # (a war mentioned in 10 turns must resolve to ONE hub, not 10). Rebuilt
+    # from points on load(). The hub aggregates the facts that gravitate to it.
+    _event_registry: Dict[str, str] = field(default_factory=dict)
+    # RETRIEVE-mode BAG : an agent-curated, order-preserving list of node refs
+    # the agent decides to collect across iterations (for "find all / list"
+    # tasks). Rendered as the exhaustive list answer at the end. Seeded from an
+    # event cluster, grown by the agent via bag_add.
+    _bag: List[str] = field(default_factory=list)
+    _bags: Dict[str, List[str]] = field(default_factory=dict)
+    _bag_meta: Dict[str, dict] = field(default_factory=dict)
     # absorbed point id -> surviving node id, from consolidate_duplicates().
     _merge_aliases: Dict[str, str] = field(default_factory=dict)
     # Total number of multi-hop transitions recorded by record_hop ;
@@ -107,6 +189,43 @@ class Memory:
     # cloud and the walk finds them recursively. Opt-in.
     _skill_ledger: Any = None
     skills_enabled: bool = False
+    # LATENT TAG REFINER (run in sleep()) : replays FACT phrase keywords and
+    # crystallizes their hierarchical namespace tags ("fingers too big" ->
+    # body:finger, health:condition:swelling) so inference queries can SCOPE
+    # on the latent category. Opt-in, idempotent, LLM-backed. See
+    # metacog.tag_refine.
+    tags_refine_enabled: bool = False
+    # Decay-driven FORGETTING pass in sleep (opt-in, OFF by default). The query
+    # path only DECAYS (need-odds ranking) ; the actual pruning of cold nodes
+    # happens OFFLINE here so it never handicaps query latency. Conservative :
+    # only nodes already accessed then gone cold (never the untried), tools
+    # protected, emergent threshold (mean - std of need-odds).
+    forget_enabled: bool = False
+    # Run the SAME hierarchical refinement at INGEST time for each created
+    # FACT/ACTION (opt-in) instead of waiting for latent sleep. Costs one LLM
+    # call per node on the hot path — off by default ; sleep is the cheap path.
+    tags_refine_on_ingest: bool = False
+    # TONE READING at ingest (opt-in). Irony / sarcasm / hyperbole / echoed
+    # register are properties of the DOCUMENT, not of any query — so they are
+    # read ONCE here (amortized across every later query) instead of per-query
+    # per-candidate by the stance judge. Produces tone:* tags and, for
+    # non-plain tones, a GLOSS THOUGHT (`gloss_<id>`) carrying the author's
+    # INTENDED meaning : the judge batches over glosses and semantic search
+    # matches the intended meaning, not the literal surface. One LLM call per
+    # FACT on the hot path.
+    tone_reading: bool = False
+    _tone_cache: Dict[str, dict] = field(default_factory=dict)
+    # DOCUMENT CARD (Phase 1, docs/ingest_index_plan.md) : ONE structured LLM
+    # reading per ingested FACT replacing the separate keyword/entity/event/
+    # tone reads — and pre-computing the stance + answerable-questions
+    # artifacts consumed by later phases. When set it supersedes the individual
+    # hooks ; on a failed/unparseable card the individual extractors run as
+    # FALLBACK (never lose ingestion to a flaky combined call).
+    doc_card_extractor: Any = None
+    # Phase-2 text index : per-doc token artifacts (raw token sets, stemmed
+    # BM25 docs, postings) memoized at first touch — never re-tokenize a doc
+    # per query. Lazy/self-healing ; NOT pickled (refills after load()).
+    _text_index: Any = field(default_factory=TextIndex)
     # Resolution ledger driving the LATENT SKILL DISTILLER (run in sleep()).
     # Each entry records a solved task — (query, the walk's resolution path
     # point-ids, the output) — so the distiller can replay it afterwards and
@@ -116,17 +235,67 @@ class Memory:
     # how far the distiller has consumed the ledger.
     _resolution_ledger: List[dict] = field(default_factory=list)
     _distill_cursor: int = 0
+    # Append-only usage JOURNAL (metacog.journal.Journal, SQLite) — the mnema
+    # access-log model. When set, every retrieval is logged (retrievals +
+    # access_events) so co-retrieval is computed in SQL on demand (edgeless)
+    # and mark_useful / decay-fit have their supervised history. None = off (the
+    # in-memory lateral ledger remains the only co-retrieval source). Holds a
+    # live sqlite connection : shared-by-reference on snapshot, never pickled.
+    journal: Any = None
+    # Path to a PERSISTENT journal SQLite file, so the SQL triggers (co-retrieval
+    # / lateral / Chasles / tag index / decay history) survive restarts. Opened
+    # in __post_init__ when `journal` is not already set. The sentinel "auto"
+    # derives "<storage_path>.journal.db" (requires storage_path). None = no
+    # persistent journal (the in-memory `journal` field, if any, still applies).
+    journal_path: Optional[str] = None
+    # Anderson-Schooler decay exponent — the ONE learned hyperparameter (fitted
+    # by fit_decay() from the journal's mark_useful labels + access history).
+    # Persisted with the cloud. 0.5 = the human-memory-literature default.
+    decay_exponent: float = 0.5
+    # ACT-R base-level activation in ranking : blend the base relevance score
+    # with each candidate's need-odds (recency×frequency of journal accesses)
+    # under `decay_exponent`. 0.0 = OFF (pure base ; mnema's default) ; 1.0 =
+    # pure need-odds. Only applied when > 0 AND a journal is present.
+    recency_weight: float = 0.0
+    # ACT-R associative spreading via the JOURNAL co-retrieval log (distinct from
+    # the geometric `use_spreading`, which spreads over embedding manifold
+    # neighbours). The base top hits are seeds ; nodes historically co-retrieved
+    # with them are boosted, and capped missed neighbours are injected — surfaces
+    # associatively-relevant nodes the cosine missed (the oblique win). 0.0 = OFF.
+    # Applied only when > 0 AND a journal is present. A popularity loop : keep the
+    # weight modest and validate recall before raising it.
+    spreading_weight: float = 0.0
     # Episodic conversation index : the id of the last message ingested per
     # (user, session), so successive messages chain via sequence_prev and a
     # session reads back in order. Continuous indexation feeds this.
     _session_msg_chain: Dict[tuple, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._open_persistent_journal()
         if self.storage_path:
             try:
                 self.load()
             except FileNotFoundError:
                 pass  # first run
+
+    def _open_persistent_journal(self) -> None:
+        """Attach a persistent Journal from `journal_path` so the SQL triggers
+        outlive the process. No-op when a journal is already set or no path is
+        configured. "auto" -> "<storage_path>.journal.db". Failure-safe : a
+        journal that cannot be opened leaves the memory journal-less (fallbacks
+        apply) rather than breaking construction."""
+        if self.journal is not None or not self.journal_path:
+            return
+        path = self.journal_path
+        if path == "auto":
+            if not self.storage_path:
+                return                      # nothing to derive from
+            path = f"{self.storage_path}.journal.db"
+        try:
+            from metacog.journal import Journal
+            self.journal = Journal(path)
+        except Exception:
+            self.journal = None
 
     # ------------------------------------------------------------------
     # Isolation
@@ -155,8 +324,8 @@ class Memory:
         # Seed the deepcopy memo with the shared resources keyed by id, so
         # deepcopy returns them as-is (shared) instead of cloning them.
         memo: Dict[int, Any] = {}
-        for name in ("encoder", "llm", "executor", "extractor",
-                     "entity_extractor", "atomic_extractor"):
+        for name in ("encoder", "reranker", "journal", "llm", "executor",
+                     "extractor", "entity_extractor", "atomic_extractor"):
             obj = getattr(self, name, None)
             if obj is not None:
                 memo[id(obj)] = obj
@@ -220,6 +389,13 @@ class Memory:
             keywords_source=kw_src,
         )
         self.points.append(point)
+        # Deterministic session-date tags from the "[<date>]" content prefix —
+        # so EVERY dated turn is date-filterable (time:year/month/date), never
+        # depending on the LLM to notice the date. Enables date-scoped search.
+        if kind.upper() == "FACT" and not id.startswith(("entity_", "atom_")):
+            for dt in _session_date_tags(content):
+                if dt not in point.tags:
+                    point.tags.append(dt)
         # Backfill the previous point's sequence_next if we know it
         if sequence_prev:
             for p in self.points:
@@ -232,10 +408,24 @@ class Memory:
             for p in self.points:
                 if p.id in parent_set and id not in p.children:
                     p.children = list(p.children) + [id]
+        # DOCUMENT CARD (Phase 1) : ONE structured reading replacing the
+        # separate entity/event/tone reads below. On failure card_ok stays
+        # False and the individual extractors run as fallback.
+        card_ok = False
+        if (
+            self.doc_card_extractor is not None
+            and kind.upper() == "FACT"
+            and not self._is_derived(id)
+        ):
+            try:
+                card_ok = self._spawn_card(point)
+            except Exception:
+                card_ok = False
         # Spawn entity beacon nodes (opt-in). Only from genuine FACTs —
         # never recurse on entity-derived facts (their ids start "entity_").
         if (
             self.entity_extractor is not None
+            and not card_ok
             and kind.upper() == "FACT"
             and not id.startswith("entity_")
         ):
@@ -251,6 +441,54 @@ class Memory:
         ):
             try:
                 self._spawn_atomics(point)
+            except Exception:
+                pass
+        # Detect/type an EVENT in the turn and gravitate it onto its hub (opt-in,
+        # never on derived nodes ; a flaky extractor must not break ingestion).
+        # EVENTS keep the DEDICATED extractor even in card mode : Phase-1
+        # validation showed the card's embedded event line reads events far
+        # worse (context channel 13->2) — a specialised short read wins here.
+        # The card's events are only a degraded fallback when no dedicated
+        # extractor is wired.
+        if (
+            self.event_extractor is not None
+            and kind.upper() == "FACT"
+            and not id.startswith(("entity_", "atom_", "event_"))
+        ):
+            try:
+                self._spawn_events(point)
+            except Exception:
+                pass
+        # TONE READING (opt-in) : read the document's tone + intended meaning
+        # ONCE, here — query-independent, amortized across every later query.
+        if (
+            self.tone_reading
+            and not card_ok
+            and kind.upper() == "FACT"
+            and not self._is_derived(id)
+        ):
+            try:
+                self._spawn_tone(point)
+            except Exception:
+                pass
+        # Optional INGEST-time hierarchical tag refinement for genuine
+        # FACT/ACTION nodes (entity beacons / atomics are already typed). Off
+        # by default — the latent-sleep pass is the cheap path ; this is the
+        # opt-in eager path. The refined tags land in the tag glossary (the
+        # registry) automatically since they are appended to point.tags.
+        if (
+            self.tags_refine_on_ingest
+            and kind.upper() in ("FACT", "ACTION")
+            and not id.startswith(("entity_", "atom_"))
+            and "refined" not in point.tags
+        ):
+            try:
+                from metacog.tag_refine import refine_tags as _refine
+                fresh = [t for t in _refine(list(point.keywords or []), self.llm)
+                         if t not in point.tags]
+                point.tags.extend(fresh)
+                if hasattr(self.llm, "generate"):
+                    point.tags.append("refined")
             except Exception:
                 pass
         return point
@@ -342,15 +580,959 @@ class Memory:
             apply_pull(beacon, parent_entity, +1.0, t_now)
         return beacon
 
-    def _spawn_entities(self, source_fact: Point) -> None:
+    @staticmethod
+    def _cos(a, b) -> float:
+        if not a or not b:
+            return 0.0
+        num = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(y * y for y in b) ** 0.5
+        return num / (na * nb) if na and nb else 0.0
+
+    def _same_event_llm(self, new_name: str, hub: Point) -> bool:
+        """LLM arbitration : is `new_name` the SAME real-world event as the
+        existing hub? Bounded (only called for same-type, mid-cosine
+        candidates). Fails closed (False) so a flaky LLM never over-merges."""
+        if not hasattr(self.llm, "generate"):
+            return False
+        existing = hub.content.split(" ", 1)[1] if " " in hub.content else hub.content
+        try:
+            r = self.llm.generate(
+                "Are these two references to the SAME real-world event? "
+                "Answer only yes or no.\n"
+                f"A: {new_name}\nB: {existing}\nAnswer:", max_tokens=4)
+            return (r or "").strip().lower().startswith("y")
+        except Exception:
+            return False
+
+    def ingest_event(
+        self,
+        name: str,
+        etype: str,
+        *,
+        source_facts: Sequence[Point] = (),
+        t_start: Optional[str] = None,
+        t_end: Optional[str] = None,
+        salience: float = 0.30,
+        t_now: Optional[float] = None,
+    ) -> Point:
+        """Create (or RESOLVE to an existing) EVENT hub and gravitate the
+        relevant source facts onto it.
+
+        The EVENT is a `PointKind.EVENT` aggregator — NOT a fact — carrying a
+        hierarchical `event:type:<etype>` schema tag and an interval
+        [t_start, t_end?] (t_end absent ⇒ ongoing / right-open). It is the
+        temporally-extended HUB the facts gravitate around.
+
+        RESOLUTION / DEDUP (Graphiti recipe, edge-free) : a hub with the same
+        type and a name that matches an existing hub (registry key OR cosine
+        ≥ 0.85) is REUSED — the new facts are pulled onto the existing hub, so
+        "the war" across many turns is ONE node, not many.
+
+        SELECTIVE GRAVITATION (EventKG/MEAD : centrality = relevance) : a source
+        fact is pulled onto the hub only when cos(fact, hub) ≥ `salience`, so
+        the hub aggregates the salient facts, not noise.
+
+        Cor. 5 : the hub is GENERATOR-sourced ; apply_pull is called directly,
+        never via an Observation.
+        """
+        if t_now is None:
+            t_now = self._now()
+        nm = (name or "").strip()
+        et = (etype or "").strip().lower()
+        key = f"{et}::{nm.lower()}"
+        emb = tuple(self.encoder.encode(nm or et))
+
+        # ---- resolution / dedup (Graphiti recipe : cosine + LLM arbitration) ----
+        hub: Optional[Point] = None
+        if key in self._event_registry:
+            hub = next((p for p in self.points
+                        if p.id == self._event_registry[key]), None)
+        if hub is None:
+            best, best_s = None, 0.0
+            for p in self.points:
+                if p.kind is PointKind.EVENT and f"event:type:{et}" in p.tags:
+                    s = self._cos(emb, p.embedding_orig)
+                    if s > best_s:
+                        best, best_s = p, s
+            if best is not None:
+                if best_s >= 0.85:
+                    hub = best
+                elif best_s >= 0.45 and self._same_event_llm(nm, best):
+                    # same type, ambiguous name — let the LLM decide if it is the
+                    # same real-world event ("the war" == "war between two
+                    # nations"). This is what cosine-on-names alone misses.
+                    hub = best
+            if hub is not None:                 # alias the new name to the hub
+                self._event_registry[key] = hub.id
+
+        if hub is None:
+            tags = ["event", f"event:type:{et}"]
+            for dt in _session_date_tags(f"[{t_start}]") if t_start else []:
+                tags.append(dt.replace("time:", "event:start:", 1)
+                            if dt.startswith("time:") else dt)
+            if t_end:
+                for dt in _session_date_tags(f"[{t_end}]"):
+                    tags.append(dt.replace("time:", "event:end:", 1))
+            kws = [w for w in (nm.split() + [et]) if w]
+            hub = Point(
+                id=f"event_{uuid.uuid4().hex[:8]}",
+                content=f"event:{et} {nm}".strip(),
+                embedding_orig=emb,
+                kind=PointKind.EVENT,
+                keywords=kws,
+                keywords_embedding=position_weighted_keyword_embedding(
+                    kws, self.encoder),
+                keywords_source=SourceClass.GENERATOR,
+                tags=tags,
+            )
+            self.points.append(hub)
+            self._event_registry[key] = hub.id
+
+        # ---- selective gravitation ----
+        # A fact that gravitates is also TAGGED with its hub membership
+        # (event:in:<hub_id>) — edge-free, persists with the point, and lets
+        # the schema later partition this event's gravitating CLUSTER.
+        member = f"event:in:{hub.id}"
+        for f in source_facts or ():
+            if f is None or f.id == hub.id:
+                continue
+            if self._cos(f.embedding_orig, hub.embedding_orig) >= salience:
+                apply_pull(hub, f, +1.0, t_now)
+                if member not in f.tags:
+                    f.tags.append(member)
+        return hub
+
+    def event_cluster(self, event_id: str) -> List[Point]:
+        """The facts that gravitate to an event hub (its `event:in:<id>`
+        members) — 'everything there is' about the event."""
+        m = f"event:in:{event_id}"
+        return [p for p in self.points if m in p.tags]
+
+    def event_absorb(self, event_id: str, facts: Sequence[Point],
+                     *, t_now: Optional[float] = None) -> int:
+        """Fold newly-found facts INTO an event's gravitating cluster (= the
+        context's knowledge base) : tag event:in:<id> and pull onto the hub.
+        Used when a schema GAP is filled from the corpus — 'after the first
+        search the result joins the knowledge base', so later slots and future
+        queries see it. Edge-free ; returns the number of facts absorbed."""
+        hub = next((p for p in self.points if p.id == event_id), None)
+        if hub is None:
+            return 0
+        if t_now is None:
+            t_now = self._now()
+        member = f"event:in:{event_id}"
+        n = 0
+        for f in facts or ():
+            if f is None or f.id == event_id or member in f.tags:
+                continue
+            f.tags.append(member)
+            apply_pull(hub, f, +1.0, t_now)
+            n += 1
+        return n
+
+    @staticmethod
+    def _centroid(vecs: Sequence[Sequence[float]]) -> Tuple[float, ...]:
+        """Mean (L2-normalised) of a set of embeddings — the AGGREGATE 'aboutness'
+        vector. Mean-pooling denoises : each member's idiosyncratic tokens cancel,
+        the shared latent theme survives. That is what an OBLIQUE query (latent
+        relevance, no single member matching on surface) can lock onto."""
+        vv = [v for v in vecs if v]
+        if not vv:
+            return ()
+        dim = len(vv[0])
+        acc = [0.0] * dim
+        for v in vv:
+            for i in range(dim):
+                acc[i] += v[i]
+        n = float(len(vv))
+        m = [x / n for x in acc]
+        nrm = sum(x * x for x in m) ** 0.5 or 1.0
+        return tuple(x / nrm for x in m)
+
+    def event_centroid(self, event_id: str) -> Tuple[float, ...]:
+        """Centroid of an event's gravitating cluster (+ the hub name vector) —
+        the event's latent-theme representation for oblique routing."""
+        hub = next((p for p in self.points if p.id == event_id), None)
+        vecs = [p.embedding_orig for p in self.event_cluster(event_id)]
+        if hub is not None and hub.embedding_orig:
+            vecs.append(hub.embedding_orig)
+        return self._centroid(vecs)
+
+    def context_members(self, ctx: str) -> List[Point]:
+        """A CONTEXT = an event TYPE (war, earnings, …) : the thematic frame an
+        oblique query is SITUATED in. Returns the UNION of facts gravitating to
+        every event of that type — the broadest pool of latent evidence for the
+        context (deduped, order-preserving)."""
+        tag = f"event:type:{(ctx or '').strip().lower()}"
+        seen: set = set()
+        out: List[Point] = []
+        for ev in [p for p in self.points
+                   if p.kind is PointKind.EVENT and tag in p.tags]:
+            for f in self.event_cluster(ev.id):
+                if f.id not in seen:
+                    seen.add(f.id)
+                    out.append(f)
+        return out
+
+    def context_centroid(self, ctx: str) -> Tuple[float, ...]:
+        """Centroid pooled over the WHOLE context (all events of the type and
+        their clusters) — strictly more evidence than a single event's centroid,
+        so it denoises harder and matches an oblique query's latent theme best."""
+        tag = f"event:type:{(ctx or '').strip().lower()}"
+        vecs = [p.embedding_orig for p in self.context_members(ctx)]
+        vecs += [p.embedding_orig for p in self.points
+                 if p.kind is PointKind.EVENT and tag in p.tags
+                 and p.embedding_orig]
+        return self._centroid(vecs)
+
+    # ---- NAMED BAGS : retrieve-mode + cluster + schema-slot containers ------
+    # The bag is the primitive container used everywhere parallel channels
+    # collect ids — the agent's retrieve list ("default"), an event cluster
+    # ("event:<hid>"), a schema slot ("event:<hid>:slot:<slot>"), a normal
+    # search ("normal:<q>") — all live in `_bags`. Intersecting two bags is the
+    # cheap, INTERPRETED join (a fact found by both channels is the high-
+    # precision nugget). ACTION/THOUGHT generators read every non-empty bag for
+    # context (an empty bag has no influence — the invariant of empty steps).
+    def _bag_ref(self, name: str) -> List[str]:
+        if not hasattr(self, "_bags") or self._bags is None:
+            self._bags = {}
+        return self._bags.setdefault(name or "default", [])
+
+    def _bag_meta_ref(self) -> Dict[str, dict]:
+        if not hasattr(self, "_bag_meta") or self._bag_meta is None:
+            self._bag_meta = {}
+        return self._bag_meta
+
+    @staticmethod
+    def _bag_describe(schema: Any) -> str:
+        """Derive a description from a bag schema, so description tracks schema."""
+        if not isinstance(schema, dict):
+            return str(schema or "")
+        kind = schema.get("kind", "bag")
+        if kind == "event_cluster":
+            return f"Exhaustive cluster of event {schema.get('event_id', '')}."
+        if kind == "event_slot":
+            tier = "core" if schema.get("core") else "peripheral"
+            return f"Schema slot «{schema.get('slot', '')}» ({tier})."
+        if kind == "event_schema":
+            return "Schema roll-up: slots " + \
+                   ", ".join(schema.get("slots", []) or []) + "."
+        return f"{kind} bag."
+
+    def bag_add(self, ids, *, bag: str = "default",
+                description: Optional[str] = None, schema: Any = None) -> int:
+        """Append node ref(s) to a NAMED bag (deduped, order-preserving).
+        Default bag is the agent's retrieve list (backwards-compatible).
+        `description` / `schema` annotate the bag so the agent can DECIDE which
+        bag to use and how to render it (set/overwritten when provided)."""
+        b = self._bag_ref(bag)
+        if isinstance(ids, str):
+            ids = [ids]
+        for i in ids or []:
+            if isinstance(i, str) and i and i not in b:
+                b.append(i)
+        if description is not None or schema is not None:
+            m = self._bag_meta_ref().setdefault(bag, {})
+            if schema is not None:
+                m["schema"] = schema
+                # description MUST track the schema : a schema change with no
+                # explicit description re-derives the description from it.
+                if description is None:
+                    description = self._bag_describe(schema)
+            if description is not None:
+                m["description"] = description
+        # mirror the default into the legacy `_bag` field so external readers
+        # (format_bag_answer wiring, agent loop) keep working unchanged.
+        if bag == "default":
+            self._bag = list(b)
+        return len(b)
+
+    def bag_meta(self, name: str) -> dict:
+        """A bag's decision metadata : description, schema, size, sample ids."""
+        b = self._bag_ref(name)
+        m = self._bag_meta_ref().get(name, {})
+        return {"name": name, "size": len(b),
+                "description": m.get("description", ""),
+                "schema": m.get("schema"), "sample": b[:5]}
+
+    def curated_bags(self) -> Dict[str, list]:
+        """The agent's CURATED bags as a map {name: [(id, content)]} — the
+        default retrieve list plus any named bags it collected. Internal channel
+        bags (event:*) are excluded : they feed generators, not the surface
+        answer. This is the map of lists the final generation / keepup injects."""
+        return {n: self.bag_items(bag=n) for n in self.bag_names()
+                if not n.startswith("event:")}
+
+    def bag_overview(self) -> List[dict]:
+        """Every non-empty bag with its decision metadata — what the agent reads
+        to choose which list(s) to surface and how. Default + curated bags first,
+        internal channel bags (event:*) after."""
+        names = self.bag_names()
+        names.sort(key=lambda n: (n.startswith("event:"), n != "default", n))
+        return [self.bag_meta(n) for n in names]
+
+    def bag_items(self, *, bag: str = "default"):
+        """A bag as (id, content) pairs, in collection order."""
+        b = self._bag_ref(bag)
+        by_id = {p.id: p for p in self.points}
+        return [(i, getattr(by_id.get(i), "content", "")) for i in b]
+
+    def bag_clear(self, *, bag: Optional[str] = None) -> None:
+        """Clear ONE named bag (default 'default') or, when `bag is None`, the
+        default bag — backwards-compatible with the old no-arg form."""
+        if not hasattr(self, "_bags") or self._bags is None:
+            self._bags = {}
+        name = bag if bag is not None else "default"
+        self._bags[name] = []
+        if name == "default":
+            self._bag = []
+
+    def bag_names(self) -> List[str]:
+        if not hasattr(self, "_bags") or self._bags is None:
+            self._bags = {}
+        return [n for n, b in self._bags.items() if b]
+
+    def bag_intersect(self, names: Sequence[str]) -> List[str]:
+        """Intersection of the NAMED bags — the INTERPRETED join : an id that
+        every listed channel surfaced. Order-preserving on the first bag."""
+        names = [n for n in (names or []) if n]
+        if not names:
+            return []
+        first = self._bag_ref(names[0])
+        rest = [set(self._bag_ref(n)) for n in names[1:]]
+        if not rest:
+            return list(first)
+        return [i for i in first if all(i in s for s in rest)]
+
+    def bag_union(self, names: Sequence[str]) -> List[str]:
+        """Union of the NAMED bags (dedup, order-preserving)."""
+        seen: set = set()
+        out: List[str] = []
+        for n in (names or []):
+            for i in self._bag_ref(n):
+                if i not in seen:
+                    seen.add(i)
+                    out.append(i)
+        return out
+
+    def bag_publish_cluster(self, event_id: str) -> int:
+        """Publish an event's gravitating cluster as a NAMED bag — so the
+        cluster becomes an intersect-able channel like any other bag. Carries a
+        description + schema so the agent can decide how to use it."""
+        cl = self.event_cluster(event_id)
+        hub = next((p for p in self.points if p.id == event_id), None)
+        nm = (hub.content if hub else event_id)
+        return self.bag_add(
+            [p.id for p in cl], bag=f"event:{event_id}",
+            description=f"Everything gravitating to the event «{nm}» "
+                        f"({len(cl)} nodes) — the exhaustive cluster.",
+            schema={"kind": "event_cluster", "event_id": event_id,
+                    "element": "node/fact"})
+
+    def bag_publish_schema(self, event_id: str, fill: dict) -> int:
+        """Publish each filled schema SLOT as its own bag, plus a roll-up
+        'event:<id>:schema' = union of the slots. Each carries a description +
+        schema (the slot role) so the agent can decide what to surface."""
+        rolled: List[str] = []
+        for slot, hits in ((fill or {}).get("filled") or {}).items():
+            ids = [h["id"] for h in hits if isinstance(h, dict) and h.get("id")]
+            if ids:
+                core = slot in set((fill or {}).get("core") or [])
+                self.bag_add(
+                    ids, bag=f"event:{event_id}:slot:{slot}",
+                    description=f"Schema slot «{slot}» "
+                                f"({'core' if core else 'peripheral'}) of the "
+                                f"event — the nodes filling this role.",
+                    schema={"kind": "event_slot", "slot": slot, "core": core})
+                rolled += [i for i in ids if i not in rolled]
+        if rolled:
+            self.bag_add(
+                rolled, bag=f"event:{event_id}:schema",
+                description="Union of all filled schema slots for the event.",
+                schema={"kind": "event_schema",
+                        "slots": list((fill or {}).get("slots") or []),
+                        "core": list((fill or {}).get("core") or [])})
+        return len(rolled)
+
+    # ---- bi-temporal validity (Graphiti : t_valid / t_invalid) --------------
+    # event_time lives in the time:* tags ; ingestion_time is t_last_obs. A fact
+    # superseded by newer contradicting info is INVALIDATED (tagged
+    # valid:until:<date>) rather than deleted — preserving history for "as-of"
+    # queries. valid:until absent ⇒ still valid / ongoing (right-open).
+    @staticmethod
+    def is_valid(fact: Point, as_of: Optional[str] = None) -> bool:
+        """True if `fact` holds (no valid:until, or `as_of` precedes it)."""
+        until = next((t.split(":", 2)[2] for t in fact.tags
+                      if t.startswith("valid:until:")), None)
+        if not until:
+            return True
+        return bool(as_of) and as_of < until
+
+    def invalidate(self, fact_id: str, until: str) -> bool:
+        """Mark a fact invalid from `until` (a YYYY-MM-DD date), last-write-wins.
+        Edge-free : a tag, never a deletion."""
+        p = next((q for q in self.points if q.id == fact_id), None)
+        if p is None:
+            return False
+        tag = f"valid:until:{until}"
+        if not any(t.startswith("valid:until:") for t in p.tags):
+            p.tags.append(tag)
+            if "invalidated" not in p.tags:
+                p.tags.append("invalidated")
+            return True
+        return False
+
+    def invalidate_contradictions(self, new_fact: Point, *,
+                                  threshold: float = 0.55,
+                                  max_check: int = 5) -> List[str]:
+        """Graphiti-style temporal invalidation : find prior FACTs semantically
+        close to `new_fact`, ask the LLM if the new one CONTRADICTS/supersedes
+        each, and invalidate the superseded ones at the new fact's event date
+        (last-write-wins). Bounded (top `max_check` by cosine). Returns the
+        invalidated ids. Failure-safe / no-op without an LLM."""
+        if not hasattr(self.llm, "generate"):
+            return []
+        until = next((t.split(":", 2)[2] for t in new_fact.tags
+                      if t.startswith("time:date:")), None) or "9999-99-99"
+        cands = []
+        for p in self.points:
+            if (p.kind is PointKind.FACT and p.id != new_fact.id
+                    and not p.id.startswith(("entity_", "atom_", "event_"))
+                    and self.is_valid(p)):
+                s = self._cos(new_fact.embedding_orig, p.embedding_orig)
+                if s >= threshold:
+                    cands.append((s, p))
+        cands.sort(key=lambda x: -x[0])
+        invalidated: List[str] = []
+        for _, p in cands[:max_check]:
+            try:
+                r = self.llm.generate(
+                    "Does NEW information CONTRADICT and supersede OLD (a later "
+                    "update replacing it)? Answer only yes or no.\n"
+                    f"OLD: {p.content[:160]}\nNEW: {new_fact.content[:160]}\n"
+                    "Answer:", max_tokens=4)
+            except Exception:
+                r = ""
+            if (r or "").strip().lower().startswith("y"):
+                if self.invalidate(p.id, until):
+                    invalidated.append(p.id)
+        return invalidated
+
+    def forget_node(self, node_id: str, reason: str,
+                    superseded_by: Optional[str] = None) -> Dict[str, Any]:
+        """Explicit, on-demand soft-invalidation of ONE node (mnema's `forget`).
+        Append-only : the node is never deleted, its state is set INVALID so it
+        drops out of retrieval / the walk, tagged 'invalidated', and the `reason`
+        (required, e.g. 'superseded by X' / 'user corrected') is kept both in an
+        append-only in-memory log AND as a DB event (`forget_events`) so the
+        LATENT merge in sleep can consume it. `superseded_by` (optional) names the
+        successor node the forgotten one should merge into. Returns
+        {forgotten, reason} or {forgotten: None}."""
+        from metacog.epistemic import EpistemicState
+        if not reason or not str(reason).strip():
+            return {"forgotten": None, "error": "reason required"}
+        p = next((q for q in self.points if q.id == node_id), None)
+        if p is None:
+            return {"forgotten": None}
+        p.state = EpistemicState.INVALID          # hidden, not deleted
+        if "invalidated" not in p.tags:
+            p.tags.append("invalidated")
+        if not hasattr(self, "_forget_log") or self._forget_log is None:
+            self._forget_log = []
+        self._forget_log.append(
+            {"id": node_id, "reason": str(reason), "t": self._now()})
+        # DB event : lets the offline merge in sleep pick it up (no-op w/o journal)
+        if self.journal is not None:
+            try:
+                self.journal.log_forget(node_id, str(reason), superseded_by,
+                                        self._now())
+            except Exception:
+                pass
+        return {"forgotten": node_id, "reason": str(reason),
+                "superseded_by": superseded_by}
+
+    def merge_forgotten(self) -> Dict[str, Any]:
+        """LATENT merge : consume pending forget events from the DB and, for each
+        one that names a `superseded_by` successor, redirect the forgotten node's
+        alias to it (references now resolve to the successor — the same alias
+        mechanism lateral collision uses). Every pending event is then marked
+        merged (idempotent). No-op without a journal. Runs offline in sleep, so it
+        never touches the query path."""
+        if self.journal is None:
+            return {"merged": 0, "aliased": []}
+        aliased: List[str] = []
+        pending = self.journal.pending_forgets()
+        for ev in pending:
+            succ = ev.get("superseded_by")
+            if succ:
+                keeper = self._merge_aliases.get(succ, succ)
+                self._merge_aliases[ev["node_id"]] = keeper
+                aliased.append(ev["node_id"])
+            self.journal.mark_forget_merged(ev["id"])
+        return {"merged": len(pending), "aliased": aliased}
+
+    # ------------------------------------------------------------------
+    # OKF wiki — a bidirectional, continuously-evolving RAG extension
+    # ------------------------------------------------------------------
+
+    def feed_wiki(self, doc_id: str, title: str, node_ids: Sequence[str], *,
+                  type: str = "note", body: Optional[str] = None,
+                  t: Optional[float] = None) -> Dict[str, Any]:
+        """RAG -> wiki : build/update an OKF doc from RAG nodes. The node refs go
+        in BOTH the frontmatter (`refs:`) and inline in the body (`[[node_id]]`),
+        the union of their knowledge tags go in the frontmatter AND inline
+        (`#tag`), and the wiki<->node links are stored in the DB. Ids are resolved
+        to their live canonical node first. No-op without a journal."""
+        if self.journal is None:
+            return {"doc_id": None}
+        from metacog import wiki as _w
+        id2p = {p.id: p for p in self.points}
+        ids: List[str] = []
+        for nid in node_ids:
+            r = self.resolve_alias(str(nid))
+            if r not in ids:
+                ids.append(r)
+        tags: List[str] = []
+        for nid in ids:
+            p = id2p.get(nid)
+            for tg in (_w.context_tags(p.tags) if p else []):
+                if tg not in tags:
+                    tags.append(tg)
+        if body is None:
+            items = [(nid, (id2p[nid].content if nid in id2p else nid))
+                     for nid in ids]
+            body = _w.default_body(items, tags)
+        ts = self._now(t)
+        self.journal.upsert_wiki_doc(doc_id, type, title, tags, body, ts)
+        refs = list(dict.fromkeys(ids + _w.body_refs(body)))   # links = union
+        self.journal.set_wiki_refs(doc_id, refs)
+        self._reindex_okf(doc_id)
+        return {"doc_id": doc_id, "refs": refs, "tags": tags}
+
+    def wiki_doc(self, doc_id: str) -> Optional[str]:
+        """Render the current OKF markdown (frontmatter refs from the live link
+        table). None if absent / no journal."""
+        if self.journal is None:
+            return None
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return None
+        from metacog import wiki as _w
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        fb = self._doc_usefulness(doc_id)          # feedback = first-order
+        extra = {k: v for k, v in fb.items() if v}
+        return _w.render_okf(type=doc["type"], title=doc["title"],
+                             tags=doc["tags"], refs=refs, body=doc["body"],
+                             timestamp=doc["ts"], extra=extra)
+
+    def docs_for_node(self, node_id: str) -> List[str]:
+        """Which wiki docs cite this node (RAG->wiki reverse link). [] w/o journal."""
+        if self.journal is None:
+            return []
+        return self.journal.docs_referencing(self.resolve_alias(str(node_id)))
+
+    def reconcile_wiki(self) -> Dict[str, Any]:
+        """RAG -> wiki sync (offline, in sleep). For every wiki ref: follow merges
+        (`resolve_alias`) and rewrite old->new in BOTH the DB links and the body
+        `[[…]]`; flag refs whose target is gone or INVALID as stale so the doc is
+        known to need revision. No-op without a journal."""
+        if self.journal is None:
+            return {"remapped": 0, "stale": 0}
+        from metacog import wiki as _w
+        from metacog.epistemic import EpistemicState
+        id2p = {p.id: p for p in self.points}
+        remapped = stale = 0
+        for doc_id in self.journal.all_wiki_doc_ids():
+            doc = self.journal.get_wiki_doc(doc_id)
+            mapping: Dict[str, str] = {}
+            for r in self.journal.wiki_refs_for_doc(doc_id):
+                nid = r["node_id"]
+                resolved = self.resolve_alias(nid)
+                if resolved != nid:                    # node merged -> redirect
+                    self.journal.remap_wiki_ref(doc_id, nid, resolved)
+                    mapping[nid] = resolved
+                    remapped += 1
+                    nid = resolved
+                    self._reindex_okf(doc_id)          # refs changed -> reindex
+                p = id2p.get(nid)
+                gone = (p is None or p.state in (EpistemicState.INVALID,
+                                                 EpistemicState.DEPRECATED))
+                if gone:
+                    self.journal.mark_wiki_ref_stale(doc_id, nid, True)
+                    stale += 1
+                elif r["stale"]:
+                    self.journal.mark_wiki_ref_stale(doc_id, nid, False)
+            if mapping:
+                nb = _w.rewrite_body_refs(doc["body"], mapping)
+                if nb != doc["body"]:
+                    self.journal.upsert_wiki_doc(doc_id, doc["type"],
+                                                 doc["title"], doc["tags"], nb,
+                                                 self._now())
+        return {"remapped": remapped, "stale": stale}
+
+    def ingest_from_wiki(self, doc_id: str, text: str, *,
+                         kind: str = "FACT") -> Dict[str, Any]:
+        """wiki -> RAG : a wiki edit adds prose; ingest it as a NEW node carrying
+        the doc's tags as CONTEXT, and link it back into the doc (a new ref +
+        inline `[[…]]`). Returns {node_id}. No-op without a journal / doc."""
+        if self.journal is None:
+            return {"node_id": None}
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"node_id": None}
+        p = self.ingest(text, kind=kind)
+        for tg in doc["tags"]:                          # carry the doc's context
+            if tg not in p.tags:
+                p.tags.append(tg)
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        if p.id not in refs:
+            refs.append(p.id)
+        self.journal.set_wiki_refs(doc_id, refs)
+        new_body = doc["body"].rstrip() + f"\n- {text.strip()} [[{p.id}]]"
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"],
+                                     doc["tags"], new_body, self._now())
+        self._reindex_okf(doc_id)
+        return {"node_id": p.id}
+
+    def _doc_usefulness(self, doc_id: str) -> Dict[str, int]:
+        """Aggregate feedback over a doc's refs — the FIRST-ORDER credibility the
+        wiki carries (OKF usage_count-style), summed from mark_useful labels."""
+        pos = neg = 0
+        if self.journal is None:
+            return {"useful": 0, "useless": 0}
+        for r in self.journal.wiki_refs_for_doc(doc_id):
+            u = self.journal.node_usefulness(r["node_id"])
+            pos += u["useful"]
+            neg += u["useless"]
+        return {"useful": pos, "useless": neg}
+
+    def _reindex_okf(self, doc_id: str) -> None:
+        """Rebuild a doc's EAV frontmatter index from its live row + link table,
+        INCLUDING the first-order feedback (useful/useless) so it is queryable
+        like any other field. Called whenever the doc/refs/feedback change."""
+        if self.journal is None:
+            return
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        fb = self._doc_usefulness(doc_id)
+        self.journal.index_okf_fields(doc_id, doc["type"], {
+            "type": doc["type"], "title": doc["title"], "tags": doc["tags"],
+            "refs": refs, "useful": fb["useful"], "useless": fb["useless"],
+            "timestamp": doc["ts"],
+        })
+
+    def wiki_where(self, key: str,
+                   value: Optional[str] = None) -> List[str]:
+        """Query the OKF EAV index : doc ids having frontmatter field `key`
+        (= `value` if given). e.g. wiki_where('tags', 'health:fatigue') or
+        wiki_where('refs', node_id). [] without a journal."""
+        if self.journal is None:
+            return []
+        return self.journal.okf_docs_where(key, value)
+
+    def okf_schema(self) -> Dict[str, List[str]]:
+        """The recovered OKF schema — {type: [frontmatter keys]} derived from the
+        indexed data (no registry, no migrations). {} without a journal."""
+        return self.journal.okf_schema() if self.journal is not None else {}
+
+    def okf_fields(self, doc_id: str) -> Dict[str, List[str]]:
+        """All indexed frontmatter fields of a doc, {key: [values]}."""
+        return self.journal.okf_fields_of(doc_id) if self.journal is not None else {}
+
+    def import_okf(self, doc_id: str, markdown: str) -> Dict[str, Any]:
+        """Consume an EXTERNAL OKF doc : parse its frontmatter + body, store it,
+        link its refs (frontmatter + body `[[…]]`), and index its fields — so a
+        hand-written / third-party OKF bundle becomes queryable and evolves with
+        the RAG. No-op without a journal."""
+        if self.journal is None:
+            return {"doc_id": None}
+        from metacog import wiki as _w
+        d = _w.parse_okf(markdown)
+        ts = d.get("timestamp")
+        ts = self._now() if ts is None else float(ts)
+        self.journal.upsert_wiki_doc(doc_id, d["type"], d["title"], d["tags"],
+                                     d["body"], ts)
+        refs = list(dict.fromkeys(list(d["refs"]) + _w.body_refs(d["body"])))
+        self.journal.set_wiki_refs(doc_id, refs)
+        self._reindex_okf(doc_id)
+        return {"doc_id": doc_id, "type": d["type"], "refs": refs}
+
+    _EVENT_STOP = {
+        "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
+        "over", "into", "this", "that", "their", "his", "her", "its", "new",
+        "us", "a", "an", "by", "at", "as", "is", "are", "was",
+    }
+
+    def _event_tokens(self, hub: Point) -> set:
+        """Salient entity tokens of an event hub's name (drop its type word and
+        stopwords) — the participants that decide if two events are facets of
+        the SAME situation."""
+        et = next((t.split(":", 2)[2] for t in hub.tags
+                   if t.startswith("event:type:")), "")
+        name = hub.content.split(" ", 1)[1] if " " in hub.content else ""
+        et_words = set(re.findall(r"[a-z]{3,}", et.lower()))
+        return {w for w in re.findall(r"[a-z]{3,}", name.lower())
+                if w not in self._EVENT_STOP and w not in et_words}
+
+    def consolidate_events(
+        self, *, min_shared: int = 1, name_cos: float = 0.85,
+        cluster_overlap: int = 1, use_llm: bool = True,
+    ) -> Dict[str, Any]:
+        """Hierarchical aggregation : micro-event hubs that describe the SAME
+        real-world situation are MERGED into a macro hub ; its cluster becomes
+        the UNION of their gravitating facts. Fixes event fragmentation (27
+        tweets → 31 micro-hubs → 1 'iran-israel war' macro).
+
+        Multi-signal merge (mirrors the ingest dedup recipe, but post-hoc, so
+        it ALSO catches dedup failures where the LLM gave the same event two
+        very different names) — pair (a,b) merges when ANY of :
+          * `len(toks(a) ∩ toks(b)) ≥ min_shared`         (shared entity)
+          * same etype AND cos(name(a), name(b)) ≥ `name_cos`   (synonyms)
+          * same etype AND `|cluster(a) ∩ cluster(b)| ≥ cluster_overlap`
+              (the SAME facts gravitate to both : strongest signal)
+          * same etype, ambiguous cosine (0.45-0.85), LLM arbitrates yes
+              (Graphiti dedup recipe, bounded ; skipped when `use_llm=False`)
+        Edge-free : facts re-tagged event:in:<macro> and pulled onto the macro,
+        registry re-pointed. Last-write-wins on hub absorption ; deterministic
+        choice of canonical = the hub with the largest gravitating cluster."""
+        events = [p for p in self.points if p.kind is PointKind.EVENT]
+        toks = {e.id: self._event_tokens(e) for e in events}
+        etype = {e.id: next((t.split(":", 2)[2] for t in e.tags
+                             if t.startswith("event:type:")), "") for e in events}
+        cluster_ids = {e.id: {p.id for p in self.event_cluster(e.id)}
+                       for e in events}
+        parent = {e.id: e.id for e in events}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a_id, b_id):
+            parent[find(a_id)] = find(b_id)
+
+        for i in range(len(events)):
+            for j in range(i + 1, len(events)):
+                a, b = events[i], events[j]
+                if find(a.id) == find(b.id):
+                    continue
+                if len(toks[a.id] & toks[b.id]) >= min_shared:
+                    union(a.id, b.id); continue
+                if etype[a.id] and etype[a.id] == etype[b.id]:
+                    if (cluster_ids[a.id] and cluster_ids[b.id]
+                            and len(cluster_ids[a.id] & cluster_ids[b.id])
+                                >= cluster_overlap):
+                        union(a.id, b.id); continue
+                    cos = self._cos(a.embedding_orig, b.embedding_orig)
+                    if cos >= name_cos:
+                        union(a.id, b.id); continue
+                    if use_llm and cos >= 0.45 and self._same_event_llm(
+                            a.content.split(" ", 1)[-1], b):
+                        union(a.id, b.id)
+
+        groups: Dict[str, List[Point]] = {}
+        for e in events:
+            groups.setdefault(find(e.id), []).append(e)
+
+        t_now = self._now()
+        merged = 0
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            # canonical = the hub with the largest gravitating cluster
+            canon = max(members, key=lambda e: len(self.event_cluster(e.id)))
+            cmem = f"event:in:{canon.id}"
+            for e in members:
+                if e.id == canon.id:
+                    continue
+                for f in self.event_cluster(e.id):
+                    if cmem not in f.tags:
+                        f.tags.append(cmem)
+                        apply_pull(canon, f, +1.0, t_now)
+                # re-point the registry entries of the merged hub to the canon
+                for k, v in list(self._event_registry.items()):
+                    if v == e.id:
+                        self._event_registry[k] = canon.id
+                if cmem not in e.tags:           # the micro stays as a sub-event
+                    e.tags.append(cmem)
+                merged += 1
+        return {"events": len(events), "groups": sum(
+            1 for m in groups.values() if len(m) >= 2), "merged": merged}
+
+    def event_tag_signature(self, event_id: str, *, top: int = 12) -> List[str]:
+        """The TAG SIGNATURE of an event : the meaningful tags shared across its
+        gravitating cluster, most-frequent first (structural tags dropped). A
+        compact, discriminative fingerprint of what the event is about — far
+        less to reason over than the raw facts."""
+        from collections import Counter
+        cl = self.event_cluster(event_id)
+        cnt: Counter = Counter()
+        for p in cl:
+            for t in p.tags:                    # hierarchical tags (if refined)
+                if (":" in t and not t.startswith(("event:in:", "valid:",
+                                                   "time:"))
+                        and t not in ("fact", "refined", "invalidated")):
+                    cnt[t] += 1
+            for kw in (p.keywords or []):        # + the facts' keywords
+                k = (kw or "").strip().lower()
+                if len(k) >= 3:
+                    cnt[k] += 1
+        # the SHARED signal = tags/keywords recurring across the cluster.
+        return [t for t, c in cnt.most_common(top) if c >= 2] or \
+               [t for t, _ in cnt.most_common(top)]
+
+    def _route_event_llm(self, query: str, cands: List[Point]) -> Optional[Point]:
+        """LLM event routing : of these candidate events, which one is the query
+        REALLY about? Uses reasoning, so it bridges the obliqueness cosine can't
+        (a query sharing no words with its event). Each candidate is shown by
+        its TAG SIGNATURE (the cluster's shared tags) — compact and
+        discriminative, much less to process than the raw facts. Returns the
+        chosen Point or None (declines / no LLM). Fails closed."""
+        if not hasattr(self.llm, "generate") or not cands:
+            return None
+        lines = []
+        for i, m in enumerate(cands, 1):
+            et = next((t.split(":", 2)[2] for t in m.tags
+                       if t.startswith("event:type:")), "")
+            nm = m.content.split(" ", 1)[1] if " " in m.content else m.content
+            sig = ", ".join(self.event_tag_signature(m.id, top=10))
+            lines.append(f"{i}. {nm} [{et}] — tags: {sig}")
+        try:
+            r = self.llm.generate(
+                "Which numbered EVENT is the QUESTION really about? It may share "
+                "NO words with the event (e.g. 'mocking branding while wars "
+                "intensify' is about a WAR). Reason about the referent. Answer "
+                "ONLY the number, or 0 if none.\n\n"
+                f"QUESTION: {query}\n\nEVENTS:\n" + "\n".join(lines) + "\nNumber:",
+                max_tokens=6)
+        except Exception:
+            return None
+        m = re.search(r"\d+", r or "")
+        if not m:
+            return None
+        n = int(m.group(0))
+        return cands[n - 1] if 1 <= n <= len(cands) else None
+
+    def detect_event_type(self, query: str, *, threshold: float = 0.42
+                          ) -> Optional[dict]:
+        """Decide whether a QUERY is about an event, and of which TYPE.
+
+        Two signals (grounded first) : (1) the EVENT hubs are first-class
+        retrievable nodes — the query's nearest hub (cosine ≥ threshold) carries
+        the type, because the hub embeds near its gravitating facts ; (2)
+        fallback to the LLM event extractor on the query for events not yet
+        hubbed. Returns `{name, etype, event_id, score, via}` or None (then the
+        caller runs the normal walk/clue_search)."""
+        q = (query or "").strip()
+        if not q:
+            return None
+        try:
+            qe = tuple(self.encoder.encode(q))
+        except Exception:
+            return None
+        # CLUSTER-AWARE multi-event routing : score each MACRO event not just by
+        # its name's cosine to the query but by how well its gravitating CLUSTER
+        # matches — so a query routes to the event whose facts it is really
+        # about, not merely the nearest hub name (multi-event disambiguation).
+        ev_by_id = {p.id: p for p in self.points if p.kind is PointKind.EVENT}
+
+        def _macro(hub: Point) -> Point:
+            seen: set = set()
+            while True:
+                mid = next((t.split(":", 2)[2] for t in hub.tags
+                            if t.startswith("event:in:")
+                            and t.split(":", 2)[2] in ev_by_id
+                            and t.split(":", 2)[2] != hub.id), None)
+                if not mid or mid in seen:
+                    return hub
+                seen.add(mid)
+                hub = ev_by_id[mid]
+
+        macro_score: Dict[str, float] = {}
+        macro_pt: Dict[str, Point] = {}
+        for p in ev_by_id.values():
+            m = _macro(p)
+            name_s = self._cos(qe, m.embedding_orig)
+            clus = self.event_cluster(m.id)
+            # best single member — catches a SPECIFIC query naming one fact.
+            clus_s = max((self._cos(qe, f.embedding_orig)
+                          for f in clus[:40]), default=0.0)
+            # CONTEXT centroid — the latent-theme signal. An OBLIQUE query shares
+            # no surface words with any single member (so name_s and clus_s are
+            # both low), but is close to the mean of the whole context : the
+            # denoised 'aboutness' vector. This is the path that avoids '0 clue'.
+            et = next((t.split(":", 2)[2] for t in m.tags
+                       if t.startswith("event:type:")), "")
+            cent_s = self._cos(qe, self.context_centroid(et)) if et else 0.0
+            s = max(name_s, 0.5 * name_s + 0.5 * clus_s, cent_s)
+            if s > macro_score.get(m.id, -1.0):
+                macro_score[m.id] = s
+                macro_pt[m.id] = m
+        if macro_score:
+            ranked = sorted(macro_score, key=macro_score.get, reverse=True)
+            best_id = ranked[0]
+            via = "hub"
+            # LLM ROUTING for oblique disambiguation. When several events
+            # compete, cosine cannot route a query that shares NO surface words
+            # with its own evidence ("mocking branding while wars intensify" ->
+            # a war). Give the LLM the event glossary and let it pick by
+            # reasoning (cosine only narrows the candidate list). Cosine is the
+            # fallback (single event, or the LLM declines).
+            cands = [macro_pt[i] for i in ranked[:8]]
+            if len(cands) > 1:
+                pick = self._route_event_llm(q, cands)
+                if pick is not None:
+                    best_id, via = pick.id, "llm"
+            if via == "llm" or macro_score[best_id] >= threshold:
+                best = macro_pt[best_id]
+                et = next((t.split(":", 2)[2] for t in best.tags
+                           if t.startswith("event:type:")), "")
+                nm = best.content.split(" ", 1)[1] if " " in best.content else ""
+                return {"name": nm, "etype": et, "event_id": best.id,
+                        "score": round(macro_score[best_id], 3), "via": via}
+        if self.event_extractor is not None:
+            try:
+                evs = self.event_extractor.extract_events(q)
+            except Exception:
+                evs = []
+            if evs:
+                return {"name": evs[0].name, "etype": evs[0].etype,
+                        "event_id": None, "score": 0.0, "via": "llm"}
+        return None
+
+    def _spawn_events(self, source_fact: Point, pre=None) -> None:
+        """Detect events in a freshly ingested FACT and gravitate it onto each
+        event's hub (create/dedup the hub via ingest_event). The selective
+        gravitation gate in ingest_event keeps only turns actually about the
+        event."""
+        evs = pre if pre is not None else \
+            self.event_extractor.extract_events(source_fact.content)
+        if not evs:
+            return
+        t_now = self._now()
+        for e in evs:
+            self.ingest_event(
+                e.name, e.etype, source_facts=[source_fact],
+                t_start=getattr(e, "t_start", None), t_now=t_now,
+            )
+
+    def _spawn_entities(self, source_fact: Point, pre=None) -> None:
         """Extract entities from a freshly ingested FACT and spawn their
         beacon nodes. A date yields a full-date beacon plus day/month/year
         component beacons — all tagged "date" and all pulled onto the SAME
         source fact, so they cluster together near it (their geometric
         "part_of" link is this shared co-location, not a separate pull,
         which would only fight the source pull). One frozen t_now per fact
-        so pulls accumulate without inter-pull decay."""
-        ents = self.entity_extractor.extract_entities(source_fact.content)
+        so pulls accumulate without inter-pull decay.
+
+        `pre` : entities already extracted by the document card — skips the
+        extractor call (one reading of the document, not two)."""
+        ents = pre if pre is not None else \
+            self.entity_extractor.extract_entities(source_fact.content)
         if not ents:
             return
         t_now = self._now()
@@ -1172,6 +2354,8 @@ class Memory:
         lineage_depth: int = 7,
         prefer_kind: Optional[str] = None,
         t: Optional[float] = None,
+        abstain: bool = False,
+        abstain_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -1186,8 +2370,15 @@ class Memory:
                                  a PointKind ; ignored unless use_hybrid.
 
         Default k=7 (≈ matches LoCoMo / typical agentic context budget).
+
+        `abstain` (opt-in) applies the ACT-R retrieval threshold : if no chunk is
+        sufficiently activated for `query` (see `abstains`), retrieval FAILS and
+        returns [] — an explicit 'I don't know' instead of the least-bad match.
+        `abstain_threshold` fixes tau ; None uses the emergent floor.
         """
         t_now = self._now(t)
+        if abstain and self.abstains(query, abstain_threshold):
+            return []                            # retrieval failure (ACT-R)
         # When entity beacons exist they act as ingest-time pull agents :
         # their geometric pull already shifted the real facts, so we drop
         # them from the RETURNED ids (over-fetching to backfill to k) — the
@@ -1207,6 +2398,12 @@ class Memory:
         if beacons and not atomics:
             search_pts = [p for p in self.points
                           if not p.id.startswith("entity_")]
+        # event-action beacons : event_action_enrich plants a GENERATOR ACTION
+        # that re-anchors the WALK on the schema's findings. Like entity beacons
+        # their pull already shifted the real facts ; they are dead weight in a
+        # cosine retrieve and would only displace evidence (and aren't answers).
+        search_pts = [p for p in search_pts
+                      if "event:action" not in (p.tags or ())]
         # Over-fetch more when atomic facts are present : many atoms resolve
         # to the same source turn, so we need headroom to dedup to k turns.
         k_fetch = k
@@ -1234,6 +2431,7 @@ class Memory:
                 use_spreading=use_spreading,
                 lineage_depth=lineage_depth,
                 prefer_kind=kind_filter,
+                text_index=self._text_index,
             )
             if atomics:
                 # Second pass over RAW turns only — atoms flood the joint
@@ -1246,6 +2444,7 @@ class Memory:
                     encoder=self.encoder, extractor=self.extractor,
                     use_lineage=use_lineage, use_spreading=use_spreading,
                     lineage_depth=lineage_depth, prefer_kind=kind_filter,
+                    text_index=self._text_index,
                 )
         elif use_lineage:
             q_emb = tuple(self.encoder.encode(query))
@@ -1299,6 +2498,41 @@ class Memory:
                     if len(deduped) >= k:
                         break
             results = [(s, p) for s, p in deduped if p is not None]
+        # Drop soft-invalidated nodes (mnema `forget` / supersession) — same
+        # exclusion the walk applies, so a forgotten node stops surfacing.
+        from metacog.epistemic import EpistemicState as _ES
+        results = [(s, p) for s, p in results
+                   if p.state not in (_ES.INVALID, _ES.DEPRECATED)]
+        # ACT-R base-level : re-rank by blending the base relevance with each
+        # candidate's need-odds (journal access recency×frequency). OFF unless
+        # recency_weight > 0 and a journal is present -> default order untouched.
+        if self.recency_weight > 0.0 and self.journal is not None and results:
+            from metacog.need_odds import blend
+            pts = [p for _, p in results]
+            blended = blend([s for s, _ in results],
+                            [self.need_odds(p.id, t_now) for p in pts],
+                            self.recency_weight)
+            results = sorted(zip(blended, pts), key=lambda sp: sp[0],
+                             reverse=True)
+        # ACT-R associative spreading : the base top hits activate nodes they
+        # were historically co-retrieved with (journal). Boost co-hits already
+        # present, inject capped missed neighbours. OFF unless spreading_weight
+        # > 0 and a journal is present -> default candidate set untouched.
+        if self.spreading_weight > 0.0 and self.journal is not None and results:
+            seeds = [p.id for _, p in results[:3]]
+            co = dict(self.journal.find_co_retrieved(seeds, k=2 * k))
+            if co:
+                mx = max(co.values()) or 1
+                pt_by_id = {p.id: p for p in self.points}
+                cur = {p.id: [s, p] for s, p in results}
+                for nid, cooc in co.items():
+                    spread = self.spreading_weight * (cooc / mx)
+                    if nid in cur:
+                        cur[nid][0] += spread
+                    elif nid in pt_by_id:
+                        cur[nid] = [spread, pt_by_id[nid]]   # missed neighbour
+                results = sorted(((s, p) for s, p in cur.values()),
+                                 key=lambda sp: sp[0], reverse=True)[:k]
         return [
             {
                 "id": p.id,
@@ -1344,6 +2578,720 @@ class Memory:
         )
         yield from walker.keepup()
 
+    @staticmethod
+    def _point_date(p: Point) -> Optional[str]:
+        """A point's event date (YYYY-MM-DD) from its time:date tag, or None."""
+        return next((t.split(":", 2)[2] for t in p.tags
+                     if t.startswith("time:date:")), None)
+
+    _DERIVED_PREFIXES = ("entity_", "atom_", "event_", "act_", "lateral_",
+                         "thought_", "gen_", "gloss_", "stance_", "dq_")
+
+    @classmethod
+    def _is_derived(cls, pid: str) -> bool:
+        """True for auto-spawned / generated nodes (never source documents)."""
+        return str(pid).startswith(cls._DERIVED_PREFIXES) or "@" in str(pid)
+
+    # ---- TONE READING : ingest-time irony / register / intended meaning -----
+    _TONES = ("ironic", "hyperbole", "echo-register", "plain")
+
+    def _read_tone(self, content: str) -> Optional[dict]:
+        """One cached LLM reading of a document's TONE and INTENDED meaning.
+        Query-independent. Returns {'tone': <label>, 'gloss': <intended>} or
+        None on failure ; never caches an empty result."""
+        key = (content or "").strip()
+        if not key or not hasattr(self.llm, "generate"):
+            return None
+        if key in self._tone_cache:
+            return self._tone_cache[key]
+        try:
+            out = self.llm.generate(
+                "Read this text. 1) TONE — one of : ironic (irony/sarcasm/"
+                "satire/absurd or false-premise scenario/mock-innocent), "
+                "hyperbole (gross exaggeration), echo-register (grandiose "
+                "official/promotional wording echoed by an ordinary voice, a "
+                "distancing signal), plain (says what it means). Do not force "
+                "irony where there is none. 2) INTENDED — one short sentence of "
+                "what the author TRULY means (for plain, restate plainly).\n"
+                f"TEXT : {key[:400]}\n"
+                "Answer exactly :\nTONE: <label>\nINTENDED: <sentence>",
+                max_tokens=90) or ""
+        except Exception:
+            return None
+        tone, gloss = None, ""
+        for ln in out.splitlines():
+            ls = ln.strip()
+            if ls.lower().startswith("tone:"):
+                cand = ls.split(":", 1)[1].strip().lower()
+                tone = next((t for t in self._TONES if t in cand), None)
+            elif ls.lower().startswith("intended:"):
+                gloss = ls.split(":", 1)[1].strip()
+        if tone is None:
+            return None                          # unparseable -> never cache
+        res = {"tone": tone, "gloss": gloss}
+        self._tone_cache[key] = res
+        return res
+
+    def _spawn_tone(self, fact: Point, pre=None) -> None:
+        """Tag the fact with its tone and, for NON-plain tones, spawn a GLOSS
+        THOUGHT (`gloss_<id>`, GENERATOR, pulled onto the fact) carrying the
+        author's intended meaning — searchable, judge-readable. Edge-free ;
+        Cor. 5 : created directly, never through an Observation."""
+        res = pre if pre is not None else self._read_tone(fact.content)
+        if not res:
+            return
+        tag = f"tone:{res['tone']}"
+        if tag not in fact.tags:
+            fact.tags.append(tag)
+        gloss = (res.get("gloss") or "").strip()
+        if res["tone"] == "plain" or not gloss:
+            return                               # plain : the text IS the meaning
+        gid = f"gloss_{fact.id}"
+        if any(p.id == gid for p in self.points):
+            return
+        kws = [w for w in gloss.split()[:6] if w]
+        gp = Point(
+            id=gid,
+            content=gloss,
+            embedding_orig=tuple(self.encoder.encode(gloss)),
+            kind=PointKind.THOUGHT,
+            keywords=kws,
+            keywords_embedding=position_weighted_keyword_embedding(
+                kws, self.encoder),
+            keywords_source=SourceClass.GENERATOR,
+            tags=["gloss", f"gloss:of:{fact.id}", tag],
+        )
+        self.points.append(gp)
+        apply_pull(fact, gp, +1.0, self._now())
+
+    def gloss_of(self, fact_id: str) -> str:
+        """The intended-meaning gloss of a fact ('' if none/plain)."""
+        gid = f"gloss_{fact_id}"
+        return next((p.content for p in self.points if p.id == gid), "")
+
+    def stance_of(self, fact_id: str) -> str:
+        """The stance card of a fact ('' if the text takes no position)."""
+        sid = f"stance_{fact_id}"
+        return next((p.content for p in self.points if p.id == sid), "")
+
+    def _spawn_card(self, fact: Point) -> bool:
+        """ONE document-card reading -> every ingest artifact (Phase 1).
+
+        Dispatches the single coherent reading to the existing spawners via
+        their `pre` hooks : keywords (enrich), entity beacons, event hubs,
+        tone tag + intended gloss — plus the STANCE thought (`stance_<id>`)
+        and answerable-QUESTION thoughts (`dq_<id>_<n>`) consumed by later
+        phases. Returns True when the card was read (the individual ingest
+        hooks then skip) ; False -> caller falls back. Cor. 5 : every spawned
+        node is GENERATOR, created via apply_pull, never an Observation."""
+        card = self.doc_card_extractor.extract_card(fact.content)
+        if card is None:
+            return False
+        t_now = self._now()
+        if card.keywords:
+            merged = list(card.keywords) + [k for k in (fact.keywords or [])
+                                            if k not in card.keywords]
+            fact.keywords = merged[:8]
+            fact.keywords_embedding = position_weighted_keyword_embedding(
+                fact.keywords, self.encoder)
+            fact.keywords_source = SourceClass.GENERATOR
+        if card.entities:
+            try:
+                self._spawn_entities(fact, pre=card.entities)
+            except Exception:
+                pass
+        if card.events and self.event_extractor is None:
+            try:
+                self._spawn_events(fact, pre=card.events)
+            except Exception:
+                pass
+        try:
+            self._spawn_tone(fact, pre={"tone": card.tone,
+                                        "gloss": card.intended})
+        except Exception:
+            pass
+        # STANCE thought (Phase 3 consumer) : the position the text takes.
+        if card.stance:
+            sid = f"stance_{fact.id}"
+            if not any(p.id == sid for p in self.points):
+                kws = [w for w in card.stance.split()[:6] if w]
+                sp = Point(
+                    id=sid, content=card.stance,
+                    embedding_orig=tuple(self.encoder.encode(card.stance)),
+                    kind=PointKind.THOUGHT, keywords=kws,
+                    keywords_embedding=position_weighted_keyword_embedding(
+                        kws, self.encoder),
+                    keywords_source=SourceClass.GENERATOR,
+                    tags=["stance", f"stance:of:{fact.id}"],
+                )
+                self.points.append(sp)
+                apply_pull(fact, sp, +1.0, t_now)
+        # Answerable QUESTIONS (Phase 4 consumer) : doc2query.
+        for n, q in enumerate(card.questions):
+            qid = f"dq_{fact.id}_{n}"
+            if any(p.id == qid for p in self.points):
+                continue
+            kws = [w for w in q.split()[:6] if w]
+            qp = Point(
+                id=qid, content=q,
+                embedding_orig=tuple(self.encoder.encode(q)),
+                kind=PointKind.THOUGHT, keywords=kws,
+                keywords_embedding=position_weighted_keyword_embedding(
+                    kws, self.encoder),
+                keywords_source=SourceClass.GENERATOR,
+                tags=["dq", f"dq:of:{fact.id}"],
+            )
+            self.points.append(qp)
+            apply_pull(fact, qp, +1.0, t_now)
+        return True
+
+    def filter_list(
+        self,
+        *,
+        tags: Optional[Sequence[str]] = None,
+        match: str = "exact",
+        event_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        kind: Optional[str] = None,
+        valid_only: bool = False,
+        as_of: Optional[str] = None,
+    ) -> List[Point]:
+        """NON-kNN FILTERED LISTING : return ALL points matching the PARAMETERS
+        as a plain list — a scan, with no query embedding, no walk, no top-k.
+
+        This is the "refer an exhaustive set" primitive the walk's ACTION
+        launches once meta-cognition sees the input relates to an event : a
+        targeted, filtered knowledge-base query by `event_id` (the gravitating
+        cluster), inclusive `date_from`/`date_to` range (ISO dates, lexical),
+        hierarchical `tags`, and `kind`. Ordered by event date then id, so the
+        listing is deterministic and exhaustive (every match, not a similarity
+        ranking)."""
+        from metacog.tags import filter_points
+        if tags:
+            keep = set(filter_points(self.points, list(tags), mode=match))
+            pts = [p for p in self.points if p.id in keep]
+        else:
+            pts = list(self.points)
+        if event_id:
+            ev = {p.id for p in self.event_cluster(event_id)}
+            pts = [p for p in pts if p.id in ev]
+        if kind:
+            kn = str(kind).upper()
+            pts = [p for p in pts
+                   if getattr(p.kind, "name", str(p.kind)).upper() == kn]
+        if date_from or date_to:
+            ranged = []
+            for p in pts:
+                d = self._point_date(p)
+                if d is None:
+                    continue
+                if date_from and d < date_from:
+                    continue
+                if date_to and d > date_to:
+                    continue
+                ranged.append(p)
+            pts = ranged
+        if valid_only:
+            pts = [p for p in pts if self.is_valid(p, as_of=as_of)]
+        pts.sort(key=lambda p: (self._point_date(p) or "9999-99-99", p.id))
+        return pts
+
+    def search_nodes(
+        self,
+        query: str,
+        *,
+        mode: str = "sim",
+        on: str = "both",
+        restrict_ids: Optional[Sequence[str]] = None,
+        event_id: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        match: str = "exact",
+        exclude_ids: Optional[Sequence[str]] = None,
+        exclude_bag: Optional[str] = None,
+        k: int = 10,
+        exclude_derived: bool = True,
+    ) -> List[Point]:
+        """Tri-modal search over a FILTERED node pool, on content and/or TAGS,
+        WITHOUT REPLACEMENT.
+
+        The agent's relevance loop : presearch finds the context events, then
+        this draws candidates from the filtered pool (by `event_id` / `tags` /
+        date / `restrict_ids`) and ranks them —
+
+          mode 'sim'   : keyword overlap (query tokens ∩ content/tag tokens),
+          mode 'regex' : `re.search(query, …)` on content / raw tags,
+          mode 'fuzzy' : edit-budget token match (content) / fuzzy tag segments,
+
+        over `on` = content | tags | both. Already-collected nodes (`exclude_ids`
+        and every id in `exclude_bag`) are removed from the pool, so each pass
+        returns only NEW candidates — sampling without replacement, the loop
+        converges as the bag grows. Returns up to `k` points, best first."""
+        from metacog.tags import match_tag
+        from metacog.fuzzy import fuzzy_match
+
+        pool = self.filter_list(tags=tags, match=match, event_id=event_id,
+                                date_from=date_from, date_to=date_to)
+        if restrict_ids is not None:
+            rid = set(restrict_ids)
+            pool = [p for p in pool if p.id in rid]
+        exclude = set(exclude_ids or [])
+        if exclude_bag:
+            exclude |= set(self._bag_ref(exclude_bag))
+        pool = [p for p in pool if p.id not in exclude]
+        # POOL HYGIENE : auto-spawned derived nodes (atoms, entities, event hubs,
+        # generated actions) are never documents and never the answer ; left in,
+        # they win top-k slots by surface score and push low-signal document gold
+        # past k. Drop them so the candidate pool is documents only.
+        if exclude_derived:
+            pool = [p for p in pool if not self._is_derived(p.id)]
+
+        # SEMANTIC mode : embedding cosine — surfaces LATENT/oblique candidates
+        # that share no surface tokens (the gap the sim/fuzzy/regex matchers miss).
+        if mode == "semantic":
+            from metacog.geometry import cosine, effective_embedding
+            if not getattr(self, "encoder", None):
+                return []
+            try:
+                qv = self.encoder.encode(query)
+            except Exception:
+                return []
+            t = self._now()
+            # ingest-time card thoughts : an oblique doc whose SURFACE is far
+            # from the query may have an INTENDED meaning (gloss), a STANCE
+            # card, or an answerable QUESTION (doc2query, Phase 4) that is
+            # close — score each doc by the max over all its card views.
+            views_by_fact: Dict[str, List[Point]] = {}
+            for p in self.points:
+                fid = None
+                if p.id.startswith("gloss_"):
+                    fid = p.id[len("gloss_"):]
+                elif p.id.startswith("stance_"):
+                    fid = p.id[len("stance_"):]
+                elif p.id.startswith("dq_"):
+                    fid = p.id[len("dq_"):].rsplit("_", 1)[0]
+                if fid:
+                    views_by_fact.setdefault(fid, []).append(p)
+            sc: List[Tuple[float, Point]] = []
+            for p in pool:
+                try:
+                    s = cosine(qv, effective_embedding(p, t))
+                    for v in views_by_fact.get(p.id, ()):
+                        s = max(s, cosine(qv, effective_embedding(v, t)))
+                except Exception:
+                    s = 0.0
+                if s > 0:
+                    sc.append((s, p))
+            sc.sort(key=lambda x: (-x[0], x[1].id))
+            return [p for _, p in sc[:max(1, k)]]
+
+        def _toks(s: str) -> set:
+            return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+        ti = self._text_index
+        qtok = set(raw_token_set(query))
+        # Phase 2 : content tokens come from the per-doc index (memoized at
+        # first touch) instead of re-tokenizing the pool on every call. TAGS
+        # stay live-scanned : they mutate after ingest (event:in, tone:*,
+        # valid:until) so indexing them would go stale. For content-only sim,
+        # postings give the candidate set directly (the exact score>0 set).
+        if mode == "sim" and on == "content":
+            pool = ti.candidates(qtok, pool)
+        qwords = [w for w in (query or "").split() if w]
+        want_c = on in ("content", "both")
+        want_t = on in ("tags", "both")
+        rx = None
+        if mode == "regex":
+            try:
+                rx = re.compile(query, re.IGNORECASE)
+            except re.error:
+                return []
+
+        scored: List[Tuple[float, Point]] = []
+        for p in pool:
+            content = p.content or ""
+            ptags = list(getattr(p, "tags", []) or [])
+            score = 0.0
+            if mode == "regex":
+                if want_c and rx.search(content):
+                    score += 1.0
+                if want_t and any(rx.search(t) for t in ptags):
+                    score += 1.0
+            elif mode == "fuzzy":
+                if want_c:
+                    dtok = ti.raw_tokens(p)
+                    score += sum(1 for q in qtok
+                                 if any(fuzzy_match(q, d) for d in dtok))
+                if want_t:
+                    score += sum(1 for w in qwords
+                                 if match_tag(ptags, w, mode="fuzzy"))
+            else:  # sim = keyword overlap
+                if want_c:
+                    score += len(qtok & ti.raw_tokens(p))
+                if want_t:
+                    score += len(qtok & _toks(" ".join(ptags)))
+            if score > 0:
+                scored.append((score, p))
+        scored.sort(key=lambda sp: (-sp[0], sp[1].id))
+        return [p for _, p in scored[:max(1, k)]]
+
+    def distill_proposition(self, query: str) -> str:
+        """Distil the request's SPECIFIC oblique proposition — the exact stance an
+        item must take to qualify, not the surface topic. Cached per query.
+        Failure / no LLM -> the query itself."""
+        if not hasattr(self, "_prop_cache") or self._prop_cache is None:
+            self._prop_cache = {}
+        if query in self._prop_cache:
+            return self._prop_cache[query]
+        prop = query
+        if hasattr(self.llm, "generate"):
+            try:
+                out = self.llm.generate(
+                    "A retrieval request describes items by an OBLIQUE stance. "
+                    "State the underlying ATTITUDE an item must take to qualify — "
+                    "the position/target it is for or against — but keep it BROAD : "
+                    "cover EVERY facet/angle the request implies, do not collapse "
+                    "it to a single narrow sub-claim (an item that takes the "
+                    "attitude via a DIFFERENT facet still qualifies). If the "
+                    "request is about IMPLICITLY alleging / suggesting something, "
+                    "state the CLAIM being raised — an item that presupposes, "
+                    "raises, questions, reports or reacts to it qualifies ; do NOT "
+                    "harden it into a demand that the item explicitly assert a "
+                    "loaded conclusion (legality, blame, etc.). 1-2 sentences.\n"
+                    f"Request : {query}\nAttitude (broad) :", max_tokens=120)
+                if out and out.strip():
+                    prop = out.strip()
+            except Exception:
+                pass
+        self._prop_cache[query] = prop
+        return prop
+
+    # Meta-prompt for the per-item stance THOUGHT — GENERAL (domain-agnostic)
+    # markers an author uses to take a stance. Detect humour/irony BUT NOT ONLY ;
+    # judge the plain case too ; never force irony where there is none. The
+    # examples are ILLUSTRATIVE of a general phenomenon, not tied to any topic.
+    _STANCE_META = (
+        "Judge what the author TRULY means, in ANY domain. An item takes the "
+        "wanted stance when ANY of these hold (do not force irony where there is "
+        "none) :\n"
+        " - HUMOUR / IRONY / SARCASM / SATIRE : literal meaning ≠ intended "
+        "meaning — signalled (in any context) by laughter/emoji, 'lol', absurd "
+        "or fictional/false-premise scenarios, hyperbole, mock-innocent "
+        "questions, parody.\n"
+        " - EXAGGERATED SUPERLATIVES / OFFICIAL or PROMOTIONAL REGISTER echoed by "
+        "an ordinary voice : grandiose, hype, or boilerplate wording that sincere "
+        "speakers don't use (e.g. titles, 'totally', 'epic', 'flawless', "
+        "press-release phrasing) — echoing it is a DISTANCING / mocking signal.\n"
+        " - the stance, or any FACET of it, stated PLAINLY (no irony) — qualifies "
+        "too ; an item that takes the attitude via a DIFFERENT angle than the "
+        "obvious one still qualifies.\n"
+        " - IMPLICIT ALLEGATION / PRESUPPOSITION : an item that raises, questions, "
+        "reports, reacts to, or takes for granted the alleged situation TREATS IT "
+        "AS REAL — that implicit allegation qualifies ; it need NOT explicitly "
+        "assert the loaded conclusion (legality, blame, harm, etc.).\n"
+        "An item merely on the same TOPIC without taking the stance, or on a "
+        "different subject, does NOT qualify."
+    )
+
+    def _judge_one(self, proposition: str, p: Point) -> str:
+        """Per-item stance THOUGHT (the mode that detects irony / superlatives).
+        Returns 'relevant'/'irrelevant' ; recall-first (fail OPEN)."""
+        if not hasattr(self.llm, "generate"):
+            return "relevant"
+        prompt = (
+            "Decide whether this ONE item belongs to a set defined by a STANCE.\n"
+            f"STANCE WANTED : {proposition}\n"
+            f"{self._STANCE_META}\n"
+            f"ITEM : {(p.content or '')[:400]}\n"
+            "Reason in ONE line, then end with `VERDICT: RELEVANT` or "
+            "`VERDICT: IRRELEVANT`."
+        )
+        try:
+            out = self.llm.generate(prompt, max_tokens=120) or ""
+        except Exception:
+            return "relevant"
+        tail = out.lower().rsplit("verdict", 1)[-1]
+        return "irrelevant" if "irrelevant" in tail else "relevant"
+
+    def _judge_text(self, p: Point) -> str:
+        """The text handed to the cross-encoder for a candidate : surface +
+        its INTENDED gloss + STANCE so ironic/oblique items expose their real
+        meaning to the reranker (else it would score the literal surface)."""
+        txt = (p.content or "")[:200]
+        g = self.gloss_of(p.id)
+        if g:
+            txt += f" [intended: {g[:120]}]"
+        s = self.stance_of(p.id)
+        if s:
+            txt += f" [stance: {s[:100]}]"
+        return txt
+
+    def _proposition_scores(self, prop: str,
+                            cands: Sequence[Point]) -> List[float]:
+        """Per-candidate relevance-to-proposition score, higher = more relevant.
+
+        Cross-encoder backend (`self.reranker`) when present : scores the
+        (prop, doc) pairs JOINTLY — the precise, zero-token judge. Else the
+        bi-encoder cosine (max over the doc and its stance/gloss cards) — the
+        blunt fallback."""
+        rr = getattr(self, "reranker", None)
+        if rr is not None:
+            docs = [self._judge_text(p) for p in cands]
+            return [float(s) for s in rr.rerank(prop, docs)]
+        from metacog.geometry import cosine, effective_embedding
+        pv = self.encoder.encode(prop)
+        t = self._now()
+        by_id = {p.id: p for p in self.points}
+        out: List[float] = []
+        for p in cands:
+            best = cosine(pv, effective_embedding(p, t))
+            for did in (f"stance_{p.id}", f"gloss_{p.id}"):
+                dp = by_id.get(did)
+                if dp is not None:
+                    best = max(best, cosine(pv, effective_embedding(dp, t)))
+            out.append(best)
+        return out
+
+    def oblique_labels(self, query: str, cands: Sequence[Point],
+                       collected: Optional[Sequence[Point]] = None,
+                       proposition: Optional[str] = None,
+                       per_item="auto", second_opinion: bool = True
+                       ) -> List[str]:
+        """OBLIQUE-aware relevance labels — test each candidate against the
+        request's distilled PROPOSITION (the specific stance), not generic
+        relevance.
+
+        COST GATING by ingest-time tone reading : the hard part of the per-item
+        judgment (literal vs intended meaning) is query-independent ; when the
+        candidates carry ingest-time tone/GLOSS annotations, ONE batch call over
+        `content + INTENDED gloss` suffices (the gloss is the per-item THOUGHT,
+        precomputed and amortized). `per_item="auto"` (default) batches when a
+        majority of candidates are tone-annotated, else falls back to the
+        per-item stance THOUGHT (`_judge_one`) that detects irony live. Recall-
+        first (fails OPEN). No LLM -> all relevant."""
+        cands = list(cands)
+        if not cands or not hasattr(self.llm, "generate"):
+            return ["relevant"] * len(cands)
+        if per_item == "auto":
+            toned = sum(1 for p in cands
+                        if any(t.startswith("tone:") for t in p.tags))
+            per_item = toned < max(1, len(cands) // 2)   # batch when annotated
+        if per_item:
+            prop = proposition or self.distill_proposition(query)
+            return [self._judge_one(prop, p) for p in cands]
+        prop = proposition or self.distill_proposition(query)
+
+        # FUNNEL stage (a) — proposition-relevance PRE-FILTER. The candidate
+        # scores come from `_proposition_scores` : a local CROSS-ENCODER when one
+        # is wired in (joint (prop, doc) scoring — precise, zero LLM tokens ; the
+        # mnema lever) else the bi-encoder cosine (blunt fallback). The bands are
+        # EMERGENT — mean ± std of THIS set's own scores (a statistical property
+        # of the data, not a tuned constant) :
+        #   * HIGH  (s >= mu+sd) : pre-accepted, skip the batch, NEVER overturned
+        #                          (recall-first — accepting more never costs recall).
+        #   * LOW   (s <= mu-sd) : auto-rejected WITHOUT an LLM call — but ONLY
+        #                          under the cross-encoder (precise enough to reject
+        #                          on) ; the bi-encoder is too blunt, so it only
+        #                          ever pre-accepts. THIS is where the batch shrinks.
+        #   * MIDDLE             : the ambiguous / oblique tail -> batch judge.
+        # Degenerate sets (<4) skip the stage entirely.
+        pre_accept: set = set()
+        auto_reject: set = set()
+        sims = None                              # per-candidate prop-score
+        mu = 0.0                                 # band centre (mean of sims)
+        if len(cands) >= 4:
+            try:
+                sims = self._proposition_scores(prop, cands)
+            except Exception:
+                sims = None
+            if sims is not None:
+                mu = sum(sims) / len(sims)
+                sd = (sum((s - mu) ** 2 for s in sims) / len(sims)) ** 0.5
+                pre_accept = {i for i, s in enumerate(sims) if s >= mu + sd}
+                if getattr(self, "reranker", None) is not None:
+                    auto_reject = {i for i, s in enumerate(sims)
+                                   if s <= mu - sd and i not in pre_accept}
+        rest = [i for i in range(len(cands))
+                if i not in pre_accept and i not in auto_reject]
+        labels = ["relevant"] * len(cands)
+        for i in auto_reject:
+            labels[i] = "irrelevant"             # cross-encoder clear-low : no LLM
+        if not rest:
+            return labels
+
+        def _line(i, p):
+            base = f"[{i}] {(p.content or '')[:200]}"
+            gloss = self.gloss_of(p.id)
+            tone = next((t.split(":", 1)[1] for t in p.tags
+                         if t.startswith("tone:")), "")
+            if gloss:
+                base += f"\n    INTENDED ({tone}): {gloss[:160]}"
+            stance = self.stance_of(p.id)
+            if stance:
+                base += f"\n    STANCE: {stance[:140]}"
+            return base
+        listing = "\n".join(_line(j, cands[gi])
+                             for j, gi in enumerate(rest))
+        ctx = ""
+        if collected:
+            ctx = "ALREADY GATHERED :\n" + "\n".join(
+                f"  - {(p.content or '')[:100]}" for p in list(collected)[-6:]
+            ) + "\n"
+        prompt = (
+            "You are assembling the EXHAUSTIVE set of items that take a specific "
+            "OBLIQUE stance. An item QUALIFIES if it expresses, implies, mocks in "
+            "agreement, supports, or exemplifies THIS proposition — by stance, "
+            "tone, sarcasm, or allusion, even sharing no words with it :\n"
+            f"  PROPOSITION : {prop}\n"
+            "Label irrelevant an item that is merely on the same TOPIC without "
+            "taking this stance, or a different subject. Be generous for items "
+            "that genuinely take the stance. When an item carries an INTENDED "
+            "line, judge by THAT (the author's true meaning), not the literal "
+            "surface.\n"
+            "For EACH numbered item output one line `i: relevant` or "
+            "`i: irrelevant`, nothing else.\n\n"
+            f"{ctx}ITEMS :\n{listing}"
+        )
+        try:
+            raw = self.llm.generate(prompt, max_tokens=max(16, 6 * len(rest)))
+        except Exception:
+            return labels                            # fail OPEN (all relevant)
+        for ln in (raw or "").splitlines():
+            ln = ln.strip().lstrip("-•* ").strip()
+            if ":" not in ln:
+                continue
+            a, _, b = ln.partition(":")
+            a = a.strip().strip("[]")
+            if a.isdigit() and 0 <= int(a) < len(rest):
+                labels[rest[int(a)]] = "irrelevant" \
+                    if "irrelevant" in b.lower() else "relevant"
+        # SECOND OPINION : re-judge ONLY the batch-rejected candidates with the
+        # live per-item stance THOUGHT. The batch on precomputed glosses is
+        # cheap but slightly blunter than reasoning against the precise stance ;
+        # a per-item pass restricted to the rejects costs ∝ |rejected| (small)
+        # and recovers most of the per-item recall — recall-first, an accept is
+        # never overturned.
+        # SECOND OPINION on the AMBIGUOUS band only : a batch-reject whose
+        # embedding similarity is at/above the band centre (mu) is near the cut
+        # and worth a live per-item re-read ; a reject far below mu is a clear
+        # distractor — trusting the batch there spends no LLM and costs no recall
+        # (those are not gold). When sims is unavailable, fall back to all.
+        if second_opinion and any(lab == "irrelevant" for lab in labels):
+            for i, (p, lab) in enumerate(zip(cands, labels)):
+                if lab != "irrelevant":
+                    continue
+                if sims is not None and sims[i] < mu:
+                    continue                     # clear-low reject : trust it
+                labels[i] = self._judge_one(prop, p)
+        return labels
+
+    def _judge_relevance(self, query: str, cands: Sequence[Point],
+                         collected: Optional[Sequence[Point]] = None,
+                         oblique: bool = True) -> List[Point]:
+        """REASON over the candidates (not surface-match them). With `oblique`
+        (default) use the implicit-relevance judge ; else the walk's Chain-of-Note
+        reading. Recall-first either way (keep everything not labelled
+        irrelevant). No LLM -> keep all."""
+        cands = list(cands)
+        if not cands:
+            return []
+        if oblique:
+            labels = self.oblique_labels(query, cands, collected=collected)
+        else:
+            from metacog.meta_walk import chain_of_note
+            try:
+                labels = chain_of_note(query, cands, self.llm,
+                                       collected=collected)
+            except Exception:
+                return cands
+        return [p for p, lab in zip(cands, labels) if lab != "irrelevant"]
+
+    def assemble_set(
+        self,
+        query: str,
+        *,
+        event_id: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        modes: Sequence[str] = ("semantic", "sim", "fuzzy", "regex"),
+        on: str = "both",
+        bag: str = "default",
+        max_rounds: int = 6,
+        k: int = 10,
+        judge: bool = True,
+        auto_route: bool = True,
+    ) -> Dict[str, Any]:
+        """AGENTIC exhaustive-set assembly — the orchestrated loop.
+
+        1. Scope : the given `event_id`/`tags`, or auto-route via
+           `detect_event_type(query)` (presearch the context event).
+        2. Loop : `search_nodes` over the filtered pool across `modes`
+           (sim → fuzzy → regex) on content+tags ; judge relevance (LLM) ;
+           `collect` the hits into `bag`. WITHOUT REPLACEMENT — every candidate
+           is judged once (collected ones via the bag, rejected ones tracked) so
+           the pool shrinks and the loop converges when no new relevant node is
+           found (or `max_rounds`).
+
+        With `auto_route=False` and no event_id/tags, the loop runs GLOBALLY over
+        the whole pool — recovering relevant nodes that the (possibly fragmented)
+        clustering scattered across micro-events, since content/tag matching does
+        not depend on cluster membership.
+
+        Returns {bag, size, rounds, added, scope}."""
+        if auto_route and event_id is None and not tags:
+            try:
+                det = self.detect_event_type(query)
+            except Exception:
+                det = None
+            if det and det.get("event_id"):
+                event_id = det["event_id"]
+        seen: set = set()
+        added_log: List[int] = []
+        for _r in range(max(1, max_rounds)):
+            added = 0
+            surfaced = 0
+            for mode in modes:
+                cand = self.search_nodes(
+                    query, mode=mode, on=on, event_id=event_id, tags=tags,
+                    date_from=date_from, date_to=date_to,
+                    exclude_ids=seen, exclude_bag=bag, k=k)
+                cand = [p for p in cand if p.id not in seen]
+                if not cand:
+                    continue
+                surfaced += len(cand)
+                # Log this surfaced set to the journal (access_events) — feeds
+                # SQL co-retrieval / lateral collision. No-op without a journal.
+                self.record_retrieval([p.id for p in cand], query_text=query)
+                if judge:
+                    bag_ids = set(self._bag_ref(bag))
+                    collected = [p for p in self.points if p.id in bag_ids]
+                    keep = self._judge_relevance(query, cand, collected=collected)
+                else:
+                    keep = cand
+                for p in cand:                          # judged once : no remise
+                    seen.add(p.id)
+                if keep:
+                    self.bag_add(
+                        [p.id for p in keep], bag=bag,
+                        description=f"Assembled relevant set for: {query[:80]}",
+                        schema={"kind": "assembled_set", "query": query,
+                                "event_id": event_id})
+                    added += len(keep)
+            added_log.append(added)
+            # Stop only when the pool is EXHAUSTED (no new candidate surfaced) —
+            # without replacement guarantees this terminates. Stopping on a quiet
+            # `added==0` round was premature : low-signal gold sit past top-k and
+            # only surface once the higher-ranked (often irrelevant) nodes are
+            # drawn and removed. `max_rounds` bounds the compute for huge pools.
+            if surfaced == 0:
+                break
+        return {"bag": bag, "size": len(self.bag_items(bag=bag)),
+                "rounds": len(added_log), "added": added_log,
+                "scope": {"event_id": event_id, "tags": list(tags or [])}}
+
     def scoped_answer(
         self,
         query: str,
@@ -1352,6 +3300,10 @@ class Memory:
         knowledge_base: bool = False,
         n_stages: int = 16,
         match: str = "exact",
+        list_only: bool = False,
+        event_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Tag-filtered retrieval as a TWO-PHASE cascade.
 
@@ -1380,7 +3332,25 @@ class Memory:
         ["global_answer", "global_evidence"]}`."""
         from metacog.meta_walk import MetaWalker, provisional_answer
         from metacog.tags import filter_points
+
+        # NON-kNN listing : the walk's ACTION saw the input relates to an event
+        # and asks for the exhaustive set by parameters, not a similarity walk.
+        if list_only:
+            pts = self.filter_list(tags=tags, match=match, event_id=event_id,
+                                   date_from=date_from, date_to=date_to)
+            return {
+                "scoped_list": [{"id": p.id, "content": p.content} for p in pts],
+                "scoped_ids": [p.id for p in pts],
+                "knowledge_base": bool(knowledge_base), "list_only": True,
+            }
+
         scoped_ids = filter_points(self.points, list(tags or []), mode=match)
+        # Targeted filter : narrow the kNN walk's pool by event / date too.
+        if event_id or date_from or date_to:
+            filt = {p.id for p in self.filter_list(
+                event_id=event_id, date_from=date_from, date_to=date_to)}
+            scoped_ids = [i for i in (scoped_ids or
+                          [p.id for p in self.points]) if i in filt]
 
         def _run(q, *, restrict):
             w = MetaWalker(q, self, n_stages=n_stages, commit=False,
@@ -1446,6 +3416,8 @@ class Memory:
         diverse queries collapse into a single keeper. No-op unless
         lateral collision is enabled and the cloud is past the gate."""
         t_now = self._now(t)
+        from metacog.geometry import clear_geo_cache
+        clear_geo_cache()                       # rebuild geometric stats fresh
         report = sleep_cycle_collisions(
             self.points, self.llm, self.encoder, t_now=t_now,
         )
@@ -1455,15 +3427,120 @@ class Memory:
             "new_children_ids": [p.id for p in report.new_children],
             "aborted_for_cascade_limit": report.aborted_for_cascade_limit,
         }
+        self._journal_collisions("fission", report.resolved)
         lat = self.lateral_collapse(t_now)
         out["lateral_collided_groups"] = lat["collided_groups"]
         out["lateral_aliases"] = lat["aliases"]
+        # LATENT decay-fit : re-fit the Anderson-Schooler exponent from the
+        # journal's accumulated usefulness labels (concept A feedback loop) so
+        # the need-odds ranking (concept B) stays calibrated as usage grows.
+        # No-op (keeps the current exponent) without a journal or without both
+        # label classes present.
+        fit = self.fit_decay(t_now)
+        out["decay_exponent"] = fit["exponent"]
+        out["decay_fit_n_pos"] = fit["n_pos"]
+        out["decay_fit_n_neg"] = fit["n_neg"]
+        # OFFLINE decay-forgetting : prune cold nodes here (never on the query
+        # path). Opt-in (forget_enabled) ; conservative + emergent. No-op off.
+        if self.forget_enabled:
+            out["forgotten"] = self.forget(t_now, apply=True)["forgotten"]
+        # LATENT merge : consume pending explicit-forget events (superseded->alias)
+        # from the DB. Offline, so it never touches the query path. No-op off DB.
+        merged = self.merge_forgotten()
+        if merged["merged"]:
+            out["forget_merged"] = merged["merged"]
+            out["forget_aliased"] = merged["aliased"]
+        # RAG -> wiki sync : rewrite refs of nodes that merged, flag stale ones.
+        # Runs AFTER merge_forgotten so the aliases are set. No-op without a wiki.
+        wr = self.reconcile_wiki()
+        if wr["remapped"] or wr["stale"]:
+            out["wiki_remapped"] = wr["remapped"]
+            out["wiki_stale"] = wr["stale"]
         # LATENT skill distiller : replay resolutions recorded since the
         # last sleep and crystallize theoretical tools linked to their
         # explicating facts. Opt-in (skills_enabled), idempotent.
         if self.skills_enabled and self._resolution_ledger:
             out["distilled"] = self.distill_skills(t_now)["distilled"]
+        # LATENT tag refiner : decompose FACT phrase keywords into
+        # hierarchical namespace tags. Opt-in (tags_refine_enabled), idempotent.
+        if self.tags_refine_enabled:
+            out["tags_refined"] = self.refine_tags()["refined_points"]
         return out
+
+    def refine_tags(self) -> Dict[str, Any]:
+        """Decompose FACT phrase keywords into hierarchical namespace tags.
+
+        For every FACT not yet refined, run the LLM taxonomy pass over its
+        keyword phrases and APPEND the resulting hierarchical tags (deduped,
+        normalised lowercase by Point.__post_init__). A "refined" marker tag
+        makes the pass idempotent : a point is visited once across sleeps.
+
+        Tags are INDEXING metadata (Cor. 5 : provenance GENERATOR) — appended
+        directly, never via an Observation. Fully failure-safe : a flaky LLM
+        leaves the cloud unchanged. Returns the count of points refined and
+        the union of new tags added."""
+        from metacog.tag_refine import refine_tags as _refine
+        from metacog.epistemic import PointKind
+
+        refined_points = 0
+        added: List[str] = []
+        for p in self.points:
+            if p.kind != PointKind.FACT or "refined" in p.tags:
+                continue
+            if p.id.startswith("entity_"):      # entity beacons are already typed
+                continue
+            try:
+                new_tags = _refine(list(p.keywords or []), self.llm)
+            except Exception:
+                new_tags = []
+            existing = set(p.tags)
+            fresh = [t for t in new_tags if t not in existing]
+            if fresh:
+                p.tags.extend(fresh)
+                for t in fresh:
+                    if t not in added:
+                        added.append(t)
+            # Mark visited regardless (so a phrase the LLM declined is not
+            # retried every sleep) — but only once we actually reached the LLM
+            # path ; a missing LLM leaves the point unmarked for a later run.
+            if hasattr(self.llm, "generate"):
+                if "refined" not in p.tags:
+                    p.tags.append("refined")
+                refined_points += 1
+        # Sync the SQL hierarchical-tag index with the freshly-crystallized tags.
+        self.reindex_tags()
+        return {"refined_points": refined_points, "tags_added": added}
+
+    def log_path(self, node_ids: Sequence[str], t: Optional[float] = None,
+                 with_hops: bool = True) -> None:
+        """Record a traversed path so 'this path is often taken' becomes a DB
+        query (`chasles_path_candidates`). With `with_hops` (default) also logs
+        each constituent hop so the per-node spike view (`effective_spike`) stays
+        consistent — set it False when the caller already recorded the hops
+        (e.g. the walk's record_hop) to avoid double-counting. No-op without a
+        journal ; failure-safe."""
+        if self.journal is None:
+            return
+        ids = [str(i) for i in node_ids]
+        if len(ids) < 2:
+            return
+        ts = self._now(t)
+        try:
+            self.journal.log_path(ids, ts=ts)
+            if with_hops:
+                for src, dst in zip(ids, ids[1:]):
+                    self.journal.log_hop(src, dst, ts=ts)
+        except Exception:
+            pass
+
+    def chasles_path_candidates(self, min_len: int = 4,
+                                min_freq: int = 2) -> List[Dict[str, Any]]:
+        """The SQL Chasles trigger surfaced on Memory : frequently-travelled,
+        refractory-clear paths ready to collapse into a start->end shortcut.
+        [] without a journal — callers fall back to the in-memory n_spike scan."""
+        if self.journal is None:
+            return []
+        return self.journal.chasles_candidates(min_len=min_len, min_freq=min_freq)
 
     def compress_chasles(self) -> List[Dict[str, Any]]:
         """Auto-detect spike-driven Chasles paths and compress them.
@@ -1472,8 +3549,17 @@ class Memory:
         end) triggers resolve_collision on the intermediates with start /
         end as anchors. Reset n_spike to 0 on every node of a fired path
         (refractory period). Returns the list of CollisionEvent dicts."""
-        from metacog.spike import auto_compress_chasles
-        events = auto_compress_chasles(self, self.llm, self.encoder)
+        # SQL-driven trigger when a journal is present : the frequently-travelled
+        # paths come from a query (chasles_path_candidates) — the DB is the
+        # driver, like lateral. Falls back to the in-memory n_spike scan
+        # otherwise. The logged collision_events below ARM the SQL refractory.
+        if self.journal is not None:
+            from metacog.spike import auto_compress_chasles_sql
+            events = auto_compress_chasles_sql(self, self.llm, self.encoder)
+        else:
+            from metacog.spike import auto_compress_chasles
+            events = auto_compress_chasles(self, self.llm, self.encoder)
+        self._journal_collisions("chasles", events)
         return [
             {
                 "child_id": ev.child_id,
@@ -1483,6 +3569,31 @@ class Memory:
             }
             for ev in events
         ]
+
+    def _journal_collisions(self, kind: str, events: Sequence[Any]) -> None:
+        """Persist CollisionEvents to the append-only journal audit log (mnema
+        model). No-op when no journal is configured ; failure-safe."""
+        if self.journal is None or not events:
+            return
+        for ev in events:
+            try:
+                self.journal.log_collision_event(
+                    kind, child_id=ev.child_id,
+                    parent_ids=list(ev.parent_ids),
+                    anchor_ids=list(ev.anchor_ids),
+                    trigger_distance=getattr(ev, "trigger_distance", None),
+                    threshold=getattr(ev, "threshold", None),
+                    ts=getattr(ev, "timestamp", None),
+                )
+            except Exception:
+                pass
+
+    def collision_history(self, kind: Optional[str] = None) -> List[dict]:
+        """The collision/compression audit trail from the journal (fission /
+        chasles / lateral, or all). [] when no journal."""
+        if self.journal is None:
+            return []
+        return self.journal.collision_events(kind)
 
     def consolidate_duplicates(self, t: Optional[float] = None) -> Dict[str, Any]:
         """True-merge deduplication : same-kind points carrying the SAME
@@ -1502,20 +3613,220 @@ class Memory:
         }
 
     def record_retrieval(
-        self, ranked_ids: Sequence[str], query_emb: Optional[Sequence[float]] = None,
-    ) -> None:
-        """Fold one retrieval's ranked result ids into the lateral
-        co-retrieval ledger. No-op unless `lateral_enabled`. Cheap
-        (O(k·window)) so it can sit on the retrieval hot path."""
-        if not self.lateral_enabled:
+        self, ranked_ids: Sequence[str],
+        query_emb: Optional[Sequence[float]] = None,
+        query_text: str = "",
+    ) -> Optional[int]:
+        """Fold one retrieval into (a) the append-only SQL JOURNAL when present —
+        the mnema access-log, source of SQL co-retrieval + mark_useful/decay —
+        and (b) the in-memory lateral ledger (gated on `lateral_enabled`). Both
+        are cheap (O(k·window)) so this sits on the retrieval hot path. Returns
+        the journal retrieval_id (the handle for a later `mark_useful`), or None
+        when no journal is configured."""
+        rid: Optional[int] = None
+        if self.journal is not None:
+            try:
+                rid = self.journal.log_retrieval(query_text, list(ranked_ids))
+            except Exception:
+                rid = None
+        if self.lateral_enabled:
+            from metacog.lateral import LateralLedger, record_coretrieval
+            if self._lateral_ledger is None:
+                self._lateral_ledger = LateralLedger()
+            record_coretrieval(
+                self._lateral_ledger, list(ranked_ids),
+                tuple(query_emb) if query_emb is not None else None,
+            )
+        return rid
+
+    def co_retrieved(self, seed_ids: Sequence[str], k: int = 7
+                     ) -> List[Tuple[str, int]]:
+        """Nodes historically surfaced TOGETHER with the seeds, computed in SQL
+        from the journal (edgeless spreading-activation ; never touches
+        embeddings). Returns [(node_id, cooc_count)] ; [] when no journal."""
+        if self.journal is None:
+            return []
+        return self.journal.find_co_retrieved(list(seed_ids), k=k)
+
+    def mark_useful(self, retrieval_id: int, score: int) -> None:
+        """Score a past retrieval 0/1/2 in the journal — the supervised label a
+        decay-fit consumes. The feedback is ALSO propagated into the wiki as
+        first-order info : every doc citing one of this retrieval's nodes has its
+        credibility (useful/useless) re-indexed. No-op without a journal."""
+        if self.journal is None:
             return
-        from metacog.lateral import LateralLedger, record_coretrieval
-        if self._lateral_ledger is None:
-            self._lateral_ledger = LateralLedger()
-        record_coretrieval(
-            self._lateral_ledger, list(ranked_ids),
-            tuple(query_emb) if query_emb is not None else None,
-        )
+        self.journal.mark_useful(retrieval_id, score)
+        try:
+            docs = set()
+            for nid in self.journal.retrieval_returned_ids(retrieval_id):
+                docs.update(self.journal.docs_referencing(self.resolve_alias(nid)))
+            for doc_id in docs:
+                self._reindex_okf(doc_id)          # feedback -> wiki, first-order
+        except Exception:
+            pass
+
+    def score_retrievals(self, retrieval_ids: Sequence[int],
+                         used_ids: Sequence[str]) -> List[Tuple[int, int]]:
+        """Auto-label past retrievals from what was ACTUALLY used downstream —
+        the supervised signal fit_decay needs (closing the L3 loop without a
+        human). For each retrieval, score = 2 if >= 2 of its returned ids were
+        used, 1 if exactly one, 0 if none (a genuine useless negative). Returns
+        [(retrieval_id, score)]. No-op ([]) without a journal."""
+        if self.journal is None:
+            return []
+        used = {str(i) for i in used_ids}
+        out: List[Tuple[int, int]] = []
+        for rid in retrieval_ids:
+            if rid is None:
+                continue
+            returned = self.journal.retrieval_returned_ids(rid)
+            overlap = len(used.intersection(returned))
+            score = 2 if overlap >= 2 else (1 if overlap == 1 else 0)
+            self.journal.mark_useful(rid, score)
+            out.append((int(rid), score))
+        return out
+
+    def retrieval_activation(self, query: str) -> float:
+        """The best chunk activation for `query` — the max cosine of any point to
+        the query embedding (ACT-R : the most-active chunk). 0.0 on an empty
+        cloud. This is what the retrieval threshold is compared against."""
+        from metacog.geometry import cosine
+        pts = [p for p in self.points if p.embedding_orig]
+        if not pts:
+            return 0.0
+        q = tuple(self.encoder.encode(query))
+        return max(cosine(q, p.embedding_orig) for p in pts)
+
+    def abstains(self, query: str,
+                 threshold: Optional[float] = None) -> bool:
+        """ACT-R retrieval-threshold test : True when retrieval should FAIL — no
+        chunk is sufficiently activated, so the honest answer is 'I don't know'
+        rather than the least-bad match.
+
+        `threshold` fixes tau (ACT-R's constant retrieval threshold) : abstain if
+        the best activation < tau. `None` (default) uses an EMERGENT floor — the
+        best match must STAND OUT from the background : abstain unless it clears
+        (mean + 2·std) of the query's similarity to the rest of the cloud. Never
+        abstains on a corpus too small (< 4) to have a background."""
+        from metacog.geometry import cosine
+        import statistics
+        pts = [p for p in self.points if p.embedding_orig]
+        if len(pts) < 4:
+            return False
+        q = tuple(self.encoder.encode(query))
+        sims = sorted(cosine(q, p.embedding_orig) for p in pts)
+        best = sims[-1]
+        if threshold is not None:
+            return best < threshold
+        background = sims[:-1]                    # everything but the top hit
+        floor = statistics.fmean(background) + 2 * statistics.pstdev(background)
+        return best <= floor
+
+    def need_odds(self, node_id: str, now: Optional[float] = None) -> float:
+        """Anderson-Schooler need-odds for a node — the power-law of its access
+        ages (journal history) under the fitted `decay_exponent`. 0.0 without a
+        journal or with no access history."""
+        if self.journal is None:
+            return 0.0
+        from metacog.need_odds import need_odds as _no
+        return _no(self.journal.access_timestamps(node_id),
+                   self._now(now), self.decay_exponent)
+
+    def fit_decay(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Fit the decay exponent from the journal (step 4 : the closed L3 loop).
+        Positives = nodes served in useful>=2 retrievals ; negatives = nodes
+        served in useful==0 retrievals ; the exponent that best separates them
+        by need-odds AUC is stored in `self.decay_exponent`. No-op (keeps the
+        current exponent) without a journal or without both classes present."""
+        base = {"exponent": self.decay_exponent, "auc": 0.5,
+                "n_pos": 0, "n_neg": 0}
+        if self.journal is None:
+            return base
+        from metacog.need_odds import fit_exponent
+        pos_ids: set = set()
+        for _rid, _q, ids in self.journal.useful_retrievals(min_score=2):
+            pos_ids.update(ids)
+        neg_ids: set = set()
+        for _rid, _q, ids in self.journal.useful_retrievals(min_score=0,
+                                                            max_score=0):
+            neg_ids.update(ids)
+        overlap = pos_ids & neg_ids            # ambiguous : served both useful & not
+        pos_ids -= overlap
+        neg_ids -= overlap
+        if not pos_ids or not neg_ids:
+            return base
+        t = self._now(now)
+        pos_h = [self.journal.access_timestamps(i) for i in pos_ids]
+        neg_h = [self.journal.access_timestamps(i) for i in neg_ids]
+        res = fit_exponent(pos_h, neg_h, t)
+        self.decay_exponent = float(res["exponent"])
+        return res
+
+    def forget(self, t: Optional[float] = None,
+               apply: bool = False) -> Dict[str, Any]:
+        """OFFLINE decay-forgetting — the other half of need-odds. Query time only
+        DECAYS (ranking) ; here, off the hot path, we PRUNE the nodes that have
+        gone cold. Uses the SAME need_odds under the fitted decay_exponent.
+
+        Conservative & emergent : considers only non-tool nodes that WERE accessed
+        (never the untried), and forgets those whose need-odds falls below
+        (mean - std) of that population — so nothing is dropped unless a clear
+        cold tail exists. Dry-run by default ; `apply=True` removes them. No-op
+        without a journal or with too few accessed nodes."""
+        base = {"forgotten": [], "candidates": [], "n_points": len(self.points)}
+        if self.journal is None:
+            return base
+        from metacog.skills import is_tool
+        now = self._now(t)
+        scored = []
+        for p in self.points:
+            if is_tool(p):
+                continue                       # tools are managed separately
+            ts = self.journal.access_timestamps(p.id)
+            if not ts:
+                continue                       # never accessed -> keep (untried)
+            scored.append((p, self.need_odds(p.id, now)))
+        if len(scored) < 4:                    # too few to judge a cold tail
+            return base
+        import statistics
+        vals = [v for _, v in scored]
+        cutoff = statistics.fmean(vals) - statistics.pstdev(vals)
+        cands = sorted(p.id for p, v in scored if v < cutoff)
+        forgotten: List[str] = []
+        if apply and cands:
+            drop = set(cands)
+            self.points = [p for p in self.points if p.id not in drop]
+            forgotten = cands
+        return {"forgotten": forgotten, "candidates": cands,
+                "n_points": len(self.points)}
+
+    def reindex_tags(self) -> int:
+        """Sync the journal's SQL hierarchical-tag index from the current points
+        (idempotent : INSERT OR IGNORE). Returns the number of points indexed.
+        No-op without a journal. Called after refine_tags ; callers can invoke
+        it to backfill after a bulk ingest."""
+        if self.journal is None:
+            return 0
+        n = 0
+        for p in self.points:
+            if p.tags:
+                self.journal.log_tags(p.id, p.tags)
+                n += 1
+        return n
+
+    def tag_scoped(self, tag: str, hierarchical: bool = True) -> List[Point]:
+        """Points carrying `tag` via the SQL tag index — hierarchical ANCESTOR
+        match by default (querying 'health' returns 'health:condition:x' nodes).
+        [] without a journal."""
+        if self.journal is None:
+            return []
+        ids = set(self.journal.nodes_with_tag(tag, hierarchical=hierarchical))
+        return [p for p in self.points if p.id in ids]
+
+    def tag_glossary_sql(self) -> List[str]:
+        """The hierarchical tag glossary from the journal (depth-ordered SQL).
+        [] without a journal."""
+        return self.journal.tag_glossary() if self.journal is not None else []
 
     def lateral_collapse(self, t: Optional[float] = None) -> Dict[str, Any]:
         """LATERAL collision : nodes that the co-retrieval ledger shows to
@@ -1525,11 +3836,15 @@ class Memory:
         map) so dropped ids still resolve. No-op when disabled or below
         the gate."""
         t_now = self._now(t)
-        if self._lateral_ledger is None:
+        # Ledger SOURCE : the SQL journal when present (co-retrieval computed
+        # from access_events — the DB is the driver), else the in-memory ledger.
+        ledger = (self._ledger_from_journal() if self.journal is not None
+                  else self._lateral_ledger)
+        if ledger is None:
             return {"collided_groups": 0, "aliases": {}, "n_points": len(self.points)}
         from metacog.lateral import lateral_collapse as _collapse
         report = _collapse(
-            self.points, self._lateral_ledger, self.encoder, t_now,
+            self.points, ledger, self.encoder, t_now,
         )
         for absorbed, keeper in report.aliases.items():
             self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
@@ -1538,6 +3853,19 @@ class Memory:
             "aliases": dict(report.aliases),
             "n_points": len(self.points),
         }
+
+    def _ledger_from_journal(self, window: int = 2):
+        """Build a LateralLedger from the SQL journal's co-retrieval — so lateral
+        collision is driven by access_events, not the in-memory ledger. Pair
+        weights are raw co-occurrence counts (`window`-adjacent, parity with the
+        in-memory adjacency span). Reuses the existing detection unchanged."""
+        from metacog.lateral import LateralLedger, _pair_key
+        ledger = LateralLedger()
+        for (a, b), cooc in self.journal.co_retrieved_pairs(window=window):
+            ledger.weight[_pair_key(a, b)] = float(cooc)
+            ledger.total_weight += float(cooc)
+        ledger.n_events = self.journal.counts()[0]
+        return ledger
 
     def record_action_generation(
         self, action: Point, query_emb: Optional[Sequence[float]],
@@ -1639,6 +3967,68 @@ class Memory:
             },
             "reused": False,
         }
+
+    def _find_tool(self, tool_id: str):
+        from metacog.skills import is_tool
+        return next((p for p in self.points
+                     if p.id == tool_id and is_tool(p)), None)
+
+    def retire_tool(self, tool_id: str, hard: bool = False) -> Dict[str, Any]:
+        """Retire a TOOL node — the removal half of the tool lifecycle. Soft
+        (default) tags it 'deprecated' so match_tool / ensure_tool stop reusing
+        it (reversible, and the tag persists) ; `hard=True` removes it from the
+        cloud. Returns {retired, hard} or {retired: None} if not a tool."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"retired": None}
+        if hard:
+            self.points = [p for p in self.points if p.id != tool_id]
+        else:
+            tool.add_tag("deprecated")
+        return {"retired": tool_id, "hard": hard}
+
+    def report_tool(self, tool_id: str, ok: bool,
+                    fail_limit: int = 2) -> Dict[str, Any]:
+        """Reinforce or penalise a tool from real use — the feedback half. `ok`
+        bumps its use count and clears any failure streak ; not-ok records a
+        failure and AUTO-retires (soft) once `fail_limit` consecutive failures
+        accumulate. Returns the tool's state."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"tool_id": None}
+        if not hasattr(self, "_tool_fail") or self._tool_fail is None:
+            self._tool_fail = {}
+        if ok:
+            tool.n_uses += 1
+            self._tool_fail.pop(tool_id, None)
+            return {"tool_id": tool_id, "ok": True, "n_uses": tool.n_uses,
+                    "retired": False}
+        fails = self._tool_fail.get(tool_id, 0) + 1
+        self._tool_fail[tool_id] = fails
+        retired = False
+        if fails >= fail_limit:
+            self.retire_tool(tool_id)          # soft-deprecate the flaky tool
+            retired = True
+        return {"tool_id": tool_id, "ok": False, "fails": fails,
+                "retired": retired}
+
+    def update_tool(self, tool_id: str, *, content: Optional[str] = None,
+                    how: Optional[str] = None) -> Dict[str, Any]:
+        """Update a tool's body — the correction half. Re-embeds so retrieval and
+        match stay consistent. Clears a stale 'deprecated' tag (an update revives
+        it). Returns the updated tool or {tool_id: None}."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"tool_id": None}
+        new_body = (content or how)
+        if new_body:
+            tool.content = new_body.strip()
+            tool.embedding_orig = tuple(self.encoder.encode(tool.content))
+        if "deprecated" in (tool.tags or []):
+            tool.tags = [t for t in tool.tags if t != "deprecated"]
+        tool.n_revision += 1
+        return {"tool_id": tool_id, "content": tool.content,
+                "n_revision": tool.n_revision}
 
     def resolve_alias(self, point_id: str) -> str:
         """Resolve an id to its canonical node : an atomic-fact id maps to
@@ -1831,6 +4221,8 @@ class Memory:
             "conversation_log": self.conversation_log,
             "_t_clock": self._t_clock,
             "_spike_total_hops": self._spike_total_hops,
+            "decay_exponent": self.decay_exponent,
+            "_forget_log": getattr(self, "_forget_log", []),
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -1843,7 +4235,21 @@ class Memory:
         with open(source, "rb") as f:
             snapshot = pickle.load(f)
         self.points = snapshot.get("points", [])
+        self._text_index = TextIndex()          # refills lazily (not pickled)
+        from metacog.geometry import clear_geo_cache
+        clear_geo_cache()                       # geometric stats rebuild too
         self.observators = snapshot.get("observators", {})
         self.conversation_log = snapshot.get("conversation_log", ConversationLog())
         self._t_clock = snapshot.get("_t_clock", 0.0)
         self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
+        self.decay_exponent = snapshot.get("decay_exponent", 0.5)
+        self._forget_log = snapshot.get("_forget_log", [])
+        # Rebuild the EVENT-hub registry from the restored points (it is not
+        # serialised — the points carry the canonical event:type tags).
+        self._event_registry = {}
+        for p in self.points:
+            if p.kind is PointKind.EVENT:
+                et = next((t.split(":", 2)[2] for t in p.tags
+                           if t.startswith("event:type:")), "")
+                nm = p.content.split(" ", 1)[1] if " " in p.content else ""
+                self._event_registry[f"{et}::{nm.lower()}"] = p.id

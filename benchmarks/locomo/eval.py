@@ -337,6 +337,7 @@ def evaluate_sample(
     merge: bool = False,
     per_category: int = None,
     auto_cluster: bool = False,
+    tags_refine: bool = False,
 ) -> Dict[str, Any]:
     qas = list(sample["qa"])
     if sample_seed is not None:
@@ -368,11 +369,35 @@ def evaluate_sample(
     if atomic:
         from metacog.atomic import AtomicFactExtractor
         atomic_extractor = AtomicFactExtractor()
-    memory = Memory(encoder=enc, entity_extractor=entity_extractor,
-                    atomic_extractor=atomic_extractor)
+    # LLM keyword extractor : keeps a noun together with its qualifying
+    # condition ("fingers too big", not the meaningless bare "fingers") and
+    # drops frequency noise — the frequency fallback strips the condition that
+    # carries the inference signal. Fails closed to the default frequency
+    # extractor when no credential is available (e.g. offline CI).
+    kw_extractor = None
+    try:
+        from metacog.keywords import LLMKeywordExtractor
+        kw_extractor = LLMKeywordExtractor()
+    except Exception:
+        kw_extractor = None
+    mem_kwargs = dict(encoder=enc, entity_extractor=entity_extractor,
+                      atomic_extractor=atomic_extractor)
+    if kw_extractor is not None:
+        mem_kwargs["extractor"] = kw_extractor
+    if tags_refine:
+        mem_kwargs["tags_refine_enabled"] = True
+    memory = Memory(**mem_kwargs)
     ingested = ingest_conversation(
         memory, sample["conversation"], with_dates=with_dates,
     )
+    if tags_refine:
+        # LATENT-SLEEP tag refinement : decompose phrase keywords into
+        # hierarchical namespace tags (health:condition, activity:exercise) so
+        # clue_search can semantic-scope inference questions onto the latent
+        # category. One LLM pass per FACT after ingest.
+        trep = memory.refine_tags()
+        print(f"  tag-refined {trep['refined_points']} points "
+              f"-> +{len(trep['tags_added'])} namespaces")
     if merge:
         # Collapse genuine same-info turns into single nodes (corroboration
         # absorbed). Recall scoring below resolves absorbed ids to survivors.
@@ -694,6 +719,12 @@ def main():
                              "observator per community. The agent can focus a "
                              "walk on a community via list_communities + "
                              "walk_start(observator_id=…). No LLM.")
+    parser.add_argument("--tags-refine", action="store_true",
+                        help="opt-in : after ingest, run the latent-sleep tag "
+                             "refiner (LLM) to decompose phrase keywords into "
+                             "hierarchical namespace tags, enabling clue_search "
+                             "semantic auto-scope on inference questions. "
+                             "One LLM call per FACT.")
     args = parser.parse_args()
     if args.react and args.answerer == "chunk":
         args.answerer = "extractive"
@@ -760,6 +791,7 @@ def main():
             merge=args.merge,
             per_category=args.per_category,
             auto_cluster=args.auto_cluster,
+            tags_refine=args.tags_refine,
         )
         results.append(summary)
         print(json.dumps(summary, indent=2))

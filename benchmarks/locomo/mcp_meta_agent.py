@@ -134,6 +134,12 @@ You have the FULL tool surface. The ones that matter for answering :
                               and bridges to the in-between turn. Use it the
                               moment a walk on the question's own words
                               drifts or returns only generic on-topic turns.
+  • event_search(query=…)    — EVENT channel (ADDITIVE, never a replacement).
+                              For a question about an EVENT (a war, trip,
+                              project, conflict, …), this gathers the facts that
+                              gravitate to the event's hub by its recurrent
+                              schema. Its evidence UNIONS with your walks — use
+                              it as an extra angle, then keep walking.
   • list_tags()             — the glossary of available tag NAMESPACES
                               (e.g. ref:date, session, person) to aim
                               presearch / scoped_answer.
@@ -280,6 +286,11 @@ CRITICAL — final answer format. Output ONLY the bare value, no prose :
   COMMON") → list EVERY gathered item, comma-separated (a list of bare
   nouns / short noun phrases, one per item). One item only when there
   truly is one. Tokens count : each listed item earns score.
+- RETRIEVE / "find all" task (return a SET of matching nodes, e.g. "find
+  all turns/tweets that …") → as you find each match during your walks,
+  call `collect(ids=[…])` to keep it in the answer bag. Keep searching with
+  different angles for EXHAUSTIVE coverage. The final answer is rendered
+  from the bag automatically — you do not need to restate the ids.
 - "Would / Could X likely … ?" inference (STARTS with "Would" or "Could")
   → answer "Likely yes, <short reason ≤4 words>" or "Likely no, <short reason ≤4 words>".
   CRITICAL: keep the reason VERY short — 2-4 words max. Reason form
@@ -478,13 +489,26 @@ def _tool_result_text(call_result) -> str:
 
 
 def _extract_fact_ids(call_result) -> List[str]:
-    """Pull `fact_ids_cumulative` out of a walk_* tool result, for
-    agent-recall measurement.
+    """Pull gathered evidence ids out of a tool result, for agent-recall
+    measurement. The walk publishes `fact_ids_cumulative` ; event_search
+    publishes `cluster_ids` / `fact_ids` — ALL are unioned, so the event channel
+    is ADDITIVE alongside the walk/clue (it adds evidence, never replaces it).
 
-    FastMCP serialises dict-returning tools as a JSON string in the
-    first TextContent block (structuredContent is not set), so we try
-    text blocks first then fall back to structuredContent.
+    FastMCP serialises dict-returning tools as a JSON string in the first
+    TextContent block (structuredContent is not set), so we try text blocks
+    first then fall back to structuredContent.
     """
+    _KEYS = ("fact_ids_cumulative", "cluster_ids", "context_ids", "fact_ids")
+
+    def _harvest(obj) -> List[str]:
+        out: List[str] = []
+        if isinstance(obj, dict):
+            for k in _KEYS:
+                v = obj.get(k)
+                if isinstance(v, list):
+                    out.extend(str(x) for x in v)
+        return out
+
     # 1. Text-block JSON (the path FastMCP actually uses for our tools).
     for block in getattr(call_result, "content", []) or []:
         text = getattr(block, "text", None)
@@ -494,18 +518,16 @@ def _extract_fact_ids(call_result) -> List[str]:
             obj = json.loads(text)
         except Exception:
             continue
-        if isinstance(obj, dict):
-            ids = obj.get("fact_ids_cumulative")
-            if isinstance(ids, list):
-                return [str(x) for x in ids]
+        ids = _harvest(obj)
+        if ids:
+            return list(dict.fromkeys(ids))
     # 2. structuredContent fallback for tools that do publish it.
     structured = getattr(call_result, "structuredContent", None)
     if isinstance(structured, dict):
         payload = structured.get("result", structured)
-        if isinstance(payload, dict):
-            ids = payload.get("fact_ids_cumulative")
-            if isinstance(ids, list):
-                return [str(x) for x in ids]
+        ids = _harvest(payload)
+        if ids:
+            return list(dict.fromkeys(ids))
     return []
 
 
@@ -977,6 +999,22 @@ def _compress_answer(answer: str, question: Optional[str],
         return None
 
 
+def _compose_final(focused, bags, question, llm):
+    """Mode-aware final composition of the two answer modes.
+
+      * "generate a focused answer" -> the terse walk answer (F1 mode).
+      * "refer an exhaustive set"   -> the rendered bag list(s) (recall mode).
+      * BOTH                        -> focused answer + the exhaustive list(s).
+
+    `bags` is a MAP {name: [(ref, content)]} (a legacy plain list is accepted as
+    the default bag). Multiple lists are a dynamic multi-value inject. Returns
+    (answer, bag_ids_used). Empty -> the focused answer unchanged. A pure
+    enumeration query, or no real focused answer, yields the list(s) alone ;
+    otherwise focused answer and list(s) coexist."""
+    from metacog.bag_render import compose_answer
+    return compose_answer(question, focused, bags, llm)
+
+
 def terse(text: str, question: Optional[str] = None) -> str:
     """Strip Haiku's preamble/interjection wrapping. Mirrors the helper
     in mcp_agent.py — keeps the bare value the F1 metric scores on.
@@ -1200,6 +1238,7 @@ class McpMetaAgent:
         # mutation stays local and cannot race another worker. Read-only
         # tools are unaffected ; the cost is one snapshot per QA.
         memory = memory.snapshot()
+
         app = build_app(memory=memory)
         total_in = 0
         total_out = 0
@@ -1640,7 +1679,20 @@ class McpMetaAgent:
                         # Guard : walk_next without any walk_start.
                         result_text = ("Call walk_start first.")
                     else:
-                        call_result = await session.call_tool(tu.name, tu.input)
+                        call_input = tu.input
+                        # TEMPORAL ANCHOR : auto-inject the ORIGINAL question's
+                        # date constraint into every walk so it stays scoped to
+                        # the asked period across all reformulations (the agent
+                        # often drops the date when it rephrases). Deterministic,
+                        # sourced from `question`, never from the reformulation.
+                        if tu.name == "walk_start" and not (
+                                tu.input or {}).get("date_tags"):
+                            from metacog.memory import query_date_tags
+                            _dt = query_date_tags(question)
+                            if _dt:
+                                call_input = dict(tu.input or {})
+                                call_input["date_tags"] = _dt
+                        call_result = await session.call_tool(tu.name, call_input)
                         result_text = _tool_result_text(call_result)
                         seen_ids.update(_extract_fact_ids(call_result))
                         # Track the latest relevant_collected for forced-final,
@@ -1945,8 +1997,25 @@ class McpMetaAgent:
             answer_text = _compress_answer(
                 answer_text, question, self.client, self.model) or answer_text
 
+        # MODE-AWARE composition (the two answer modes coexist).
+        #   * "generate a focused answer" -> the terse walk answer (F1 mode).
+        #   * "refer an exhaustive set"   -> the rendered bag list (recall mode).
+        #   * BOTH                        -> answer + the exhaustive list.
+        # The whole process above is UNCHANGED ; this only shapes the final
+        # output. Empty bag -> identical to no-bag behaviour. The bag refs join
+        # retrieved_ids either way (pure agent_recall — what the agent gathered).
+        # Gather the agent's CURATED bags (default + any named bags it collected)
+        # as a MAP of lists ; internal channel bags (event:*) are excluded from
+        # the surface answer to avoid bloat. One map -> dynamic multi-value inject.
+        bags_map = memory.curated_bags() if hasattr(memory, "curated_bags") \
+            else ({"default": memory.bag_items()}
+                  if hasattr(memory, "bag_items") else {})
+        final_answer, _bag_used = _compose_final(
+            terse(answer_text, question), bags_map, question, memory.llm)
+        seen_ids.update(_bag_used)
+
         return {
-            "answer": terse(answer_text, question),
+            "answer": final_answer,
             "answer_raw": answer_text,
             "steps": len([t for t in trace if t["action"] == "tool"]),
             "tokens_in": total_in,

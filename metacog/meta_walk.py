@@ -619,15 +619,21 @@ def nearest_facts_with_fallback(
                 from metacog.query_anchor import alignment_score
                 fact_pts = [p for p in search_points
                             if p.kind == PointKind.FACT]
-                # LEXICAL-ONLY here (set ops, zero encoding) : the precise
-                # exact-match-on-salient signal is the drift-resistant anchor
-                # the walk needs. Adding the input-embedding cosine re-injects
-                # the dominant-topic bias (cosine(question, fact) favours the
-                # co-present topic), diluting the gold's exact-match lead — so
-                # the semantic side stays in clue_search, not the walk.
+                # The anchor is INPUT + RELATIVE-thought, added. The INPUT's
+                # embedding cosine is DROPPED (use_input_sem=False) : it
+                # re-injects the dominant-topic bias (cos(question, fact)
+                # favours the co-present topic) — that is what drifted Caroline
+                # to recall 0. The precise IDF exact-match on the input's
+                # salient terms is kept (lex), and the RELATIVE thought
+                # abstraction's cosine is ADDED (use_relative_sem) : it is the
+                # inference bridge — "fingers too big" ranks near stress for the
+                # input (cos .07) but FIRST for the thought "obesity" (cos .15).
+                # Scored against the fact's frozen embedding_orig (no re-encode).
                 scored_al = [
                     (alignment_score(query_anchor, p.content,
-                                     lexical_only=True), p)
+                                     p.embedding_orig,
+                                     use_input_sem=False,
+                                     use_relative_sem=True), p)
                     for p in fact_pts
                 ]
                 scored_al.sort(key=lambda x: -x[0])
@@ -1046,13 +1052,43 @@ def meta_thought(
         chain_block = (
             "PRIOR (chain so far) :\n" + "\n".join(chain_lines) + "\n"
         )
+    # ACCUMULATED visited elements — the whole point of a THOUGHT is to add
+    # context about each VISITED element RELATIVE to the walk : not just the
+    # new pair, but what has been gathered so far, tagged by its ROLE (chosen
+    # as FACT vs ACTION) and its RELATIVE meta-state (confidence / σ). This is
+    # what lets the reflection notice the chain is drifting (all low-relevance,
+    # same topic) instead of blindly extending it — and it carries that
+    # relative reading into the anchor via the thought's keywords.
+    accum_block = ""
+    chain_pairs = list(zip(list(prev_facts), list(prev_actions)))[-4:]
+    accum_lines: List[str] = []
+    for pf, pa in chain_pairs:
+        if pf is not None:
+            st = _meta_state(pf, population)
+            accum_lines.append(
+                f"  [FACT conf={st['confidence']} sigma={st['uncertainty']}] "
+                f"{pf.content[:80]}")
+        if pa is not None:
+            accum_lines.append(f"  [ACTION] {pa.content[:80]}")
+    if accum_lines:
+        accum_block = (
+            "VISITED (gathered so far, by role + relative state) :\n"
+            + "\n".join(accum_lines) + "\n"
+        )
     query_block = f"QUERY : {query}\n" if query else ""
     prompt = (
         "Write ONE short reflection (≤ 15 words) on the NEW fact+action "
-        "that EXTENDS the prior chain toward the QUERY. Plain sentence, "
-        "no headers, no markdown.\n\n"
+        "that EXTENDS the prior chain toward the QUERY. Weigh it against the "
+        "VISITED elements and their relative state — if they keep missing the "
+        "QUERY, reflect on what kind of evidence is still MISSING. "
+        "If the fact carries HUMOUR / irony / satire, or exaggerated "
+        "SUPERLATIVES / official-promotional register echoed by an ordinary "
+        "voice (in ANY domain), note the author's INTENDED (not literal) "
+        "meaning ; if there is no such signal, reflect plainly as usual — do not "
+        "force irony. Plain sentence, no headers, no markdown.\n\n"
         f"{query_block}"
         f"{chain_block}"
+        f"{accum_block}"
         f"{meta_line}\n"
         f"FACT [{fact_kws}] : {fact.content}\n"
         f"ACTION [{action_kws}] : {action.content}"
@@ -1246,6 +1282,16 @@ def synthesize_answer_from_walk(
         return memory.llm.generate(prompt, max_tokens=max_tokens).strip()
     except Exception:
         return ""
+
+
+def _query_year_range(query: str):
+    """A YYYY year in the query -> its inclusive (date_from, date_to) range, so
+    the event scan can be date-bounded ; (None, None) otherwise."""
+    m = re.search(r"\b(?:19|20)\d{2}\b", query or "")
+    if not m:
+        return None, None
+    y = m.group(0)
+    return f"{y}-01-01", f"{y}-12-31"
 
 
 def provisional_answer(query: str, evidence: Sequence[dict],
@@ -1670,6 +1716,8 @@ class MetaWalker:
         self._action_star_chain: List[Point] = []
         self._stage_idx = 0
         self._done = False
+        self._path_logged = False
+        self._retrieval_ids: List[int] = []          # journal rids to score at end
         self._generated_ids: List[str] = []
         # MAP-REDUCE accumulator : the successively-collected set of
         # ON-TARGET facts (relevant/partial/contradicts per Chain-of-Note)
@@ -1918,6 +1966,54 @@ class MetaWalker:
         return True
 
     def step(self) -> StageOutput:
+        """Advance one stage and return the StageOutput. Sets done=True on the
+        returned output when the walk cannot continue further. Thin wrapper over
+        `_step_impl` that, once the walk finalises, records the TRAVERSED PATH
+        (fact + action chains) as first-class units in the journal so the SQL
+        Chasles trigger (`chasles_path_candidates`) sees how often each path is
+        taken. Runs through every caller — generator, run-to-done, direct step
+        loops — so no walk escapes the feed."""
+        out = self._step_impl()
+        if out.done and not self._path_logged:
+            self._path_logged = True
+            self._log_traversed_path()
+            self._score_retrievals_by_usage()
+        return out
+
+    def _score_retrievals_by_usage(self) -> None:
+        """Close the feedback loop : label this walk's retrievals by what it
+        actually USED (the fact-star chain) so fit_decay has supervision. A
+        retrieval whose facts ended up chosen is useful ; one whose facts were
+        all dropped is a genuine negative. Commit-only, failure-safe."""
+        if not self.commit or not self._retrieval_ids:
+            return
+        scorer = getattr(self.memory, "score_retrievals", None)
+        if scorer is None:
+            return
+        try:
+            used = [p.id for p in self._fact_star_chain if p is not None]
+            scorer(self._retrieval_ids, used)
+        except Exception:
+            pass
+
+    def _log_traversed_path(self) -> None:
+        """Log the fact/action star chains as traversed paths. `with_hops=False`
+        — record_hop already logged each hop during the walk, so re-logging them
+        would double-count the per-node spike. Commit-only and failure-safe."""
+        if not self.commit:
+            return
+        log_path = getattr(self.memory, "log_path", None)
+        if log_path is None:
+            return
+        try:
+            for chain in (self._fact_star_chain, self._action_star_chain):
+                ids = [p.id for p in chain if p is not None]
+                if len(ids) >= 2:
+                    log_path(ids, with_hops=False)
+        except Exception:
+            pass
+
+    def _step_impl(self) -> StageOutput:
         """Advance one stage and return the StageOutput. Sets done=True
         on the returned output when the walk cannot continue further."""
         if self._done:
@@ -2044,6 +2140,18 @@ class MetaWalker:
                 sigma_path=self._sigma_path,
             )
 
+        # Refresh the anchor's RELATIVE half from the latest thought — the
+        # "pensée distancielle" that lifts surface facts into the answer
+        # register. From stage 1 on, the thought's abstraction ("overweight")
+        # is ADDED to the input anchor so Slice C can rank the oblique
+        # evidence ("fingers too big") above the ambient topic (stress).
+        if self._query_anchor is not None and self._cur_thought is not None:
+            try:
+                self._query_anchor.with_relative(
+                    self._cur_thought.keywords, self._enc)
+            except Exception:
+                pass
+
         pts = self._all_points()
         facts = nearest_facts_with_fallback(
             seed_emb, seed_query, pts,
@@ -2062,7 +2170,9 @@ class MetaWalker:
         # collision enabled. Recorded only for committed (live) walks so
         # isolated benchmark walks stay side-effect-free.
         if self.commit and hasattr(self.memory, "record_retrieval"):
-            self.memory.record_retrieval([f.id for f in facts], seed_emb)
+            rid = self.memory.record_retrieval([f.id for f in facts], seed_emb)
+            if rid is not None:
+                self._retrieval_ids.append(rid)
 
         # Calibrate the walk-local σ threshold once from stage-0 facts.
         # median + std of pairwise cosine distances between the initial
@@ -2161,6 +2271,12 @@ class MetaWalker:
             f for i, f in enumerate(facts)
             if relevance[i] != "irrelevant"
         ] or list(facts)
+
+        # META-COGNITION : if the focused facts reveal the input relates to an
+        # EVENT and the request refers to an exhaustive set, the ACTION launches
+        # the NON-kNN filtered scan over that event and folds it into evidence —
+        # a targeted filtered KB query instead of a parallel one.
+        self._maybe_event_scan(focus_facts)
 
         # ACTIONs : at stage 0 nearest by query embedding ; at later
         # stages nearest to the previous action.
@@ -2366,6 +2482,61 @@ class MetaWalker:
     # first walk and re-write it every stage until the depth-stop validates
     # it — the last snapshot IS the final answer (no separate final pass).
     # ----------------------------------------------------------------
+
+    def _maybe_event_scan(self, focus_facts):
+        """Meta-cognition + ACTION : when the focused facts show the input relates
+        to an EVENT and the request refers to an exhaustive SET, launch the
+        NON-kNN filtered scan (Memory.filter_list) over that event — optionally
+        date-bounded by a year in the query — and FOLD the result into the walk's
+        evidence. This is the targeted filtered knowledge-base query that
+        replaces a separate parallel one.
+
+        Gated to RECALL intent : a focused query wins on the walk alone (the
+        walk-vs-event finding), so the scan only fires for set-style requests.
+        Once per event ; fully failure-safe / no-op without the primitive."""
+        mem = self.memory
+        if not hasattr(mem, "filter_list"):
+            return
+        try:
+            from metacog.enumeration import is_enumeration_query
+            if not is_enumeration_query(self.query):
+                return
+        except Exception:
+            return
+        if not hasattr(self, "_scanned_events"):
+            self._scanned_events = set()
+        eid = None
+        for f in focus_facts or ():
+            for t in getattr(f, "tags", ()) or ():
+                if t.startswith("event:in:"):
+                    eid = t.split(":", 2)[2]
+                    break
+            if eid:
+                break
+        if not eid or eid in self._scanned_events:
+            return
+        self._scanned_events.add(eid)
+        df, dt = _query_year_range(self.query)
+        try:
+            pts = mem.filter_list(event_id=eid, date_from=df, date_to=dt)
+        except Exception:
+            return
+        for p in pts:
+            if p.id not in self._relevant_ids:
+                self._relevant_cum.append(p)
+                self._relevant_ids.add(p.id)
+                self._relevant_label[p.id] = "relevant"
+            if p.id not in self._visited_fact_ids:
+                self._fact_ids_cum.append(p.id)
+                self._visited_fact_ids.add(p.id)
+        if pts and hasattr(mem, "bag_add"):
+            try:
+                mem.bag_add([p.id for p in pts], bag=f"event:{eid}",
+                            description=f"Exhaustive filtered scan of event "
+                                        f"{eid}.",
+                            schema={"kind": "event_cluster", "event_id": eid})
+            except Exception:
+                pass
 
     def keepup(self):
         """Generator yielding one snapshot per stage :
