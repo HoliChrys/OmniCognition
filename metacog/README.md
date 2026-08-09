@@ -78,6 +78,14 @@ stateDiagram-v2
 | `skills.py` | memory skills: tool crystallization, tool-intent metacognition, `match_tool` fast-path |
 | `communities.py` | Level-1 community / observator detection |
 
+### The mnema usage-journal layer (opt-in, SQL, failure-safe)
+| module | responsibility |
+|---|---|
+| `journal.py` | append-only SQLite access-log, SEPARATE from the store. SQL-derivable triggers: co-retrieval self-join, `path_traversals` (Chasles), `tags` (hierarchical), `collision_events`, `forget_events`, `wiki_docs`/`wiki_refs`/`okf_fields`. Opt-in (`journal_path="auto"`); every consumer no-ops without it |
+| `need_odds.py` | Anderson–Schooler base-level activation `Σ(now−t)^−d`, `fit_exponent` (grid-fit by useful/useless AUC), `blend` (min-max mix, not a sigmoid squash) |
+| `wiki.py` | OKF wiki helpers — render/parse (YAML frontmatter + body), `[[node_id]]` wikilinks, `#tag`, `context_tags` |
+| `canonical_tools.py` | the T1/T2/T3 tool-tier manifest + surfaces (`external`/`external_light`/`canonical`/`all`); test-guarded to partition the live `@app.tool()` set exactly |
+
 ### Perception, perspective, execution
 | module | responsibility |
 |---|---|
@@ -130,6 +138,80 @@ manifold (no separate store):
   crystallizes a tool `ACTION` whose `parents` are the explicating
   facts/thoughts/actions, so the next recurrence is retrieved without
   forced metacognition. Idempotent via `_distill_cursor`.
+
+## The mnema layer — usage journal, ACT-R activation, feedback, forgetting
+
+Alongside the point cloud (the **store**) sits an optional append-only SQLite
+**usage journal** (`journal.py`), mirroring mnema's split of the store from its
+access-log. Opt-in (`Memory(journal_path="auto")` → `<storage>.journal.db`; the
+MCP server attaches one by default) and **failure-safe** — every mechanism below
+falls back to an in-memory path or a no-op without it, so behaviour is unchanged
+when absent. Structural signals become plain SQL instead of bespoke ledgers:
+co-retrieval (self-join on `access_events`), the Chasles trigger
+(`path_traversals`, `GROUP BY signature HAVING COUNT(*)≥k` with an append-only
+refractory derived from `collision_events`), and the hierarchical tag index.
+
+**ACT-R activation in ranking.** `retrieve` optionally blends the base relevance
+with the two halves of ACT-R activation `A = B (base-level) + Σ spreading`, both
+computed from the journal and both **OFF by default** (mnema's defaults):
+`recency_weight` mixes in **need-odds** (recency×frequency of accesses under a
+learned exponent `d`); `spreading_weight` mixes in **associative spreading**
+(nodes co-retrieved with the top hits — also exposed directly as `relate`).
+
+**Feedback loop (L3).** `retrieve` returns a `retrieval_id`; the walk auto-labels
+its own retrievals by what it used, and `mark_useful(rid, 0/1/2)` lets the agent
+rate one. Those labels let `fit_decay` (run every `sleep`) fit the exponent `d`
+need-odds uses — the memory calibrates its own recency curve from real use.
+
+**Forgetting — two phases.** Query time only **decays** (the ranking above); the
+pruning is **offline** so it never adds latency. In `sleep` (`forget_enabled`) a
+conservative emergent pass drops accessed-then-cold nodes (below `mean−σ`; tools
+& the untried kept). Independently, `forget(node_id, reason[, superseded_by])` is
+the explicit runtime correction: append-only soft-invalidation (state `INVALID`
+→ leaves retrieval/walk) written as a **DB event** (`forget_events`); the next
+`sleep` runs the **latent merge** (`merge_forgotten`), redirecting a superseded
+node's alias to its successor. This is mnema's `forget` (tool) + `reflect`
+(offline merge) split.
+
+**Abstention.** `retrieve(abstain=True)` applies the ACT-R retrieval threshold:
+returns `[]` ("I don't know") when no chunk is sufficiently activated — emergent
+floor (best must clear `mean+2σ` of the background) or a fixed τ.
+
+**Tool lifecycle.** Beyond create/find/reuse (`ensure_tool`/`match_tool`/
+`build_skill`), tools have the retract & correct half: `report_tool(ok)`
+reinforces / auto-retires after repeated failures; `retire_tool` soft-deprecates
+(so `match_tool` skips it) or hard-removes; `update_tool` rewrites & revives.
+
+**Tool tiers & surface.** `canonical_tools.py` classifies tools into **T1**
+(canonical primitives), **T2** (agent-tool machinery), **T3** (internal
+mechanisms / walk modes / autonomic passes). `build_app(surface=…)` /
+`METACOG_SURFACE` gates what the MCP exposes (`external` = T1+T2); unexposed
+tools stay callable internally.
+
+## The OKF wiki — a bidirectional, continuously-evolving RAG extension
+
+An optional wiki layer (`wiki.py` + `memory.py` + `journal.py`) in Google's
+**Open Knowledge Format** (concept-per-file markdown, YAML frontmatter) that
+**co-evolves** with the RAG rather than sitting in a separate silo.
+
+- **Links live in three places** — the OKF **frontmatter** (`refs:`, many per
+  doc), **inline** in the body as `[[node_id]]` wikilinks, and the DB link table
+  (`wiki_refs`); tags likewise in frontmatter + inline `#tag`. `feed_wiki`
+  builds/updates a doc from RAG nodes; `docs_for_node` is the reverse edge.
+- **Both directions evolve** — *RAG→wiki*: `reconcile_wiki` (offline in `sleep`)
+  follows `resolve_alias`, so a **forgotten→merged** node has its refs rewritten
+  `[[old]]→[[new]]` everywhere and an `INVALID` node flags its refs **stale**.
+  *wiki→RAG*: `ingest_from_wiki` ingests new wiki prose as a node **carrying the
+  doc's tags as context**, linked back.
+- **OKF made functional, no migrations** — frontmatter alone is inert; an **EAV
+  index** (`okf_fields`) makes every field queryable (`wiki_where("tags", …)`,
+  `wiki_where("refs", node_id)`), **recovers the schema from the data**
+  (`okf_schema()`, no registry), and needs no migrations (a new field is just new
+  rows). `import_okf` consumes an external bundle.
+- **Feedback is first-order** — `mark_useful` flows into the wiki as a
+  credibility signal: each doc's `useful`/`useless` counts are re-indexed (EAV)
+  and rendered in the OKF frontmatter, so docs are queryable/rankable by real
+  feedback.
 
 ## MCP tools (`mcp_server.py`)
 

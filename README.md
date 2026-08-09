@@ -91,6 +91,50 @@ The manifold holds one kind of object — a typed `Point`. Everything else
 is a process over it: ingestion feeds it, the walk reads it, sleep
 consolidates it. There are no edges; relations are geometric proximity.
 
+### 1.2 The three tool tiers
+
+The tools that operate the memory are classified by role
+(`metacog/canonical_tools.py`, test-guarded to partition the live tool set
+exactly). This separates *what the memory needs to run* from *what an external
+agent should see*, and is the axis along which the MCP surface is gated
+(`METACOG_SURFACE` / `build_app(surface=…)`):
+
+- **T1 — canonical primitives** *(exposed).* The minimum to run the memory:
+  **feed** (`ingest`, `ingest_message`, `push_code`), **ask** (`retrieve`,
+  `walk_start`, `assemble_set`, `relate`), **observe** (`stats`, `inspect`,
+  `list_tags`), **feedback/correct** (`mark_useful`, `forget`).
+- **T2 — agent-tool machinery** *(exposed).* How the agent creates, finds,
+  reuses, and retires its **own** tools (`ensure_tool`, `match_tool`,
+  `build_skill`, `list_tools_learned`, `report_tool`, `retire_tool`,
+  `update_tool`).
+- **T3 — internal** *(callable, not on the external surface).* The specialized
+  retrieval modes the walk orchestrates (`presearch`, `scoped_*`, `clue_search`,
+  `event_search`, `reason`, `walk_keepup`), the bag mechanism, observators, and
+  the **autonomic** passes (`sleep`, `save`, `audit`, `crystallize_skills`).
+
+The `external` surface = T1 + T2; T3 stays callable internally so the walk /
+sleep orchestrate it without cluttering the agent's toolset.
+
+### 1.3 Emergent (self-built) tools
+
+Agent tools are **not** a fixed list of `@app.tool()`s — they **grow as data**.
+When the agent recognises a capability it lacks, `ensure_tool` generates it *and
+stores it as a `tool`-tagged ACTION node inside the manifold*, scoped by the
+keywords of the need. Two creation triggers:
+
+1. **On demand** — "no covering tool → make it" (`ensure_tool`); the next time a
+   query falls in its keyword scope, `match_tool` returns it and the think phase
+   is skipped (reuse, no LLM).
+2. **By recurrence** — `crystallize_skills` (in `sleep`) folds an action
+   re-derived across *diverse* queries into a persistent tool node (same Poisson
+   floor `λ+√λ` as every other emergence law).
+
+Because a tool **is a Point**, the canonical agent **retrieves the tools it
+created like any other node** — no separate registry. And the set is not
+append-only: `report_tool` reinforces or auto-retires by outcome, `retire_tool`
+soft-deprecates (so `match_tool` stops reusing it), `update_tool` rewrites and
+revives. Growth **and** decay, on tools as on facts.
+
 ---
 
 ## 2. The epistemic substrate
