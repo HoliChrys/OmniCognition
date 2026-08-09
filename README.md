@@ -731,6 +731,36 @@ mechanisms / walk modes / autonomic passes. The MCP `build_app(surface=…)`
 unexposed tools stay callable internally. This keeps the agent-facing surface
 small and purposeful without hiding capability from the internal orchestration.
 
+### 5.6 The OKF wiki — a bidirectional, continuously-evolving RAG extension
+
+On top of the store sits an optional **wiki layer** (`metacog/wiki.py`) in
+Google's **Open Knowledge Format** (OKF: one concept per markdown file, YAML
+frontmatter). It is *not* a separate silo — it is an extension of the RAG that
+**co-evolves** with it.
+
+**Links live in both places.** A wiki doc records the RAG node ids it was built
+from in the OKF **frontmatter** (`refs:` — a doc can cite many), **inline** in
+the body as Obsidian-style wikilinks `[[node_id]]`, **and** in a journal link
+table (`wiki_refs`). Tags likewise sit in the frontmatter and inline (`#tag`).
+`Memory.feed_wiki(doc_id, title, node_ids)` builds/updates a doc from nodes;
+`docs_for_node` is the reverse edge.
+
+**Both directions evolve.** *RAG → wiki*: `reconcile_wiki` (run offline in
+`sleep`, after the forget-merge) follows `resolve_alias` so a node that was
+**forgotten→merged** has its refs rewritten `[[old]]→[[new]]` everywhere, and a
+node gone `INVALID` flags its refs **stale** — the wiki self-heals as the memory
+changes. *wiki → RAG*: `ingest_from_wiki(doc_id, text)` ingests new wiki prose
+as a fresh node **carrying the doc's tags as context**, linked back into the doc.
+
+**OKF made functional (no migrations).** Frontmatter alone is inert — the
+function is consumer-side. An **EAV index** (`okf_fields(doc_id, type, key,
+value)`) makes every field queryable (`wiki_where("tags", "health:fatigue")`,
+`wiki_where("refs", node_id)`), **recovers the schema from the data**
+(`okf_schema() → {type: [keys]}`, no registry), and **needs no migrations** — a
+new frontmatter field is simply new rows, matching OKF's evolving nature.
+`import_okf(doc_id, markdown)` consumes an external OKF bundle (parse → link refs
+→ index) so third-party knowledge becomes queryable and evolves with the RAG.
+
 ---
 
 ## 6. Evaluation

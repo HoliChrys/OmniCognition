@@ -25,7 +25,10 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,
   `test_spreading_activation`, `test_forget`, `test_forget_node`,
   `test_abstention`, `test_tool_lifecycle`) all assert the OFF/opt-in default is
-  behaviour-neutral.
+  behaviour-neutral. `test_wiki` covers the OKF layer: feed/render/parse, refs in
+  frontmatter+inline+DB, `reconcile_wiki` rewriting refs on merge, wiki->RAG
+  ingest, and the EAV field index (query by any field, schema recovered, no
+  migrations).
 
 ## Work Guidance
 

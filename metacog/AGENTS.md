@@ -113,6 +113,18 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
 - `need_odds.py` — Anderson–Schooler base-level activation `Σ(now−t)^−d`,
   `fit_exponent` (grid-fit d by need-odds AUC over useful/useless labels), and
   `blend` (min-max mix of base score + need-odds; NOT a sigmoid squash).
+- `wiki.py` + the wiki layer (`memory.py` + `journal.py`) — the OKF wiki, a
+  bidirectional RAG extension. `wiki.py` = pure OKF helpers (render/parse YAML
+  frontmatter + body, `[[node_id]]` wikilinks, `#tag` inline, `context_tags`).
+  journal tables: `wiki_docs` (content), `wiki_refs` (wiki<->node links + stale
+  flag), `okf_fields` (EAV index — every frontmatter field a queryable row, no
+  migrations). Memory: `feed_wiki` (RAG->wiki: refs in frontmatter+inline+DB,
+  union of node tags), `wiki_doc`/`docs_for_node`, `reconcile_wiki` (RAG->wiki
+  sync in sleep: follow merges -> rewrite `[[old]]->[[new]]`, flag INVALID refs
+  stale), `ingest_from_wiki` (wiki->RAG: new prose -> node carrying the doc's
+  tags), `wiki_where`/`okf_schema`/`okf_fields` (query the EAV index, recover
+  the schema from data), `import_okf` (consume an external OKF bundle). All
+  no-op without a journal ; refs are resolved through `_merge_aliases`.
 - `canonical_tools.py` — the tool-tier manifest (T1 CANONICAL / T2 TOOL_TIER /
   T3 INTERNAL / DEPRECATED) + surfaces (`EXTERNAL`, `EXTERNAL_LIGHT`,
   `canonical`, `all`). `surface_tools(name)`, `classify(name)`. Must partition
