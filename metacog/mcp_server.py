@@ -298,6 +298,14 @@ def build_app(
         return memory.update_tool(tool_id, content=content, how=how)
 
     @app.tool()
+    def forget(node_id: str, reason: str) -> dict:
+        """Soft-invalidate ONE memory node (append-only : never deleted, just
+        marked invalid so it stops surfacing). `reason` is required, e.g.
+        'superseded by node X' or 'user corrected'. The explicit on-demand
+        correction — distinct from the autonomic decay-forgetting in sleep."""
+        return memory.forget_node(node_id, reason)
+
+    @app.tool()
     def mark_useful(retrieval_id: int, score: int) -> dict:
         """Rate a past retrieval : 0 (useless) / 1 / 2 (useful). This is the
         supervised feedback that calibrates the decay exponent (re-fit on the

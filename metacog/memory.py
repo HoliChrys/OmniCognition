@@ -1019,6 +1019,27 @@ class Memory:
                     invalidated.append(p.id)
         return invalidated
 
+    def forget_node(self, node_id: str, reason: str) -> Dict[str, Any]:
+        """Explicit, on-demand soft-invalidation of ONE node (mnema's `forget`).
+        Append-only : the node is never deleted, its state is set INVALID so it
+        drops out of retrieval / the walk, tagged 'invalidated', and the `reason`
+        (required, e.g. 'superseded by X' / 'user corrected') is kept in an
+        append-only forget log. Returns {forgotten, reason} or {forgotten: None}."""
+        from metacog.epistemic import EpistemicState
+        if not reason or not str(reason).strip():
+            return {"forgotten": None, "error": "reason required"}
+        p = next((q for q in self.points if q.id == node_id), None)
+        if p is None:
+            return {"forgotten": None}
+        p.state = EpistemicState.INVALID          # hidden, not deleted
+        if "invalidated" not in p.tags:
+            p.tags.append("invalidated")
+        if not hasattr(self, "_forget_log") or self._forget_log is None:
+            self._forget_log = []
+        self._forget_log.append(
+            {"id": node_id, "reason": str(reason), "t": self._now()})
+        return {"forgotten": node_id, "reason": str(reason)}
+
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
         "over", "into", "this", "that", "their", "his", "her", "its", "new",
@@ -2257,6 +2278,11 @@ class Memory:
                     if len(deduped) >= k:
                         break
             results = [(s, p) for s, p in deduped if p is not None]
+        # Drop soft-invalidated nodes (mnema `forget` / supersession) — same
+        # exclusion the walk applies, so a forgotten node stops surfacing.
+        from metacog.epistemic import EpistemicState as _ES
+        results = [(s, p) for s, p in results
+                   if p.state not in (_ES.INVALID, _ES.DEPRECATED)]
         # ACT-R base-level : re-rank by blending the base relevance with each
         # candidate's need-odds (journal access recency×frequency). OFF unless
         # recency_weight > 0 and a journal is present -> default order untouched.
@@ -3953,6 +3979,7 @@ class Memory:
             "_t_clock": self._t_clock,
             "_spike_total_hops": self._spike_total_hops,
             "decay_exponent": self.decay_exponent,
+            "_forget_log": getattr(self, "_forget_log", []),
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -3973,6 +4000,7 @@ class Memory:
         self._t_clock = snapshot.get("_t_clock", 0.0)
         self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
         self.decay_exponent = snapshot.get("decay_exponent", 0.5)
+        self._forget_log = snapshot.get("_forget_log", [])
         # Rebuild the EVENT-hub registry from the restored points (it is not
         # serialised — the points carry the canonical event:type tags).
         self._event_registry = {}

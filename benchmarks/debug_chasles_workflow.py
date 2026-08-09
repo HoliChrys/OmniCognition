@@ -246,6 +246,25 @@ def step_forget(p: _Probe):
             any(is_tool(q) for q in m.points) and "NEW" in ids)
 
 
+def step_forget_explicit(p: _Probe):
+    """mnema's `forget(node_id, reason)` — explicit on-demand soft-invalidation,
+    distinct from the autonomic decay-forget pass. Append-only, hides the node."""
+    from metacog.epistemic import EpistemicState
+    m = Memory(encoder=SimpleEncoder())
+    for kw in ("apple", "banana", "cherry", "date"):
+        m.ingest(f"a fact about {kw}", kind="FACT", id=kw)
+    p.check("reason required", m.forget_node("apple", reason="")["forgotten"] is None)
+    out = m.forget_node("apple", reason="superseded by banana")
+    p.check("soft-invalidated (append-only)",
+            out["forgotten"] == "apple"
+            and any(q.id == "apple" for q in m.points))
+    p.check("state set INVALID",
+            next(q for q in m.points if q.id == "apple").state
+            is EpistemicState.INVALID)
+    p.check("drops out of retrieve",
+            "apple" not in [h["id"] for h in m.retrieve("a fact about apple", k=4)])
+
+
 def step_abstain(p: _Probe):
     """ACT-R retrieval threshold : retrieval FAILS ('I don't know') when no chunk
     is sufficiently activated, instead of returning the least-bad match."""
@@ -300,6 +319,7 @@ STEPS = [
     ("refractory", step_refractory),
     ("decayfit", step_decayfit),
     ("forget", step_forget),
+    ("forget_explicit", step_forget_explicit),
     ("abstain", step_abstain),
     ("persist", step_persist),
 ]

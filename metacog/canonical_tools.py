@@ -43,6 +43,8 @@ CANONICAL: Set[str] = {
     "stats", "inspect", "list_tags",
     # feedback (the supervised signal that calibrates decay)
     "mark_useful",
+    # explicit correction : soft-invalidate a node (mnema's forget)
+    "forget",
 }
 
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------
