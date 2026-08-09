@@ -47,15 +47,19 @@ def context_tags(tags: Sequence[str]) -> List[str]:
 
 def render_okf(*, type: str, title: str, tags: Sequence[str],
                refs: Sequence[str], body: str,
-               timestamp: Optional[float] = None) -> str:
+               timestamp: Optional[float] = None,
+               extra: Optional[Dict] = None) -> str:
     """Serialize one OKF concept : YAML frontmatter (type required ; title, tags,
-    refs, timestamp) + markdown body. `refs` is the frontmatter mirror of the
-    body's `[[…]]` links — a doc may carry several."""
+    refs, then any `extra` first-order fields e.g. feedback credibility, then
+    timestamp) + markdown body. `refs` is the frontmatter mirror of the body's
+    `[[…]]` links — a doc may carry several."""
     fm: Dict = {"type": type, "title": title}
     if tags:
         fm["tags"] = list(tags)
     if refs:
         fm["refs"] = list(refs)                 # multiple node refs per doc
+    for k, v in (extra or {}).items():
+        fm[k] = v
     if timestamp is not None:
         fm["timestamp"] = timestamp
     front = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()

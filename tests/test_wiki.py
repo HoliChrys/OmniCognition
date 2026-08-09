@@ -133,6 +133,22 @@ def test_import_external_okf_doc():
     assert "runbook" in m.okf_schema()
 
 
+def test_feedback_is_first_order_in_the_wiki():
+    m = _mem()
+    m.feed_wiki("doc:h", "Health", ["A", "B"], type="topic")
+    # a retrieval returning A is marked USEFUL -> credibility flows to the doc
+    rid = m.record_retrieval(["A", "B"], query_text="q")
+    m.mark_useful(rid, 2)
+    # queryable via the EAV index (first-order field)
+    assert m.wiki_where("useful", "2") == ["doc:h"]
+    # and visible in the rendered OKF frontmatter
+    assert "useful: 2" in m.wiki_doc("doc:h")
+    # a useless retrieval registers on the other side
+    r2 = m.record_retrieval(["A"], query_text="q2")
+    m.mark_useful(r2, 0)
+    assert "useless: 1" in m.wiki_doc("doc:h")
+
+
 def test_wiki_noop_without_journal():
     m = Memory(encoder=SimpleEncoder())
     assert m.feed_wiki("d", "t", ["A"])["doc_id"] is None

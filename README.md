@@ -761,6 +761,12 @@ new frontmatter field is simply new rows, matching OKF's evolving nature.
 `import_okf(doc_id, markdown)` consumes an external OKF bundle (parse → link refs
 → index) so third-party knowledge becomes queryable and evolves with the RAG.
 
+**Feedback is first-order.** `mark_useful` is not just decay telemetry — it flows
+into the wiki as a credibility signal (OKF `usage_count`-style). Every doc citing
+a node from a scored retrieval has its `useful`/`useless` counts re-indexed and
+rendered in the OKF frontmatter, so docs can be queried and ranked by real
+feedback (`wiki_where("useful", "2")`).
+
 ---
 
 ## 6. Evaluation

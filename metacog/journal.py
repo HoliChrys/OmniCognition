@@ -570,6 +570,20 @@ class Journal:
         rows = self.conn.execute(sql, (*seeds, *seeds, k)).fetchall()
         return [(r["node_id"], int(r["cooc"])) for r in rows]
 
+    def node_usefulness(self, node_id: str) -> dict:
+        """First-order feedback for a node : how many USEFUL (>=2) vs USELESS (0)
+        retrievals returned it (from the mark_useful labels). The credibility
+        signal the wiki carries (OKF-style usage_count)."""
+        pos = self.conn.execute(
+            "SELECT COUNT(DISTINCT r.id) AS c FROM retrievals r "
+            "JOIN access_events a ON a.retrieval_id = r.id "
+            "WHERE a.node_id = ? AND r.useful >= 2", (str(node_id),)).fetchone()["c"]
+        neg = self.conn.execute(
+            "SELECT COUNT(DISTINCT r.id) AS c FROM retrievals r "
+            "JOIN access_events a ON a.retrieval_id = r.id "
+            "WHERE a.node_id = ? AND r.useful = 0", (str(node_id),)).fetchone()["c"]
+        return {"useful": int(pos), "useless": int(neg)}
+
     def retrieval_returned_ids(self, retrieval_id: int) -> List[str]:
         """The node ids a past retrieval returned (rank order) — used to score it
         useful once we learn which of them were actually used."""

@@ -1120,9 +1120,11 @@ class Memory:
             return None
         from metacog import wiki as _w
         refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        fb = self._doc_usefulness(doc_id)          # feedback = first-order
+        extra = {k: v for k, v in fb.items() if v}
         return _w.render_okf(type=doc["type"], title=doc["title"],
                              tags=doc["tags"], refs=refs, body=doc["body"],
-                             timestamp=doc["ts"])
+                             timestamp=doc["ts"], extra=extra)
 
     def docs_for_node(self, node_id: str) -> List[str]:
         """Which wiki docs cite this node (RAG->wiki reverse link). [] w/o journal."""
@@ -1193,18 +1195,33 @@ class Memory:
         self._reindex_okf(doc_id)
         return {"node_id": p.id}
 
+    def _doc_usefulness(self, doc_id: str) -> Dict[str, int]:
+        """Aggregate feedback over a doc's refs — the FIRST-ORDER credibility the
+        wiki carries (OKF usage_count-style), summed from mark_useful labels."""
+        pos = neg = 0
+        if self.journal is None:
+            return {"useful": 0, "useless": 0}
+        for r in self.journal.wiki_refs_for_doc(doc_id):
+            u = self.journal.node_usefulness(r["node_id"])
+            pos += u["useful"]
+            neg += u["useless"]
+        return {"useful": pos, "useless": neg}
+
     def _reindex_okf(self, doc_id: str) -> None:
-        """Rebuild a doc's EAV frontmatter index (type/title/tags/refs/timestamp)
-        from its live row + link table. Called whenever the doc/refs change."""
+        """Rebuild a doc's EAV frontmatter index from its live row + link table,
+        INCLUDING the first-order feedback (useful/useless) so it is queryable
+        like any other field. Called whenever the doc/refs/feedback change."""
         if self.journal is None:
             return
         doc = self.journal.get_wiki_doc(doc_id)
         if doc is None:
             return
         refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        fb = self._doc_usefulness(doc_id)
         self.journal.index_okf_fields(doc_id, doc["type"], {
             "type": doc["type"], "title": doc["title"], "tags": doc["tags"],
-            "refs": refs, "timestamp": doc["ts"],
+            "refs": refs, "useful": fb["useful"], "useless": fb["useless"],
+            "timestamp": doc["ts"],
         })
 
     def wiki_where(self, key: str,
@@ -3633,9 +3650,20 @@ class Memory:
 
     def mark_useful(self, retrieval_id: int, score: int) -> None:
         """Score a past retrieval 0/1/2 in the journal — the supervised label a
-        decay-fit consumes. No-op when no journal is configured."""
-        if self.journal is not None:
-            self.journal.mark_useful(retrieval_id, score)
+        decay-fit consumes. The feedback is ALSO propagated into the wiki as
+        first-order info : every doc citing one of this retrieval's nodes has its
+        credibility (useful/useless) re-indexed. No-op without a journal."""
+        if self.journal is None:
+            return
+        self.journal.mark_useful(retrieval_id, score)
+        try:
+            docs = set()
+            for nid in self.journal.retrieval_returned_ids(retrieval_id):
+                docs.update(self.journal.docs_referencing(self.resolve_alias(nid)))
+            for doc_id in docs:
+                self._reindex_okf(doc_id)          # feedback -> wiki, first-order
+        except Exception:
+            pass
 
     def score_retrievals(self, retrieval_ids: Sequence[int],
                          used_ids: Sequence[str]) -> List[Tuple[int, int]]:
