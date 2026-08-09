@@ -246,6 +246,33 @@ def step_forget(p: _Probe):
             any(is_tool(q) for q in m.points) and "NEW" in ids)
 
 
+def step_abstain(p: _Probe):
+    """ACT-R retrieval threshold : retrieval FAILS ('I don't know') when no chunk
+    is sufficiently activated, instead of returning the least-bad match."""
+    class _Enc:
+        dim = 4
+        _B = ("apple", "banana", "cherry", "date")
+
+        def encode(self, text):
+            t = (text or "").lower()
+            for i, kw in enumerate(self._B):
+                if kw in t:
+                    v = [0.0] * 4
+                    v[i] = 1.0
+                    return v
+            return [0.25, 0.25, 0.25, 0.25]
+
+    m = Memory(encoder=_Enc())
+    for kw in _Enc._B:
+        m.ingest(f"a fact about {kw}", kind="FACT", id=kw)
+    p.check("clear match does NOT abstain", m.abstains("apple pie") is False)
+    p.check("no-match ABSTAINS (emergent)", m.abstains("grapefruit") is True)
+    p.check("retrieve(abstain) fails -> []", m.retrieve("grapefruit", abstain=True) == [])
+    p.check("retrieve(abstain) succeeds on a match",
+            len(m.retrieve("apple pie", abstain=True)) > 0)
+    p.check("fixed tau (ACT-R) works", m.abstains("apple", threshold=1.01) is True)
+
+
 def step_persist(p: _Probe):
     """Save + close, then reopen the SAME store -> journal state survives."""
     p.mem.save()
@@ -273,6 +300,7 @@ STEPS = [
     ("refractory", step_refractory),
     ("decayfit", step_decayfit),
     ("forget", step_forget),
+    ("abstain", step_abstain),
     ("persist", step_persist),
 ]
 

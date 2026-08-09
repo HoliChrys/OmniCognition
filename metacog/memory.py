@@ -2113,6 +2113,8 @@ class Memory:
         lineage_depth: int = 7,
         prefer_kind: Optional[str] = None,
         t: Optional[float] = None,
+        abstain: bool = False,
+        abstain_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -2127,8 +2129,15 @@ class Memory:
                                  a PointKind ; ignored unless use_hybrid.
 
         Default k=7 (≈ matches LoCoMo / typical agentic context budget).
+
+        `abstain` (opt-in) applies the ACT-R retrieval threshold : if no chunk is
+        sufficiently activated for `query` (see `abstains`), retrieval FAILS and
+        returns [] — an explicit 'I don't know' instead of the least-bad match.
+        `abstain_threshold` fixes tau ; None uses the emergent floor.
         """
         t_now = self._now(t)
+        if abstain and self.abstains(query, abstain_threshold):
+            return []                            # retrieval failure (ACT-R)
         # When entity beacons exist they act as ingest-time pull agents :
         # their geometric pull already shifted the real facts, so we drop
         # them from the RETURNED ids (over-fetching to backfill to k) — the
@@ -3407,6 +3416,42 @@ class Memory:
             self.journal.mark_useful(rid, score)
             out.append((int(rid), score))
         return out
+
+    def retrieval_activation(self, query: str) -> float:
+        """The best chunk activation for `query` — the max cosine of any point to
+        the query embedding (ACT-R : the most-active chunk). 0.0 on an empty
+        cloud. This is what the retrieval threshold is compared against."""
+        from metacog.geometry import cosine
+        pts = [p for p in self.points if p.embedding_orig]
+        if not pts:
+            return 0.0
+        q = tuple(self.encoder.encode(query))
+        return max(cosine(q, p.embedding_orig) for p in pts)
+
+    def abstains(self, query: str,
+                 threshold: Optional[float] = None) -> bool:
+        """ACT-R retrieval-threshold test : True when retrieval should FAIL — no
+        chunk is sufficiently activated, so the honest answer is 'I don't know'
+        rather than the least-bad match.
+
+        `threshold` fixes tau (ACT-R's constant retrieval threshold) : abstain if
+        the best activation < tau. `None` (default) uses an EMERGENT floor — the
+        best match must STAND OUT from the background : abstain unless it clears
+        (mean + 2·std) of the query's similarity to the rest of the cloud. Never
+        abstains on a corpus too small (< 4) to have a background."""
+        from metacog.geometry import cosine
+        import statistics
+        pts = [p for p in self.points if p.embedding_orig]
+        if len(pts) < 4:
+            return False
+        q = tuple(self.encoder.encode(query))
+        sims = sorted(cosine(q, p.embedding_orig) for p in pts)
+        best = sims[-1]
+        if threshold is not None:
+            return best < threshold
+        background = sims[:-1]                    # everything but the top hit
+        floor = statistics.fmean(background) + 2 * statistics.pstdev(background)
+        return best <= floor
 
     def need_odds(self, node_id: str, now: Optional[float] = None) -> float:
         """Anderson-Schooler need-odds for a node — the power-law of its access

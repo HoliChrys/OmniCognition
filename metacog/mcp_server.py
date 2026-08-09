@@ -234,6 +234,7 @@ def build_app(
         use_lineage: bool = True,
         use_spreading: bool = True,
         prefer_kind: Optional[str] = None,
+        abstain: bool = False,
     ) -> List[dict]:
         """Retrieve top-k points for a query.
 
@@ -258,7 +259,11 @@ def build_app(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
+            abstain=abstain,
         )
+        if abstain and not results:
+            return [{"abstained": True,
+                     "note": "no chunk sufficiently activated — retrieval failed"}]
         # Log the retrieval (mnema access-log) and hand back a retrieval_id
         # handle so the agent can later mark_useful(...) on it — the supervised
         # feedback that calibrates decay. Failure-safe / no-op without a journal.
