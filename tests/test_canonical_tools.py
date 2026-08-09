@@ -52,6 +52,41 @@ def test_tiers_are_disjoint():
             assert not (a & b), f"tiers overlap: {a & b}"
 
 
+def test_surfaces_are_subsets_of_live_tools():
+    live = _live_tool_names()
+    assert C.EXTERNAL <= live, f"EXTERNAL has unknown tools: {C.EXTERNAL - live}"
+    assert C.EXTERNAL_LIGHT <= C.EXTERNAL <= C.ALL_KNOWN
+    assert C.CANONICAL <= live
+
+
+def test_surface_tools_resolution():
+    assert C.surface_tools("all") is None                 # no restriction
+    assert C.surface_tools("external") == C.EXTERNAL
+    assert C.surface_tools("external_light") == C.EXTERNAL_LIGHT
+    assert C.surface_tools("canonical") == C.CANONICAL
+    # mutating the returned set must not corrupt the manifest
+    C.surface_tools("external").add("zzz")
+    assert "zzz" not in C.EXTERNAL
+
+
+def test_unknown_surface_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        C.surface_tools("bogus")
+
+
+def test_external_powerful_covers_feed_ask_tools_observe():
+    # the powerful-agent contract: feed + ask + manage own tools + observe
+    assert {"ingest_message", "push_code"} <= C.EXTERNAL          # feed
+    assert {"retrieve", "walk_start"} <= C.EXTERNAL               # ask
+    assert {"ensure_tool", "match_tool", "list_tools_learned"} <= C.EXTERNAL
+    assert {"stats", "inspect", "list_tags"} <= C.EXTERNAL        # observe
+    # internal machinery stays OFF the external surface
+    assert not (C.OBSERVATORS & C.EXTERNAL)
+    assert not (C.BAGS & C.EXTERNAL)
+    assert not (C.SPECIALIZED_RETRIEVAL & C.EXTERNAL)
+
+
 def test_classify_and_is_canonical():
     assert C.classify("retrieve") == "canonical"
     assert C.classify("ensure_tool") == "tool_tier"

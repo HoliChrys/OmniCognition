@@ -59,11 +59,32 @@ def _resolve_lever(arg: Optional[float], env_name: str) -> Optional[float]:
     return float(raw) if raw not in (None, "") else None
 
 
+def _install_surface_gate(app, exposed) -> None:
+    """Wrap `app.tool` so only tools whose name is in `exposed` are REGISTERED on
+    the MCP ; unexposed ones are returned undecorated (still callable internally).
+    `exposed=None` -> no gate (expose all). Kept module-level + mcp-free so the
+    gating logic is unit-testable with a fake app (the real FastMCP is absent in
+    this environment)."""
+    if exposed is None:
+        return
+    raw_tool = app.tool
+
+    def gated_tool(*a, **kw):
+        deco = raw_tool(*a, **kw)
+
+        def wrap(fn):
+            return deco(fn) if fn.__name__ in exposed else fn
+        return wrap
+
+    app.tool = gated_tool
+
+
 def build_app(
     storage_path: Optional[str] = None,
     memory: Optional[Memory] = None,
     recency_weight: Optional[float] = None,
     spreading_weight: Optional[float] = None,
+    surface: Optional[str] = None,
 ) -> FastMCP:
     """Build the metacog MCP app.
 
@@ -77,9 +98,17 @@ def build_app(
     (METACOG_RECENCY_WEIGHT / METACOG_SPREADING_WEIGHT) > the memory's own value
     (untouched) — so a deploy can turn them on without code changes, and an
     injected memory keeps its settings unless one is explicitly given.
+
+    `surface` restricts which tools are EXPOSED on the MCP : "all" (default,
+    every tool), "external" (a powerful external agent : feed / ask / manage its
+    own tools / observe), "external_light" (feed + ask), or "canonical" (the
+    primitives). Resolution : arg > env METACOG_SURFACE > "all". Unexposed tools
+    stay callable internally — they only leave the external surface, so the agent
+    that drives the MCP sees a small, purposeful toolset instead of all 40.
     """
     from metacog.meta_walk import MetaWalker, WalkerRegistry, _NEIGHBOUR_GATE
     from mcp.server.fastmcp import FastMCP
+    from metacog.canonical_tools import surface_tools
 
     app = FastMCP(
         "metacog",
@@ -99,6 +128,13 @@ def build_app(
             "tool keeps a bidirectional link back to it."
         ),
     )
+
+    # Gate which @app.tool()s are REGISTERED on the MCP surface. Wrap app.tool
+    # once ; a tool whose name is not exposed is left unregistered (but still a
+    # local callable used internally). "all" -> no restriction.
+    _surface = surface or os.environ.get("METACOG_SURFACE") or "all"
+    _install_surface_gate(app, surface_tools(_surface))
+
     if memory is None:
         # Attach a PERSISTENT journal ("<storage_path>.journal.db") so the SQL
         # triggers (co-retrieval / lateral / Chasles / tag index / decay

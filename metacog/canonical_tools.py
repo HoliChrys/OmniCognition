@@ -66,6 +66,49 @@ DERIVED: Set[str] = SPECIALIZED_RETRIEVAL | BAGS | OBSERVATORS
 #: Every tool name this manifest knows about (must equal the live @app.tool() set).
 ALL_KNOWN: Set[str] = CANONICAL | TOOL_TIER | DERIVED | DEPRECATED
 
+# -- MCP surfaces (who calls what) --------------------------------------------
+# A different axis than the tiers above : which tools an EXTERNAL actor calls,
+# vs internal/autonomic machinery the memory orchestrates itself.
+
+#: Light client — the minimal contract from the server's own instructions :
+#: feed every message + code block, and ask.
+EXTERNAL_LIGHT: Set[str] = {"ingest_message", "push_code", "walk_start"}
+
+#: Powerful external agent — feeds, asks, manages its OWN tools, and observes
+#: state. The specialized retrieval / bags / observators stay INTERNAL (the walk
+#: orchestrates them), so the surface stays small instead of re-bloating to 40.
+EXTERNAL: Set[str] = {
+    # feed
+    "ingest", "ingest_message", "process_turn", "push_code",
+    # ask
+    "retrieve", "walk_start",
+    # manage its own tools (tools live as memory nodes)
+    "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
+    # observe state
+    "stats", "inspect", "list_tags",
+    # trigger consolidation explicitly (otherwise autonomic)
+    "sleep",
+}
+
+_SURFACES = {
+    "all": None,                       # no restriction (default, backward-compat)
+    "canonical": CANONICAL,
+    "external": EXTERNAL,
+    "external_light": EXTERNAL_LIGHT,
+}
+
+
+def surface_tools(surface: str) -> "Set[str] | None":
+    """The set of tool names to EXPOSE for a named surface, or None for 'all'
+    (no restriction). Unknown names raise. Used by build_app to gate which
+    @app.tool()s are registered on the MCP ; unexposed tools remain callable
+    internally, they just leave the external surface."""
+    if surface not in _SURFACES:
+        raise ValueError(
+            f"unknown surface {surface!r} ; choose from {sorted(_SURFACES)}")
+    s = _SURFACES[surface]
+    return set(s) if s is not None else None
+
 
 def classify(name: str) -> str:
     """Return the tier of a tool name : 'canonical' | 'tool_tier' |
