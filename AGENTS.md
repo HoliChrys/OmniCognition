@@ -87,8 +87,22 @@ bind every subtree; child docs add local detail but may not weaken them.
   directly, never through an `Observation`. Enforced by `tests/test_no_laundering.py`.
 - **LLM extractors** are cached, fully failure-safe (`try/except -> []`), and
   **never cache an empty result**.
-- **Persistence:** `Memory.save()` pickles `points` only; anything else
-  (registries, bags, threads) is rebuilt in `load()`.
+- **Persistence:** `Memory.save()` pickles a whitelist (`points`, observators,
+  conversation_log, clocks, `decay_exponent`, `_forget_log`); registries/bags/
+  threads are rebuilt in `load()`. The SQL **usage journal is a SEPARATE SQLite
+  file** (`<storage>.journal.db`), never pickled — it persists on its own and is
+  re-attached on construction.
+- **mnema usage journal (opt-in, failure-safe).** `metacog/journal.py` is an
+  append-only access-log separate from the store. Structural signals are SQL
+  queries (co-retrieval self-join, `path_traversals` for Chasles, hierarchical
+  `tags`, `forget_events`). Every consumer degrades to the in-memory path or a
+  no-op without a journal — **behaviour must be unchanged when it is absent**.
+  ACT-R ranking levers (`recency_weight`/`spreading_weight`) and the explicit
+  `forget`/decay-prune are all **OFF/opt-in by default** (mnema's defaults).
+- **Tool surface.** `metacog/canonical_tools.py` partitions tools into T1/T2/T3
+  (guarded by `tests/test_canonical_tools.py`). `build_app(surface=…)` /
+  `METACOG_SURFACE` gates what the MCP EXPOSES; unexposed tools stay callable
+  internally. A new `@app.tool()` must be classified or the partition test fails.
 
 ## Commands
 

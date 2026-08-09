@@ -100,7 +100,31 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
   `scoped_answer`, `scoped_list` (non-kNN filtered listing), `search_nodes`
   (tri-modal relevance step over content+tags, without replacement vs the bag),
-  and `assemble_set` (the whole orchestrated loop in one call).
+  and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
+  `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
+  `app.tool` once; unexposed names not registered, still callable internally).
+- `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
+  from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
+  `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
+  `path_traversals` (Chasles trigger = `GROUP BY signature`, append-only
+  refractory from `collision_events`), `tags` (hierarchical ancestor match),
+  `collision_events`, `forget_events` (node_id, reason, superseded_by, merged —
+  consumed by the latent merge). Every reader is failure-safe; absence ⇒ no-op.
+- `need_odds.py` — Anderson–Schooler base-level activation `Σ(now−t)^−d`,
+  `fit_exponent` (grid-fit d by need-odds AUC over useful/useless labels), and
+  `blend` (min-max mix of base score + need-odds; NOT a sigmoid squash).
+- `canonical_tools.py` — the tool-tier manifest (T1 CANONICAL / T2 TOOL_TIER /
+  T3 INTERNAL / DEPRECATED) + surfaces (`EXTERNAL`, `EXTERNAL_LIGHT`,
+  `canonical`, `all`). `surface_tools(name)`, `classify(name)`. Must partition
+  the live `@app.tool()` set exactly (test-guarded).
+- `memory.py` (mnema layer) — `record_retrieval` (returns retrieval_id, logs the
+  access-log + in-mem lateral ledger); `score_retrievals`/`mark_useful` (feedback
+  → `fit_decay`, auto each `sleep`); `retrieve(recency_weight/spreading_weight)`
+  ACT-R activation blend + `abstain`/`abstains` (retrieval-threshold "I don't
+  know"); `forget` (autonomic decay-prune, opt-in in sleep) vs `forget_node`
+  (explicit soft-invalidate → DB event) + `merge_forgotten` (latent alias merge
+  in sleep); tool lifecycle `retire_tool`/`report_tool`/`update_tool`
+  (`match_tool` skips `deprecated`). All OFF/opt-in/failure-safe by default.
 
 ## Work Guidance
 

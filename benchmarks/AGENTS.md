@@ -20,6 +20,17 @@ cross-benchmark conventions.
   evidence set.
 - The event channel is **additive** — measure walk-alone vs walk∪event, never
   event-replaces-walk.
+- **Step debuggers (no full benchmark, no LLM):** `debug_chasles_workflow.py`
+  steps the SQL-journal workflow (ingest → walk feed → co-retrieval → feedback →
+  need-odds → spreading → tags → chasles → refractory → decay-fit → forget →
+  forget_explicit → abstain → persist) on SimpleEncoder + a fake LLM, printing
+  `[ok]/[FAIL]` and exiting non-zero — a smoke gate. `debug_skill_lifecycle.py`
+  steps the tool tier (need → create → organic retrieve → reuse → discriminate →
+  crystallize → lifecycle → persist). Both take `--steps a,b` / `--list`.
+- **Calibration probe (real encoder, NOT a benchmark):** `calibrate_levers.py`
+  sweeps `recency_weight`/`spreading_weight` on curated oblique probes with the
+  real MiniLM encoder (`--favorable` = the spreading-bridge regime). Measures
+  mechanism efficacy, not a LoCoMo/OBLIQ score.
 
 ## Work Guidance
 

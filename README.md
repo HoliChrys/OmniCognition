@@ -129,13 +129,16 @@ observation set O that updates a point's epistemic counters. The
 `metacog/audit.py` pass verifies the invariant holds over a whole store
 (Corollary 5).
 
-### 2.4 No hyperparameters, no deletion
+### 2.4 No hyperparameters, append-only forgetting
 
 Every "threshold" is a mathematical constant (`cos π/4`, `cos π/12`) or
 emerges from the population (`median ± σ` for collision; the Poisson floor
-`λ + √λ` for every recurrence law). Invalidated points are not removed:
-the states `INVALID`/`DEPRECATED` **exile** a point geometrically, and new
-corroborating observations resurrect it automatically.
+`λ + √λ` for every recurrence law). Forgetting is **append-only, never a hard
+delete**: an invalidated point keeps its row but its state `INVALID`/`DEPRECATED`
+**exiles** it geometrically and drops it from retrieval and the walk, while new
+corroborating observations resurrect it automatically. Both an autonomic
+decay-driven pass and an explicit agent `forget` use this same soft mechanism
+(§5.3) — the store only ever grows; visibility is what changes.
 
 ---
 
@@ -650,6 +653,84 @@ the background, so feeding a message never delays a concurrent search
 The server's MCP `instructions` make this a standing client obligation —
 index every message, push every code block.
 
+### 5.3 The usage journal — mnema-aligned activation, feedback & forgetting
+
+Alongside the point cloud (the *store*) there is an append-only SQLite **usage
+journal** (`metacog/journal.py`), mirroring mnema's separation of the store from
+its access-log. It is **opt-in** (`Memory(journal_path="auto")` derives
+`<storage>.journal.db`; the MCP server attaches one by default) and **failure-safe**:
+with no journal every mechanism below falls back to the in-memory path or a no-op,
+so behaviour is unchanged when it is absent. Every structural signal is then a
+plain SQL query rather than a bespoke in-memory ledger:
+
+- **co-retrieval** — a self-join over `access_events` (nodes surfaced in the same
+  retrieval); drives lateral collision.
+- **lateral / Chasles** collision triggers become queries: `co_retrieved_pairs`
+  for redundancy, and `path_traversals` (a travelled path is one countable row,
+  signature = the group key) so "this path is often taken" is
+  `GROUP BY signature HAVING COUNT(*) ≥ k` — with an append-only refractory
+  derived from the `chasles` collision events (nothing mutated).
+- **hierarchical tag index** — `tags(node_id, tag, depth)`, ancestor-matched in
+  SQL (`tag = ? OR tag LIKE ?||':%'`).
+
+**ACT-R activation in ranking.** `retrieve` optionally blends the base relevance
+with the two halves of ACT-R activation, both computed from the journal and both
+**OFF by default** (mnema's defaults):
+`A_i = B_i (base-level) + Σ spreading`.
+`recency_weight` mixes in **need-odds** — the Anderson–Schooler power-law of a
+node's access ages (`Σ (now − t)^−d`) under a learned exponent `d`. `spreading_weight`
+mixes in **associative spreading** — nodes historically co-retrieved with the
+top hits, boosting present ones and injecting cosine-missed associates. (The base
+score is min-max normalized, not squashed, so a dominant hit resists being
+flipped.)
+
+**The feedback loop (L3).** A retrieval hands back a `retrieval_id`; the walk
+auto-labels its own retrievals by which facts it actually used, and the agent can
+also rate one explicitly (`mark_useful` 0/1/2). Those supervised labels let
+`fit_decay` (run automatically each `sleep`) fit the decay exponent `d` that
+need-odds uses — so the memory calibrates its own recency curve from real use.
+
+**Forgetting — two phases.** At **query time** memory only *decays* (the need-odds
+ranking above); the actual pruning is **offline** so it never handicaps latency.
+In `sleep` (opt-in `forget_enabled`) a conservative, emergent pass drops nodes
+that were accessed then went cold (below `mean − σ` of the accessed population;
+tools and the never-tried are kept). Independently, an agent can **explicitly**
+forget one node — `forget(node_id, reason[, superseded_by])`: append-only
+soft-invalidation (state `INVALID`, so it leaves retrieval and the walk) that is
+also written as a **DB event** (`forget_events`); the next `sleep` runs the
+**latent merge** (`merge_forgotten`), redirecting a superseded node's alias to
+its successor (the same `_merge_aliases` mechanism lateral collision uses) and
+marking the event done. This is mnema's `forget` (runtime tool) + `reflect`
+(offline merge) split.
+
+**Retrieval-threshold abstention.** `retrieve(abstain=True)` applies the ACT-R
+retrieval threshold: if no chunk is sufficiently activated it returns `[]` — an
+explicit "I don't know" instead of the least-bad match. The threshold is
+emergent by default (the best match must clear `mean + 2σ` of the background) or
+a fixed τ.
+
+### 5.4 The self-built tool set — a full lifecycle
+
+Generated tools live as `tool`-tagged nodes *in* the memory (§5.1), so the agent
+retrieves the tools it created like any other node. Beyond create/find/reuse
+(`ensure_tool` / `match_tool` / `build_skill`), the set now has the retract &
+correct half: `report_tool(ok)` reinforces on success and **auto-retires** after
+repeated failures; `retire_tool` soft-deprecates (so `match_tool` stops reusing
+it) or hard-removes; `update_tool` rewrites a tool's body (re-embedded) and
+revives a deprecated one. Append-only growth **and** decay, on both facts and
+tools.
+
+### 5.5 Canonical tools & the MCP surface
+
+Tools are classified into role tiers (`metacog/canonical_tools.py`, guarded by a
+test that the manifest partitions the live tool set exactly): **T1 canonical**
+primitives that run the memory, **T2** agent-tool machinery, **T3** internal
+mechanisms / walk modes / autonomic passes. The MCP `build_app(surface=…)`
+(`arg > env METACOG_SURFACE > "all"`) gates which tools are *exposed* — `external`
+(the powerful-agent contract), `external_light`, `canonical`, or `all` — while
+unexposed tools stay callable internally. This keeps the agent-facing surface
+small and purposeful without hiding capability from the internal orchestration.
+
 ---
 
 ## 6. Evaluation
@@ -1058,7 +1139,16 @@ Tools appear as `mcp__metacog__*`:
 ingest              add a FACT / THOUGHT / ACTION
 observe             apply an Observation on existing point(s)
 process_turn        record a conversation turn (detectors fire)
-retrieve            top-k hybrid retrieval (RRF)
+retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
+                    abstain=true applies the ACT-R threshold → [] when no
+                    chunk is sufficiently activated ("I don't know") (§5.3)
+assemble_set        orchestrated exhaustive-set retrieval ("list every …")
+
+# feedback & forgetting (§5.3)
+mark_useful         rate a past retrieval 0/1/2 → calibrates decay (fit next sleep)
+forget              soft-invalidate ONE node (reason required; optional
+                    superseded_by) → append-only, drops from retrieval, logged
+                    as a DB event for the latent merge in sleep
 
 # the walk  ── depth is decided by the walk, not the caller ──
 walk_start          run a COMPLETE uncertainty-governed walk for a query
@@ -1095,6 +1185,9 @@ match_tool          fast-path: does a generated tool already cover this query?
 ensure_tool         get a tool, generating it if absent ("no tool → make it")
 crystallize_skills  fold recurring actions into persistent tool nodes
 list_tools_learned  list the self-built tool set
+report_tool         reinforce a tool (ok) / auto-retire after repeated failures
+retire_tool         soft-deprecate (stop reuse) or hard-remove a tool
+update_tool         rewrite a tool's body (re-embedded); revives a deprecated one
 
 # introspection & perspective
 inspect             dump a point's full state (keywords, tags, σ, spike count)
@@ -1104,6 +1197,14 @@ declare_observator · detect_polarized · spawn_observators · route
 list_communities    Level-1 community / observator detection
 save                persist to disk
 ```
+
+**Surface (§5.5).** `METACOG_SURFACE` (or `build_app(surface=…)`) gates which
+tools are exposed: `all` (default) · `external` (the powerful-agent contract:
+feed / ask / manage-own-tools / observe / feedback / forget) · `external_light`
+(feed + ask) · `canonical` (T1 primitives). Unexposed tools stay callable
+internally. A **persistent journal** (`<storage>.journal.db`) is attached
+automatically so the SQL triggers, learned decay exponent and forget log survive
+restarts.
 
 The crucial semantic difference from a conventional retrieval tool:
 **`walk_start` owns the depth decision.** A caller cannot ask for "one more
