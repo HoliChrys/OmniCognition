@@ -121,6 +121,26 @@ def step_feedback(p: _Probe):
             f"n_pos={res['n_pos']} n_neg={res['n_neg']} exponent={res['exponent']:.3f}")
 
 
+def step_needodds(p: _Probe):
+    """Concept B : need-odds (ACT-R base-level) blended into ranking behind
+    recency_weight. OFF by default (order identical) ; ON re-ranks by access
+    recency×frequency."""
+    q = "shared common topic"
+    base = [h["id"] for h in p.mem.retrieve(q, k=6)]           # recency_weight=0
+    target = base[-1]                                          # the base-LAST node
+    p.check("baseline captured (weight 0)", p.mem.recency_weight == 0.0,
+            f"base={base[:4]} target={target}")
+    # hammer accesses onto the base-last node so its need-odds dominates
+    for _ in range(8):
+        p.mem.record_retrieval([target], query_text="hammer")
+    p.mem.recency_weight = 1.0                                 # pure need-odds
+    ranked = [h["id"] for h in p.mem.retrieve(q, k=6)]
+    p.mem.recency_weight = 0.0                                 # restore
+    p.check("need-odds LIFTS the hammered base-last node",
+            ranked.index(target) < base.index(target),
+            f"{target}: base#{base.index(target)} -> need#{ranked.index(target)}")
+
+
 def step_lateral(p: _Probe):
     """lateral_collapse runs off the SQL ledger when a journal is present
     (informational on a tiny cloud — it is gated on a large tag-rich cloud)."""
@@ -179,6 +199,7 @@ STEPS = [
     ("spike", step_spike),
     ("coretr", step_coretr),
     ("feedback", step_feedback),
+    ("needodds", step_needodds),
     ("lateral", step_lateral),
     ("tags", step_tags),
     ("chasles", step_chasles),

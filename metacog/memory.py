@@ -246,6 +246,11 @@ class Memory:
     # by fit_decay() from the journal's mark_useful labels + access history).
     # Persisted with the cloud. 0.5 = the human-memory-literature default.
     decay_exponent: float = 0.5
+    # ACT-R base-level activation in ranking : blend the base relevance score
+    # with each candidate's need-odds (recency×frequency of journal accesses)
+    # under `decay_exponent`. 0.0 = OFF (pure base ; mnema's default) ; 1.0 =
+    # pure need-odds. Only applied when > 0 AND a journal is present.
+    recency_weight: float = 0.0
     # Episodic conversation index : the id of the last message ingested per
     # (user, session), so successive messages chain via sequence_prev and a
     # session reads back in order. Continuous indexation feeds this.
@@ -2229,6 +2234,17 @@ class Memory:
                     if len(deduped) >= k:
                         break
             results = [(s, p) for s, p in deduped if p is not None]
+        # ACT-R base-level : re-rank by blending the base relevance with each
+        # candidate's need-odds (journal access recency×frequency). OFF unless
+        # recency_weight > 0 and a journal is present -> default order untouched.
+        if self.recency_weight > 0.0 and self.journal is not None and results:
+            from metacog.need_odds import blend
+            pts = [p for _, p in results]
+            blended = blend([s for s, _ in results],
+                            [self.need_odds(p.id, t_now) for p in pts],
+                            self.recency_weight)
+            results = sorted(zip(blended, pts), key=lambda sp: sp[0],
+                             reverse=True)
         return [
             {
                 "id": p.id,
