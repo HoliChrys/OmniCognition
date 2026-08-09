@@ -195,6 +195,12 @@ class Memory:
     # on the latent category. Opt-in, idempotent, LLM-backed. See
     # metacog.tag_refine.
     tags_refine_enabled: bool = False
+    # Decay-driven FORGETTING pass in sleep (opt-in, OFF by default). The query
+    # path only DECAYS (need-odds ranking) ; the actual pruning of cold nodes
+    # happens OFFLINE here so it never handicaps query latency. Conservative :
+    # only nodes already accessed then gone cold (never the untried), tools
+    # protected, emergent threshold (mean - std of need-odds).
+    forget_enabled: bool = False
     # Run the SAME hierarchical refinement at INGEST time for each created
     # FACT/ACTION (opt-in) instead of waiting for latent sleep. Costs one LLM
     # call per node on the hot path — off by default ; sleep is the cheap path.
@@ -3179,6 +3185,10 @@ class Memory:
         out["decay_exponent"] = fit["exponent"]
         out["decay_fit_n_pos"] = fit["n_pos"]
         out["decay_fit_n_neg"] = fit["n_neg"]
+        # OFFLINE decay-forgetting : prune cold nodes here (never on the query
+        # path). Opt-in (forget_enabled) ; conservative + emergent. No-op off.
+        if self.forget_enabled:
+            out["forgotten"] = self.forget(t_now, apply=True)["forgotten"]
         # LATENT skill distiller : replay resolutions recorded since the
         # last sleep and crystallize theoretical tools linked to their
         # explicating facts. Opt-in (skills_enabled), idempotent.
@@ -3437,6 +3447,44 @@ class Memory:
         res = fit_exponent(pos_h, neg_h, t)
         self.decay_exponent = float(res["exponent"])
         return res
+
+    def forget(self, t: Optional[float] = None,
+               apply: bool = False) -> Dict[str, Any]:
+        """OFFLINE decay-forgetting — the other half of need-odds. Query time only
+        DECAYS (ranking) ; here, off the hot path, we PRUNE the nodes that have
+        gone cold. Uses the SAME need_odds under the fitted decay_exponent.
+
+        Conservative & emergent : considers only non-tool nodes that WERE accessed
+        (never the untried), and forgets those whose need-odds falls below
+        (mean - std) of that population — so nothing is dropped unless a clear
+        cold tail exists. Dry-run by default ; `apply=True` removes them. No-op
+        without a journal or with too few accessed nodes."""
+        base = {"forgotten": [], "candidates": [], "n_points": len(self.points)}
+        if self.journal is None:
+            return base
+        from metacog.skills import is_tool
+        now = self._now(t)
+        scored = []
+        for p in self.points:
+            if is_tool(p):
+                continue                       # tools are managed separately
+            ts = self.journal.access_timestamps(p.id)
+            if not ts:
+                continue                       # never accessed -> keep (untried)
+            scored.append((p, self.need_odds(p.id, now)))
+        if len(scored) < 4:                    # too few to judge a cold tail
+            return base
+        import statistics
+        vals = [v for _, v in scored]
+        cutoff = statistics.fmean(vals) - statistics.pstdev(vals)
+        cands = sorted(p.id for p, v in scored if v < cutoff)
+        forgotten: List[str] = []
+        if apply and cands:
+            drop = set(cands)
+            self.points = [p for p in self.points if p.id not in drop]
+            forgotten = cands
+        return {"forgotten": forgotten, "candidates": cands,
+                "n_points": len(self.points)}
 
     def reindex_tags(self) -> int:
         """Sync the journal's SQL hierarchical-tag index from the current points

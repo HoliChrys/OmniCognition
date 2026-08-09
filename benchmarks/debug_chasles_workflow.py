@@ -24,6 +24,7 @@ import tempfile
 from typing import List
 
 from metacog.defaults import SimpleEncoder
+from metacog.journal import Journal
 from metacog.memory import Memory
 from metacog.spike import record_hop
 
@@ -212,6 +213,39 @@ def step_refractory(p: _Probe):
     p.check("re-run is a no-op", p.mem.compress_chasles() == [])
 
 
+def step_forget(p: _Probe):
+    """Concept #2 : OFFLINE decay-forgetting. Query time only decays (ranking) ;
+    here (sleep-phase, isolated memory) cold nodes are pruned — hot & tools kept,
+    the untried untouched."""
+    from metacog.epistemic import Point, PointKind
+    from metacog.skills import TOOL_TAG, is_tool
+    enc = SimpleEncoder()
+    m = Memory(encoder=enc, journal=Journal())
+    for i in range(6):
+        m.ingest(f"hot fact {i}", kind="FACT", id=f"H{i}")
+    for i in range(2):
+        m.ingest(f"cold fact {i}", kind="FACT", id=f"C{i}")
+    m.points.append(Point(id="tool::x", content="a tool",
+                          embedding_orig=tuple(enc.encode("a tool")),
+                          kind=PointKind.ACTION, tags=[TOOL_TAG]))
+    m.ingest("never retrieved", kind="FACT", id="NEW")
+    now = 10_000
+    for i in range(6):
+        m.journal.log_retrieval("q", [f"H{i}"], ts=now - 1)      # hot
+    for i in range(2):
+        m.journal.log_retrieval("q", [f"C{i}"], ts=now - 5_000)  # cold
+    m.journal.log_retrieval("q", ["tool::x"], ts=now - 5_000)     # cold tool
+    dry = m.forget(t=now, apply=False)
+    p.check("dry-run flags only cold outliers", set(dry["candidates"]) == {"C0", "C1"},
+            str(dry["candidates"]))
+    out = m.forget(t=now, apply=True)
+    ids = {q.id for q in m.points}
+    p.check("cold nodes pruned", set(out["forgotten"]) == {"C0", "C1"})
+    p.check("hot nodes kept", all(f"H{i}" in ids for i in range(6)))
+    p.check("tools + untried protected",
+            any(is_tool(q) for q in m.points) and "NEW" in ids)
+
+
 def step_persist(p: _Probe):
     """Save + close, then reopen the SAME store -> journal state survives."""
     p.mem.save()
@@ -238,6 +272,7 @@ STEPS = [
     ("chasles", step_chasles),
     ("refractory", step_refractory),
     ("decayfit", step_decayfit),
+    ("forget", step_forget),
     ("persist", step_persist),
 ]
 
