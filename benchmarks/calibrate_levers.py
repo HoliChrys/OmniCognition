@@ -10,7 +10,8 @@ issuing each theme's DIRECT query (which the cosine does surface), logging acces
 queries. It answers "does the mechanism help recall, and at what weight?" — the
 gain is on THIS probe, not a claim about LoCoMo/OBLIQ.
 
-    python -m benchmarks.calibrate_levers            # full sweep
+    python -m benchmarks.calibrate_levers            # neutral probe sweep
+    python -m benchmarks.calibrate_levers --favorable  # spreading-bridge regime
     python -m benchmarks.calibrate_levers --k 10
 """
 
@@ -91,6 +92,93 @@ THEMES: List[dict] = [
 ]
 
 
+# Favorable regime for SPREADING : each theme has a BRIDGE doc that paraphrases
+# the oblique query (so cosine surfaces it as a seed) and a cosine-FAR GOLD that
+# the bridge was co-retrieved with in prior sessions. Spreading from the bridge
+# seed should then inject the gold the cosine misses.
+BRIDGES: List[dict] = [
+    dict(theme="heir",   oblique="why does he never check the price tag",
+         bridge="He shops without ever glancing at the price.",
+         gold="He is the sole heir to a shipping fortune."),
+    dict(theme="nightshift", oblique="why is she always so tired in the mornings",
+         bridge="She feels completely exhausted every single morning.",
+         gold="She works the overnight shift at the hospital."),
+    dict(theme="selling", oblique="why does the house smell of fresh paint",
+         bridge="The whole house smells strongly of new paint.",
+         gold="They are staging the home to put it on the market next month."),
+    dict(theme="bedrest", oblique="why did he cancel the hiking trip",
+         bridge="He called off all his hiking plans.",
+         gold="His doctor ordered strict bed rest after the surgery."),
+    dict(theme="vacation", oblique="why are the kids so excited this week",
+         bridge="The children have been thrilled all week long.",
+         gold="The family is flying to Disneyland on Saturday."),
+    dict(theme="homecoming", oblique="why does she keep glancing at the door",
+         bridge="She keeps looking anxiously toward the front door.",
+         gold="She is waiting for her deployed son to return from overseas."),
+    dict(theme="diet", oblique="why is the fridge suddenly full of vegetables",
+         bridge="The refrigerator is packed with fresh vegetables now.",
+         gold="She has started a strict plant-based diet plan."),
+    dict(theme="baby", oblique="why did he trade in the sports car",
+         bridge="He finally got rid of his two-seater sports car.",
+         gold="They are expecting their first child in the spring."),
+]
+
+
+def build_favorable() -> Memory:
+    from metacog.journal import Journal
+    mem = Memory(encoder=SemanticEncoder(), journal=Journal())
+    for th in BRIDGES:
+        mem.ingest(th["bridge"], kind="FACT", id=f"bridge::{th['theme']}")
+        mem.ingest(th["gold"], kind="FACT", id=f"gold::{th['theme']}")
+    # competitive distractors : the neutral-probe golds + contexts, so cosine has
+    # a genuinely crowded field and the bridge/gold recovery is not trivial.
+    for th in THEMES:
+        mem.ingest(th["gold"], kind="FACT", id=f"dist::{th['theme']}")
+        for i, c in enumerate(th["context"]):
+            mem.ingest(c, kind="FACT", id=f"distctx::{th['theme']}::{i}")
+    return mem
+
+
+def warmup_favorable(mem: Memory, rounds: int = 3) -> None:
+    """Forge the associative history a prior session would leave : the gold and
+    its bridge were retrieved TOGETHER (co-retrieval), and the gold was accessed
+    repeatedly (base-level). The oblique test queries are never used here."""
+    for _ in range(rounds):
+        for th in BRIDGES:
+            g, b = f"gold::{th['theme']}", f"bridge::{th['theme']}"
+            mem.record_retrieval([g, b], query_text=f"warm-{th['theme']}")
+
+
+def _fav_recall(mem: Memory, k: int) -> float:
+    hits = 0
+    for th in BRIDGES:
+        got = [h["id"] for h in mem.retrieve(th["oblique"], k=k)]
+        if f"gold::{th['theme']}" in got:
+            hits += 1
+    return hits / len(BRIDGES)
+
+
+def run_favorable(k: int) -> int:
+    mem = build_favorable()
+    warmup_favorable(mem)
+    print(f"\nFAVORABLE regime (spreading bridges) — corpus={len(mem.points)} "
+          f"docs, {len(BRIDGES)} probes, recall@{k}\n")
+    base = _fav_recall(mem, k)
+    print(f"  baseline (spreading OFF)             recall@{k} = {base:.3f}")
+    print("\n  -- spreading (spreading_weight) sweep --")
+    for w in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
+        mem.spreading_weight = w
+        print(f"     spreading_weight={w:.1f} recall@{k} = {_fav_recall(mem, k):.3f}")
+    mem.spreading_weight = 0.0
+    print("\n(Favorable/synthetic regime : the gold is cosine-far from the oblique"
+          "\n query but was co-retrieved with a bridge the query DOES surface. It"
+          "\n demonstrates spreading's UPSIDE — recovering associatively-linked"
+          "\n nodes the cosine misses — the complement to the neutral probe where"
+          "\n it degrades. Real gains need a real dataset ; this shows the regime"
+          "\n exists.)\n")
+    return 0
+
+
 def _gold_rank(mem: Memory, th: dict, depth: int = 30) -> int:
     """Rank (0-based) of the theme's gold in the oblique retrieval, or depth if
     it falls outside the fetched window."""
@@ -132,8 +220,12 @@ def warmup(mem: Memory, rounds: int = 3) -> None:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--favorable", action="store_true",
+                    help="run the spreading-bridge favorable regime instead")
     args = ap.parse_args(argv)
     k = args.k
+    if args.favorable:
+        return run_favorable(k)
 
     mem = build()
     warmup(mem)
