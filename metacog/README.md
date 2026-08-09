@@ -133,34 +133,56 @@ manifold (no separate store):
 
 ## MCP tools (`mcp_server.py`)
 
+Classified into role tiers (`canonical_tools.py`). The `external` surface
+exposes **T1 + T2**; **T3** stays callable internally (surface `all`) but off the
+agent-facing surface — the walk / sleep orchestrate it.
+
 ```
-ingest · observe · process_turn · retrieve
-walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
-                    user_id/session_id add the double-query section boost
-walk_keepup         keepup streaming: provisional answer re-written each
-                    stage until validated (SSE → a self-rewriting message)
-scoped_answer       tag-filtered cascade: walk the discussion first, then
-                    (knowledge_base=true) the global memory seeded by it.
-                    match=exact|fuzzy|regex selects how each tag resolves
-                    (exact = equality OR hierarchical ancestry)
-presearch           BATCH reconnaissance GATE: top-k nearest hits per query
-                    WITHOUT a walk — the agent validates a query is
-                    probative before paying walk_start (optional tag
-                    pre-filter, same exact|fuzzy|regex semantics)
-list_tags           glossary of tag NAMESPACES (parent prefixes of the
-                    hierarchical `:` tags, leaf dropped), depth-ordered
-walk_next           deprecated — walk_start runs to completion
-reason · sleep
-ingest_skill        re-index a named skill-JSON directory tree
-build_skill         task-mode walk → synthesise + ingest a named skill
-get_session_skill   the skill JSON cached for this (user, session)
+#####  T1 — CANONICAL primitives (exposed)  #####
+# feed
+ingest              add a FACT / THOUGHT / ACTION
 ingest_message      EPISODIC: index a message (user/agent), async, timestamped
 push_code           evaluate & route generated code → project doc and/or tool
-capture_code_tool   feed generated code into the RAG if it is a reusable tool
-match_tool · ensure_tool · crystallize_skills · list_tools_learned
-inspect · audit · stats
-declare_observator · detect_polarized · spawn_observators · route
-list_communities · save
+# ask
+retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
+                    abstain=true → [] when no chunk is sufficiently activated
+walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
+                    user_id/session_id add the double-query section boost
+assemble_set        orchestrated exhaustive-set retrieval ("list every …")
+relate              co-retrieved neighbours of node ids (associative spreading)
+# observe state
+stats · inspect · list_tags
+# feedback & correction
+mark_useful         rate a retrieval 0/1/2 → calibrates decay + wiki credibility
+forget              soft-invalidate ONE node (reason req.; optional superseded_by)
+
+#####  T2 — agent-tool machinery (exposed)  #####
+ensure_tool         get a tool, generating it if absent ("no tool → make it")
+match_tool          fast-path: does a generated tool already cover this query?
+build_skill         task-mode walk → synthesise + ingest a named skill
+list_tools_learned  list the self-built tool set
+report_tool         reinforce a tool (ok) / auto-retire after repeated failures
+retire_tool         soft-deprecate (stop reuse) or hard-remove a tool
+update_tool         rewrite a tool's body (re-embedded); revives a deprecated one
+
+#####  T3 — internal (callable in `all`, NOT on the external surface)  #####
+# retrieval modes the walk orchestrates
+presearch           BATCH reconnaissance GATE: top-k per query, NO walk
+scoped_answer       tag-filtered cascade (match=exact|fuzzy|regex)
+scoped_list         non-kNN filtered listing (scan by event/date/tags/kind)
+search_nodes        tri-modal relevance over a filtered pool (no replacement)
+clue_search · event_search · reason · walk_keepup
+# bag mechanism (assemble_set / event scans drive it)
+collect · bag · bags · bag_render
+# observators
+declare_observator · detect_polarized · spawn_observators · route · list_communities
+# autonomic (run by the system, not the caller)
+sleep               consolidation: collision + decay-fit + forget-merge + wiki reconcile
+save · audit · crystallize_skills
+# internal / admin
+observe · process_turn · capture_code_tool · ingest_skill · get_session_skill
+# deprecated (removal follow-up)
+walk_next           walk_start now runs to completion
 ```
 
 ## Touching this package

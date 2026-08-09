@@ -862,7 +862,7 @@ horizontal dashed boxes are agent rounds. Three dots between edges mean
 }}%%
 flowchart TB
 
-Q["<span style='font-size:28px;'><b>Q</b> &nbsp; &quot;What might John's financial status be?&quot;</span><br/><br/><span style='font-size:18px;'><i>gold answer: Middle-class or wealthy &nbsp; · &nbsp; gold evidence: D5:5</i></span>"]:::question
+Q["<span style='font-size:28px;'><b>Q</b> &nbsp; “What might John's financial status be?”</span><br/><br/><span style='font-size:18px;'><i>gold answer: Middle-class or wealthy &nbsp; · &nbsp; gold evidence: D5:5</i></span>"]:::question
 Q --> R0
 
 subgraph TOPROW[" "]
