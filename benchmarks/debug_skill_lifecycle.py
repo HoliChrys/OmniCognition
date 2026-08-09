@@ -107,6 +107,27 @@ def step_crystallize(p: _Probe):
             len(tools_in(p.mem.points)) > before)
 
 
+def step_lifecycle(p: _Probe):
+    """Concept #3 : the retract / feedback / correct half. Isolated memory (one
+    tool) so ensure_tool's regenerate-on-miss doesn't accumulate copies."""
+    m = Memory(encoder=SimpleEncoder(), llm=_FakeLLM())
+    tid = m.ensure_tool(NEED, how=HOW)["tool"]["id"]
+    p.check("reusable before retire", m.ensure_tool(NEED)["reused"] is True)
+    m.retire_tool(tid)
+    # after a soft-retire the ONLY tool is deprecated -> a fresh one is generated
+    r = m.ensure_tool(NEED)
+    p.check("soft-retire stops reuse of the retired tool", r["reused"] is False)
+    # correct + revive the ORIGINAL, retire the regenerated copy to isolate it
+    m.retire_tool(r["tool"]["id"], hard=True)
+    m.update_tool(tid, content="reverse via two-pointer swap")
+    p.check("update revives + reuses again", m.ensure_tool(NEED)["reused"] is True)
+    # feedback : two failures auto-retire the (now sole) tool
+    m.report_tool(tid, ok=False)
+    p.check("repeated failures auto-retire", m.report_tool(tid, ok=False)["retired"])
+    p.check("auto-retired tool no longer reused",
+            m.ensure_tool(NEED)["reused"] is False)
+
+
 def step_persist(p: _Probe):
     """Tool nodes are normal nodes : they survive save/load and stay retrievable."""
     import os, tempfile
@@ -125,7 +146,7 @@ STEPS = [
     ("need", step_need), ("create", step_create),
     ("organic_retrieve", step_organic_retrieve), ("reuse", step_reuse),
     ("discriminate", step_discriminate), ("crystallize", step_crystallize),
-    ("persist", step_persist),
+    ("lifecycle", step_lifecycle), ("persist", step_persist),
 ]
 
 

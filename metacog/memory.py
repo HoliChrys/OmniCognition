@@ -3654,6 +3654,68 @@ class Memory:
             "reused": False,
         }
 
+    def _find_tool(self, tool_id: str):
+        from metacog.skills import is_tool
+        return next((p for p in self.points
+                     if p.id == tool_id and is_tool(p)), None)
+
+    def retire_tool(self, tool_id: str, hard: bool = False) -> Dict[str, Any]:
+        """Retire a TOOL node — the removal half of the tool lifecycle. Soft
+        (default) tags it 'deprecated' so match_tool / ensure_tool stop reusing
+        it (reversible, and the tag persists) ; `hard=True` removes it from the
+        cloud. Returns {retired, hard} or {retired: None} if not a tool."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"retired": None}
+        if hard:
+            self.points = [p for p in self.points if p.id != tool_id]
+        else:
+            tool.add_tag("deprecated")
+        return {"retired": tool_id, "hard": hard}
+
+    def report_tool(self, tool_id: str, ok: bool,
+                    fail_limit: int = 2) -> Dict[str, Any]:
+        """Reinforce or penalise a tool from real use — the feedback half. `ok`
+        bumps its use count and clears any failure streak ; not-ok records a
+        failure and AUTO-retires (soft) once `fail_limit` consecutive failures
+        accumulate. Returns the tool's state."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"tool_id": None}
+        if not hasattr(self, "_tool_fail") or self._tool_fail is None:
+            self._tool_fail = {}
+        if ok:
+            tool.n_uses += 1
+            self._tool_fail.pop(tool_id, None)
+            return {"tool_id": tool_id, "ok": True, "n_uses": tool.n_uses,
+                    "retired": False}
+        fails = self._tool_fail.get(tool_id, 0) + 1
+        self._tool_fail[tool_id] = fails
+        retired = False
+        if fails >= fail_limit:
+            self.retire_tool(tool_id)          # soft-deprecate the flaky tool
+            retired = True
+        return {"tool_id": tool_id, "ok": False, "fails": fails,
+                "retired": retired}
+
+    def update_tool(self, tool_id: str, *, content: Optional[str] = None,
+                    how: Optional[str] = None) -> Dict[str, Any]:
+        """Update a tool's body — the correction half. Re-embeds so retrieval and
+        match stay consistent. Clears a stale 'deprecated' tag (an update revives
+        it). Returns the updated tool or {tool_id: None}."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"tool_id": None}
+        new_body = (content or how)
+        if new_body:
+            tool.content = new_body.strip()
+            tool.embedding_orig = tuple(self.encoder.encode(tool.content))
+        if "deprecated" in (tool.tags or []):
+            tool.tags = [t for t in tool.tags if t != "deprecated"]
+        tool.n_revision += 1
+        return {"tool_id": tool_id, "content": tool.content,
+                "n_revision": tool.n_revision}
+
     def resolve_alias(self, point_id: str) -> str:
         """Resolve an id to its canonical node : an atomic-fact id maps to
         its source turn (dia_id), and a merge-absorbed id to its survivor."""

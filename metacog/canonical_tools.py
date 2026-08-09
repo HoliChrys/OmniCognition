@@ -48,11 +48,15 @@ CANONICAL: Set[str] = {
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------
 #: The create / find / reuse subset is exposed ; get_session_skill stays internal.
 TOOL_TIER: Set[str] = {
+    # create / find / reuse
     "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
     "get_session_skill",
+    # lifecycle : retire / feedback / update (the retract+correct half)
+    "retire_tool", "report_tool", "update_tool",
 }
 _TOOL_TIER_EXPOSED: Set[str] = {
     "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
+    "retire_tool", "report_tool", "update_tool",
 }
 
 # -- T3 : internal mechanisms / walk modes / autonomic passes -----------------

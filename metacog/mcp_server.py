@@ -273,6 +273,26 @@ def build_app(
         return results
 
     @app.tool()
+    def retire_tool(tool_id: str, hard: bool = False) -> dict:
+        """Retire a generated tool. Soft (default) deprecates it so it stops
+        being reused ; hard removes it. The removal half of the tool lifecycle."""
+        return memory.retire_tool(tool_id, hard=hard)
+
+    @app.tool()
+    def report_tool(tool_id: str, ok: bool) -> dict:
+        """Report a tool's outcome from real use : ok=True reinforces it,
+        ok=False records a failure and auto-retires it after repeated failures.
+        The feedback half of the tool lifecycle."""
+        return memory.report_tool(tool_id, ok)
+
+    @app.tool()
+    def update_tool(tool_id: str, content: Optional[str] = None,
+                    how: Optional[str] = None) -> dict:
+        """Correct a tool's body (re-embedded ; revives it if it was
+        deprecated). The correction half of the tool lifecycle."""
+        return memory.update_tool(tool_id, content=content, how=how)
+
+    @app.tool()
     def mark_useful(retrieval_id: int, score: int) -> dict:
         """Rate a past retrieval : 0 (useless) / 1 / 2 (useful). This is the
         supervised feedback that calibrates the decay exponent (re-fit on the

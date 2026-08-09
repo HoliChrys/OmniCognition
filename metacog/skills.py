@@ -521,6 +521,8 @@ def match_tool(
     for p in points:
         if not is_tool(p) or p.keywords_embedding is None:
             continue
+        if "deprecated" in (p.tags or []):          # retired -> not reusable
+            continue
         s = cosine(query_emb, p.keywords_embedding)
         if s >= threshold and (best is None or s > best[1]):
             best = (p, s)
