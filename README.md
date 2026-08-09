@@ -1168,71 +1168,69 @@ uv run metacog-mcp --transport sse --host 127.0.0.1 --port 8765
 #   (or --transport streamable-http ; or METACOG_TRANSPORT=sse)
 ```
 
-Tools appear as `mcp__metacog__*`:
+Tools appear as `mcp__metacog__*`, organized by the role tiers of §5.5
+(`metacog/canonical_tools.py`). The `external` surface exposes **T1 + T2**
+(19 tools); **T3** stays callable internally (surface `all`) but off the
+agent-facing surface — the walk / sleep orchestrate it.
 
 ```
-# memory I/O
+#####  T1 — CANONICAL primitives (exposed)  #####
+# feed
 ingest              add a FACT / THOUGHT / ACTION
-observe             apply an Observation on existing point(s)
-process_turn        record a conversation turn (detectors fire)
+ingest_message      EPISODIC: index a message (user/agent), async, timestamped
+push_code           evaluate & route generated code → project doc and/or tool
+# ask
 retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
                     abstain=true applies the ACT-R threshold → [] when no
                     chunk is sufficiently activated ("I don't know") (§5.3)
+walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
+                    user_id/session_id add the double-query section boost. The
+                    agent does BREADTH pivots, never micro-drives depth.
 assemble_set        orchestrated exhaustive-set retrieval ("list every …")
-
-# feedback & forgetting (§5.3)
-mark_useful         rate a past retrieval 0/1/2 → calibrates decay (fit next sleep)
+relate              co-retrieved neighbours of given node ids — edgeless
+                    associative spreading over the access graph (§5.3)
+# observe state
+stats · inspect · list_tags
+# feedback & correction (§5.3)
+mark_useful         rate a past retrieval 0/1/2 → calibrates decay AND flows
+                    into the wiki as first-order credibility (§5.6)
 forget              soft-invalidate ONE node (reason required; optional
-                    superseded_by) → append-only, drops from retrieval, logged
-                    as a DB event for the latent merge in sleep
+                    superseded_by) → append-only, drops from retrieval, a DB
+                    event for the latent merge in sleep
 
-# the walk  ── depth is decided by the walk, not the caller ──
-walk_start          run a COMPLETE uncertainty-governed walk for a query
-                    (loops to its own σ-termination; returns the bounded
-                     composable evidence + reasoning chain). user_id/
-                     session_id add the double-query section boost. The
-                     agent does BREADTH pivots — re-issue walk_start with
-                     new vocabulary; it never micro-drives depth.
-walk_keepup         KEEPUP (§3.1): the snapshot trajectory — a provisional
-                    answer re-written each stage until validated. Over SSE,
-                    a message that rewrites itself until done=True.
-scoped_answer       SCOPED (§3.2): tag-filtered cascade — walk the
-                    discussion first, then (knowledge_base=true) the global
-                    memory seeded by what it found. match=exact|fuzzy|regex.
-presearch           GATE (§3.3): batch reconnaissance — top-k nearest hits
-                    per query, NO walk. Validate a query is probative before
-                    paying walk_start (optional tag pre-filter).
-list_tags           glossary of tag NAMESPACES (parent prefixes of the
-                    hierarchical `:` tags, leaf dropped), depth-ordered.
-walk_next           DEPRECATED — walk_start now runs to completion.
-
-# reasoning & consolidation
-reason              full reasoning trajectory until a usable answer
-sleep               geometric + lateral collapse, and the latent skill distiller
-
-# skills & self-built tools (§5)
-ingest_skill        re-index a named skill-JSON directory tree
-build_skill         task-mode walk → synthesise + ingest a named skill
-get_session_skill   the skill JSON cached for this (user, session)
-ingest_message      EPISODIC: index a message (user/agent), async, timestamped
-push_code           evaluate & route generated code → project doc and/or tool
-capture_code_tool   feed generated code into the RAG if it is a reusable tool
-match_tool          fast-path: does a generated tool already cover this query?
+#####  T2 — agent-tool machinery (exposed)  #####
 ensure_tool         get a tool, generating it if absent ("no tool → make it")
-crystallize_skills  fold recurring actions into persistent tool nodes
+match_tool          fast-path: does a generated tool already cover this query?
+build_skill         task-mode walk → synthesise + ingest a named skill
 list_tools_learned  list the self-built tool set
 report_tool         reinforce a tool (ok) / auto-retire after repeated failures
 retire_tool         soft-deprecate (stop reuse) or hard-remove a tool
 update_tool         rewrite a tool's body (re-embedded); revives a deprecated one
 
-# introspection & perspective
-inspect             dump a point's full state (keywords, tags, σ, spike count)
-audit               verify no laundering (Corollary 5)
-stats               system overview
-declare_observator · detect_polarized · spawn_observators · route
-list_communities    Level-1 community / observator detection
-save                persist to disk
+#####  T3 — internal (callable in `all`, NOT on the external surface)  #####
+# retrieval modes the walk orchestrates
+presearch           GATE (§3.3): batch reconnaissance, NO walk
+scoped_answer       SCOPED (§3.2): tag-filtered cascade (match=exact|fuzzy|regex)
+scoped_list         non-kNN filtered listing (scan by event/date/tags/kind)
+search_nodes        tri-modal relevance over a filtered pool (no replacement)
+clue_search · event_search · reason · walk_keepup
+# bag mechanism (assemble_set/event scans drive it)
+collect · bag · bags · bag_render
+# observators
+declare_observator · detect_polarized · spawn_observators · route · list_communities
+# autonomic (run by the system, not the caller)
+sleep               consolidation: collision + decay-fit + forget-merge +
+                    wiki reconcile (§5.3, §5.6)
+save · audit · crystallize_skills
+# internal / admin
+observe · process_turn · capture_code_tool · ingest_skill · get_session_skill
+# deprecated (removal follow-up)
+walk_next           walk_start now runs to completion
 ```
+
+> The **wiki layer** (§5.6 — `feed_wiki` / `wiki_doc` / `reconcile_wiki` /
+> `ingest_from_wiki` / `wiki_where` / `okf_schema` / `import_okf`) is currently a
+> library API on `Memory`, not yet an MCP tool surface.
 
 **Surface (§5.5).** `METACOG_SURFACE` (or `build_app(surface=…)`) gates which
 tools are exposed: `all` (default) · `external` (the powerful-agent contract:
