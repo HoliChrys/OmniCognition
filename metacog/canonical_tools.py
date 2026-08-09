@@ -41,6 +41,8 @@ CANONICAL: Set[str] = {
     "retrieve", "walk_start", "assemble_set",
     # observe state
     "stats", "inspect", "list_tags",
+    # feedback (the supervised signal that calibrates decay)
+    "mark_useful",
 }
 
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------

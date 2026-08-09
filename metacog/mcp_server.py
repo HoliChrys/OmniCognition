@@ -254,11 +254,34 @@ def build_app(
         k is capped at 7 (the system's retrieval budget).
         """
         k = min(max(1, k), 7)
-        return memory.retrieve(
+        results = memory.retrieve(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
         )
+        # Log the retrieval (mnema access-log) and hand back a retrieval_id
+        # handle so the agent can later mark_useful(...) on it — the supervised
+        # feedback that calibrates decay. Failure-safe / no-op without a journal.
+        try:
+            rid = memory.record_retrieval(
+                [r["id"] for r in results], query_text=query)
+            if rid is not None:
+                for r in results:
+                    r["retrieval_id"] = rid
+        except Exception:
+            pass
+        return results
+
+    @app.tool()
+    def mark_useful(retrieval_id: int, score: int) -> dict:
+        """Rate a past retrieval : 0 (useless) / 1 / 2 (useful). This is the
+        supervised feedback that calibrates the decay exponent (re-fit on the
+        next sleep). Get `retrieval_id` from a `retrieve` result. No-op without
+        a journal."""
+        if score not in (0, 1, 2):
+            return {"error": "score must be 0, 1 or 2", "score": score}
+        memory.mark_useful(retrieval_id, score)
+        return {"retrieval_id": retrieval_id, "score": score, "recorded": True}
 
     # ----------------------------------------------------------------
     # Meta-cognitive walk — streaming, step-by-step

@@ -105,7 +105,12 @@ def test_classify_and_is_canonical():
     assert C.classify("bag") == "internal"
     assert C.classify("walk_next") == "deprecated"
     assert C.classify("does_not_exist") == "unknown"
+    assert C.classify("mark_useful") == "canonical"       # feedback exposed (#1)
     assert C.is_canonical("ingest") and not C.is_canonical("clue_search")
+
+
+def test_feedback_tool_is_exposed_externally():
+    assert "mark_useful" in C.EXTERNAL                     # agent can give feedback
 
 
 # -- 2. canonical core runs the memory ----------------------------------------
