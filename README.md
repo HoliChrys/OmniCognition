@@ -135,6 +135,10 @@ append-only: `report_tool` reinforces or auto-retires by outcome, `retire_tool`
 soft-deprecates (so `match_tool` stops reusing it), `update_tool` rewrites and
 revives. Growth **and** decay, on tools as on facts.
 
+The moment an emergent tool is created it is **auto-registered as a wiki
+concept** (an OKF `type: tool` doc referencing the tool node, §5.6) — so the
+self-built capability set is also a browsable, queryable part of the deepwiki.
+
 ---
 
 ## 2. The epistemic substrate

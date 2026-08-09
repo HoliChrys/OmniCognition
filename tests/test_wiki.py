@@ -149,6 +149,41 @@ def test_feedback_is_first_order_in_the_wiki():
     assert "useless: 1" in m.wiki_doc("doc:h")
 
 
+def test_emergent_tool_is_auto_registered_in_the_wiki():
+    """The moment an emergent tool is created it becomes a wiki concept."""
+    class _LLM:  # no generate -> deterministic fallback synthesis
+        pass
+    m = Memory(encoder=SimpleEncoder(), journal=Journal(), llm=_LLM())
+    r = m.ensure_tool("reverse a string end to end", how="iterate backwards")
+    tid = r["tool"]["id"]
+    doc = f"tool:{tid}"
+    # a type=tool OKF doc now exists, referencing the tool node
+    assert m.wiki_where("type", "tool") == [doc]
+    assert m.wiki_where("refs", tid) == [doc]
+    assert f"[[{tid}]]" in m.wiki_doc(doc)
+
+
+def test_crystallized_tool_is_auto_registered():
+    from metacog.epistemic import Point, PointKind
+    class _LLM:
+        pass
+    m = Memory(encoder=SimpleEncoder(), journal=Journal(), llm=_LLM())
+    m.skills_enabled = True
+    enc = SimpleEncoder()
+    pop = {"sort a list ascending": 12, "count the words": 2,
+           "parse a date": 2, "trim whitespace": 2}
+    for content, reps in pop.items():
+        for i in range(reps):
+            a = Point(id=f"{content[:5]}{i}", content=content,
+                      embedding_orig=tuple(enc.encode(content)),
+                      kind=PointKind.ACTION, keywords=content.split())
+            m.record_action_generation(a, None, f"{content} — approach {i}", [])
+    out = m.crystallize_skills()
+    assert out["crystallized"] >= 1
+    tid = out["tool_ids"][0]
+    assert m.wiki_where("refs", tid) == [f"tool:{tid}"]   # auto-registered
+
+
 def test_wiki_noop_without_journal():
     m = Memory(encoder=SimpleEncoder())
     assert m.feed_wiki("d", "t", ["A"])["doc_id"] is None

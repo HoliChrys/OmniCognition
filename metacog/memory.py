@@ -1076,6 +1076,18 @@ class Memory:
     # OKF wiki — a bidirectional, continuously-evolving RAG extension
     # ------------------------------------------------------------------
 
+    def _wiki_register_tool(self, tool) -> None:
+        """Auto-register an emergent tool as a first-class wiki concept the moment
+        it is created — an OKF doc (type=tool) `tool:<id>` referencing the tool
+        node, carrying its scope tags. No-op without a journal ; failure-safe."""
+        if self.journal is None or tool is None:
+            return
+        try:
+            title = (tool.content or tool.id).strip()[:80]
+            self.feed_wiki(f"tool:{tool.id}", title, [tool.id], type="tool")
+        except Exception:
+            pass
+
     def feed_wiki(self, doc_id: str, title: str, node_ids: Sequence[str], *,
                   type: str = "note", body: Optional[str] = None,
                   t: Optional[float] = None) -> Dict[str, Any]:
@@ -3907,6 +3919,7 @@ class Memory:
             if tool is not None:
                 self.points.append(tool)
                 new_ids.append(tool.id)
+                self._wiki_register_tool(tool)     # emergent tool -> wiki concept
         return {
             "crystallized": len(new_ids),
             "tool_ids": new_ids,
@@ -3960,6 +3973,7 @@ class Memory:
         if tool is None:
             return {"tool": None, "reused": False}
         self.points.append(tool)
+        self._wiki_register_tool(tool)             # emergent tool -> wiki concept
         return {
             "tool": {
                 "id": tool.id, "content": tool.content,
