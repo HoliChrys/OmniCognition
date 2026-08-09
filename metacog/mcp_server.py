@@ -31,8 +31,6 @@ import os
 import sys
 from typing import List, Optional
 
-from mcp.server.fastmcp import FastMCP
-
 from metacog.memory import Memory
 
 # Hard cap on facts returned by walk_start : a deep walk can retrieve 100+
@@ -51,17 +49,37 @@ _MAX_RETURNED_FACTS = 20
 _ANCHOR_ALPHA = 0.5
 
 
+def _resolve_lever(arg: Optional[float], env_name: str) -> Optional[float]:
+    """Resolve an ACT-R ranking lever : explicit arg wins, else the env var,
+    else None (leave the memory's own value untouched). Pure + mcp-free so it
+    is unit-testable without the FastMCP dependency."""
+    if arg is not None:
+        return arg
+    raw = os.environ.get(env_name)
+    return float(raw) if raw not in (None, "") else None
+
+
 def build_app(
     storage_path: Optional[str] = None,
     memory: Optional[Memory] = None,
+    recency_weight: Optional[float] = None,
+    spreading_weight: Optional[float] = None,
 ) -> FastMCP:
     """Build the metacog MCP app.
 
     `memory` lets a caller inject an already-populated Memory (e.g. a
     benchmark conversation pre-ingested in-process) instead of creating
     an empty one. When omitted, a fresh Memory(storage_path=…) is used.
+
+    `recency_weight` / `spreading_weight` enable the ACT-R ranking levers
+    (need-odds base-level / co-retrieval spreading) in production. Both are OFF
+    by default. Resolution order per lever : explicit arg > env var
+    (METACOG_RECENCY_WEIGHT / METACOG_SPREADING_WEIGHT) > the memory's own value
+    (untouched) — so a deploy can turn them on without code changes, and an
+    injected memory keeps its settings unless one is explicitly given.
     """
     from metacog.meta_walk import MetaWalker, WalkerRegistry, _NEIGHBOUR_GATE
+    from mcp.server.fastmcp import FastMCP
 
     app = FastMCP(
         "metacog",
@@ -87,6 +105,15 @@ def build_app(
         # history) survive restarts. "auto" is a no-op when storage_path is None
         # (ephemeral in-memory server) -> falls back to no journal.
         memory = Memory(storage_path=storage_path, journal_path="auto")
+
+    # Apply the ACT-R ranking levers (arg > env > leave as-is). Only assigned
+    # when explicitly provided, so an injected memory's own weights survive.
+    _rw = _resolve_lever(recency_weight, "METACOG_RECENCY_WEIGHT")
+    if _rw is not None:
+        memory.recency_weight = _rw
+    _sw = _resolve_lever(spreading_weight, "METACOG_SPREADING_WEIGHT")
+    if _sw is not None:
+        memory.spreading_weight = _sw
 
     walkers = WalkerRegistry()
 
