@@ -298,6 +298,15 @@ def build_app(
         return memory.update_tool(tool_id, content=content, how=how)
 
     @app.tool()
+    def relate(node_ids: List[str], k: int = 5) -> List[dict]:
+        """Find memories historically CO-RETRIEVED with the given node ids —
+        edgeless spreading activation over the access graph (mnema's `relate`).
+        Seed with ids from a `retrieve` result to surface associatively-linked
+        nodes the cosine misses. [] without a journal."""
+        return [{"id": nid, "cooc": c}
+                for nid, c in memory.co_retrieved([str(i) for i in node_ids], k=k)]
+
+    @app.tool()
     def forget(node_id: str, reason: str,
                superseded_by: Optional[str] = None) -> dict:
         """Soft-invalidate ONE memory node (append-only : never deleted, just

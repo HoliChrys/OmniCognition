@@ -38,7 +38,7 @@ CANONICAL: Set[str] = {
     # feed
     "ingest", "ingest_message", "push_code",
     # ask
-    "retrieve", "walk_start", "assemble_set",
+    "retrieve", "walk_start", "assemble_set", "relate",
     # observe state
     "stats", "inspect", "list_tags",
     # feedback (the supervised signal that calibrates decay)
