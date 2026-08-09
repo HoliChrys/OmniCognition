@@ -141,6 +141,19 @@ def step_needodds(p: _Probe):
             f"{target}: base#{base.index(target)} -> need#{ranked.index(target)}")
 
 
+def step_decayfit(p: _Probe):
+    """Auto-maintenance : sleep() re-fits the decay exponent from accumulated
+    feedback labels (concept A -> B), so the need-odds ranking stays calibrated
+    without a manual fit_decay call."""
+    before = p.mem.decay_exponent
+    out = p.mem.sleep()
+    p.check("sleep reports decay-fit", "decay_exponent" in out,
+            f"n_pos={out.get('decay_fit_n_pos')} n_neg={out.get('decay_fit_n_neg')}")
+    p.check("exponent maintained from feedback",
+            out["decay_fit_n_pos"] > 0 and out["decay_fit_n_neg"] > 0,
+            f"{before:.3f} -> {p.mem.decay_exponent:.3f}")
+
+
 def step_lateral(p: _Probe):
     """lateral_collapse runs off the SQL ledger when a journal is present
     (informational on a tiny cloud — it is gated on a large tag-rich cloud)."""
@@ -224,6 +237,7 @@ STEPS = [
     ("tags", step_tags),
     ("chasles", step_chasles),
     ("refractory", step_refractory),
+    ("decayfit", step_decayfit),
     ("persist", step_persist),
 ]
 

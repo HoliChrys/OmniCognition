@@ -39,6 +39,29 @@ def test_feedback_unlocks_fit_decay():
     assert res["n_pos"] > 0 and res["n_neg"] > 0        # both classes present now
 
 
+def test_sleep_refits_decay_from_feedback():
+    """sleep() auto-maintains the decay exponent from accumulated labels."""
+    j = Journal()
+    m = Memory(encoder=SimpleEncoder(), journal=j)
+    for nid in ("A", "B", "C", "D"):
+        m.ingest(f"{nid} topic", kind="FACT", id=nid)
+    ru = m.record_retrieval(["A", "B"], query_text="useful")   # 2 used -> 2
+    rn = m.record_retrieval(["C", "D"], query_text="useless")  # 0 used -> 0
+    m.score_retrievals([ru], used_ids=["A", "B"])
+    m.score_retrievals([rn], used_ids=[])
+    out = m.sleep()
+    assert out["decay_fit_n_pos"] > 0 and out["decay_fit_n_neg"] > 0
+    assert "decay_exponent" in out
+
+
+def test_sleep_decay_fit_noop_without_labels():
+    """Without both label classes, sleep keeps the exponent (no crash)."""
+    m = Memory(encoder=SimpleEncoder(), journal=Journal())
+    m.ingest("x", kind="FACT", id="A")
+    out = m.sleep()
+    assert out["decay_fit_n_pos"] == 0 and out["decay_exponent"] == 0.5
+
+
 def test_score_retrievals_noop_without_journal():
     m = Memory(encoder=SimpleEncoder())
     assert m.score_retrievals([1, 2], ["A"]) == []

@@ -3170,6 +3170,15 @@ class Memory:
         lat = self.lateral_collapse(t_now)
         out["lateral_collided_groups"] = lat["collided_groups"]
         out["lateral_aliases"] = lat["aliases"]
+        # LATENT decay-fit : re-fit the Anderson-Schooler exponent from the
+        # journal's accumulated usefulness labels (concept A feedback loop) so
+        # the need-odds ranking (concept B) stays calibrated as usage grows.
+        # No-op (keeps the current exponent) without a journal or without both
+        # label classes present.
+        fit = self.fit_decay(t_now)
+        out["decay_exponent"] = fit["exponent"]
+        out["decay_fit_n_pos"] = fit["n_pos"]
+        out["decay_fit_n_neg"] = fit["n_neg"]
         # LATENT skill distiller : replay resolutions recorded since the
         # last sleep and crystallize theoretical tools linked to their
         # explicating facts. Opt-in (skills_enabled), idempotent.
