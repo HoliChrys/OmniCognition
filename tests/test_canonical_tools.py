@@ -45,8 +45,7 @@ def test_manifest_partitions_live_tools_exactly():
 
 
 def test_tiers_are_disjoint():
-    tiers = [C.CANONICAL, C.TOOL_TIER, C.SPECIALIZED_RETRIEVAL, C.BAGS,
-             C.OBSERVATORS, C.DEPRECATED]
+    tiers = [C.CANONICAL, C.TOOL_TIER, C.INTERNAL, C.DEPRECATED]
     for i, a in enumerate(tiers):
         for b in tiers[i + 1:]:
             assert not (a & b), f"tiers overlap: {a & b}"
@@ -77,20 +76,33 @@ def test_unknown_surface_raises():
 
 def test_external_powerful_covers_feed_ask_tools_observe():
     # the powerful-agent contract: feed + ask + manage own tools + observe
-    assert {"ingest_message", "push_code"} <= C.EXTERNAL          # feed
-    assert {"retrieve", "walk_start"} <= C.EXTERNAL               # ask
+    assert {"ingest_message", "push_code", "ingest"} <= C.EXTERNAL       # feed
+    assert {"retrieve", "walk_start", "assemble_set"} <= C.EXTERNAL      # ask
     assert {"ensure_tool", "match_tool", "list_tools_learned"} <= C.EXTERNAL
-    assert {"stats", "inspect", "list_tags"} <= C.EXTERNAL        # observe
+    assert {"stats", "inspect", "list_tags"} <= C.EXTERNAL               # observe
     # internal machinery stays OFF the external surface
-    assert not (C.OBSERVATORS & C.EXTERNAL)
-    assert not (C.BAGS & C.EXTERNAL)
-    assert not (C.SPECIALIZED_RETRIEVAL & C.EXTERNAL)
+    assert not (C.INTERNAL_OBSERVATORS & C.EXTERNAL)
+    assert not (C.INTERNAL_BAGS & C.EXTERNAL)
+    assert not (C.INTERNAL_RETRIEVAL & C.EXTERNAL)
+    assert not (C.AUTONOMIC & C.EXTERNAL)          # sleep/save/audit not exposed
+
+
+def test_transition_moved_things_off_the_surface():
+    # sleep/process_turn are no longer exposed; bag mechanism stays internal
+    assert "sleep" not in C.EXTERNAL and "process_turn" not in C.EXTERNAL
+    assert "walk_keepup" in C.INTERNAL and "reason" in C.INTERNAL
+    # bag DRIVER tools are internal, but the mechanism is used by assemble_set (T1)
+    assert C.INTERNAL_BAGS <= C.INTERNAL and "assemble_set" in C.CANONICAL
 
 
 def test_classify_and_is_canonical():
     assert C.classify("retrieve") == "canonical"
+    assert C.classify("assemble_set") == "canonical"      # promoted in transition
+    assert C.classify("push_code") == "canonical"         # promoted in transition
     assert C.classify("ensure_tool") == "tool_tier"
-    assert C.classify("clue_search") == "specialized"
+    assert C.classify("clue_search") == "internal"        # was specialized
+    assert C.classify("sleep") == "internal"              # autonomic now
+    assert C.classify("bag") == "internal"
     assert C.classify("walk_next") == "deprecated"
     assert C.classify("does_not_exist") == "unknown"
     assert C.is_canonical("ingest") and not C.is_canonical("clue_search")

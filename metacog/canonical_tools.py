@@ -1,94 +1,92 @@
 """
-Canonical tool manifest — the mnema-style two-tier separation of the tool surface.
+Canonical tool manifest — the mnema-style tier separation, AFTER the agreed
+transition.
 
-The MCP server grew 40 flat tools organically (each benchmark / subsystem added
-its own). That is the wrong growth axis. The mnema model is:
+Three role tiers + a removal bucket. The MCP EXPOSES only the external surface
+(T1 primitives + the exposed T2 agent-tool machinery) ; everything in T3 stays a
+callable function used INTERNALLY (a walk mode, an autonomic maintenance pass, a
+mechanism another tool drives) but leaves the agent-facing surface.
 
-  Tier 1 — CANONICAL primitives
-      The fixed, minimal set the memory NEEDS to run. Same definitions used by
-      internal processes and exposed over MCP to an external agent. This set does
-      NOT grow organically ; new capability never lands here.
+  T1 CANONICAL  — exposed primitives that serve the memory : feed, ask, observe.
+  T2 TOOL_TIER  — the agent-tool machinery (tools live as memory nodes) ; the
+                  create/find/reuse subset is exposed.
+  T3 INTERNAL   — mechanisms, walk modes, and autonomic passes. NOT exposed ;
+                  orchestrated by walk_start / assemble_set / sleep. The bag
+                  MECHANISM lives here too (assemble_set + event scans use it) —
+                  only its manual driver tools left the surface.
+  DEPRECATED    — dead surface, kept callable for back-compat but off the surface
+                  and slated for removal.
 
-  Tier 2 — TOOL_TIER (the bridge to the organic tier)
-      The primitives by which the AGENT creates and retrieves its OWN tools. Those
-      agent tools are NOT hardcoded @app.tool()s — they live as TOOL nodes IN the
-      memory (tag `tool`), contextualized by the task / keywords that spawned them
-      ("ok, to do X I need this tool" -> a node carrying that context), and the
-      agent finds them by querying the memory like any other node. Organic growth
-      happens HERE, as data, not as code.
+`test_canonical_tools.py` asserts the tiers partition the live @app.tool() set
+EXACTLY, so a new tool must be classified — organic growth cannot silently land
+on the canonical surface.
 
-  Tier 3 — DERIVED (specialized retrieval regimes, bag-building, observators)
-      Hardcoded today, but per the model these are candidates to migrate into
-      memory-resident action-tools the agent selects/creates on demand — not
-      permanent fixtures of the canonical surface.
-
-`test_canonical_tools.py` asserts this manifest partitions the live @app.tool()
-set EXACTLY, so a newly-added tool fails the test until it is classified — the
-guard that keeps organic growth off the canonical surface.
+Transition applied vs the previous flat classification:
+  - push_code, assemble_set  -> promoted to T1 (a core feed / a core "list all").
+  - process_turn, observe     -> T3 (fold into ingest_message / detector-driven).
+  - sleep, save, audit, crystallize_skills, spawn_observators -> T3 AUTONOMIC.
+  - all specialized retrieval / bag driver tools / observators -> T3 INTERNAL.
+  - walk_next -> DEPRECATED (removal follow-up ; a test + a bench still name it).
 """
 
 from __future__ import annotations
 
-from typing import Set
+from typing import Optional, Set
 
-# -- Tier 1 : canonical primitives (must exist to run the memory) --------------
+# -- T1 : canonical exposed primitives ----------------------------------------
 CANONICAL: Set[str] = {
-    # write
-    "ingest", "ingest_message", "observe", "process_turn",
-    # read
-    "retrieve", "walk_start", "inspect", "stats", "list_tags",
-    # maintain / persist
-    "sleep", "save", "audit",
+    # feed
+    "ingest", "ingest_message", "push_code",
+    # ask
+    "retrieve", "walk_start", "assemble_set",
+    # observe state
+    "stats", "inspect", "list_tags",
 }
 
-# -- Tier 2 : the agent-tool machinery (tools live as memory nodes) ------------
+# -- T2 : agent-tool machinery (tools live as memory nodes) --------------------
+#: The create / find / reuse subset is exposed ; get_session_skill stays internal.
 TOOL_TIER: Set[str] = {
-    "ensure_tool", "match_tool", "list_tools_learned",
-    "build_skill", "ingest_skill", "crystallize_skills",
-    "get_session_skill", "capture_code_tool", "push_code",
+    "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
+    "get_session_skill",
+}
+_TOOL_TIER_EXPOSED: Set[str] = {
+    "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
 }
 
-# -- Tier 3 : derived / specialized (migration candidates -> memory nodes) -----
-SPECIALIZED_RETRIEVAL: Set[str] = {
+# -- T3 : internal mechanisms / walk modes / autonomic passes -----------------
+INTERNAL_RETRIEVAL: Set[str] = {          # the walk orchestrates these
     "presearch", "clue_search", "event_search", "scoped_answer",
-    "scoped_list", "search_nodes", "assemble_set", "reason", "walk_keepup",
+    "scoped_list", "search_nodes", "reason", "walk_keepup",
 }
-BAGS: Set[str] = {"collect", "bag", "bags", "bag_render"}
-OBSERVATORS: Set[str] = {
+INTERNAL_BAGS: Set[str] = {               # mechanism is canonical ; drivers hidden
+    "collect", "bag", "bags", "bag_render",
+}
+INTERNAL_OBSERVATORS: Set[str] = {
     "declare_observator", "detect_polarized", "spawn_observators",
     "route", "list_communities",
 }
+AUTONOMIC: Set[str] = {                    # run by the system, not called outside
+    "sleep", "save", "audit", "crystallize_skills",
+}
+INTERNAL_MISC: Set[str] = {
+    "observe", "process_turn", "capture_code_tool", "ingest_skill",
+}
+INTERNAL: Set[str] = (INTERNAL_RETRIEVAL | INTERNAL_BAGS | INTERNAL_OBSERVATORS
+                      | AUTONOMIC | INTERNAL_MISC)
 
-# -- Dead surface (remove) -----------------------------------------------------
+# -- Dead surface (removal follow-up) -----------------------------------------
 DEPRECATED: Set[str] = {"walk_next"}
 
-DERIVED: Set[str] = SPECIALIZED_RETRIEVAL | BAGS | OBSERVATORS
 #: Every tool name this manifest knows about (must equal the live @app.tool() set).
-ALL_KNOWN: Set[str] = CANONICAL | TOOL_TIER | DERIVED | DEPRECATED
+ALL_KNOWN: Set[str] = CANONICAL | TOOL_TIER | INTERNAL | DEPRECATED
 
-# -- MCP surfaces (who calls what) --------------------------------------------
-# A different axis than the tiers above : which tools an EXTERNAL actor calls,
-# vs internal/autonomic machinery the memory orchestrates itself.
-
-#: Light client — the minimal contract from the server's own instructions :
-#: feed every message + code block, and ask.
+# -- MCP surfaces (what is EXPOSED) -------------------------------------------
+#: Light client — the server's own contract : feed every message + code, and ask.
 EXTERNAL_LIGHT: Set[str] = {"ingest_message", "push_code", "walk_start"}
 
-#: Powerful external agent — feeds, asks, manages its OWN tools, and observes
-#: state. The specialized retrieval / bags / observators stay INTERNAL (the walk
-#: orchestrates them), so the surface stays small instead of re-bloating to 40.
-EXTERNAL: Set[str] = {
-    # feed
-    "ingest", "ingest_message", "process_turn", "push_code",
-    # ask
-    "retrieve", "walk_start",
-    # manage its own tools (tools live as memory nodes)
-    "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
-    # observe state
-    "stats", "inspect", "list_tags",
-    # trigger consolidation explicitly (otherwise autonomic)
-    "sleep",
-}
+#: Powerful external agent — feed, ask, manage its OWN tools, observe state.
+#: = T1 canonical + the exposed T2 subset. Everything else stays internal.
+EXTERNAL: Set[str] = CANONICAL | _TOOL_TIER_EXPOSED
 
 _SURFACES = {
     "all": None,                       # no restriction (default, backward-compat)
@@ -98,11 +96,10 @@ _SURFACES = {
 }
 
 
-def surface_tools(surface: str) -> "Set[str] | None":
+def surface_tools(surface: str) -> Optional[Set[str]]:
     """The set of tool names to EXPOSE for a named surface, or None for 'all'
     (no restriction). Unknown names raise. Used by build_app to gate which
-    @app.tool()s are registered on the MCP ; unexposed tools remain callable
-    internally, they just leave the external surface."""
+    @app.tool()s are registered ; unexposed tools stay callable internally."""
     if surface not in _SURFACES:
         raise ValueError(
             f"unknown surface {surface!r} ; choose from {sorted(_SURFACES)}")
@@ -111,23 +108,25 @@ def surface_tools(surface: str) -> "Set[str] | None":
 
 
 def classify(name: str) -> str:
-    """Return the tier of a tool name : 'canonical' | 'tool_tier' |
-    'specialized' | 'bags' | 'observators' | 'deprecated' | 'unknown'."""
+    """Tier of a tool name : 'canonical' | 'tool_tier' | 'internal' |
+    'deprecated' | 'unknown'."""
     if name in CANONICAL:
         return "canonical"
     if name in TOOL_TIER:
         return "tool_tier"
-    if name in SPECIALIZED_RETRIEVAL:
-        return "specialized"
-    if name in BAGS:
-        return "bags"
-    if name in OBSERVATORS:
-        return "observators"
+    if name in INTERNAL:
+        return "internal"
     if name in DEPRECATED:
         return "deprecated"
     return "unknown"
 
 
 def is_canonical(name: str) -> bool:
-    """True for the fixed primitives that must stay on the MCP surface."""
+    """True for the T1 primitives on the exposed canonical surface."""
     return name in CANONICAL
+
+
+def is_exposed(name: str, surface: str = "external") -> bool:
+    """True if `name` is exposed on the given surface ('all' -> always True)."""
+    exposed = surface_tools(surface)
+    return exposed is None or name in exposed
