@@ -45,6 +45,11 @@ CANONICAL: Set[str] = {
     "mark_useful",
     # explicit correction : soft-invalidate a node (mnema's forget)
     "forget",
+    # OKF wiki : author / query the RAG-extension knowledge layer, so the agent
+    # can build emergent tools that populate the wiki (reconcile_wiki stays
+    # autonomic in sleep, not exposed).
+    "feed_wiki", "wiki_doc", "ingest_from_wiki", "wiki_where", "okf_schema",
+    "import_okf", "docs_for_node",
 }
 
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------

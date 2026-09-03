@@ -317,6 +317,56 @@ def build_app(
         decay-forgetting in sleep."""
         return memory.forget_node(node_id, reason, superseded_by=superseded_by)
 
+    # ----------------------------------------------------------------
+    # OKF wiki — author/query the RAG-extension knowledge layer
+    # ----------------------------------------------------------------
+
+    @app.tool()
+    def feed_wiki(doc_id: str, title: str, node_ids: List[str],
+                  type: str = "note", body: Optional[str] = None) -> dict:
+        """RAG → wiki : build/update an OKF doc from RAG nodes. Node ids are
+        recorded in the frontmatter (`refs`) AND inline (`[[id]]`); the union of
+        their tags becomes the doc's tags. Links co-evolve — a merged node's ref
+        is auto-rewritten on the next sleep."""
+        return memory.feed_wiki(doc_id, title, node_ids, type=type, body=body)
+
+    @app.tool()
+    def wiki_doc(doc_id: str) -> dict:
+        """Render the current OKF markdown of a wiki doc (live frontmatter refs +
+        first-order feedback), or {} if absent."""
+        md = memory.wiki_doc(doc_id)
+        return {"doc_id": doc_id, "okf": md} if md else {}
+
+    @app.tool()
+    def ingest_from_wiki(doc_id: str, text: str) -> dict:
+        """wiki → RAG : ingest new wiki prose as a fresh node carrying the doc's
+        tags as context, linked back into the doc."""
+        return memory.ingest_from_wiki(doc_id, text)
+
+    @app.tool()
+    def wiki_where(key: str, value: Optional[str] = None) -> dict:
+        """Query the OKF field index by any frontmatter field — e.g.
+        wiki_where('tags','health:x') or wiki_where('refs', node_id). Returns the
+        matching doc ids."""
+        return {"key": key, "value": value, "docs": memory.wiki_where(key, value)}
+
+    @app.tool()
+    def okf_schema() -> dict:
+        """The recovered wiki schema {type: [frontmatter keys]}, derived from the
+        data (no registry, no migrations)."""
+        return memory.okf_schema()
+
+    @app.tool()
+    def import_okf(doc_id: str, markdown: str) -> dict:
+        """Consume an EXTERNAL OKF doc (parse frontmatter+body, link its refs,
+        index it) so it becomes queryable and evolves with the RAG."""
+        return memory.import_okf(doc_id, markdown)
+
+    @app.tool()
+    def docs_for_node(node_id: str) -> dict:
+        """Reverse link : which wiki docs cite this RAG node (RAG → wiki edge)."""
+        return {"node_id": node_id, "docs": memory.docs_for_node(node_id)}
+
     @app.tool()
     def mark_useful(retrieval_id: int, score: int) -> dict:
         """Rate a past retrieval : 0 (useless) / 1 / 2 (useful). This is the
