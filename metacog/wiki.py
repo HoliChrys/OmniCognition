@@ -22,11 +22,39 @@ import yaml
 #: Obsidian-style wikilink to a RAG node : [[node_id]].
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)\]\]")
 
+#: Inline `#tag` in a body (not a markdown heading : no space after the #).
+INLINE_TAG_RE = re.compile(r"(?<![\w#])#([a-z0-9_][a-z0-9_:\-]*)", re.IGNORECASE)
+
 #: Structural tags that are plumbing, not knowledge — kept off the wiki surface.
 _STRUCTURAL_TAGS = {
     "fact", "thought", "action", "event", "refined", "invalidated",
     "tool", "eager", "deprecated", "generated", "atomic", "entity",
+    "proposed", "established",
 }
+
+#: OKF concept types accepted out of the box ; any OTHER type is preserved as
+#: a vocabulary PROPOSAL (never rejected, never silently canonical) until vetted.
+KNOWN_OKF_TYPES = frozenset({"note", "topic", "tool"})
+
+# -- explicit reason codes : nothing degrades silently -------------------------
+#: A ref whose target node does not exist (never did, or was hard-removed).
+REF_MISSING = "missing_node"
+#: A ref whose target was soft-invalidated (forget / contradiction) with no successor.
+REF_INVALIDATED = "invalidated"
+#: A ref whose target is a DEPRECATED node.
+REF_DEPRECATED = "deprecated"
+#: A ref that was redirected old->new by a merge (informational, not stale).
+REF_REDIRECTED = "redirected"
+#: A doc imported without any YAML frontmatter (parsed as a bare note).
+DOC_NO_FRONTMATTER = "no_frontmatter"
+#: A doc whose `type` is outside the vetted vocabulary (kept as a proposal).
+TYPE_PROPOSED = "type_proposed"
+#: A doc whose `type` was explicitly REJECTED when vetted.
+TYPE_REJECTED = "type_rejected"
+REASON_CODES = frozenset({
+    REF_MISSING, REF_INVALIDATED, REF_DEPRECATED, REF_REDIRECTED,
+    DOC_NO_FRONTMATTER, TYPE_PROPOSED, TYPE_REJECTED,
+})
 
 
 def body_refs(body: str) -> List[str]:
@@ -34,10 +62,52 @@ def body_refs(body: str) -> List[str]:
     return list(dict.fromkeys(WIKILINK_RE.findall(body or "")))
 
 
+def body_tags(body: str) -> List[str]:
+    """All inline `#tag`s of a doc body, lowercased, in order (dedup)."""
+    return list(dict.fromkeys(t.lower() for t in INLINE_TAG_RE.findall(body or "")))
+
+
 def rewrite_body_refs(body: str, mapping: Dict[str, str]) -> str:
     """Rewrite `[[old]]` -> `[[new]]` per `mapping` (unmapped ids untouched)."""
     return WIKILINK_RE.sub(
         lambda m: f"[[{mapping.get(m.group(1), m.group(1))}]]", body or "")
+
+
+def rewrite_body_refs_traced(body: str, mapping: Dict[str, str]
+                             ) -> tuple:
+    """Like `rewrite_body_refs`, but also returns the TRACE needed to undo it
+    precisely : {old: [ordinals]} — for each rewritten id, which occurrences
+    (0-based, counted among ALL `[[new]]` links of the result) came from
+    `[[old]]`. Occurrences of `[[new]]` the author wrote stay unmarked."""
+    ordinal: Dict[str, int] = {}
+    trace: Dict[str, List[int]] = {}
+
+    def _sub(m):
+        old = m.group(1)
+        new = mapping.get(old, old)
+        k = ordinal.get(new, 0)
+        ordinal[new] = k + 1
+        if new != old:
+            trace.setdefault(old, []).append(k)
+        return f"[[{new}]]"
+
+    return WIKILINK_RE.sub(_sub, body or ""), trace
+
+
+def revert_body_refs(body: str, new: str, old: str,
+                     ordinals: Sequence[int]) -> str:
+    """Undo one traced rewrite : turn the given occurrences (ordinals among all
+    `[[new]]` links) back into `[[old]]`, leaving the others untouched."""
+    wanted = set(int(i) for i in ordinals)
+    seen = {"k": -1}
+
+    def _sub(m):
+        if m.group(1) != new:
+            return m.group(0)
+        seen["k"] += 1
+        return f"[[{old}]]" if seen["k"] in wanted else m.group(0)
+
+    return WIKILINK_RE.sub(_sub, body or "")
 
 
 def context_tags(tags: Sequence[str]) -> List[str]:
@@ -71,7 +141,8 @@ def parse_okf(text: str) -> Dict:
     m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text or "", re.DOTALL)
     if not m:
         return {"type": "note", "title": "", "tags": [], "refs": [],
-                "timestamp": None, "body": (text or "").strip()}
+                "timestamp": None, "body": (text or "").strip(),
+                "has_frontmatter": False}
     fm = yaml.safe_load(m.group(1)) or {}
     return {
         "type": fm.get("type", "note"),
@@ -80,6 +151,7 @@ def parse_okf(text: str) -> Dict:
         "refs": list(fm.get("refs", []) or []),
         "timestamp": fm.get("timestamp"),
         "body": (m.group(2) or "").strip(),
+        "has_frontmatter": True,
     }
 
 

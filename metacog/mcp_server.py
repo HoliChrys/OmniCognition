@@ -278,10 +278,19 @@ def build_app(
         return results
 
     @app.tool()
-    def retire_tool(tool_id: str, hard: bool = False) -> dict:
+    def retire_tool(tool_id: str, hard: bool = False,
+                    reason: str = "manual") -> dict:
         """Retire a generated tool. Soft (default) deprecates it so it stops
-        being reused ; hard removes it. The removal half of the tool lifecycle."""
-        return memory.retire_tool(tool_id, hard=hard)
+        being reused ; hard removes it. The removal half of the tool lifecycle.
+        `reason` is recorded in the tool's event history."""
+        return memory.retire_tool(tool_id, hard=hard, reason=reason)
+
+    @app.tool()
+    def promote_tool(tool_id: str, reason: str = "manual") -> dict:
+        """Vet a PROPOSED emergent tool as ESTABLISHED (the proposal loop :
+        new tools start proposed, stay usable, and earn their status by use —
+        auto-promoted in sleep after repeated success — or explicitly here)."""
+        return memory.promote_tool(tool_id, reason=reason)
 
     @app.tool()
     def report_tool(tool_id: str, ok: bool) -> dict:
@@ -317,9 +326,49 @@ def build_app(
         decay-forgetting in sleep."""
         return memory.forget_node(node_id, reason, superseded_by=superseded_by)
 
+    @app.tool()
+    def revert_merge(node_id: str) -> dict:
+        """UNDO a forget / merge / collapse of `node_id` from the merge ledger :
+        drops its redirect, restores its pre-op state and tags, and un-rewrites
+        exactly the wiki refs that redirect rewrote. Nothing destructive is
+        final — every identity op is a reversible ledger row."""
+        return memory.revert_merge(node_id)
+
     # ----------------------------------------------------------------
     # OKF wiki — author/query the RAG-extension knowledge layer
     # ----------------------------------------------------------------
+
+    @app.tool()
+    def check_wiki(doc_id: Optional[str] = None) -> dict:
+        """READ-ONLY consistency check of the wiki (one doc or all) : stale refs
+        with their reason, prose/link mismatches, inline tags missing from the
+        frontmatter, empty bodies, schema drift within a type, unvetted types.
+        Writes nothing — surfacing violations is separate from inferring."""
+        v = memory.check_wiki(doc_id)
+        return {"violations": v, "count": len(v)}
+
+    @app.tool()
+    def okf_proposals(status: Optional[str] = "proposed") -> dict:
+        """Out-of-vocabulary OKF concept types preserved as PROPOSALS (never
+        rejected, never silently canonical). status: proposed | accepted |
+        rejected | null for all."""
+        return {"proposals": memory.okf_proposals(status)}
+
+    @app.tool()
+    def vet_okf_type(type: str, accept: bool) -> dict:
+        """Close the vocabulary loop : accept a proposed OKF type into the
+        schema, or reject it (its docs get flagged by check_wiki ; they are
+        never touched)."""
+        return memory.vet_okf_type(type, accept)
+
+    @app.tool()
+    def infer_wiki(apply: bool = False) -> dict:
+        """MATERIALIZED wiki inference : derived fields (related docs via shared
+        refs, tag drift of cited nodes, ids absorbed into cited nodes) go to a
+        SEPARATE table, never into the asserted index ; asserted facts always
+        win. apply=false previews ; run autonomically in sleep when
+        infer_enabled."""
+        return memory.infer_wiki(apply=apply)
 
     @app.tool()
     def feed_wiki(doc_id: str, title: str, node_ids: List[str],

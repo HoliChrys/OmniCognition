@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS wiki_refs (
     doc_id  TEXT NOT NULL,
     node_id TEXT NOT NULL,                         -- a RAG node this doc cites
     stale   INTEGER NOT NULL DEFAULT 0,            -- 1 = target gone/invalid
+    reason  TEXT,                                  -- WHY stale (explicit code)
     PRIMARY KEY (doc_id, node_id)
 );
 CREATE INDEX IF NOT EXISTS idx_wikiref_node ON wiki_refs(node_id);
@@ -128,7 +129,75 @@ CREATE TABLE IF NOT EXISTS okf_fields (
 );
 CREATE INDEX IF NOT EXISTS idx_okf_kv   ON okf_fields(key, value);
 CREATE INDEX IF NOT EXISTS idx_okf_type ON okf_fields(type);
+
+-- MERGE LEDGER : every destructive identity op (forget / merge / collapse) is a
+-- row, so it is (a) a persistent REDIRECT absorbed->keeper that outlives the
+-- in-memory alias map and (b) REVERSIBLE (snapshot = what revert restores).
+CREATE TABLE IF NOT EXISTS merge_ledger (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    absorbed_id TEXT NOT NULL,                     -- id that stops being canonical
+    keeper_id   TEXT,                              -- survivor (NULL = forget, no successor)
+    kind        TEXT NOT NULL,                     -- 'forget'|'merge'|'lateral'|'duplicate'
+    reason      TEXT NOT NULL,                     -- explicit reason, never blank
+    snapshot    TEXT NOT NULL,                     -- JSON {state, tags} before the op
+    ts          REAL NOT NULL,
+    reverted    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_absorbed ON merge_ledger(absorbed_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_keeper   ON merge_ledger(keeper_id);
+
+-- Which wiki refs were rewritten by which redirect (so a revert can un-rewrite
+-- EXACTLY those, and nothing else).
+CREATE TABLE IF NOT EXISTS wiki_ref_remaps (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id   TEXT NOT NULL,
+    old_id   TEXT NOT NULL,
+    new_id   TEXT NOT NULL,
+    had_new  INTEGER NOT NULL DEFAULT 0,           -- doc already linked new_id before
+    ordinals TEXT NOT NULL DEFAULT '[]',           -- which [[new]] occurrences came from old
+    ts       REAL NOT NULL,
+    reverted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_remap_old ON wiki_ref_remaps(old_id);
+
+-- Tool lifecycle events with an explicit reason code (created / reused /
+-- promoted / failed / retired / rejected ...) : nothing about a tool is silent.
+CREATE TABLE IF NOT EXISTS tool_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_id TEXT NOT NULL,
+    event   TEXT NOT NULL,
+    reason  TEXT,
+    ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_toolev_tool ON tool_events(tool_id);
+
+-- DERIVED (inferred) OKF fields live in their OWN table, never in okf_fields :
+-- asserted facts always win, and inference is off unless enabled.
+CREATE TABLE IF NOT EXISTS okf_derived (
+    doc_id TEXT NOT NULL,
+    key    TEXT NOT NULL,
+    value  TEXT NOT NULL,
+    rule   TEXT NOT NULL,                          -- which inference rule produced it
+    ts     REAL NOT NULL,
+    PRIMARY KEY (doc_id, key, value)
+);
+CREATE INDEX IF NOT EXISTS idx_okfd_kv ON okf_derived(key, value);
+
+-- Out-of-vocabulary OKF terms (a new concept `type`) are PRESERVED as proposals
+-- rather than rejected or silently accepted : vetted later (accepted/rejected).
+CREATE TABLE IF NOT EXISTS okf_vocab (
+    kind      TEXT NOT NULL,                       -- 'type'
+    value     TEXT NOT NULL,
+    status    TEXT NOT NULL,                       -- 'proposed'|'accepted'|'rejected'
+    first_doc TEXT,
+    ts        REAL NOT NULL,
+    PRIMARY KEY (kind, value)
+);
 """
+
+#: Columns added after a table first shipped ; applied idempotently on open so an
+#: existing journal file keeps working (the ONLY migration-ish step we do).
+_LATE_COLUMNS = [("wiki_refs", "reason", "TEXT")]
 
 
 class Journal:
@@ -140,6 +209,11 @@ class Journal:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        for table, col, decl in _LATE_COLUMNS:
+            have = {r["name"] for r in
+                    self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         self.conn.commit()
 
     # -- write ---------------------------------------------------------------
@@ -308,9 +382,10 @@ class Journal:
 
     def wiki_refs_for_doc(self, doc_id: str) -> List[dict]:
         rows = self.conn.execute(
-            "SELECT node_id, stale FROM wiki_refs WHERE doc_id = ? "
+            "SELECT node_id, stale, reason FROM wiki_refs WHERE doc_id = ? "
             "ORDER BY node_id", (str(doc_id),)).fetchall()
-        return [{"node_id": r["node_id"], "stale": bool(r["stale"])} for r in rows]
+        return [{"node_id": r["node_id"], "stale": bool(r["stale"]),
+                 "reason": r["reason"]} for r in rows]
 
     def docs_referencing(self, node_id: str) -> List[str]:
         """Reverse link : which wiki docs cite this node (the RAG->wiki edge)."""
@@ -329,11 +404,224 @@ class Journal:
         self.conn.commit()
 
     def mark_wiki_ref_stale(self, doc_id: str, node_id: str,
-                            stale: bool = True) -> None:
+                            stale: bool = True,
+                            reason: Optional[str] = None) -> None:
+        """Flag / clear a stale ref WITH its explicit reason code (a cleared
+        flag drops the reason)."""
         self.conn.execute(
-            "UPDATE wiki_refs SET stale = ? WHERE doc_id = ? AND node_id = ?",
-            (1 if stale else 0, str(doc_id), str(node_id)))
+            "UPDATE wiki_refs SET stale = ?, reason = ? "
+            "WHERE doc_id = ? AND node_id = ?",
+            (1 if stale else 0, reason if stale else None,
+             str(doc_id), str(node_id)))
         self.conn.commit()
+
+    # -- merge ledger : persistent redirects + reversibility ------------------
+
+    def log_merge(self, absorbed_id: str, keeper_id: Optional[str], kind: str,
+                  reason: str, snapshot: Optional[dict] = None,
+                  ts: Optional[float] = None) -> int:
+        """Append one destructive identity op. `keeper_id` None = a forget with
+        no successor (a redirect to nowhere) ; otherwise absorbed->keeper is a
+        persistent redirect. `snapshot` is what a revert restores."""
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO merge_ledger(absorbed_id, keeper_id, kind, reason, "
+            "snapshot, ts, reverted) VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (str(absorbed_id), None if keeper_id is None else str(keeper_id),
+             str(kind), str(reason or "unspecified"),
+             json.dumps(snapshot or {}), ts))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def redirect_of(self, node_id: str) -> Optional[str]:
+        """ONE redirect step : the keeper the latest non-reverted ledger row
+        sends `node_id` to (None if it is canonical / only forgotten)."""
+        row = self.conn.execute(
+            "SELECT keeper_id FROM merge_ledger WHERE absorbed_id = ? AND "
+            "reverted = 0 AND keeper_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (str(node_id),)).fetchone()
+        return None if row is None else row["keeper_id"]
+
+    def active_redirects(self) -> dict:
+        """All live redirects {absorbed: keeper} (latest non-reverted row per
+        absorbed id) — used to re-hydrate the in-memory alias map on restart."""
+        rows = self.conn.execute(
+            "SELECT absorbed_id, keeper_id FROM merge_ledger WHERE reverted = 0 "
+            "AND keeper_id IS NOT NULL ORDER BY id ASC").fetchall()
+        return {r["absorbed_id"]: r["keeper_id"] for r in rows}
+
+    def absorbed_by(self, keeper_id: str) -> List[str]:
+        """Direct reverse redirect : ids currently redirected INTO `keeper_id`."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT absorbed_id FROM merge_ledger WHERE keeper_id = ? "
+            "AND reverted = 0 ORDER BY absorbed_id", (str(keeper_id),)).fetchall()
+        return [r["absorbed_id"] for r in rows]
+
+    def merge_history(self, node_id: Optional[str] = None,
+                      include_reverted: bool = True) -> List[dict]:
+        """Ledger rows (newest first), all or for one absorbed id."""
+        q = ("SELECT id, absorbed_id, keeper_id, kind, reason, snapshot, ts, "
+             "reverted FROM merge_ledger")
+        args: tuple = ()
+        conds = []
+        if node_id is not None:
+            conds.append("absorbed_id = ?")
+            args += (str(node_id),)
+        if not include_reverted:
+            conds.append("reverted = 0")
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        rows = self.conn.execute(q + " ORDER BY id DESC", args).fetchall()
+        return [{"id": r["id"], "absorbed_id": r["absorbed_id"],
+                 "keeper_id": r["keeper_id"], "kind": r["kind"],
+                 "reason": r["reason"], "snapshot": json.loads(r["snapshot"]),
+                 "ts": r["ts"], "reverted": bool(r["reverted"])} for r in rows]
+
+    def mark_merge_reverted(self, ledger_id: int) -> None:
+        self.conn.execute("UPDATE merge_ledger SET reverted = 1 WHERE id = ?",
+                          (int(ledger_id),))
+        self.conn.commit()
+
+    def log_ref_remap(self, doc_id: str, old_id: str, new_id: str, *,
+                      had_new: bool = False, ordinals: Sequence[int] = (),
+                      ts: Optional[float] = None) -> int:
+        """Record one ref rewrite old->new in a doc precisely enough to undo
+        it : whether the doc ALREADY linked new (so revert must not unlink it)
+        and which `[[new]]` occurrences in the prose came from `[[old]]`."""
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO wiki_ref_remaps(doc_id, old_id, new_id, had_new, "
+            "ordinals, ts, reverted) VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (str(doc_id), str(old_id), str(new_id), 1 if had_new else 0,
+             json.dumps([int(i) for i in ordinals]), ts))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def ref_remaps_from(self, old_id: str) -> List[dict]:
+        """Live (non-reverted) wiki ref rewrites that sent `old_id` somewhere."""
+        rows = self.conn.execute(
+            "SELECT id, doc_id, old_id, new_id, had_new, ordinals "
+            "FROM wiki_ref_remaps WHERE old_id = ? AND reverted = 0 "
+            "ORDER BY id ASC", (str(old_id),)).fetchall()
+        return [{"id": r["id"], "doc_id": r["doc_id"], "old_id": r["old_id"],
+                 "new_id": r["new_id"], "had_new": bool(r["had_new"]),
+                 "ordinals": json.loads(r["ordinals"])} for r in rows]
+
+    def mark_ref_remap_reverted(self, remap_id: int) -> None:
+        self.conn.execute("UPDATE wiki_ref_remaps SET reverted = 1 WHERE id = ?",
+                          (int(remap_id),))
+        self.conn.commit()
+
+    # -- tool lifecycle events (explicit reason codes) ------------------------
+
+    def log_tool_event(self, tool_id: str, event: str,
+                       reason: Optional[str] = None,
+                       ts: Optional[float] = None) -> int:
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO tool_events(tool_id, event, reason, ts) VALUES (?, ?, ?, ?)",
+            (str(tool_id), str(event), reason, ts))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def tool_events(self, tool_id: Optional[str] = None) -> List[dict]:
+        if tool_id is None:
+            rows = self.conn.execute(
+                "SELECT tool_id, event, reason, ts FROM tool_events "
+                "ORDER BY id ASC").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT tool_id, event, reason, ts FROM tool_events "
+                "WHERE tool_id = ? ORDER BY id ASC", (str(tool_id),)).fetchall()
+        return [{"tool_id": r["tool_id"], "event": r["event"],
+                 "reason": r["reason"], "ts": r["ts"]} for r in rows]
+
+    # -- derived OKF fields (materialized inference, separate table) ----------
+
+    def set_okf_derived(self, doc_id: str, rows: Sequence[tuple],
+                        ts: Optional[float] = None) -> int:
+        """Replace a doc's DERIVED fields with `rows` = [(key, value, rule)].
+        Never touches okf_fields (the asserted facts)."""
+        ts = time.time() if ts is None else ts
+        self.conn.execute("DELETE FROM okf_derived WHERE doc_id = ?", (str(doc_id),))
+        data = [(str(doc_id), str(k), str(v), str(rule), ts) for k, v, rule in rows]
+        if data:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO okf_derived(doc_id, key, value, rule, ts) "
+                "VALUES (?, ?, ?, ?, ?)", data)
+        self.conn.commit()
+        return len(data)
+
+    def okf_derived_of(self, doc_id: str) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT key, value, rule FROM okf_derived WHERE doc_id = ? "
+            "ORDER BY key, value", (str(doc_id),)).fetchall()
+        return [{"key": r["key"], "value": r["value"], "rule": r["rule"]}
+                for r in rows]
+
+    def okf_derived_docs_where(self, key: str,
+                               value: Optional[str] = None) -> List[str]:
+        if value is None:
+            rows = self.conn.execute(
+                "SELECT DISTINCT doc_id FROM okf_derived WHERE key = ? "
+                "ORDER BY doc_id", (str(key),)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT DISTINCT doc_id FROM okf_derived WHERE key = ? AND value = ?"
+                " ORDER BY doc_id", (str(key), str(value))).fetchall()
+        return [r["doc_id"] for r in rows]
+
+    def clear_okf_derived(self) -> None:
+        self.conn.execute("DELETE FROM okf_derived")
+        self.conn.commit()
+
+    # -- OKF vocabulary proposals --------------------------------------------
+
+    def propose_vocab(self, kind: str, value: str, doc_id: Optional[str] = None,
+                      ts: Optional[float] = None) -> bool:
+        """Preserve an out-of-vocabulary term as a PROPOSAL (idempotent ; an
+        already-vetted term keeps its status). True if newly proposed."""
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO okf_vocab(kind, value, status, first_doc, ts) "
+            "VALUES (?, ?, 'proposed', ?, ?)",
+            (str(kind), str(value), doc_id, ts))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def vet_vocab(self, kind: str, value: str, status: str,
+                  ts: Optional[float] = None) -> None:
+        """Set a term's status ('accepted' | 'rejected' | 'proposed')."""
+        if status not in ("accepted", "rejected", "proposed"):
+            raise ValueError(f"bad vocab status {status!r}")
+        ts = time.time() if ts is None else ts
+        self.conn.execute(
+            "INSERT INTO okf_vocab(kind, value, status, first_doc, ts) "
+            "VALUES (?, ?, ?, NULL, ?) ON CONFLICT(kind, value) DO UPDATE SET "
+            "status = excluded.status", (str(kind), str(value), status, ts))
+        self.conn.commit()
+
+    def vocab_status(self, kind: str, value: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT status FROM okf_vocab WHERE kind = ? AND value = ?",
+            (str(kind), str(value))).fetchone()
+        return None if row is None else row["status"]
+
+    def vocab(self, kind: Optional[str] = None,
+              status: Optional[str] = None) -> List[dict]:
+        q = "SELECT kind, value, status, first_doc, ts FROM okf_vocab"
+        conds, args = [], []
+        if kind is not None:
+            conds.append("kind = ?")
+            args.append(str(kind))
+        if status is not None:
+            conds.append("status = ?")
+            args.append(str(status))
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        rows = self.conn.execute(q + " ORDER BY ts ASC, value", args).fetchall()
+        return [{"kind": r["kind"], "value": r["value"], "status": r["status"],
+                 "first_doc": r["first_doc"], "ts": r["ts"]} for r in rows]
 
     def all_wiki_doc_ids(self) -> List[str]:
         rows = self.conn.execute(

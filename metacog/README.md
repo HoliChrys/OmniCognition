@@ -81,7 +81,7 @@ stateDiagram-v2
 ### The mnema usage-journal layer (opt-in, SQL, failure-safe)
 | module | responsibility |
 |---|---|
-| `journal.py` | append-only SQLite access-log, SEPARATE from the store. SQL-derivable triggers: co-retrieval self-join, `path_traversals` (Chasles), `tags` (hierarchical), `collision_events`, `forget_events`, `wiki_docs`/`wiki_refs`/`okf_fields`. Opt-in (`journal_path="auto"`); every consumer no-ops without it |
+| `journal.py` | append-only SQLite access-log, SEPARATE from the store. SQL-derivable triggers: co-retrieval self-join, `path_traversals` (Chasles), `tags` (hierarchical), `collision_events`, `forget_events`, `wiki_docs`/`wiki_refs`/`okf_fields`; the safety rails: `merge_ledger` (persistent, reversible redirects), `wiki_ref_remaps`, `tool_events`, `okf_derived`, `okf_vocab`. Opt-in (`journal_path="auto"`); every consumer no-ops without it |
 | `need_odds.py` | Anderson–Schooler base-level activation `Σ(now−t)^−d`, `fit_exponent` (grid-fit by useful/useless AUC), `blend` (min-max mix, not a sigmoid squash) |
 | `wiki.py` | OKF wiki helpers — render/parse (YAML frontmatter + body), `[[node_id]]` wikilinks, `#tag`, `context_tags` |
 | `canonical_tools.py` | the T1/T2/T3 tool-tier manifest + surfaces (`external`/`external_light`/`canonical`/`all`); test-guarded to partition the live `@app.tool()` set exactly |
@@ -213,6 +213,50 @@ An optional wiki layer (`wiki.py` + `memory.py` + `journal.py`) in Google's
   and rendered in the OKF frontmatter, so docs are queryable/rankable by real
   feedback.
 
+## Safety rails on identity ops — redirects, reversibility, reasons, proposals
+
+Five rails (borrowed from knowledge-graph engineering practice) make the
+destructive half of the memory — forget, merge, collapse — safe and legible.
+All live in the journal; all no-op without one.
+
+- **Active redirects, not one-shot rewrites.** Every forget→merge, lateral
+  collapse and duplicate merge writes a `merge_ledger` row (`absorbed →
+  keeper`, kind, **reason**, snapshot). `resolve_alias` follows it and is
+  **re-hydrated from the ledger after a restart**, so a reference discovered
+  *after* the merge (a late `feed_wiki`, an external `import_okf`, a new
+  process) still lands on the keeper; chains `A→B→C` resolve to the final
+  survivor and `absorbed_into(C)` gives the transitive reverse edge.
+- **Reversible ledger.** `revert_merge(id)` undoes every live row for an id:
+  drops the redirect, restores the node's pre-op state/tags from the oldest
+  snapshot, and un-rewrites **exactly** the wiki refs the redirect rewrote
+  (`wiki_ref_remaps` traces which `[[…]]` occurrences came from the old id and
+  whether the doc already cited the keeper) — the author's own links stay.
+- **Explicit reason codes, never a silent collapse.** A stale wiki ref carries
+  *why* (`missing_node` / `invalidated` / `deprecated`); `feed_wiki` /
+  `import_okf` return `issues` (`redirected`, `missing_node` — the ref is kept
+  and flagged, not dropped — `no_frontmatter`, `type_proposed`); every tool
+  lifecycle step is a `tool_events` row (`created` / `reused` / `ok` / `failed`
+  / `retired` / `promoted` / `rejected: synthesis_failed` …), readable via
+  `tool_history`.
+- **Consistency check ≠ inference.** `check_wiki` is **read-only**: it
+  surfaces violations (`stale_ref` + reason, `body_ref_unlinked`,
+  `link_not_in_body`, `tag_not_in_frontmatter`, `empty_body`, `schema_drift`
+  within a type, unvetted types) and writes nothing. `infer_wiki` is
+  **materialized inference, OFF by default** (`infer_enabled`): derived fields
+  (`related` via shared refs, `tags` drift of cited nodes, `absorbed` ids) go
+  to their **own table** (`okf_derived`), never into the asserted index, and
+  **asserted facts win** (an asserted `(key, value)` is never re-derived).
+  `wiki_where(…, derived=True)` opts in at query time.
+- **Proposal loop for out-of-vocabulary terms.** An OKF `type` outside the
+  vetted vocabulary (`note` / `topic` / `tool` + accepted ones) is **preserved
+  as a proposal** (`okf_vocab`): the doc is written and queryable, the term is
+  neither rejected nor silently canonical until `vet_okf_type(t, accept)`.
+  Likewise every emergent tool starts **`proposed`** — fully usable — and earns
+  **`established`** by use (`promote_tools` in `sleep` after
+  `tool_promote_after` successes with no failure streak, or `promote_tool`);
+  its wiki doc exposes `status`, so `wiki_where("status", "proposed")` lists
+  the unvetted capability set.
+
 ## MCP tools (`mcp_server.py`)
 
 Classified into role tiers (`canonical_tools.py`). The `external` surface
@@ -237,15 +281,32 @@ stats · inspect · list_tags
 # feedback & correction
 mark_useful         rate a retrieval 0/1/2 → calibrates decay + wiki credibility
 forget              soft-invalidate ONE node (reason req.; optional superseded_by)
+revert_merge        undo a forget/merge/collapse from the ledger (state, redirect,
+                    and exactly the wiki refs it rewrote)
+# OKF wiki (author / query the RAG-extension knowledge layer)
+feed_wiki           RAG→wiki: build/update an OKF doc from node ids (refs in
+                    frontmatter + inline [[id]]); returns `issues` with reasons
+wiki_doc            render a doc's current OKF markdown (live refs, feedback, status)
+ingest_from_wiki    wiki→RAG: ingest new prose as a node carrying the doc's tags
+wiki_where          query the EAV field index by any frontmatter field
+okf_schema          the schema recovered from the data ({type: [keys]})
+import_okf          consume an external OKF doc (redirects followed, issues reported)
+docs_for_node       reverse link: which docs cite this node
+check_wiki          READ-ONLY consistency check (stale refs + reason, prose/link
+                    mismatches, schema drift, unvetted types) — writes nothing
+okf_proposals       out-of-vocabulary OKF types preserved as proposals
+vet_okf_type        accept / reject a proposed type (closes the vocabulary loop)
 
 #####  T2 — agent-tool machinery (exposed)  #####
-ensure_tool         get a tool, generating it if absent ("no tool → make it")
+ensure_tool         get a tool, generating it if absent ("no tool → make it");
+                    a new tool starts `proposed`; failures return a `reason`
 match_tool          fast-path: does a generated tool already cover this query?
 build_skill         task-mode walk → synthesise + ingest a named skill
 list_tools_learned  list the self-built tool set
 report_tool         reinforce a tool (ok) / auto-retire after repeated failures
-retire_tool         soft-deprecate (stop reuse) or hard-remove a tool
+retire_tool         soft-deprecate (stop reuse) or hard-remove a tool (+ reason)
 update_tool         rewrite a tool's body (re-embedded); revives a deprecated one
+promote_tool        vet a proposed tool as established (also autonomic in sleep)
 
 #####  T3 — internal (callable in `all`, NOT on the external surface)  #####
 # retrieval modes the walk orchestrates
@@ -259,7 +320,9 @@ collect · bag · bags · bag_render
 # observators
 declare_observator · detect_polarized · spawn_observators · route · list_communities
 # autonomic (run by the system, not the caller)
-sleep               consolidation: collision + decay-fit + forget-merge + wiki reconcile
+sleep               consolidation: collision + decay-fit + forget-merge + wiki
+                    reconcile + tool promotion (+ wiki inference if enabled)
+infer_wiki          materialized wiki inference → separate derived table (opt-in)
 save · audit · crystallize_skills
 # internal / admin
 observe · process_turn · capture_code_tool · ingest_skill · get_session_skill
