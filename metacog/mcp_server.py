@@ -442,11 +442,103 @@ def build_app(
         return memory.refresh_wiki(doc_id, body=body)
 
     @app.tool()
-    def wiki_doc(doc_id: str) -> dict:
+    def wiki_doc(doc_id: str, view: str = "source") -> dict:
         """Render the current OKF markdown of a wiki doc (live frontmatter refs +
-        first-order feedback), or {} if absent."""
-        md = memory.wiki_doc(doc_id)
-        return {"doc_id": doc_id, "okf": md} if md else {}
+        first-order feedback + seeds / vars / annotations), or {} if absent.
+        view="source" keeps the object tags (<portion>, <var/>) — what you
+        edit ; view="rendered" resolves variables to their live value, strips
+        portion tags and appends annotations as footnotes — what you read."""
+        md = memory.wiki_doc(doc_id, view=view)
+        return {"doc_id": doc_id, "okf": md, "view": view} if md else {}
+
+    @app.tool()
+    def wiki_seed(doc_id: str, action: str = "add", query: str = "",
+                  target: str = "*", k: int = 7,
+                  seed_id: Optional[str] = None) -> dict:
+        """SEED QUERIES on a doc. action=add : attach a semantic `query` to a
+        portion (`target`=portion id) or the whole doc (`*`) ; its ranked
+        result is cached now and becomes part of what the target owns — a
+        generated target is rendered from it at once. action=rerun : re-run
+        the doc's seeds (all docs when doc_id="*"), diff vs the cache, absorb
+        (generated) or record a pending change with the diff (authored /
+        kept). action=remove : detach `seed_id`. action=list."""
+        if action == "add":
+            return memory.add_seed(doc_id, query, target=target or "*", k=k,
+                                   seed_id=seed_id)
+        if action == "rerun":
+            return memory.rerun_seeds(None if doc_id == "*" else doc_id)
+        if action == "remove":
+            return memory.remove_seed(doc_id, seed_id or "")
+        if action == "list":
+            return {"seeds": memory.list_seeds(None if doc_id == "*" else doc_id)}
+        return {"reason": "unknown_action", "actions": ["add", "rerun", "remove", "list"]}
+
+    @app.tool()
+    def wiki_var(doc_id: str, name: str, action: str = "set",
+                 node_id: str = "", field: str = "content") -> dict:
+        """VARIABLES : a `<var name=… node=… field=…/>` is a live BINDING to a
+        node (rendered from it, never copied). action=set binds / rebinds
+        (refused for a missing node — a binding stays reliable), action=remove
+        unbinds (refused when a `keep` annotation protects it), action=list
+        shows the doc's vars with their live value. Every change is a
+        reversible op (see wiki_ops)."""
+        if action == "set":
+            return memory.set_var(doc_id, name, node_id, field=field or "content")
+        if action == "remove":
+            return memory.remove_var(doc_id, name)
+        if action == "list":
+            return {"vars": memory.wiki_vars(doc_id)}
+        return {"reason": "unknown_action", "actions": ["set", "remove", "list"]}
+
+    @app.tool()
+    def wiki_portion(doc_id: str, portion_id: str, action: str = "set",
+                     body: Optional[str] = None,
+                     seeds: Optional[List[str]] = None,
+                     mode: Optional[str] = None) -> dict:
+        """PORTIONS : a `<portion id=… seeds=… mode=…>` block is an object of
+        the doc. action=set creates / updates it (body None on a generated
+        portion re-renders it from what it owns : links, bindings, seed
+        results) ; action=remove drops it with its seeds (refused when kept).
+        mode = generated | authored (default : the doc's). Reversible ops."""
+        if action == "set":
+            return memory.set_portion(doc_id, portion_id, body=body, seeds=seeds, mode=mode)
+        if action == "remove":
+            return memory.remove_portion(doc_id, portion_id)
+        return {"reason": "unknown_action", "actions": ["set", "remove"]}
+
+    @app.tool()
+    def wiki_annotate(doc_id: str, target: str = "*", note: str = "",
+                      kind: str = "note", action: str = "add",
+                      annotation_id: Optional[int] = None) -> dict:
+        """ANNOTATIONS on a portion id, a var name, a cited node id or the doc
+        (`*`) : kind = note | purpose ("this variable serves …") | keep ("this
+        part must be preserved" — protects it from regeneration / removal) |
+        todo. Read like a bibliography (frontmatter `annotations`, footnotes
+        in the rendered view). action=add | remove (annotation_id) | list."""
+        if action == "add":
+            return memory.annotate(doc_id, target or "*", note, kind=kind)
+        if action == "remove":
+            return memory.remove_annotation(doc_id, int(annotation_id or 0))
+        if action == "list":
+            return {"annotations": memory.annotations(doc_id)}
+        return {"reason": "unknown_action", "actions": ["add", "remove", "list"]}
+
+    @app.tool()
+    def wiki_pending(doc_id: Optional[str] = None) -> dict:
+        """What a doc (or every doc) still has to absorb : seed results that
+        moved on an authored / kept target (with the added / removed ids) and
+        drifted refs. Resolve with refresh_wiki(doc, body)."""
+        p = memory.wiki_pending(doc_id)
+        return {"pending": p, "count": len(p)}
+
+    @app.tool()
+    def wiki_ops(doc_id: str, revert_op_id: Optional[int] = None) -> dict:
+        """The reversible history of object edits (vars / portions) on a doc ;
+        pass revert_op_id to undo one (a removed object comes back, a created
+        one leaves, a rebinding is restored)."""
+        if revert_op_id is not None:
+            return memory.revert_wiki_op(int(revert_op_id))
+        return {"ops": memory.wiki_ops(doc_id)}
 
     @app.tool()
     def ingest_from_wiki(doc_id: str, text: str) -> dict:

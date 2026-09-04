@@ -222,6 +222,19 @@ An optional wiki layer (`wiki.py` + `memory.py` + `journal.py`) in Google's
   flagged `outdated` (EAV field, `check_wiki` → `outdated_ref`), and
   `refresh_wiki(doc[, body])` returns the pending changes or stores the new
   prose. Tests: `tests/test_wiki_drift.py`.
+- **Objects** (`wiki.py` parsers + `memory.py`, journal tables `wiki_seeds` /
+  `wiki_annotations` / `wiki_ops` / `wiki_pending`) — `<portion id seeds refs
+  mode>` blocks own their sources (explicit `refs`, `<var/>` bindings, cached
+  **seed query** results) and a generated one re-renders alone
+  (`_regenerate_portion`); `rerun_seeds` (in `sleep`) re-runs each query,
+  diffs vs the cache, absorbs (generated) or records a `wiki_pending` row
+  with the diff (authored / kept). `<var name node field/>` is a live binding
+  (`resolve_body` for the rendered view; `set_var` refuses a missing node).
+  Every var / portion edit is a reversible `wiki_ops` row (`revert_wiki_op`).
+  `annotate(doc, target, note, kind)` — `keep` protects a target from
+  regeneration and removal (`_kept`); annotations render in the frontmatter
+  and as footnotes. `wiki_doc(view="source"|"rendered")`. Tests:
+  `tests/test_wiki_objects.py`.
 
 ## Safety rails on identity ops — redirects, reversibility, reasons, proposals
 
@@ -338,6 +351,10 @@ check_wiki          READ-ONLY consistency check (stale refs + reason, prose/link
                     mismatches, outdated refs, schema drift, unvetted types)
 refresh_wiki        re-align a doc with its changed refs (generated: re-render;
                     authored: pending changes, or store the rewritten body)
+wiki_seed · wiki_var · wiki_portion · wiki_annotate · wiki_pending · wiki_ops
+                    the wiki OBJECTS: seed queries (cached, diffed offline),
+                    live variable bindings, portion blocks, typed annotations
+                    (keep protects), pending changes, reversible op history
 okf_proposals       out-of-vocabulary OKF types preserved as proposals
 vet_okf_type        accept / reject a proposed type (closes the vocabulary loop)
 

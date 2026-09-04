@@ -847,6 +847,45 @@ say now) so the agent can rewrite and store the new prose with
 `refresh_wiki(doc, body)`. `update_tool` triggers the targeted pass at once, so
 a tool's wiki doc never lags its body.
 
+**Objects, not character runs — seeds, portions, variables, annotations.**
+Parts of a doc are first-class objects with an identity, so a change is an
+*operation* on the object rather than a text edit:
+
+- **Portions** — `<portion id="p" seeds="q1" refs="A,B" mode="generated">…</portion>`
+  is a block that owns its sources: its explicit `refs`, its `<var/>` bindings
+  and the cached results of its **seed queries**. A generated portion is
+  rendered from those sources (its inline `[[…]]` are a rendering, not a
+  source) and re-renders *alone* when one of them drifts; an authored one is
+  only flagged. `wiki_portion(doc, id, set|remove, body, seeds, mode)`.
+- **Seed queries** — `wiki_seed(doc, add, query, target)` attaches a semantic
+  query to a portion (or the doc, `*`); its ranked result is **cached at
+  creation** and becomes part of what the target owns. `sleep` **re-runs**
+  every seed (cheap `retrieve`, no LLM) and diffs it against the cache: a
+  generated target absorbs the new set, an authored or kept one gets a
+  **pending change** carrying the diff (`added` / `removed` / current
+  contents) — `wiki_pending`, `check_wiki` → `pending_change`,
+  `wiki_where("pending")`, and `refresh_wiki(doc)` returns it for rewriting.
+- **Variables** — `<var name="target" node="N42" field="content"/>` is a
+  **live binding**: the rendered view reads the node, nothing is copied, so
+  the text can never go stale. `wiki_var(doc, name, set|remove, node_id)`
+  binds / rebinds / unbinds; binding to a missing node is **refused** (a ref
+  stays reliable), the bound node is a ref like any other (`wiki_where("bindings", id)`).
+- **Reversible ops** — every set / remove of a var or portion is a
+  `wiki_ops` row with its before / after; `wiki_ops(doc, revert_op_id)` undoes
+  one (a removed object comes back, a rebinding is restored). A ref never
+  silently becomes a different string.
+- **Annotations** — `wiki_annotate(doc, target, note, kind)` hangs a typed note
+  on a portion id, a var name, a cited node or the doc: `purpose` ("this
+  variable is the cluster we ship to"), `note`, `todo`, and **`keep`** ("this
+  part must be preserved"), which **protects its target from automatic
+  regeneration and from removal** (the drift is then flagged instead).
+  Annotations render in the OKF frontmatter as a **bibliography**
+  (`annotations: [{target, kind, note}]`, indexed: `wiki_where("keep", …)`)
+  and, in the rendered view, as footnotes `[^target] (kind) note`.
+- **Two views** — `wiki_doc(doc, view="source")` keeps the object tags (what
+  you edit); `view="rendered"` resolves every variable to its live value,
+  strips portion tags and appends the footnotes (what you read).
+
 ### 5.7 Safety rails on identity ops — redirects, reversibility, reasons, proposals
 
 The destructive half of the memory — forget, merge, lateral collapse, dedup —
@@ -1360,6 +1399,13 @@ check_wiki          READ-ONLY consistency check (stale refs + reason, prose/link
 refresh_wiki        re-align a doc with its changed refs: a generated doc
                     re-renders; an authored doc returns the pending changes
                     or stores the rewritten `body` (§5.6 drift)
+wiki_seed           add | rerun | remove | list seed queries on a portion or
+                    the doc (cached result, diffed offline) (§5.6 objects)
+wiki_var            set | remove | list live variable bindings to nodes
+wiki_portion        set | remove a <portion> object (sources: refs, seeds)
+wiki_annotate       add | remove | list typed notes (note/purpose/keep/todo)
+wiki_pending        what a doc still has to absorb (seed diffs, drifted refs)
+wiki_ops            reversible history of object edits (+ revert one)
 okf_proposals       out-of-vocabulary OKF types preserved as proposals
 vet_okf_type        accept / reject a proposed type (closes the vocabulary loop)
 
@@ -1388,7 +1434,8 @@ declare_observator · detect_polarized · spawn_observators · route · list_com
 # autonomic (run by the system, not the caller)
 sleep               consolidation: collision + decay-fit + forget-merge +
                     wiki reconcile (redirects, stale, DRIFT: regenerate /
-                    flag) + tool promotion (+ wiki inference when enabled)
+                    flag) + seed re-run (diff → absorb / pending) + tool
+                    promotion (+ wiki inference when enabled)
                     (§5.3, §5.6, §5.7)
 infer_wiki          materialized wiki inference → separate derived table (opt-in)
 save · audit · crystallize_skills

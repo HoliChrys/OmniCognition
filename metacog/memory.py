@@ -1325,9 +1325,12 @@ class Memory:
                 out.append({"ref": nid, "reason": _w.REF_MISSING})
         return out
 
-    def wiki_doc(self, doc_id: str) -> Optional[str]:
+    def wiki_doc(self, doc_id: str, view: str = "source") -> Optional[str]:
         """Render the current OKF markdown (frontmatter refs from the live link
-        table). None if absent / no journal."""
+        table). `view="source"` keeps the object tags (`<portion>`, `<var/>`)
+        — what you edit ; `view="rendered"` resolves every variable to its live
+        value, strips the portion tags and appends the annotations as
+        footnotes — what you read. None if absent / no journal."""
         if self.journal is None:
             return None
         doc = self.journal.get_wiki_doc(doc_id)
@@ -1345,8 +1348,33 @@ class Memory:
                     if r.get("outdated"))
         if n_out:
             extra["outdated"] = n_out
+        seeds = self.journal.seeds_for_doc(doc_id)
+        if seeds:
+            extra["seeds"] = [{"id": s["seed_id"], "query": s["query"],
+                               "target": s["target"], "n": len(s["cached"])}
+                              for s in seeds]
+        vars_ = _w.parse_vars(doc["body"])
+        if vars_:
+            extra["vars"] = vars_
+        anns = self.journal.annotations_for_doc(doc_id)
+        if anns:                                    # the bibliography
+            extra["annotations"] = [{"target": a["target"], "kind": a["kind"],
+                                     "note": a["note"]} for a in anns]
+        pend = len(self.journal.pending_for_doc(doc_id))
+        if pend:
+            extra["pending"] = pend
+        body = doc["body"]
+        if view == "rendered":
+            id2p = {p.id: p for p in self.points}
+            values = {}
+            for v in vars_:
+                p = id2p.get(self.resolve_alias(v["node"] or ""))
+                val = self._var_value(p, v["field"])
+                if val is not None:
+                    values[v["name"]] = val
+            body = _w.resolve_body(body, values, anns)
         return _w.render_okf(type=doc["type"], title=doc["title"],
-                             tags=doc["tags"], refs=refs, body=doc["body"],
+                             tags=doc["tags"], refs=refs, body=body,
                              timestamp=doc["ts"], extra=extra)
 
     def docs_for_node(self, node_id: str) -> List[str]:
@@ -1468,7 +1496,27 @@ class Memory:
             if cleared:
                 self._reindex_okf(doc_id)      # `outdated` leaves the index too
             return {"refreshed": 0, "outdated": 0, "reasons": reasons}
-        if doc["body_mode"] == _w.BODY_GENERATED:
+        # drifted refs OWNED by a generated, non-kept portion : that portion
+        # re-renders on its own, whatever the doc's mode
+        portions = _w.parse_portions(doc["body"])
+        if portions:
+            gen = {p["id"] for p in self._generated_portions(doc)}
+            handled = set()
+            for nid in list(drift):
+                pid = (_w.portion_of(doc["body"], f"[[{nid}]]")
+                       or next((_w.portion_of(doc["body"], _w.var_tag(v["name"], v["node"], v["field"]))
+                                for v in _w.parse_vars(doc["body"]) if v.get("node") == nid), None))
+                if pid in gen:
+                    self._regenerate_portion(doc_id, pid, id2p)
+                    handled.add(nid)
+            for nid in handled:
+                self.journal.set_ref_fingerprint(
+                    doc_id, nid, _w.node_fingerprint(id2p[nid].content, id2p[nid].tags))
+                drift.pop(nid, None)
+            if not drift:
+                self._reindex_okf(doc_id)
+                return {"refreshed": 1 if handled else 0, "outdated": 0, "reasons": reasons}
+        if doc["body_mode"] == _w.BODY_GENERATED and not self._kept(doc_id) and not portions:
             self._regenerate_doc(doc_id, id2p)
             return {"refreshed": 1, "outdated": 0, "reasons": reasons}
         for nid, code in drift.items():
@@ -1476,14 +1524,77 @@ class Memory:
         self._reindex_okf(doc_id)
         return {"refreshed": 0, "outdated": 1, "reasons": reasons}
 
+    def _kept(self, doc_id: str, target: str = "*") -> bool:
+        """A `keep` annotation on the target (or on the whole doc) protects it
+        from any automatic regeneration / removal."""
+        anns = self.journal.annotations_for_doc(doc_id)
+        return any(a["kind"] == "keep" and a["target"] in (target, "*") for a in anns)
+
+    def _portion_refs(self, doc_id: str, portion: dict,
+                      generated: bool = True) -> List[str]:
+        """The refs a portion OWNS : its explicit refs (the `refs` attribute
+        for a generated portion — its inline links are a rendering ; the
+        inline links for an authored one) + var bindings + the cached results
+        of its seed queries, in order, dedup."""
+        from metacog import wiki as _w
+        ids = list(portion["refs"]) if generated else _w.body_refs(portion["body"])
+        ids += _w.body_bindings(portion["body"])
+        for s in self.journal.seeds_for_doc(doc_id):
+            if s["target"] == portion["id"] and s["seed_id"] in portion["seeds"]:
+                ids += list(s["cached"])
+        return list(dict.fromkeys(self.resolve_alias(i) for i in ids))
+
+    def _regenerate_portion(self, doc_id: str, pid: str,
+                            id2p: Optional[Dict[str, Point]] = None) -> bool:
+        """Re-render ONE generated portion from the nodes it owns (links + its
+        seeds' cached results). Leaves the rest of the body untouched."""
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return False
+        p = next((x for x in _w.parse_portions(doc["body"]) if x["id"] == pid), None)
+        if p is None:
+            return False
+        if id2p is None:
+            id2p = {q.id: q for q in self.points}
+        refs = self._portion_refs(doc_id, p, generated=True)
+        items = [(nid, (id2p[nid].content if nid in id2p else nid)) for nid in refs]
+        inner = _w.default_body(items, [], with_tags=False)
+        body, _ = _w.set_portion_body(doc["body"], pid, inner)
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
+                                     body, self._now())
+        self._relink(doc_id, id2p)
+        return True
+
+    def _generated_portions(self, doc: dict) -> List[dict]:
+        """The portions that may be regenerated : mode='generated', or no mode
+        in a generated doc — minus the kept ones."""
+        from metacog import wiki as _w
+        out = []
+        for p in _w.parse_portions(doc["body"]):
+            mode = p["mode"] or doc.get("body_mode") or _w.BODY_GENERATED
+            if mode == _w.BODY_GENERATED and not self._kept(doc["doc_id"], p["id"]):
+                out.append(p)
+        return out
+
     def _regenerate_doc(self, doc_id: str,
                         id2p: Optional[Dict[str, Point]] = None) -> None:
         """Re-render a GENERATED doc from the CURRENT state of its refs
-        (content + tags), refresh every fingerprint, clear drift flags."""
+        (content + tags), refresh every fingerprint, clear drift flags. A doc
+        made of `<portion>` objects regenerates only its generated, non-kept
+        portions (each from what it owns) and leaves the rest as written."""
         from metacog import wiki as _w
         doc = self.journal.get_wiki_doc(doc_id)
         if id2p is None:
             id2p = {p.id: p for p in self.points}
+        if _w.parse_portions(doc["body"]):
+            for p in self._generated_portions(doc):
+                self._regenerate_portion(doc_id, p["id"], id2p)
+            self._relink(doc_id, id2p, rebaseline=True)
+            return
+        if self._kept(doc_id):                       # the whole doc is protected
+            self._relink(doc_id, id2p, rebaseline=True)
+            return
         refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
         tags: List[str] = []
         for nid in refs:
@@ -1498,6 +1609,389 @@ class Memory:
         for nid, fp in self._ref_fingerprints(refs, id2p).items():
             self.journal.set_ref_fingerprint(doc_id, nid, fp)
         self._reindex_okf(doc_id)
+
+    def _relink(self, doc_id: str, id2p: Optional[Dict[str, Point]] = None,
+                rebaseline: bool = False) -> List[str]:
+        """Recompute a doc's refs from what its body OWNS — `[[links]]`, `<var/>`
+        bindings, every seed's cached results — keeping the fingerprint of refs
+        already linked (or re-baselining all), then re-index."""
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return []
+        if id2p is None:
+            id2p = {p.id: p for p in self.points}
+        ids = _w.body_refs(doc["body"]) + _w.body_bindings(doc["body"])
+        for s in self.journal.seeds_for_doc(doc_id):
+            ids += list(s["cached"])
+        refs = list(dict.fromkeys(self.resolve_alias(i) for i in ids))
+        old = {r["node_id"]: r for r in self.journal.wiki_refs_for_doc(doc_id)}
+        fps = self._ref_fingerprints(refs, id2p)
+        if not rebaseline:
+            for nid, r in old.items():
+                if nid in fps and r["fingerprint"]:
+                    fps[nid] = r["fingerprint"]
+        self.journal.set_wiki_refs(doc_id, refs, fps)
+        if not rebaseline:
+            for nid, r in old.items():          # carry the flags of kept refs
+                if nid in fps and (r["stale"] or r["outdated"]):
+                    if r["stale"]:
+                        self.journal.mark_wiki_ref_stale(doc_id, nid, True, r["reason"])
+                    if r["outdated"]:
+                        self.journal.mark_wiki_ref_outdated(doc_id, nid, r["outdated"])
+        self._flag_unknown_refs(doc_id, refs, id2p)
+        self._reindex_okf(doc_id)
+        return refs
+
+    # -- seed queries ---------------------------------------------------------
+
+    def add_seed(self, doc_id: str, query: str, target: str = "*",
+                 k: int = 7, seed_id: Optional[str] = None) -> Dict[str, Any]:
+        """Attach a semantic query to a portion (or the whole doc, `*`). Its
+        ranked result is CACHED now and becomes part of what the target owns
+        (refs). A generated target is rendered from it at once ; an authored
+        one only gains the refs. Re-run offline by `rerun_seeds` (sleep)."""
+        if self.journal is None:
+            return {"seed_id": None, "reason": "no_journal"}
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"seed_id": None, "reason": "missing_doc"}
+        target = target or "*"
+        portions = {p["id"]: p for p in _w.parse_portions(doc["body"])}
+        if target != "*" and target not in portions:
+            return {"seed_id": None, "reason": "unknown_target", "target": target}
+        seeds = {s["seed_id"] for s in self.journal.seeds_for_doc(doc_id)}
+        sid = seed_id or f"q{len(seeds) + 1}"
+        while sid in seeds and seed_id is None:
+            sid = f"q{int(sid[1:]) + 1}"
+        ids = [h["id"] for h in self.retrieve(query, k=k, rerank=False)]
+        self.journal.upsert_seed(doc_id, sid, query, target, k, ids, self._now())
+        id2p = {p.id: p for p in self.points}
+        if target != "*":                          # declare the seed on its portion
+            p = portions[target]
+            if sid not in p["seeds"]:
+                body, _ = _w.set_portion_body(doc["body"], target, p["body"],
+                                              seeds=p["seeds"] + [sid])
+                self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"],
+                                             doc["tags"], body, self._now())
+            doc = self.journal.get_wiki_doc(doc_id)
+            p = next(x for x in _w.parse_portions(doc["body"]) if x["id"] == target)
+            mode = p["mode"] or doc["body_mode"]
+            if mode == _w.BODY_GENERATED and not self._kept(doc_id, target):
+                self._regenerate_portion(doc_id, target, id2p)
+            else:
+                self._relink(doc_id, id2p)
+        elif doc["body_mode"] == _w.BODY_GENERATED and not self._kept(doc_id):
+            self._relink(doc_id, id2p)
+            self._regenerate_doc(doc_id, id2p)
+        else:
+            self._relink(doc_id, id2p)
+        return {"seed_id": sid, "doc_id": doc_id, "target": target, "query": query,
+                "ids": ids}
+
+    def list_seeds(self, doc_id: Optional[str] = None) -> List[dict]:
+        return self.journal.seeds_for_doc(doc_id) if self.journal is not None else []
+
+    def remove_seed(self, doc_id: str, seed_id: str) -> Dict[str, Any]:
+        """Detach a seed : its cached results leave the target's refs (a
+        generated target re-renders without them)."""
+        if self.journal is None:
+            return {"removed": False, "reason": "no_journal"}
+        from metacog import wiki as _w
+        s = next((x for x in self.journal.seeds_for_doc(doc_id)
+                  if x["seed_id"] == seed_id), None)
+        if s is None:
+            return {"removed": False, "reason": "unknown_seed"}
+        self.journal.remove_seed(doc_id, seed_id)
+        doc = self.journal.get_wiki_doc(doc_id)
+        id2p = {p.id: p for p in self.points}
+        if s["target"] != "*":
+            p = next((x for x in _w.parse_portions(doc["body"]) if x["id"] == s["target"]), None)
+            if p is not None:
+                body, _ = _w.set_portion_body(doc["body"], p["id"], p["body"],
+                                              seeds=[q for q in p["seeds"] if q != seed_id])
+                self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"],
+                                             doc["tags"], body, self._now())
+                doc = self.journal.get_wiki_doc(doc_id)
+                mode = p["mode"] or doc["body_mode"]
+                if mode == _w.BODY_GENERATED and not self._kept(doc_id, p["id"]):
+                    self._regenerate_portion(doc_id, p["id"], id2p)
+                    return {"removed": True, "seed_id": seed_id}
+        self._relink(doc_id, id2p)
+        return {"removed": True, "seed_id": seed_id}
+
+    def rerun_seeds(self, doc_id: Optional[str] = None) -> Dict[str, Any]:
+        """Re-run every seed query (cheap retrieve, no LLM) and DIFF against
+        its cache. A changed result : a generated, non-kept target absorbs it
+        (re-rendered from the new set) ; an authored or kept target gets a
+        PENDING change carrying the diff (`added` / `removed` / `order`) for
+        `refresh_wiki` / `wiki_pending`. Runs in sleep."""
+        if self.journal is None:
+            return {"reran": 0, "changed": 0, "refreshed": 0, "pending": 0}
+        from metacog import wiki as _w
+        reran = changed = refreshed = pending = 0
+        id2p = {p.id: p for p in self.points}
+        for s in self.journal.seeds_for_doc(doc_id):
+            reran += 1
+            new = [h["id"] for h in self.retrieve(s["query"], k=s["k"], rerank=False)]
+            old = [self.resolve_alias(i) for i in s["cached"]]
+            if new == old:
+                continue
+            changed += 1
+            diff = {"seed_id": s["seed_id"], "query": s["query"],
+                    "added": [i for i in new if i not in old],
+                    "removed": [i for i in old if i not in new],
+                    "order_changed": sorted(new) == sorted(old),
+                    "now": new}
+            self.journal.set_seed_cache(s["doc_id"], s["seed_id"], new, self._now())
+            doc = self.journal.get_wiki_doc(s["doc_id"])
+            if doc is None:
+                continue
+            tgt = s["target"]
+            if tgt != "*":
+                p = next((x for x in _w.parse_portions(doc["body"]) if x["id"] == tgt), None)
+                mode = (p["mode"] if p else None) or doc["body_mode"]
+                auto = p is not None and mode == _w.BODY_GENERATED and not self._kept(s["doc_id"], tgt)
+            else:
+                auto = doc["body_mode"] == _w.BODY_GENERATED and not self._kept(s["doc_id"])
+            if auto:
+                if tgt != "*":
+                    self._regenerate_portion(s["doc_id"], tgt, id2p)
+                else:
+                    self._relink(s["doc_id"], id2p)
+                    self._regenerate_doc(s["doc_id"], id2p)
+                refreshed += 1
+            else:
+                self.journal.add_pending(s["doc_id"], tgt, "seed_changed", diff,
+                                         self._now())
+                self._relink(s["doc_id"], id2p)
+                pending += 1
+        return {"reran": reran, "changed": changed, "refreshed": refreshed,
+                "pending": pending}
+
+    # -- objects : variables & portions (journaled, reversible) ---------------
+
+    def set_var(self, doc_id: str, name: str, node_id: str,
+                field: str = "content") -> Dict[str, Any]:
+        """Bind (or rebind) a variable to a node. The doc renders the node's
+        `field` live — nothing is copied. Refuses a node that does not exist
+        (a binding must stay reliable) ; every change is a reversible op."""
+        if self.journal is None:
+            return {"name": name, "bound": False, "reason": "no_journal"}
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"name": name, "bound": False, "reason": "missing_doc"}
+        nid = self.resolve_alias(str(node_id))
+        if not any(p.id == nid for p in self.points):
+            return {"name": name, "bound": False, "reason": "missing_node", "node": nid}
+        body, prev = _w.set_var_tag(doc["body"], name, nid, field)
+        after = {"name": name, "node": nid, "field": field}
+        self.journal.log_wiki_op(doc_id, f"var:{name}", "set", prev, after, self._now())
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
+                                     body, self._now())
+        self._relink(doc_id)
+        return {"name": name, "bound": True, "node": nid, "field": field,
+                "previous": prev, "redirected": nid != str(node_id)}
+
+    def remove_var(self, doc_id: str, name: str) -> Dict[str, Any]:
+        """Unbind a variable (its tag leaves the body). Refused when a `keep`
+        annotation protects it. Reversible (`revert_wiki_op`)."""
+        if self.journal is None:
+            return {"name": name, "removed": False, "reason": "no_journal"}
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"name": name, "removed": False, "reason": "missing_doc"}
+        if self._kept(doc_id, name):
+            return {"name": name, "removed": False, "reason": "kept"}
+        body, prev = _w.remove_var_tag(doc["body"], name)
+        if prev is None:
+            return {"name": name, "removed": False, "reason": "unknown_var"}
+        self.journal.log_wiki_op(doc_id, f"var:{name}", "remove", prev, None, self._now())
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
+                                     body, self._now())
+        self._relink(doc_id)
+        return {"name": name, "removed": True, "previous": prev}
+
+    def wiki_vars(self, doc_id: str) -> List[dict]:
+        """The doc's variables with their LIVE value and annotations."""
+        if self.journal is None:
+            return []
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return []
+        id2p = {p.id: p for p in self.points}
+        out = []
+        for v in _w.parse_vars(doc["body"]):
+            p = id2p.get(self.resolve_alias(v["node"] or ""))
+            out.append({**v, "value": self._var_value(p, v["field"]),
+                        "bound": p is not None,
+                        "annotations": self.journal.annotations_for_doc(doc_id, v["name"])})
+        return out
+
+    @staticmethod
+    def _var_value(p: Optional[Point], field: str) -> Optional[str]:
+        if p is None:
+            return None
+        if field in ("content", "", None):
+            return p.content
+        v = getattr(p, field, None)
+        if v is None:
+            return None
+        return v.value if hasattr(v, "value") else str(v)
+
+    def set_portion(self, doc_id: str, pid: str, body: Optional[str] = None,
+                    seeds: Optional[Sequence[str]] = None,
+                    mode: Optional[str] = None) -> Dict[str, Any]:
+        """Create or update a `<portion>` object. `body` None on a generated
+        portion re-renders it from what it owns ; on a new portion with no
+        body an empty generated block is created. Reversible op."""
+        if self.journal is None:
+            return {"portion": pid, "ok": False, "reason": "no_journal"}
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"portion": pid, "ok": False, "reason": "missing_doc"}
+        prev = next((p for p in _w.parse_portions(doc["body"]) if p["id"] == pid), None)
+        if prev is not None and body is not None and self._kept(doc_id, pid):
+            return {"portion": pid, "ok": False, "reason": "kept"}
+        inner = body if body is not None else (prev["body"] if prev else "")
+        eff = mode or (prev["mode"] if prev else None) or doc["body_mode"]
+        # a generated portion keeps its SOURCES in the tag : the links of the
+        # body you hand it become its explicit refs (the body is re-rendered)
+        refs = (list(dict.fromkeys(_w.body_refs(body)))
+                if body is not None and eff == _w.BODY_GENERATED else None)
+        new_body, _ = _w.set_portion_body(doc["body"], pid, inner, seeds=seeds,
+                                          mode=mode, refs=refs)
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
+                                     new_body, self._now())
+        doc = self.journal.get_wiki_doc(doc_id)
+        cur = next(p for p in _w.parse_portions(doc["body"]) if p["id"] == pid)
+        before = None if prev is None else {k: prev[k] for k in ("body", "seeds", "mode", "refs")}
+        after = {k: cur[k] for k in ("body", "seeds", "mode", "refs")}
+        self.journal.log_wiki_op(doc_id, f"portion:{pid}", "set", before, after, self._now())
+        eff_mode = cur["mode"] or doc["body_mode"]
+        if eff_mode == _w.BODY_GENERATED and not self._kept(doc_id, pid):
+            self._regenerate_portion(doc_id, pid)     # render from its sources
+        else:
+            self._relink(doc_id)
+        return {"portion": pid, "ok": True, "created": prev is None,
+                "mode": eff_mode, "seeds": cur["seeds"], "refs": cur["refs"]}
+
+    def remove_portion(self, doc_id: str, pid: str) -> Dict[str, Any]:
+        """Drop a portion (and detach its seeds). Refused when kept. Reversible."""
+        if self.journal is None:
+            return {"portion": pid, "removed": False, "reason": "no_journal"}
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"portion": pid, "removed": False, "reason": "missing_doc"}
+        if self._kept(doc_id, pid):
+            return {"portion": pid, "removed": False, "reason": "kept"}
+        body, prev = _w.remove_portion_tag(doc["body"], pid)
+        if prev is None:
+            return {"portion": pid, "removed": False, "reason": "unknown_portion"}
+        for s in self.journal.seeds_for_doc(doc_id):
+            if s["target"] == pid:
+                self.journal.remove_seed(doc_id, s["seed_id"])
+        self.journal.log_wiki_op(doc_id, f"portion:{pid}", "remove",
+                                 {k: prev[k] for k in ("body", "seeds", "mode", "refs")},
+                                 None, self._now())
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
+                                     body, self._now())
+        self._relink(doc_id)
+        return {"portion": pid, "removed": True}
+
+    def wiki_ops(self, doc_id: str) -> List[dict]:
+        """The reversible history of object edits on a doc (newest first)."""
+        return self.journal.wiki_ops_for_doc(doc_id) if self.journal is not None else []
+
+    def revert_wiki_op(self, op_id: int) -> Dict[str, Any]:
+        """Undo one object edit : restore the var binding / portion as it was
+        before the op (a removed one comes back, a created one leaves)."""
+        if self.journal is None:
+            return {"reverted": False, "reason": "no_journal"}
+        from metacog import wiki as _w
+        op = self.journal.get_wiki_op(op_id)
+        if op is None or op["reverted"]:
+            return {"reverted": False, "reason": "no_live_op"}
+        doc = self.journal.get_wiki_doc(op["doc_id"])
+        if doc is None:
+            return {"reverted": False, "reason": "missing_doc"}
+        kind, _, key = op["target"].partition(":")
+        before = op["before"]
+        if kind == "var":
+            body = (_w.remove_var_tag(doc["body"], key)[0] if before is None
+                    else _w.set_var_tag(doc["body"], key, before["node"], before["field"])[0])
+        elif kind == "portion":
+            body = (_w.remove_portion_tag(doc["body"], key)[0] if before is None
+                    else _w.set_portion_body(doc["body"], key, before["body"],
+                                             seeds=before["seeds"], mode=before["mode"],
+                                             refs=before.get("refs", []))[0])
+        else:
+            return {"reverted": False, "reason": "unknown_target"}
+        self.journal.upsert_wiki_doc(op["doc_id"], doc["type"], doc["title"],
+                                     doc["tags"], body, self._now())
+        self.journal.mark_wiki_op_reverted(op_id)
+        self._relink(op["doc_id"])
+        return {"reverted": True, "op": op["op"], "target": op["target"]}
+
+    # -- annotations ----------------------------------------------------------
+
+    def annotate(self, doc_id: str, target: str, note: str, kind: str = "note",
+                 author: Optional[str] = None) -> Dict[str, Any]:
+        """Attach a typed note to a portion id, a var name, a cited node id, or
+        the whole doc (`*`). `keep` protects its target from automatic
+        regeneration and from removal ; `purpose` / `todo` / `note` are read
+        like a bibliography (frontmatter + footnotes). Unknown targets are
+        refused so a note never dangles."""
+        if self.journal is None:
+            return {"annotation_id": None, "reason": "no_journal"}
+        from metacog import wiki as _w
+        if kind not in _w.ANNOTATION_KINDS:
+            return {"annotation_id": None, "reason": "unknown_kind",
+                    "kinds": list(_w.ANNOTATION_KINDS)}
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"annotation_id": None, "reason": "missing_doc"}
+        known = {"*"} | {p["id"] for p in _w.parse_portions(doc["body"])} \
+            | {v["name"] for v in _w.parse_vars(doc["body"])} \
+            | {r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)}
+        if target not in known:
+            return {"annotation_id": None, "reason": "unknown_target", "target": target}
+        aid = self.journal.add_annotation(doc_id, target, kind, note.strip(), author,
+                                         self._now())
+        self._reindex_okf(doc_id)
+        return {"annotation_id": aid, "doc_id": doc_id, "target": target, "kind": kind}
+
+    def annotations(self, doc_id: str, target: Optional[str] = None) -> List[dict]:
+        return (self.journal.annotations_for_doc(doc_id, target)
+                if self.journal is not None else [])
+
+    def remove_annotation(self, doc_id: str, annotation_id: int) -> Dict[str, Any]:
+        if self.journal is None:
+            return {"removed": False, "reason": "no_journal"}
+        ok = self.journal.remove_annotation(annotation_id)
+        if ok:
+            self._reindex_okf(doc_id)
+        return {"removed": ok}
+
+    def wiki_pending(self, doc_id: Optional[str] = None) -> List[dict]:
+        """Changes a doc still has to absorb : seed results that moved on an
+        authored / kept target (with the diff) plus drifted refs."""
+        if self.journal is None:
+            return []
+        out = list(self.journal.pending_for_doc(doc_id))
+        docs = [doc_id] if doc_id is not None else self.journal.all_wiki_doc_ids()
+        for d in docs:
+            for r in self.journal.wiki_refs_for_doc(d):
+                if r.get("outdated"):
+                    out.append({"doc_id": d, "target": r["node_id"],
+                                "reason": r["outdated"], "detail": {"ref": r["node_id"]}})
+        return out
 
     def refresh_wiki(self, doc_id: str, body: Optional[str] = None
                      ) -> Dict[str, Any]:
@@ -1516,6 +2010,7 @@ class Memory:
         id2p = {p.id: p for p in self.points}
         if body is None and doc["body_mode"] == _w.BODY_GENERATED:
             self._regenerate_doc(doc_id, id2p)
+            self.journal.resolve_pending(doc_id)
             return {"doc_id": doc_id, "refreshed": True, "body_mode": doc["body_mode"]}
         if body is None:
             changes = []
@@ -1529,15 +2024,18 @@ class Memory:
                     changes.append({"ref": r["node_id"], "reason": code,
                                     "content": (p.content if p else None),
                                     "tags": (_w.context_tags(p.tags) if p else [])})
+            for pnd in self.journal.pending_for_doc(doc_id):   # seed diffs
+                d = dict(pnd["detail"])
+                d["now_content"] = {i: id2p[i].content for i in d.get("now", [])
+                                    if i in id2p}
+                changes.append({"target": pnd["target"], "reason": pnd["reason"], **d})
             return {"doc_id": doc_id, "refreshed": False,
                     "reason": "authored_body_needs_text", "changes": changes}
-        refs = list(dict.fromkeys(
-            [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
-            + _w.body_refs(body)))
         self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
                                      body.strip(), self._now(),
                                      body_mode=_w.BODY_AUTHORED)
-        self.journal.set_wiki_refs(doc_id, refs, self._ref_fingerprints(refs, id2p))
+        refs = self._relink(doc_id, id2p, rebaseline=True)
+        self.journal.resolve_pending(doc_id)      # the new prose absorbed them
         issues = self._flag_unknown_refs(doc_id, refs, id2p)
         self._reindex_okf(doc_id)
         return {"doc_id": doc_id, "refreshed": True, "body_mode": _w.BODY_AUTHORED,
@@ -1616,6 +2114,28 @@ class Memory:
         st = self._doc_tool_status(doc, refs)      # proposed / established / retired
         if st:
             fields["status"] = st
+        # the objects, queryable too : seeds (queries), vars (names + bindings),
+        # portions (ids), annotations (kinds, keep targets), pending changes
+        from metacog import wiki as _w
+        seeds = self.journal.seeds_for_doc(doc_id)
+        if seeds:
+            fields["seeds"] = [s["query"] for s in seeds]
+        vs = _w.parse_vars(doc["body"])
+        if vs:
+            fields["vars"] = [v["name"] for v in vs]
+            fields["bindings"] = [v["node"] for v in vs if v.get("node")]
+        ps = _w.parse_portions(doc["body"])
+        if ps:
+            fields["portions"] = [p["id"] for p in ps]
+        anns = self.journal.annotations_for_doc(doc_id)
+        if anns:
+            fields["annotations"] = sorted({a["kind"] for a in anns})
+            keep = [a["target"] for a in anns if a["kind"] == "keep"]
+            if keep:
+                fields["keep"] = keep
+        pend = len(self.journal.pending_for_doc(doc_id))
+        if pend:
+            fields["pending"] = pend
         self.journal.index_okf_fields(doc_id, doc["type"], fields)
 
     def _doc_tool_status(self, doc: dict, refs: Sequence[str]) -> Optional[str]:
@@ -1685,6 +2205,16 @@ class Memory:
                     out.append({"doc_id": d, "code": "outdated_ref",
                                 "detail": {"ref": r["node_id"],
                                            "reason": r["outdated"]}})
+            id2p_chk = {p.id: p for p in self.points}
+            for v in _w.parse_vars(doc["body"]):
+                if not v.get("node") or self.resolve_alias(v["node"]) not in id2p_chk:
+                    out.append({"doc_id": d, "code": "unbound_var",
+                                "detail": {"var": v["name"], "node": v.get("node")}})
+            for pnd in self.journal.pending_for_doc(d):
+                out.append({"doc_id": d, "code": "pending_change",
+                            "detail": {"target": pnd["target"], "reason": pnd["reason"],
+                                       **{k: pnd["detail"][k] for k in ("seed_id", "added", "removed")
+                                          if k in pnd["detail"]}}})
             inline = _w.body_refs(doc["body"])
             for nid in inline:
                 if nid not in linked:
@@ -4069,6 +4599,12 @@ class Memory:
             out["wiki_stale_reasons"] = wr["reasons"]
             out["wiki_refreshed"] = wr["refreshed"]   # generated docs re-rendered
             out["wiki_outdated"] = wr["outdated"]     # authored docs flagged
+        # SEED QUERIES : re-run, diff against the cache, absorb / flag.
+        sr = self.rerun_seeds()
+        if sr["changed"]:
+            out["seeds_changed"] = sr["changed"]
+            out["seeds_refreshed"] = sr["refreshed"]
+            out["seeds_pending"] = sr["pending"]
         # PROPOSED -> ESTABLISHED : emergent tools that earned their uses.
         pt = self.promote_tools(t_now)
         if pt["promoted"]:

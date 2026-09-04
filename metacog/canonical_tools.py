@@ -53,6 +53,10 @@ CANONICAL: Set[str] = {
     "feed_wiki", "wiki_doc", "ingest_from_wiki", "wiki_where", "okf_schema",
     "import_okf", "docs_for_node", "check_wiki", "okf_proposals", "vet_okf_type",
     "refresh_wiki",
+    # wiki OBJECTS : seed queries, variables, portions, annotations, pending
+    # changes, reversible op history
+    "wiki_seed", "wiki_var", "wiki_portion", "wiki_annotate", "wiki_pending",
+    "wiki_ops",
 }
 
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------
