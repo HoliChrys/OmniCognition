@@ -103,18 +103,21 @@ CREATE INDEX IF NOT EXISTS idx_forget_node   ON forget_events(node_id);
 CREATE INDEX IF NOT EXISTS idx_forget_merged ON forget_events(merged);
 
 CREATE TABLE IF NOT EXISTS wiki_docs (
-    doc_id  TEXT PRIMARY KEY,
-    type    TEXT NOT NULL,
-    title   TEXT NOT NULL,
-    tags    TEXT NOT NULL,                        -- JSON array
-    body    TEXT NOT NULL,                        -- markdown (inline [[refs]]/#tags)
-    ts      REAL NOT NULL
+    doc_id    TEXT PRIMARY KEY,
+    type      TEXT NOT NULL,
+    title     TEXT NOT NULL,
+    tags      TEXT NOT NULL,                      -- JSON array
+    body      TEXT NOT NULL,                      -- markdown (inline [[refs]]/#tags)
+    ts        REAL NOT NULL,
+    body_mode TEXT                                -- 'generated' (from refs) | 'authored'
 );
 CREATE TABLE IF NOT EXISTS wiki_refs (
-    doc_id  TEXT NOT NULL,
-    node_id TEXT NOT NULL,                         -- a RAG node this doc cites
-    stale   INTEGER NOT NULL DEFAULT 0,            -- 1 = target gone/invalid
-    reason  TEXT,                                  -- WHY stale (explicit code)
+    doc_id      TEXT NOT NULL,
+    node_id     TEXT NOT NULL,                     -- a RAG node this doc cites
+    stale       INTEGER NOT NULL DEFAULT 0,        -- 1 = target gone/invalid
+    reason      TEXT,                              -- WHY stale (explicit code)
+    fingerprint TEXT,                              -- node content/tags hash at link time
+    outdated    TEXT,                              -- drift code when the node changed since
     PRIMARY KEY (doc_id, node_id)
 );
 CREATE INDEX IF NOT EXISTS idx_wikiref_node ON wiki_refs(node_id);
@@ -183,6 +186,58 @@ CREATE TABLE IF NOT EXISTS okf_derived (
 );
 CREATE INDEX IF NOT EXISTS idx_okfd_kv ON okf_derived(key, value);
 
+-- SEED QUERIES : semantic queries attached to a portion (or the whole doc,
+-- target '*') ; the ranked result is CACHED at creation and re-run offline —
+-- a different result is a change the attached portion must absorb.
+CREATE TABLE IF NOT EXISTS wiki_seeds (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id  TEXT NOT NULL,
+    seed_id TEXT NOT NULL,
+    query   TEXT NOT NULL,
+    target  TEXT NOT NULL DEFAULT '*',              -- portion id | '*'
+    k       INTEGER NOT NULL DEFAULT 7,
+    cached  TEXT NOT NULL,                         -- JSON ranked node ids
+    ts      REAL NOT NULL,
+    UNIQUE (doc_id, seed_id)
+);
+-- ANNOTATIONS : typed notes on a portion / var / ref / the doc ('*').
+CREATE TABLE IF NOT EXISTS wiki_annotations (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id  TEXT NOT NULL,
+    target  TEXT NOT NULL,
+    kind    TEXT NOT NULL,                         -- note | purpose | keep | todo
+    note    TEXT NOT NULL,
+    author  TEXT,
+    ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wikiann_doc ON wiki_annotations(doc_id);
+-- OPERATIONS on wiki objects (set / remove / replace a var or portion) :
+-- a ref never silently becomes a different string — every edit is a row
+-- with its before / after, reversible.
+CREATE TABLE IF NOT EXISTS wiki_ops (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id   TEXT NOT NULL,
+    target   TEXT NOT NULL,                        -- 'var:<name>' | 'portion:<id>'
+    op       TEXT NOT NULL,                        -- set | remove
+    before   TEXT,                                 -- JSON state before (NULL = created)
+    after    TEXT,                                 -- JSON state after  (NULL = removed)
+    ts       REAL NOT NULL,
+    reverted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_wikiops_doc ON wiki_ops(doc_id);
+-- PENDING changes a doc must absorb (a seed whose result moved on an authored
+-- or kept target) : what changed, for whom, until resolved.
+CREATE TABLE IF NOT EXISTS wiki_pending (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id   TEXT NOT NULL,
+    target   TEXT NOT NULL,
+    reason   TEXT NOT NULL,
+    detail   TEXT NOT NULL,                        -- JSON
+    ts       REAL NOT NULL,
+    resolved INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_wikipend_doc ON wiki_pending(doc_id);
+
 -- Out-of-vocabulary OKF terms (a new concept `type`) are PRESERVED as proposals
 -- rather than rejected or silently accepted : vetted later (accepted/rejected).
 CREATE TABLE IF NOT EXISTS okf_vocab (
@@ -197,7 +252,12 @@ CREATE TABLE IF NOT EXISTS okf_vocab (
 
 #: Columns added after a table first shipped ; applied idempotently on open so an
 #: existing journal file keeps working (the ONLY migration-ish step we do).
-_LATE_COLUMNS = [("wiki_refs", "reason", "TEXT")]
+_LATE_COLUMNS = [
+    ("wiki_refs", "reason", "TEXT"),
+    ("wiki_refs", "fingerprint", "TEXT"),
+    ("wiki_refs", "outdated", "TEXT"),
+    ("wiki_docs", "body_mode", "TEXT"),
+]
 
 
 class Journal:
@@ -350,42 +410,82 @@ class Journal:
 
     def upsert_wiki_doc(self, doc_id: str, type: str, title: str,
                         tags: Sequence[str], body: str,
-                        ts: Optional[float] = None) -> None:
-        """Create or replace a wiki doc's content (frontmatter + body)."""
+                        ts: Optional[float] = None,
+                        body_mode: Optional[str] = None) -> None:
+        """Create or replace a wiki doc's content (frontmatter + body).
+        `body_mode` : 'generated' (the body is the deterministic rendering of
+        its refs — safe to regenerate) or 'authored' (prose someone wrote —
+        never overwritten automatically). None keeps the existing mode
+        (defaulting to 'generated' for a new doc)."""
         ts = time.time() if ts is None else ts
+        if body_mode is None:
+            row = self.conn.execute(
+                "SELECT body_mode FROM wiki_docs WHERE doc_id = ?",
+                (str(doc_id),)).fetchone()
+            body_mode = (row["body_mode"] if row is not None else None) or "generated"
         self.conn.execute(
-            "INSERT INTO wiki_docs(doc_id, type, title, tags, body, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET "
+            "INSERT INTO wiki_docs(doc_id, type, title, tags, body, ts, body_mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET "
             "type=excluded.type, title=excluded.title, tags=excluded.tags, "
-            "body=excluded.body, ts=excluded.ts",
-            (str(doc_id), type, title, json.dumps(list(tags)), body, ts),
+            "body=excluded.body, ts=excluded.ts, body_mode=excluded.body_mode",
+            (str(doc_id), type, title, json.dumps(list(tags)), body, ts, body_mode),
         )
         self.conn.commit()
 
     def get_wiki_doc(self, doc_id: str) -> Optional[dict]:
         row = self.conn.execute(
-            "SELECT doc_id, type, title, tags, body, ts FROM wiki_docs "
+            "SELECT doc_id, type, title, tags, body, ts, body_mode FROM wiki_docs "
             "WHERE doc_id = ?", (str(doc_id),)).fetchone()
         if row is None:
             return None
         return {"doc_id": row["doc_id"], "type": row["type"],
                 "title": row["title"], "tags": json.loads(row["tags"]),
-                "body": row["body"], "ts": row["ts"]}
+                "body": row["body"], "ts": row["ts"],
+                "body_mode": row["body_mode"] or "generated"}
 
-    def set_wiki_refs(self, doc_id: str, node_ids: Sequence[str]) -> None:
-        """Replace a doc's node refs (the canonical wiki<->node links)."""
+    def set_wiki_refs(self, doc_id: str, node_ids: Sequence[str],
+                      fingerprints: Optional[dict] = None) -> None:
+        """Replace a doc's node refs (the canonical wiki<->node links), with
+        each node's fingerprint at link time when known ({node_id: fp})."""
+        fps = fingerprints or {}
         self.conn.execute("DELETE FROM wiki_refs WHERE doc_id = ?", (str(doc_id),))
         self.conn.executemany(
-            "INSERT OR IGNORE INTO wiki_refs(doc_id, node_id, stale) "
-            "VALUES (?, ?, 0)", [(str(doc_id), str(n)) for n in node_ids])
+            "INSERT OR IGNORE INTO wiki_refs(doc_id, node_id, stale, fingerprint) "
+            "VALUES (?, ?, 0, ?)",
+            [(str(doc_id), str(n), fps.get(str(n))) for n in node_ids])
+        self.conn.commit()
+
+    def set_ref_fingerprint(self, doc_id: str, node_id: str,
+                            fingerprint: Optional[str],
+                            clear_outdated: bool = True) -> None:
+        """Record what the doc last saw of this node (and clear its drift)."""
+        if clear_outdated:
+            self.conn.execute(
+                "UPDATE wiki_refs SET fingerprint = ?, outdated = NULL "
+                "WHERE doc_id = ? AND node_id = ?",
+                (fingerprint, str(doc_id), str(node_id)))
+        else:
+            self.conn.execute(
+                "UPDATE wiki_refs SET fingerprint = ? WHERE doc_id = ? AND node_id = ?",
+                (fingerprint, str(doc_id), str(node_id)))
+        self.conn.commit()
+
+    def mark_wiki_ref_outdated(self, doc_id: str, node_id: str,
+                               reason: Optional[str]) -> None:
+        """Flag (reason code) / clear (None) a ref whose node drifted since the
+        doc last saw it."""
+        self.conn.execute(
+            "UPDATE wiki_refs SET outdated = ? WHERE doc_id = ? AND node_id = ?",
+            (reason, str(doc_id), str(node_id)))
         self.conn.commit()
 
     def wiki_refs_for_doc(self, doc_id: str) -> List[dict]:
         rows = self.conn.execute(
-            "SELECT node_id, stale, reason FROM wiki_refs WHERE doc_id = ? "
-            "ORDER BY node_id", (str(doc_id),)).fetchall()
+            "SELECT node_id, stale, reason, fingerprint, outdated FROM wiki_refs "
+            "WHERE doc_id = ? ORDER BY node_id", (str(doc_id),)).fetchall()
         return [{"node_id": r["node_id"], "stale": bool(r["stale"]),
-                 "reason": r["reason"]} for r in rows]
+                 "reason": r["reason"], "fingerprint": r["fingerprint"],
+                 "outdated": r["outdated"]} for r in rows]
 
     def docs_referencing(self, node_id: str) -> List[str]:
         """Reverse link : which wiki docs cite this node (the RAG->wiki edge)."""
@@ -574,6 +674,150 @@ class Journal:
     def clear_okf_derived(self) -> None:
         self.conn.execute("DELETE FROM okf_derived")
         self.conn.commit()
+
+    # -- wiki objects : seeds / annotations / ops / pending -------------------
+
+    def upsert_seed(self, doc_id: str, seed_id: str, query: str, target: str,
+                    k: int, cached: Sequence[str],
+                    ts: Optional[float] = None) -> None:
+        ts = time.time() if ts is None else ts
+        self.conn.execute(
+            "INSERT INTO wiki_seeds(doc_id, seed_id, query, target, k, cached, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(doc_id, seed_id) DO UPDATE SET "
+            "query=excluded.query, target=excluded.target, k=excluded.k, "
+            "cached=excluded.cached, ts=excluded.ts",
+            (str(doc_id), str(seed_id), query, target or "*", int(k),
+             json.dumps([str(i) for i in cached]), ts))
+        self.conn.commit()
+
+    def set_seed_cache(self, doc_id: str, seed_id: str, cached: Sequence[str],
+                       ts: Optional[float] = None) -> None:
+        ts = time.time() if ts is None else ts
+        self.conn.execute(
+            "UPDATE wiki_seeds SET cached = ?, ts = ? WHERE doc_id = ? AND seed_id = ?",
+            (json.dumps([str(i) for i in cached]), ts, str(doc_id), str(seed_id)))
+        self.conn.commit()
+
+    def seeds_for_doc(self, doc_id: Optional[str] = None) -> List[dict]:
+        q = "SELECT doc_id, seed_id, query, target, k, cached, ts FROM wiki_seeds"
+        args: tuple = ()
+        if doc_id is not None:
+            q += " WHERE doc_id = ?"
+            args = (str(doc_id),)
+        rows = self.conn.execute(q + " ORDER BY id ASC", args).fetchall()
+        return [{"doc_id": r["doc_id"], "seed_id": r["seed_id"], "query": r["query"],
+                 "target": r["target"], "k": r["k"], "cached": json.loads(r["cached"]),
+                 "ts": r["ts"]} for r in rows]
+
+    def remove_seed(self, doc_id: str, seed_id: str) -> bool:
+        cur = self.conn.execute(
+            "DELETE FROM wiki_seeds WHERE doc_id = ? AND seed_id = ?",
+            (str(doc_id), str(seed_id)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def add_annotation(self, doc_id: str, target: str, kind: str, note: str,
+                       author: Optional[str] = None,
+                       ts: Optional[float] = None) -> int:
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO wiki_annotations(doc_id, target, kind, note, author, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (str(doc_id), str(target), kind, note, author, ts))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def annotations_for_doc(self, doc_id: str,
+                            target: Optional[str] = None) -> List[dict]:
+        q = ("SELECT id, doc_id, target, kind, note, author, ts FROM wiki_annotations "
+             "WHERE doc_id = ?")
+        args: list = [str(doc_id)]
+        if target is not None:
+            q += " AND target = ?"
+            args.append(str(target))
+        rows = self.conn.execute(q + " ORDER BY id ASC", args).fetchall()
+        return [{"id": r["id"], "doc_id": r["doc_id"], "target": r["target"],
+                 "kind": r["kind"], "note": r["note"], "author": r["author"],
+                 "ts": r["ts"]} for r in rows]
+
+    def remove_annotation(self, annotation_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM wiki_annotations WHERE id = ?",
+                                (int(annotation_id),))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def log_wiki_op(self, doc_id: str, target: str, op: str,
+                    before: Optional[dict], after: Optional[dict],
+                    ts: Optional[float] = None) -> int:
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO wiki_ops(doc_id, target, op, before, after, ts, reverted) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (str(doc_id), str(target), op,
+             None if before is None else json.dumps(before),
+             None if after is None else json.dumps(after), ts))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def wiki_ops_for_doc(self, doc_id: str) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT id, doc_id, target, op, before, after, ts, reverted FROM wiki_ops "
+            "WHERE doc_id = ? ORDER BY id DESC", (str(doc_id),)).fetchall()
+        return [{"id": r["id"], "doc_id": r["doc_id"], "target": r["target"],
+                 "op": r["op"],
+                 "before": None if r["before"] is None else json.loads(r["before"]),
+                 "after": None if r["after"] is None else json.loads(r["after"]),
+                 "ts": r["ts"], "reverted": bool(r["reverted"])} for r in rows]
+
+    def get_wiki_op(self, op_id: int) -> Optional[dict]:
+        r = self.conn.execute(
+            "SELECT id, doc_id, target, op, before, after, ts, reverted FROM wiki_ops "
+            "WHERE id = ?", (int(op_id),)).fetchone()
+        if r is None:
+            return None
+        return {"id": r["id"], "doc_id": r["doc_id"], "target": r["target"],
+                "op": r["op"],
+                "before": None if r["before"] is None else json.loads(r["before"]),
+                "after": None if r["after"] is None else json.loads(r["after"]),
+                "ts": r["ts"], "reverted": bool(r["reverted"])}
+
+    def mark_wiki_op_reverted(self, op_id: int) -> None:
+        self.conn.execute("UPDATE wiki_ops SET reverted = 1 WHERE id = ?", (int(op_id),))
+        self.conn.commit()
+
+    def add_pending(self, doc_id: str, target: str, reason: str, detail: dict,
+                    ts: Optional[float] = None) -> int:
+        ts = time.time() if ts is None else ts
+        cur = self.conn.execute(
+            "INSERT INTO wiki_pending(doc_id, target, reason, detail, ts, resolved) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (str(doc_id), str(target), reason, json.dumps(detail), ts))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def pending_for_doc(self, doc_id: Optional[str] = None) -> List[dict]:
+        q = ("SELECT id, doc_id, target, reason, detail, ts FROM wiki_pending "
+             "WHERE resolved = 0")
+        args: tuple = ()
+        if doc_id is not None:
+            q += " AND doc_id = ?"
+            args = (str(doc_id),)
+        rows = self.conn.execute(q + " ORDER BY id ASC", args).fetchall()
+        return [{"id": r["id"], "doc_id": r["doc_id"], "target": r["target"],
+                 "reason": r["reason"], "detail": json.loads(r["detail"]),
+                 "ts": r["ts"]} for r in rows]
+
+    def resolve_pending(self, doc_id: str, target: Optional[str] = None) -> int:
+        if target is None:
+            cur = self.conn.execute(
+                "UPDATE wiki_pending SET resolved = 1 WHERE doc_id = ? AND resolved = 0",
+                (str(doc_id),))
+        else:
+            cur = self.conn.execute(
+                "UPDATE wiki_pending SET resolved = 1 WHERE doc_id = ? AND target = ? "
+                "AND resolved = 0", (str(doc_id), str(target)))
+        self.conn.commit()
+        return cur.rowcount
 
     # -- OKF vocabulary proposals --------------------------------------------
 

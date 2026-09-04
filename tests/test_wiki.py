@@ -197,7 +197,8 @@ def test_wiki_noop_without_journal():
     m = Memory(encoder=SimpleEncoder())
     assert m.feed_wiki("d", "t", ["A"])["doc_id"] is None
     assert m.wiki_doc("d") is None
-    assert m.reconcile_wiki() == {"remapped": 0, "stale": 0, "reasons": {}}
+    assert m.reconcile_wiki() == {"remapped": 0, "stale": 0, "reasons": {},
+                                  "refreshed": 0, "outdated": 0}
     assert m.ingest_from_wiki("d", "x")["node_id"] is None
     assert m.wiki_where("type", "topic") == [] and m.okf_schema() == {}
     assert m.import_okf("d", "---\ntype: x\n---\n")["doc_id"] is None
