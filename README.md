@@ -102,15 +102,20 @@ agent should see*, and is the axis along which the MCP surface is gated
 - **T1 — canonical primitives** *(exposed).* The minimum to run the memory:
   **feed** (`ingest`, `ingest_message`, `push_code`), **ask** (`retrieve`,
   `walk_start`, `assemble_set`, `relate`), **observe** (`stats`, `inspect`,
-  `list_tags`), **feedback/correct** (`mark_useful`, `forget`).
+  `list_tags`), **feedback/correct** (`mark_useful`, `forget`, `revert_merge`),
+  and the **OKF wiki** primitives (`feed_wiki`, `wiki_doc`, `ingest_from_wiki`,
+  `wiki_where`, `okf_schema`, `import_okf`, `docs_for_node`, `check_wiki`,
+  `okf_proposals`, `vet_okf_type`) so an agent can build its own tools that
+  populate the wiki (§5.6, §5.7).
 - **T2 — agent-tool machinery** *(exposed).* How the agent creates, finds,
-  reuses, and retires its **own** tools (`ensure_tool`, `match_tool`,
+  reuses, vets and retires its **own** tools (`ensure_tool`, `match_tool`,
   `build_skill`, `list_tools_learned`, `report_tool`, `retire_tool`,
-  `update_tool`).
+  `update_tool`, `promote_tool`).
 - **T3 — internal** *(callable, not on the external surface).* The specialized
   retrieval modes the walk orchestrates (`presearch`, `scoped_*`, `clue_search`,
   `event_search`, `reason`, `walk_keepup`), the bag mechanism, observators, and
-  the **autonomic** passes (`sleep`, `save`, `audit`, `crystallize_skills`).
+  the **autonomic** passes (`sleep`, `save`, `audit`, `crystallize_skills`,
+  `infer_wiki`).
 
 The `external` surface = T1 + T2; T3 stays callable internally so the walk /
 sleep orchestrate it without cluttering the agent's toolset.
@@ -138,6 +143,17 @@ revives. Growth **and** decay, on tools as on facts.
 The moment an emergent tool is created it is **auto-registered as a wiki
 concept** (an OKF `type: tool` doc referencing the tool node, §5.6) — so the
 self-built capability set is also a browsable, queryable part of the deepwiki.
+A new tool starts **`proposed`** (fully usable — a proposal never blocks) and
+earns **`established`** by use (§5.7); the wiki doc exposes that `status`.
+
+The division of labour is strict: **canonical = primitives, emergent =
+workflows.** A task-specific capability such as "index a repository's history
+commit by commit into the wiki" is *not* a hardcoded tool — the agent creates it
+(`ensure_tool`), executes it with the primitives (`ingest` with tags,
+`feed_wiki`, `okf_proposals` / `vet_okf_type`, `wiki_where`, `check_wiki`),
+reuses it through `match_tool` and sees it promoted by the autonomic `sleep`.
+`tests/test_emergent_wiki_tool.py` runs that whole loop over the `external`
+MCP surface only.
 
 ---
 
@@ -815,6 +831,64 @@ a node from a scored retrieval has its `useful`/`useless` counts re-indexed and
 rendered in the OKF frontmatter, so docs can be queried and ranked by real
 feedback (`wiki_where("useful", "2")`).
 
+### 5.7 Safety rails on identity ops — redirects, reversibility, reasons, proposals
+
+The destructive half of the memory — forget, merge, lateral collapse, dedup —
+is where a self-organizing store can silently lose knowledge. Five rails,
+borrowed from knowledge-graph engineering practice, make it safe and legible.
+All live in the journal and no-op without one.
+
+**Active redirects, not one-shot rewrites.** Every forget→merge, lateral
+collapse and duplicate merge writes a **`merge_ledger`** row (`absorbed →
+keeper`, kind, *reason*, snapshot). `resolve_alias` follows the ledger and is
+**re-hydrated from it after a restart** (the alias map itself is not pickled),
+so a reference discovered *after* the merge — a late `feed_wiki`, an external
+`import_okf` citing an absorbed id, a new process — still lands on the keeper.
+Chains `A→B→C` resolve to the final survivor; `absorbed_into(C)` returns the
+transitive reverse edge (the coreferences that cascaded into `C`).
+
+**A reversible ledger.** Nothing destructive is final: `revert_merge(id)` undoes
+every live row for an id — drops its redirect, restores the node's pre-op state
+and tags from the *oldest* snapshot (a forget followed by a merge reverts to the
+original), and un-rewrites **exactly** the wiki refs that redirect rewrote. The
+`wiki_ref_remaps` table traces, per rewrite, *which* `[[…]]` occurrences came
+from the old id and whether the doc already cited the keeper — so the author's
+own `[[keeper]]` links are left alone. Rows are marked reverted, never deleted.
+
+**Explicit reason codes — never a silent collapse.** A stale wiki ref says *why*
+(`missing_node` / `invalidated` / `deprecated`, per ref and aggregated by
+`reconcile_wiki`). `feed_wiki` and `import_okf` return an `issues` list
+(`redirected` old→new, `missing_node` — the ref is **kept and flagged**, not
+dropped —, `no_frontmatter`, `type_proposed`/`type_rejected`). Every step of a
+tool's life is a **`tool_events`** row with a reason (`created`, `reused`, `ok`,
+`failed 1/2`, `retired: auto: 2 consecutive failures`, `promoted`, `rejected:
+synthesis_failed`, `wiki_register_failed: …`), readable through `tool_history`;
+`ensure_tool` returns `reason` instead of a bare `None` when it cannot build.
+
+**Consistency check ≠ inference.** `check_wiki` is a **read-only** pass that
+surfaces violations and writes nothing: `stale_ref` (with its reason),
+`body_ref_unlinked` (a `[[id]]` in the prose with no link row), `link_not_in_body`,
+`tag_not_in_frontmatter`, `empty_body`, `schema_drift` (a field ≥80% of the
+other docs of that type carry, missing here), and unvetted types. Separately,
+`infer_wiki` is **materialized inference, OFF by default** (`infer_enabled`;
+runs in `sleep` when on): derived fields — `related` docs via shared refs, `tags`
+a cited node gained since the doc was fed, `absorbed` ids redirected into a
+cited node — go to their **own table** (`okf_derived`), never into the asserted
+EAV index, and **asserted facts win** (an asserted `(key, value)` is never
+re-derived). `wiki_where(…, derived=True)` opts in at query time.
+
+**A proposal loop for out-of-vocabulary terms.** An OKF `type` outside the
+vetted vocabulary (`note` / `topic` / `tool` plus accepted ones) is **preserved
+as a proposal** (`okf_vocab`): the doc is written, indexed and queryable, and the
+term is neither rejected nor silently canonical until `vet_okf_type(t, accept)`
+(a rejected type flags its docs in `check_wiki`; the docs are never touched).
+The same loop governs emergent tools: every new tool starts **`proposed`** —
+fully usable — and earns **`established`** by use (`promote_tools` in `sleep`
+after `tool_promote_after` successful reports with no failure streak, or an
+explicit `promote_tool`); its wiki doc carries `status`, so
+`wiki_where("status", "proposed")` lists the capability set still awaiting
+vetting.
+
 ---
 
 ## 6. Evaluation
@@ -1224,13 +1298,19 @@ agent-facing surface — the walk / sleep orchestrate it.
 ```
 #####  T1 — CANONICAL primitives (exposed)  #####
 # feed
-ingest              add a FACT / THOUGHT / ACTION
+ingest              add a FACT / THOUGHT / ACTION (+ optional indexing `tags`,
+                    e.g. module:x / file:y — the scope of the node and the
+                    context tags of any wiki doc built from it)
 ingest_message      EPISODIC: index a message (user/agent), async, timestamped
 push_code           evaluate & route generated code → project doc and/or tool
 # ask
-retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
+retrieve            top-k hybrid retrieval (RRF) + cross-encoder rerank when
+                    a reranker is wired (rerank=false → cosine order);
+                    returns a retrieval_id (+ rerank_score).
                     abstain=true applies the ACT-R threshold → [] when no
-                    chunk is sufficiently activated ("I don't know") (§5.3)
+                    chunk is sufficiently activated ("I don't know") (§5.3);
+                    always appends the in-band GAP sentinel on such a query
+                    (the plugin's PostToolUse hook forces grounding, §7.4)
 walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
                     user_id/session_id add the double-query section boost. The
                     agent does BREADTH pivots, never micro-drives depth.
@@ -1245,15 +1325,34 @@ mark_useful         rate a past retrieval 0/1/2 → calibrates decay AND flows
 forget              soft-invalidate ONE node (reason required; optional
                     superseded_by) → append-only, drops from retrieval, a DB
                     event for the latent merge in sleep
+revert_merge        undo a forget/merge/collapse from the ledger: redirect,
+                    state/tags, and exactly the wiki refs it rewrote (§5.7)
+# OKF wiki (§5.6, §5.7) — author / query the RAG-extension knowledge layer
+feed_wiki           RAG→wiki: build/update an OKF doc from node ids (refs in
+                    frontmatter + inline [[id]]); returns `issues` with reasons
+wiki_doc            render a doc's current OKF markdown (live refs, feedback,
+                    tool status)
+ingest_from_wiki    wiki→RAG: ingest new prose as a node carrying the doc's tags
+wiki_where          query the EAV field index by any frontmatter field
+okf_schema          the schema recovered from the data ({type: [keys]})
+import_okf          consume an external OKF doc (redirects followed, issues
+                    reported, never silently dropped)
+docs_for_node       reverse link: which docs cite this node
+check_wiki          READ-ONLY consistency check (stale refs + reason, prose/link
+                    mismatches, schema drift, unvetted types) — writes nothing
+okf_proposals       out-of-vocabulary OKF types preserved as proposals
+vet_okf_type        accept / reject a proposed type (closes the vocabulary loop)
 
 #####  T2 — agent-tool machinery (exposed)  #####
-ensure_tool         get a tool, generating it if absent ("no tool → make it")
+ensure_tool         get a tool, generating it if absent ("no tool → make it");
+                    a new tool starts `proposed`; failures return a `reason`
 match_tool          fast-path: does a generated tool already cover this query?
 build_skill         task-mode walk → synthesise + ingest a named skill
 list_tools_learned  list the self-built tool set
 report_tool         reinforce a tool (ok) / auto-retire after repeated failures
-retire_tool         soft-deprecate (stop reuse) or hard-remove a tool
+retire_tool         soft-deprecate (stop reuse) or hard-remove a tool (+ reason)
 update_tool         rewrite a tool's body (re-embedded); revives a deprecated one
+promote_tool        vet a proposed tool as established (also autonomic in sleep)
 
 #####  T3 — internal (callable in `all`, NOT on the external surface)  #####
 # retrieval modes the walk orchestrates
@@ -1268,7 +1367,9 @@ collect · bag · bags · bag_render
 declare_observator · detect_polarized · spawn_observators · route · list_communities
 # autonomic (run by the system, not the caller)
 sleep               consolidation: collision + decay-fit + forget-merge +
-                    wiki reconcile (§5.3, §5.6)
+                    wiki reconcile + tool promotion (+ wiki inference when
+                    enabled) (§5.3, §5.6, §5.7)
+infer_wiki          materialized wiki inference → separate derived table (opt-in)
 save · audit · crystallize_skills
 # internal / admin
 observe · process_turn · capture_code_tool · ingest_skill · get_session_skill
@@ -1276,13 +1377,12 @@ observe · process_turn · capture_code_tool · ingest_skill · get_session_skil
 walk_next           walk_start now runs to completion
 ```
 
-> The **wiki layer** (§5.6 — `feed_wiki` / `wiki_doc` / `reconcile_wiki` /
-> `ingest_from_wiki` / `wiki_where` / `okf_schema` / `import_okf`) is currently a
-> library API on `Memory`, not yet an MCP tool surface.
+> The **wiki layer** (§5.6) is exposed as T1 primitives above; only
+> `reconcile_wiki` (offline sync) stays a library call, driven by `sleep`.
 
 **Surface (§5.5).** `METACOG_SURFACE` (or `build_app(surface=…)`) gates which
 tools are exposed: `all` (default) · `external` (the powerful-agent contract:
-feed / ask / manage-own-tools / observe / feedback / forget) · `external_light`
+feed / ask / manage-own-tools / observe / feedback / forget / wiki) · `external_light`
 (feed + ask) · `canonical` (T1 primitives). Unexposed tools stay callable
 internally. A **persistent journal** (`<storage>.journal.db`) is attached
 automatically so the SQL triggers, learned decay exponent and forget log survive
@@ -1305,6 +1405,61 @@ uv run python -m benchmarks.locomo.eval \
 ```
 
 ---
+
+### 7.4 Claude Code plugin — the memory as a hook-wired habit
+
+The repo is itself a **Claude Code plugin** (`.claude-plugin/plugin.json`,
+`hooks/hooks.json`, `bin/metacog-mcp.sh`): one install gives the MCP server
+*and* the hooks that turn the memory into a standing habit rather than a tool
+the model has to remember to call. This is the integration layer mnema wires by
+hand (a `~/.claude/CLAUDE.md` rule + `settings.json` hooks); here it ships with
+the package.
+
+```
+/plugin marketplace add HoliChrys/OmniCognition     # then
+/plugin install metacog@omnicognition
+# dev / local checkout :
+claude --plugin-dir /path/to/OmniCognition
+```
+
+| hook | script | what it does |
+|------|--------|--------------|
+| **SessionStart** | `hooks/session_start.py` | injects the **memory discipline** (recall before answering; feed every turn; remember what is durable; `forget` on correction; `mark_useful`; tools are memory) with the brain in use. No LLM, no memory load. |
+| **PostToolUse** on `retrieve` / `walk_start` | `hooks/recall_gap.py` | the **forcing layer**: the server emits an in-band **gap sentinel** (`⚠ NO RELEVANT MEMORY (gap)`) when no chunk is sufficiently activated (`Memory.abstains`, the ACT-R retrieval threshold, §5.3); the hook greps it and injects a just-in-time *"ground first, then `ingest`"* directive. A static rule read 50 turns ago loses to the parametric prior; a directive in the tool output the model just read does not. |
+| **SessionEnd** | `hooks/capture_session.py` | **auto-capture**: the user's own typed messages (tool results, slash commands and harness noise filtered out) are fed as episodic turns with their timestamps, **deduplicated** against what the session already indexed live, then one `sleep` cycle runs and the brain is saved. No LLM. |
+| **UserPromptSubmit** *(opt-in, `METACOG_AUTO_RECALL=1`)* | `hooks/auto_recall.py` | the cheap recall path (`retrieve`, k=5, no walk) injected before every prompt; silent on a gap. Off by default because it opens the brain in a fresh process on every turn — the default discipline is the model calling `retrieve` itself, with the gap hook as the safety net. |
+
+**Which brain.** The launcher and every hook resolve the storage the same way:
+a **`.metacog-brain`** marker file walked up from the project directory (first
+non-empty, non-comment line = the path — so a dev repo keeps its *own* memory
+instead of polluting the shared one; this has to live in the scripts, not in
+settings, because Claude Code merges hooks across scopes), else
+`METACOG_STORAGE`, else `~/.metacog/memory.pkl`. The plugin exposes the
+`external` surface (§5.5) unless `METACOG_SURFACE` says otherwise, and runs
+`python3` unless `METACOG_PYTHON` points elsewhere (a venv with `mcp<2`). Every
+hook is silent and exits 0 on anything unexpected — a hook must never break the
+session.
+
+**Which encoder.** The server and the hooks embed with the **production
+encoder** — mnema's stack: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+(384 dims, FR/EN) run locally as ONNX by `fastembed`, no torch, no API
+(`metacog.defaults.FastEmbedEncoder`). `METACOG_ENCODER` overrides (`auto` |
+`fastembed[:model]` | `org/model` | `simple[:dim]`); `auto` falls back to the
+hash `SimpleEncoder` **with a stderr warning** when fastembed is missing, an
+explicit `fastembed` never downgrades silently. A brain is **stamped with its
+encoder id** on save; reopening it with another encoder **re-encodes every
+point once** from content (learned geometric pulls are reset) and says so —
+cosines across two embedding spaces are never silently compared.
+
+**Which reranker.** The server also wires mnema's second stage: a **local
+cross-encoder** (`jinaai/jina-reranker-v2-base-multilingual`, ONNX/CPU, ~1.1 GB;
+`METACOG_RERANKER` = `auto` | `fastembed[:model]` | `none`, `auto` falls back to
+cosine-only with a warning). `retrieve` then runs *cosine pre-fetch (30) → joint
+(query, doc) scoring → sigmoid → top-k*, **before** the ACT-R need-odds /
+spreading blends (mnema's `blend_scores` order), and returns the raw logit as
+`rerank_score`; `rerank=false` forces the cosine order. The same model is what
+the oblique judge (§3.4) uses as its zero-token pre-filter. Hooks deliberately
+run without it (a 1 GB model per hook process is not worth a k=5 recall).
 
 ## References
 

@@ -201,6 +201,16 @@ class Memory:
     # only nodes already accessed then gone cold (never the untried), tools
     # protected, emergent threshold (mean - std of need-odds).
     forget_enabled: bool = False
+    # MATERIALIZED wiki inference in sleep (opt-in, OFF by default). Derived
+    # OKF fields go to their OWN table (`okf_derived`) ; asserted fields always
+    # win. `check_wiki` (read-only consistency) never depends on this.
+    infer_enabled: bool = False
+    # Emergent tools start PROPOSED ; auto-promoted in sleep once they earned
+    # this many successful uses with no failure streak (or via promote_tool).
+    tool_promote_after: int = 3
+    # In-memory alias map re-hydrated ONCE from the journal's merge ledger (so
+    # redirects survive a restart even though the alias map is not pickled).
+    _aliases_hydrated: bool = False
     # Run the SAME hierarchical refinement at INGEST time for each created
     # FACT/ACTION (opt-in) instead of waiting for latent sleep. Costs one LLM
     # call per node on the hot path — off by default ; sleep is the cheap path.
@@ -1034,7 +1044,8 @@ class Memory:
             return {"forgotten": None, "error": "reason required"}
         p = next((q for q in self.points if q.id == node_id), None)
         if p is None:
-            return {"forgotten": None}
+            return {"forgotten": None, "reason": "missing_node"}
+        snap = self._node_snapshot(p)             # what a revert restores
         p.state = EpistemicState.INVALID          # hidden, not deleted
         if "invalidated" not in p.tags:
             p.tags.append("invalidated")
@@ -1047,6 +1058,9 @@ class Memory:
             try:
                 self.journal.log_forget(node_id, str(reason), superseded_by,
                                         self._now())
+                # ledger row (keeper None) : the forget itself is reversible
+                self.journal.log_merge(node_id, None, "forget", str(reason),
+                                       snap, self._now())
             except Exception:
                 pass
         return {"forgotten": node_id, "reason": str(reason),
@@ -1066,11 +1080,139 @@ class Memory:
         for ev in pending:
             succ = ev.get("superseded_by")
             if succ:
-                keeper = self._merge_aliases.get(succ, succ)
-                self._merge_aliases[ev["node_id"]] = keeper
+                self._alias(ev["node_id"], succ, "merge", ev.get("reason") or
+                            f"superseded by {succ}")
                 aliased.append(ev["node_id"])
             self.journal.mark_forget_merged(ev["id"])
         return {"merged": len(pending), "aliased": aliased}
+
+    # ------------------------------------------------------------------
+    # Merge ledger — persistent redirects + reversibility
+    # ------------------------------------------------------------------
+
+    def _node_snapshot(self, p: Optional[Point]) -> Dict[str, Any]:
+        """What `revert_merge` restores : the node's epistemic state + tags."""
+        if p is None:
+            return {}
+        return {"state": p.state.value, "tags": list(p.tags or [])}
+
+    def _alias(self, absorbed: str, keeper: str, kind: str,
+               reason: str) -> str:
+        """Redirect `absorbed` -> the CANONICAL keeper (chained through the
+        existing map, so older absorbed ids still land on the final survivor)
+        and record it in the journal's merge ledger — a persistent, reversible
+        redirect. Returns the resolved keeper."""
+        keeper = self._merge_aliases.get(keeper, keeper)
+        self._merge_aliases[absorbed] = keeper
+        if self.journal is not None:
+            try:
+                p = next((q for q in self.points if q.id == absorbed), None)
+                self.journal.log_merge(absorbed, keeper, kind, reason,
+                                       self._node_snapshot(p), self._now())
+            except Exception:
+                pass
+        return keeper
+
+    def _hydrate_aliases(self) -> None:
+        """Re-load the live redirects from the journal ONCE (after a restart the
+        alias map is empty while the ledger still knows every absorbed id)."""
+        if self._aliases_hydrated or self.journal is None:
+            return
+        self._aliases_hydrated = True
+        try:
+            for absorbed, keeper in self.journal.active_redirects().items():
+                self._merge_aliases.setdefault(absorbed, keeper)
+        except Exception:
+            pass
+
+    def absorbed_into(self, node_id: str) -> List[str]:
+        """Reverse redirect, transitive : every id that now resolves to
+        `node_id` because it was forgotten→merged / laterally collapsed /
+        deduplicated into it (or into something that was). [] w/o journal."""
+        if self.journal is None:
+            return []
+        self._hydrate_aliases()
+        out: List[str] = []
+        frontier = [self.resolve_alias(str(node_id))]
+        seen = set(frontier)
+        while frontier:
+            nxt = []
+            for k in frontier:
+                for a in self.journal.absorbed_by(k):
+                    if a not in seen:
+                        seen.add(a)
+                        out.append(a)
+                        nxt.append(a)
+            frontier = nxt
+        return out
+
+    def merge_history(self, node_id: Optional[str] = None) -> List[dict]:
+        """The ledger of destructive identity ops (newest first), all or for
+        one absorbed id — each with its explicit reason. [] w/o journal."""
+        if self.journal is None:
+            return []
+        return self.journal.merge_history(node_id)
+
+    def revert_merge(self, absorbed_id: str) -> Dict[str, Any]:
+        """UNDO every live ledger row for `absorbed_id` : drop its redirect,
+        restore the node's pre-op state/tags from the OLDEST snapshot (so a
+        forget followed by a merge reverts to the original), un-rewrite exactly
+        the wiki refs that redirect rewrote (`wiki_ref_remaps`), re-index the
+        touched docs, and mark the rows reverted. A node hard-removed from the
+        cloud cannot be restored (the redirect is still dropped). Returns
+        {reverted: n_rows, restored, docs, reason?}."""
+        from metacog import wiki as _w
+        from metacog.epistemic import EpistemicState
+        if self.journal is None:
+            return {"reverted": 0, "restored": False, "docs": [],
+                    "reason": "no_journal"}
+        self._hydrate_aliases()
+        rows = self.journal.merge_history(absorbed_id, include_reverted=False)
+        if not rows:
+            return {"reverted": 0, "restored": False, "docs": [],
+                    "reason": "no_live_ledger_row"}
+        self._merge_aliases.pop(absorbed_id, None)
+        # restore from the OLDEST snapshot (rows are newest-first)
+        snap = next((r["snapshot"] for r in reversed(rows) if r["snapshot"]), {})
+        p = next((q for q in self.points if q.id == absorbed_id), None)
+        restored = False
+        if p is not None and snap:
+            try:
+                p.state = EpistemicState(snap.get("state", p.state.value))
+            except ValueError:
+                pass
+            p.tags = list(snap.get("tags", p.tags))
+            restored = True
+        for r in rows:
+            self.journal.mark_merge_reverted(r["id"])
+        # un-rewrite the wiki refs this redirect rewrote — those only
+        docs: List[str] = []
+        for rm in self.journal.ref_remaps_from(absorbed_id):
+            doc = self.journal.get_wiki_doc(rm["doc_id"])
+            if doc is not None:
+                if rm["had_new"]:                  # the doc cited new itself
+                    self.journal.set_wiki_refs(
+                        rm["doc_id"],
+                        [r["node_id"] for r in
+                         self.journal.wiki_refs_for_doc(rm["doc_id"])]
+                        + [rm["old_id"]])
+                else:
+                    self.journal.remap_wiki_ref(rm["doc_id"], rm["new_id"],
+                                                rm["old_id"])
+                nb = _w.revert_body_refs(doc["body"], rm["new_id"],
+                                         rm["old_id"], rm["ordinals"])
+                if nb != doc["body"]:
+                    self.journal.upsert_wiki_doc(rm["doc_id"], doc["type"],
+                                                 doc["title"], doc["tags"], nb,
+                                                 self._now())
+                self._reindex_okf(rm["doc_id"])
+                if rm["doc_id"] not in docs:
+                    docs.append(rm["doc_id"])
+            self.journal.mark_ref_remap_reverted(rm["id"])
+        out = {"reverted": len(rows), "restored": restored, "docs": docs}
+        if p is None:
+            out["reason"] = "node_gone"
+        return out
 
     # ------------------------------------------------------------------
     # OKF wiki — a bidirectional, continuously-evolving RAG extension
@@ -1085,8 +1227,34 @@ class Memory:
         try:
             title = (tool.content or tool.id).strip()[:80]
             self.feed_wiki(f"tool:{tool.id}", title, [tool.id], type="tool")
+        except Exception as exc:                 # never silent : say why
+            self._tool_event(tool.id, "wiki_register_failed", repr(exc)[:200])
+
+    def _tool_event(self, tool_id: str, event: str,
+                    reason: Optional[str] = None) -> None:
+        """Append a tool lifecycle event with its explicit reason (no-op w/o
+        journal ; failure-safe)."""
+        if self.journal is None:
+            return
+        try:
+            self.journal.log_tool_event(tool_id, event, reason, self._now())
         except Exception:
             pass
+
+    def _vet_type(self, doc_id: str, type: str) -> List[Dict[str, str]]:
+        """Out-of-vocabulary OKF `type` : never blocks the write, never becomes
+        canonical silently — it is PRESERVED as a proposal until vetted.
+        Returns the issue(s) to surface ([] for a known / accepted type)."""
+        from metacog import wiki as _w
+        if type in _w.KNOWN_OKF_TYPES or self.journal is None:
+            return []
+        st = self.journal.vocab_status("type", type)
+        if st == "accepted":
+            return []
+        if st == "rejected":
+            return [{"type": type, "reason": _w.TYPE_REJECTED}]
+        self.journal.propose_vocab("type", type, doc_id, self._now())
+        return [{"type": type, "reason": _w.TYPE_PROPOSED}]
 
     def feed_wiki(self, doc_id: str, title: str, node_ids: Sequence[str], *,
                   type: str = "note", body: Optional[str] = None,
@@ -1097,12 +1265,16 @@ class Memory:
         (`#tag`), and the wiki<->node links are stored in the DB. Ids are resolved
         to their live canonical node first. No-op without a journal."""
         if self.journal is None:
-            return {"doc_id": None}
+            return {"doc_id": None, "reason": "no_journal"}
         from metacog import wiki as _w
         id2p = {p.id: p for p in self.points}
         ids: List[str] = []
+        issues: List[Dict[str, str]] = []
         for nid in node_ids:
             r = self.resolve_alias(str(nid))
+            if r != str(nid):
+                issues.append({"ref": str(nid), "to": r,
+                               "reason": _w.REF_REDIRECTED})
             if r not in ids:
                 ids.append(r)
         tags: List[str] = []
@@ -1119,8 +1291,26 @@ class Memory:
         self.journal.upsert_wiki_doc(doc_id, type, title, tags, body, ts)
         refs = list(dict.fromkeys(ids + _w.body_refs(body)))   # links = union
         self.journal.set_wiki_refs(doc_id, refs)
+        issues += self._flag_unknown_refs(doc_id, refs, id2p)
+        issues += self._vet_type(doc_id, type)
         self._reindex_okf(doc_id)
-        return {"doc_id": doc_id, "refs": refs, "tags": tags}
+        return {"doc_id": doc_id, "refs": refs, "tags": tags, "issues": issues}
+
+    def _flag_unknown_refs(self, doc_id: str, refs: Sequence[str],
+                           id2p: Optional[Dict[str, Point]] = None
+                           ) -> List[Dict[str, str]]:
+        """A ref to a node that does not exist is KEPT (the link is the
+        author's assertion) but flagged stale at once with an explicit reason,
+        and reported back — never dropped silently."""
+        from metacog import wiki as _w
+        if id2p is None:
+            id2p = {p.id: p for p in self.points}
+        out: List[Dict[str, str]] = []
+        for nid in refs:
+            if nid not in id2p:
+                self.journal.mark_wiki_ref_stale(doc_id, nid, True, _w.REF_MISSING)
+                out.append({"ref": nid, "reason": _w.REF_MISSING})
+        return out
 
     def wiki_doc(self, doc_id: str) -> Optional[str]:
         """Render the current OKF markdown (frontmatter refs from the live link
@@ -1134,6 +1324,9 @@ class Memory:
         refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
         fb = self._doc_usefulness(doc_id)          # feedback = first-order
         extra = {k: v for k, v in fb.items() if v}
+        st = self._doc_tool_status(doc, refs)
+        if st:
+            extra["status"] = st
         return _w.render_okf(type=doc["type"], title=doc["title"],
                              tags=doc["tags"], refs=refs, body=doc["body"],
                              timestamp=doc["ts"], extra=extra)
@@ -1150,38 +1343,55 @@ class Memory:
         `[[…]]`; flag refs whose target is gone or INVALID as stale so the doc is
         known to need revision. No-op without a journal."""
         if self.journal is None:
-            return {"remapped": 0, "stale": 0}
+            return {"remapped": 0, "stale": 0, "reasons": {}}
         from metacog import wiki as _w
         from metacog.epistemic import EpistemicState
         id2p = {p.id: p for p in self.points}
         remapped = stale = 0
+        reasons: Dict[str, int] = {}
         for doc_id in self.journal.all_wiki_doc_ids():
             doc = self.journal.get_wiki_doc(doc_id)
             mapping: Dict[str, str] = {}
+            had_new: Dict[str, bool] = {}
+            linked = {r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)}
             for r in self.journal.wiki_refs_for_doc(doc_id):
                 nid = r["node_id"]
                 resolved = self.resolve_alias(nid)
                 if resolved != nid:                    # node merged -> redirect
+                    had_new[nid] = resolved in linked  # revert must not unlink it
                     self.journal.remap_wiki_ref(doc_id, nid, resolved)
+                    linked.add(resolved)
                     mapping[nid] = resolved
                     remapped += 1
                     nid = resolved
                     self._reindex_okf(doc_id)          # refs changed -> reindex
                 p = id2p.get(nid)
-                gone = (p is None or p.state in (EpistemicState.INVALID,
-                                                 EpistemicState.DEPRECATED))
-                if gone:
-                    self.journal.mark_wiki_ref_stale(doc_id, nid, True)
+                # explicit reason code, never a bare boolean
+                if p is None:
+                    why: Optional[str] = _w.REF_MISSING
+                elif p.state is EpistemicState.INVALID:
+                    why = _w.REF_INVALIDATED
+                elif p.state is EpistemicState.DEPRECATED:
+                    why = _w.REF_DEPRECATED
+                else:
+                    why = None
+                if why is not None:
+                    self.journal.mark_wiki_ref_stale(doc_id, nid, True, why)
                     stale += 1
+                    reasons[why] = reasons.get(why, 0) + 1
                 elif r["stale"]:
                     self.journal.mark_wiki_ref_stale(doc_id, nid, False)
             if mapping:
-                nb = _w.rewrite_body_refs(doc["body"], mapping)
+                nb, trace = _w.rewrite_body_refs_traced(doc["body"], mapping)
                 if nb != doc["body"]:
                     self.journal.upsert_wiki_doc(doc_id, doc["type"],
                                                  doc["title"], doc["tags"], nb,
                                                  self._now())
-        return {"remapped": remapped, "stale": stale}
+                for old, new in mapping.items():   # the undo trace, per redirect
+                    self.journal.log_ref_remap(
+                        doc_id, old, new, had_new=had_new.get(old, False),
+                        ordinals=trace.get(old, []), ts=self._now())
+        return {"remapped": remapped, "stale": stale, "reasons": reasons}
 
     def ingest_from_wiki(self, doc_id: str, text: str, *,
                          kind: str = "FACT") -> Dict[str, Any]:
@@ -1189,10 +1399,10 @@ class Memory:
         the doc's tags as CONTEXT, and link it back into the doc (a new ref +
         inline `[[…]]`). Returns {node_id}. No-op without a journal / doc."""
         if self.journal is None:
-            return {"node_id": None}
+            return {"node_id": None, "reason": "no_journal"}
         doc = self.journal.get_wiki_doc(doc_id)
         if doc is None:
-            return {"node_id": None}
+            return {"node_id": None, "reason": "missing_doc"}
         p = self.ingest(text, kind=kind)
         for tg in doc["tags"]:                          # carry the doc's context
             if tg not in p.tags:
@@ -1230,20 +1440,186 @@ class Memory:
             return
         refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
         fb = self._doc_usefulness(doc_id)
-        self.journal.index_okf_fields(doc_id, doc["type"], {
+        fields = {
             "type": doc["type"], "title": doc["title"], "tags": doc["tags"],
             "refs": refs, "useful": fb["useful"], "useless": fb["useless"],
             "timestamp": doc["ts"],
-        })
+        }
+        st = self._doc_tool_status(doc, refs)      # proposed / established / retired
+        if st:
+            fields["status"] = st
+        self.journal.index_okf_fields(doc_id, doc["type"], fields)
 
-    def wiki_where(self, key: str,
-                   value: Optional[str] = None) -> List[str]:
+    def _doc_tool_status(self, doc: dict, refs: Sequence[str]) -> Optional[str]:
+        """For a type=tool doc, the lifecycle status of the tool it registers."""
+        if doc.get("type") != "tool":
+            return None
+        for nid in refs:
+            tool = self._find_tool(nid)
+            if tool is not None:
+                return self.tool_status(tool)
+        return None
+
+    def wiki_where(self, key: str, value: Optional[str] = None,
+                   derived: bool = False) -> List[str]:
         """Query the OKF EAV index : doc ids having frontmatter field `key`
         (= `value` if given). e.g. wiki_where('tags', 'health:fatigue') or
-        wiki_where('refs', node_id). [] without a journal."""
+        wiki_where('refs', node_id). ASSERTED fields only by default ;
+        `derived=True` also matches the materialized inferences (`okf_derived`).
+        [] without a journal."""
         if self.journal is None:
             return []
-        return self.journal.okf_docs_where(key, value)
+        out = self.journal.okf_docs_where(key, value)
+        if derived:
+            for d in self.journal.okf_derived_docs_where(key, value):
+                if d not in out:
+                    out.append(d)
+            out.sort()
+        return out
+
+    # -- consistency check (read-only) vs materialized inference (opt-in) -----
+
+    def check_wiki(self, doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """READ-ONLY consistency pass : surfaces violations, writes NOTHING.
+        Codes : `stale_ref` (with the ref's reason), `body_ref_unlinked` (a
+        `[[id]]` in the prose with no link row), `link_not_in_body` (a link row
+        the prose never cites), `tag_not_in_frontmatter` (inline #tag missing
+        from the frontmatter), `empty_body`, `schema_drift` (a field ≥80% of the
+        other docs of this type carry, missing here), `type_proposed` /
+        `type_rejected` (vocabulary not vetted). [] without a journal."""
+        if self.journal is None:
+            return []
+        from metacog import wiki as _w
+        ids = [doc_id] if doc_id is not None else self.journal.all_wiki_doc_ids()
+        # per-type field prevalence over ASSERTED fields (for schema_drift)
+        by_type: Dict[str, Dict[str, int]] = {}
+        n_type: Dict[str, int] = {}
+        for d in self.journal.all_wiki_doc_ids():
+            f = self.journal.okf_fields_of(d)
+            t = (f.get("type") or ["?"])[0]
+            n_type[t] = n_type.get(t, 0) + 1
+            for k in f:
+                by_type.setdefault(t, {})[k] = by_type.get(t, {}).get(k, 0) + 1
+        out: List[Dict[str, Any]] = []
+        for d in ids:
+            doc = self.journal.get_wiki_doc(d)
+            if doc is None:
+                out.append({"doc_id": d, "code": "missing_doc", "detail": None})
+                continue
+            refs = self.journal.wiki_refs_for_doc(d)
+            linked = {r["node_id"] for r in refs}
+            for r in refs:
+                if r["stale"]:
+                    out.append({"doc_id": d, "code": "stale_ref",
+                                "detail": {"ref": r["node_id"],
+                                           "reason": r["reason"]}})
+            inline = _w.body_refs(doc["body"])
+            for nid in inline:
+                if nid not in linked:
+                    out.append({"doc_id": d, "code": "body_ref_unlinked",
+                                "detail": {"ref": nid}})
+            for nid in sorted(linked - set(inline)):
+                out.append({"doc_id": d, "code": "link_not_in_body",
+                            "detail": {"ref": nid}})
+            fm_tags = {t.lower() for t in doc["tags"]}
+            for tg in _w.body_tags(doc["body"]):
+                if tg not in fm_tags:
+                    out.append({"doc_id": d, "code": "tag_not_in_frontmatter",
+                                "detail": {"tag": tg}})
+            if not doc["body"].strip():
+                out.append({"doc_id": d, "code": "empty_body", "detail": None})
+            t = doc["type"]
+            mine = set(self.journal.okf_fields_of(d))
+            n_others = n_type.get(t, 1) - 1
+            if n_others >= 2:
+                for k, c in by_type.get(t, {}).items():
+                    if k not in mine and (c / n_others) >= 0.8:
+                        out.append({"doc_id": d, "code": "schema_drift",
+                                    "detail": {"field": k, "type": t}})
+            if t not in _w.KNOWN_OKF_TYPES:
+                st = self.journal.vocab_status("type", t)
+                if st == "rejected":
+                    out.append({"doc_id": d, "code": _w.TYPE_REJECTED,
+                                "detail": {"type": t}})
+                elif st != "accepted":
+                    out.append({"doc_id": d, "code": _w.TYPE_PROPOSED,
+                                "detail": {"type": t}})
+        return out
+
+    def infer_wiki(self, apply: Optional[bool] = None) -> Dict[str, Any]:
+        """MATERIALIZED inference over the wiki — derived fields written to
+        their OWN table (`okf_derived`), never into the asserted index, and
+        only when applied (`apply` defaults to `infer_enabled`, OFF). Asserted
+        facts win : a (key, value) the doc already asserts is never derived.
+        Rules : `shared_ref` (docs citing a common node -> `related`),
+        `node_tag_drift` (tags a cited node gained since the doc was fed ->
+        `tags`), `redirect` (ids absorbed into a cited node -> `absorbed`).
+        Returns {applied, derived, rows} (rows = the preview when not applied)."""
+        if self.journal is None:
+            return {"applied": False, "derived": 0, "rows": []}
+        from metacog import wiki as _w
+        do_apply = self.infer_enabled if apply is None else bool(apply)
+        id2p = {p.id: p for p in self.points}
+        docs = self.journal.all_wiki_doc_ids()
+        doc_refs = {d: [r["node_id"] for r in self.journal.wiki_refs_for_doc(d)]
+                    for d in docs}
+        citing: Dict[str, List[str]] = {}
+        for d, refs in doc_refs.items():
+            for nid in refs:
+                citing.setdefault(nid, []).append(d)
+        rows: List[Dict[str, str]] = []
+        per_doc: Dict[str, List[tuple]] = {}
+        for d in docs:
+            asserted = self.journal.okf_fields_of(d)
+            have = {(k, v) for k, vs in asserted.items() for v in vs}
+            cand: List[tuple] = []
+            for nid in doc_refs[d]:
+                for other in citing.get(nid, []):
+                    if other != d:
+                        cand.append(("related", other, "shared_ref"))
+                p = id2p.get(nid)
+                if p is not None:
+                    for tg in _w.context_tags(p.tags):
+                        cand.append(("tags", tg, "node_tag_drift"))
+                for a in self.absorbed_into(nid):
+                    cand.append(("absorbed", a, "redirect"))
+            seen = set()
+            for k, v, rule in cand:
+                if (k, v) in have or (k, v) in seen:
+                    continue                      # asserted wins / dedup
+                seen.add((k, v))
+                per_doc.setdefault(d, []).append((k, v, rule))
+                rows.append({"doc_id": d, "key": k, "value": v, "rule": rule})
+        if do_apply:
+            for d in docs:
+                self.journal.set_okf_derived(d, per_doc.get(d, []), self._now())
+        return {"applied": do_apply, "derived": len(rows),
+                "rows": [] if do_apply else rows}
+
+    def okf_derived(self, doc_id: str) -> List[dict]:
+        """The materialized inferences of a doc (empty unless infer applied)."""
+        return self.journal.okf_derived_of(doc_id) if self.journal is not None else []
+
+    # -- vocabulary proposal loop ---------------------------------------------
+
+    def okf_proposals(self, status: Optional[str] = "proposed") -> List[dict]:
+        """Out-of-vocabulary OKF terms preserved as proposals (or filter by
+        status : 'accepted' / 'rejected' / None = all). [] w/o journal."""
+        if self.journal is None:
+            return []
+        return self.journal.vocab("type", status)
+
+    def vet_okf_type(self, type: str, accept: bool) -> Dict[str, Any]:
+        """Close the loop on a proposed `type` : accept it into the vocabulary
+        (its docs stop being flagged) or reject it (they are flagged
+        `type_rejected` by check_wiki — the docs themselves are never touched).
+        Returns {type, status, docs}."""
+        if self.journal is None:
+            return {"type": type, "status": None, "docs": []}
+        status = "accepted" if accept else "rejected"
+        self.journal.vet_vocab("type", type, status, self._now())
+        return {"type": type, "status": status,
+                "docs": self.journal.okf_docs_where("type", type)}
 
     def okf_schema(self) -> Dict[str, List[str]]:
         """The recovered OKF schema — {type: [frontmatter keys]} derived from the
@@ -1260,17 +1636,33 @@ class Memory:
         hand-written / third-party OKF bundle becomes queryable and evolves with
         the RAG. No-op without a journal."""
         if self.journal is None:
-            return {"doc_id": None}
+            return {"doc_id": None, "reason": "no_journal"}
         from metacog import wiki as _w
         d = _w.parse_okf(markdown)
+        issues: List[Dict[str, str]] = []
+        if not d.get("has_frontmatter", True):
+            issues.append({"reason": _w.DOC_NO_FRONTMATTER})
         ts = d.get("timestamp")
         ts = self._now() if ts is None else float(ts)
+        # an external bundle may cite ids that were since absorbed : follow the
+        # redirects (and rewrite the prose) instead of linking a dead id
+        raw = list(dict.fromkeys(list(d["refs"]) + _w.body_refs(d["body"])))
+        mapping = {}
+        for nid in raw:
+            r = self.resolve_alias(str(nid))
+            if r != nid:
+                mapping[nid] = r
+                issues.append({"ref": nid, "to": r, "reason": _w.REF_REDIRECTED})
+        body = _w.rewrite_body_refs(d["body"], mapping) if mapping else d["body"]
         self.journal.upsert_wiki_doc(doc_id, d["type"], d["title"], d["tags"],
-                                     d["body"], ts)
-        refs = list(dict.fromkeys(list(d["refs"]) + _w.body_refs(d["body"])))
+                                     body, ts)
+        refs = list(dict.fromkeys(mapping.get(n, n) for n in raw))
         self.journal.set_wiki_refs(doc_id, refs)
+        issues += self._flag_unknown_refs(doc_id, refs)
+        issues += self._vet_type(doc_id, d["type"])
         self._reindex_okf(doc_id)
-        return {"doc_id": doc_id, "type": d["type"], "refs": refs}
+        return {"doc_id": doc_id, "type": d["type"], "refs": refs,
+                "issues": issues}
 
     _EVENT_STOP = {
         "the", "of", "and", "to", "in", "on", "for", "with", "from", "between",
@@ -2368,6 +2760,8 @@ class Memory:
         t: Optional[float] = None,
         abstain: bool = False,
         abstain_threshold: Optional[float] = None,
+        rerank: Optional[bool] = None,
+        rerank_pre: int = 30,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -2387,10 +2781,20 @@ class Memory:
         sufficiently activated for `query` (see `abstains`), retrieval FAILS and
         returns [] — an explicit 'I don't know' instead of the least-bad match.
         `abstain_threshold` fixes tau ; None uses the emergent floor.
+
+        `rerank` : the mnema second stage — pre-fetch `rerank_pre` candidates
+        by the mode above, score each (query, content) pair JOINTLY with the
+        cross-encoder `self.reranker`, sigmoid the logits, keep top-k. Default
+        None = on whenever a reranker is wired in ; False forces cosine order.
+        Runs BEFORE the ACT-R blends (need-odds / spreading act on the reranked
+        relevance, as in mnema's `blend_scores`). Failure-safe : a reranker
+        error leaves the cosine order.
         """
         t_now = self._now(t)
         if abstain and self.abstains(query, abstain_threshold):
             return []                            # retrieval failure (ACT-R)
+        rr = getattr(self, "reranker", None)
+        do_rerank = rr is not None and (rerank if rerank is not None else True)
         # When entity beacons exist they act as ingest-time pull agents :
         # their geometric pull already shifted the real facts, so we drop
         # them from the RETURNED ids (over-fetching to backfill to k) — the
@@ -2423,6 +2827,8 @@ class Memory:
             k_fetch = k * 2 + 10
         if atomics:
             k_fetch = max(k_fetch, k * 5 + 20)
+        if do_rerank:
+            k_fetch = max(k_fetch, max(k, rerank_pre))   # the rerank pre-fetch
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
@@ -2515,6 +2921,24 @@ class Memory:
         from metacog.epistemic import EpistemicState as _ES
         results = [(s, p) for s, p in results
                    if p.state not in (_ES.INVALID, _ES.DEPRECATED)]
+        # CROSS-ENCODER RERANK (mnema's second stage) : the pre-fetched
+        # candidates are scored jointly with the query ; sigmoid(logit) becomes
+        # the relevance the ACT-R blends below act on. Top-k after rerank.
+        rerank_logits: Dict[str, float] = {}
+        if do_rerank and results:
+            try:
+                docs = [(p.content or "")[:512] for _, p in results]
+                logits = [float(x) for x in rr.rerank(query, docs)]
+                if len(logits) == len(results):
+                    import math as _m
+                    scored = []
+                    for (_, p), lg in zip(results, logits):
+                        rerank_logits[p.id] = lg
+                        scored.append((1.0 / (1.0 + _m.exp(-lg)), p))
+                    results = sorted(scored, key=lambda sp: sp[0],
+                                     reverse=True)[:k]
+            except Exception:
+                results = results[:k]                # keep the cosine order
         # ACT-R base-level : re-rank by blending the base relevance with each
         # candidate's need-odds (journal access recency×frequency). OFF unless
         # recency_weight > 0 and a journal is present -> default order untouched.
@@ -2555,6 +2979,8 @@ class Memory:
                 "confidence": p.confidence,
                 "n_corrob": p.n_corrob,
                 "n_contra": p.n_contra,
+                **({"rerank_score": rerank_logits[p.id]}
+                   if p.id in rerank_logits else {}),
             }
             for score, p in results
         ]
@@ -3468,6 +3894,14 @@ class Memory:
         if wr["remapped"] or wr["stale"]:
             out["wiki_remapped"] = wr["remapped"]
             out["wiki_stale"] = wr["stale"]
+            out["wiki_stale_reasons"] = wr["reasons"]
+        # PROPOSED -> ESTABLISHED : emergent tools that earned their uses.
+        pt = self.promote_tools(t_now)
+        if pt["promoted"]:
+            out["tools_promoted"] = pt["promoted"]
+        # MATERIALIZED wiki inference (opt-in, derived table only ; asserted wins)
+        if self.infer_enabled:
+            out["wiki_derived"] = self.infer_wiki(apply=True)["derived"]
         # LATENT skill distiller : replay resolutions recorded since the
         # last sleep and crystallize theoretical tools linked to their
         # explicating facts. Opt-in (skills_enabled), idempotent.
@@ -3615,9 +4049,10 @@ class Memory:
         t_now = self._now(t)
         report = merge_duplicates(self.points, t_now)
         # Chain aliases through the existing map so older absorbed ids still
-        # resolve to the final survivor.
+        # resolve to the final survivor (ledger-recorded : reversible).
         for absorbed, keeper in report.aliases.items():
-            self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
+            self._alias(absorbed, keeper, "duplicate",
+                        f"same information as {keeper}")
         return {
             "merged_count": len(report.merged),
             "aliases": dict(report.aliases),
@@ -3859,7 +4294,8 @@ class Memory:
             self.points, ledger, self.encoder, t_now,
         )
         for absorbed, keeper in report.aliases.items():
-            self._merge_aliases[absorbed] = self._merge_aliases.get(keeper, keeper)
+            self._alias(absorbed, keeper, "lateral",
+                        f"functionally redundant with {keeper}")
         return {
             "collided_groups": len(report.collided),
             "aliases": dict(report.aliases),
@@ -3917,9 +4353,15 @@ class Memory:
                 sig, trace, self.llm, self.encoder, t_now,
             )
             if tool is not None:
+                tool.add_tag("proposed")           # earns 'established' by use
                 self.points.append(tool)
                 new_ids.append(tool.id)
+                self._tool_event(tool.id, "created",
+                                 f"crystallized from recurrence ({sig})")
                 self._wiki_register_tool(tool)     # emergent tool -> wiki concept
+            else:
+                self._tool_event(sig.replace("|", "_")[:44] or "tool", "rejected",
+                                 "synthesis_failed")
         return {
             "crystallized": len(new_ids),
             "tool_ids": new_ids,
@@ -3956,6 +4398,8 @@ class Memory:
         approach (`how`) and added to the cloud. Generation is
         unconstrained — this never blocks the agent, it only ever grows the
         self-built tool set. Returns {tool, reused}."""
+        if not (query or "").strip():
+            return {"tool": None, "reused": False, "reason": "empty_query"}
         existing = self.match_tool(query)
         if existing is not None:
             tid = existing["id"]
@@ -3963,21 +4407,30 @@ class Memory:
                 if p.id == tid:
                     p.n_uses += 1
                     break
+            self._tool_event(tid, "reused", f"matched {existing['score']}")
             return {"tool": existing, "reused": True}
         from metacog.skills import synthesize_tool_from_intent
         t_now = self._now()
-        tool = synthesize_tool_from_intent(
-            query, how or query, self.llm, self.encoder, t_now,
-            genre=genre, extractor=self.extractor,
-        )
+        try:
+            tool = synthesize_tool_from_intent(
+                query, how or query, self.llm, self.encoder, t_now,
+                genre=genre, extractor=self.extractor,
+            )
+            why = "synthesis_returned_none"
+        except Exception as exc:                   # explicit, never swallowed
+            tool, why = None, f"synthesis_failed: {repr(exc)[:160]}"
         if tool is None:
-            return {"tool": None, "reused": False}
+            self._tool_event(f"intent:{query[:40]}", "rejected", why)
+            return {"tool": None, "reused": False, "reason": why}
+        tool.add_tag("proposed")                   # earns 'established' by use
         self.points.append(tool)
+        self._tool_event(tool.id, "created", "generated from intent")
         self._wiki_register_tool(tool)             # emergent tool -> wiki concept
         return {
             "tool": {
                 "id": tool.id, "content": tool.content,
                 "keywords": list(tool.keywords or []), "tags": list(tool.tags or []),
+                "status": self.tool_status(tool),
             },
             "reused": False,
         }
@@ -3987,19 +4440,72 @@ class Memory:
         return next((p for p in self.points
                      if p.id == tool_id and is_tool(p)), None)
 
-    def retire_tool(self, tool_id: str, hard: bool = False) -> Dict[str, Any]:
+    @staticmethod
+    def tool_status(tool: Point) -> str:
+        """Lifecycle status of a tool node : 'retired' (deprecated) >
+        'proposed' (not yet vetted by use) > 'established'."""
+        tags = tool.tags or []
+        if "deprecated" in tags:
+            return "retired"
+        if "proposed" in tags:
+            return "proposed"
+        return "established"
+
+    def promote_tool(self, tool_id: str, reason: str = "manual") -> Dict[str, Any]:
+        """PROPOSED -> ESTABLISHED : the vetting half of the proposal loop. The
+        tool stays usable either way (a proposal never blocks) ; promotion only
+        records that it earned its place. Re-indexes its wiki doc so
+        `wiki_where('status', 'established')` sees it."""
+        tool = self._find_tool(tool_id)
+        if tool is None:
+            return {"tool_id": None, "reason": "not_a_tool"}
+        if "proposed" in (tool.tags or []):
+            tool.tags = [t for t in tool.tags if t != "proposed"]
+        tool.add_tag("established")
+        self._tool_event(tool_id, "promoted", reason)
+        if self.journal is not None and self.journal.get_wiki_doc(f"tool:{tool_id}"):
+            self._reindex_okf(f"tool:{tool_id}")
+        return {"tool_id": tool_id, "status": self.tool_status(tool)}
+
+    def promote_tools(self, t: Optional[float] = None) -> Dict[str, Any]:
+        """Autonomic (sleep) : promote every PROPOSED tool that reached
+        `tool_promote_after` successful uses with no live failure streak."""
+        fails = getattr(self, "_tool_fail", None) or {}
+        promoted: List[str] = []
+        from metacog.skills import is_tool
+        for p in list(self.points):
+            if (is_tool(p) and "proposed" in (p.tags or [])
+                    and "deprecated" not in (p.tags or [])
+                    and p.n_uses >= self.tool_promote_after
+                    and not fails.get(p.id)):
+                self.promote_tool(p.id, f"{p.n_uses} uses, no failure streak")
+                promoted.append(p.id)
+        return {"promoted": promoted}
+
+    def tool_history(self, tool_id: Optional[str] = None) -> List[dict]:
+        """The tool lifecycle events with their explicit reasons (all tools or
+        one). [] without a journal."""
+        return self.journal.tool_events(tool_id) if self.journal is not None else []
+
+    def retire_tool(self, tool_id: str, hard: bool = False,
+                    reason: str = "manual") -> Dict[str, Any]:
         """Retire a TOOL node — the removal half of the tool lifecycle. Soft
         (default) tags it 'deprecated' so match_tool / ensure_tool stop reusing
         it (reversible, and the tag persists) ; `hard=True` removes it from the
-        cloud. Returns {retired, hard} or {retired: None} if not a tool."""
+        cloud. The `reason` is recorded (tool_events). Returns {retired, hard}
+        or {retired: None, reason} if not a tool."""
         tool = self._find_tool(tool_id)
         if tool is None:
-            return {"retired": None}
+            return {"retired": None, "reason": "not_a_tool"}
         if hard:
             self.points = [p for p in self.points if p.id != tool_id]
         else:
             tool.add_tag("deprecated")
-        return {"retired": tool_id, "hard": hard}
+        self._tool_event(tool_id, "retired_hard" if hard else "retired", reason)
+        if (not hard and self.journal is not None
+                and self.journal.get_wiki_doc(f"tool:{tool_id}")):
+            self._reindex_okf(f"tool:{tool_id}")   # status -> retired
+        return {"retired": tool_id, "hard": hard, "reason": reason}
 
     def report_tool(self, tool_id: str, ok: bool,
                     fail_limit: int = 2) -> Dict[str, Any]:
@@ -4009,19 +4515,22 @@ class Memory:
         accumulate. Returns the tool's state."""
         tool = self._find_tool(tool_id)
         if tool is None:
-            return {"tool_id": None}
+            return {"tool_id": None, "reason": "not_a_tool"}
         if not hasattr(self, "_tool_fail") or self._tool_fail is None:
             self._tool_fail = {}
         if ok:
             tool.n_uses += 1
             self._tool_fail.pop(tool_id, None)
+            self._tool_event(tool_id, "ok", f"n_uses={tool.n_uses}")
             return {"tool_id": tool_id, "ok": True, "n_uses": tool.n_uses,
                     "retired": False}
         fails = self._tool_fail.get(tool_id, 0) + 1
         self._tool_fail[tool_id] = fails
+        self._tool_event(tool_id, "failed", f"failure {fails}/{fail_limit}")
         retired = False
         if fails >= fail_limit:
-            self.retire_tool(tool_id)          # soft-deprecate the flaky tool
+            self.retire_tool(tool_id,          # soft-deprecate the flaky tool
+                             reason=f"auto: {fails} consecutive failures")
             retired = True
         return {"tool_id": tool_id, "ok": False, "fails": fails,
                 "retired": retired}
@@ -4033,20 +4542,30 @@ class Memory:
         it). Returns the updated tool or {tool_id: None}."""
         tool = self._find_tool(tool_id)
         if tool is None:
-            return {"tool_id": None}
+            return {"tool_id": None, "reason": "not_a_tool"}
         new_body = (content or how)
         if new_body:
             tool.content = new_body.strip()
             tool.embedding_orig = tuple(self.encoder.encode(tool.content))
-        if "deprecated" in (tool.tags or []):
+        revived = "deprecated" in (tool.tags or [])
+        if revived:
             tool.tags = [t for t in tool.tags if t != "deprecated"]
         tool.n_revision += 1
+        self._tool_event(tool_id, "updated",
+                         "revived" if revived else f"revision {tool.n_revision}")
+        if self.journal is not None and self.journal.get_wiki_doc(f"tool:{tool_id}"):
+            self._reindex_okf(f"tool:{tool_id}")
         return {"tool_id": tool_id, "content": tool.content,
                 "n_revision": tool.n_revision}
 
     def resolve_alias(self, point_id: str) -> str:
         """Resolve an id to its canonical node : an atomic-fact id maps to
-        its source turn (dia_id), and a merge-absorbed id to its survivor."""
+        its source turn (dia_id), and a merge-absorbed id to its survivor.
+        Redirects are ACTIVE : the map is fed by every merge and re-hydrated
+        from the journal's ledger after a restart, so a reference discovered
+        AFTER the merge still lands on the keeper."""
+        if not self._aliases_hydrated and self.journal is not None:
+            self._hydrate_aliases()
         point_id = self._atom_parent.get(point_id, point_id)
         seen = set()
         while point_id in self._merge_aliases and point_id not in seen:
@@ -4229,6 +4748,7 @@ class Memory:
         target = path or self.storage_path
         if target is None:
             raise ValueError("no storage_path configured and none provided")
+        from metacog.defaults import encoder_id
         snapshot = {
             "points": self.points,
             "observators": self.observators,
@@ -4237,6 +4757,9 @@ class Memory:
             "_spike_total_hops": self._spike_total_hops,
             "decay_exponent": self.decay_exponent,
             "_forget_log": getattr(self, "_forget_log", []),
+            # which encoder produced the stored embeddings (mnema's model_id
+            # stamp) : a later process with another encoder must re-encode.
+            "encoder_id": encoder_id(self.encoder),
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -4267,3 +4790,50 @@ class Memory:
                            if t.startswith("event:type:")), "")
                 nm = p.content.split(" ", 1)[1] if " " in p.content else ""
                 self._event_registry[f"{et}::{nm.lower()}"] = p.id
+        # ENCODER MISMATCH : the stored embeddings belong to another encoder
+        # (or a legacy snapshot with another dimension) — cosines would be
+        # garbage, so re-encode everything once from content. Never silent.
+        from metacog.defaults import encoder_id
+        saved = snapshot.get("encoder_id")
+        mine = encoder_id(self.encoder)
+        mismatch = saved is not None and saved != mine
+        if saved is None and self.points:
+            try:
+                mismatch = len(self.points[0].embedding_orig) != len(self.encoder.encode("probe"))
+            except Exception:
+                mismatch = False
+        if mismatch:
+            n = self.reencode()
+            self._reencoded_from = saved
+            import sys as _sys
+            print(f"[metacog] encoder changed ({saved or 'unknown'} -> {mine}) : "
+                  f"re-encoded {n} points", file=_sys.stderr)
+
+    def reencode(self) -> int:
+        """Re-embed every point from its content with the CURRENT encoder
+        (and the keyword embeddings from their keywords). Learned geometric
+        pulls (`delta_active` / `delta_latent`) live in the old space and are
+        reset ; observator keyword embeddings are dropped and rebuilt lazily.
+        Returns the number of points re-encoded."""
+        from metacog.keywords import position_weighted_keyword_embedding
+        from metacog.geometry import clear_geo_cache
+        enc = self.encoder
+        batch = getattr(enc, "encode_batch", None)
+        if batch is not None and self.points:
+            embs = batch([p.content for p in self.points])
+        else:
+            embs = [tuple(enc.encode(p.content)) for p in self.points]
+        for p, emb in zip(self.points, embs):
+            emb = tuple(emb)
+            p.embedding_orig = emb
+            zero = tuple(0.0 for _ in emb)
+            p.delta_active = zero
+            p.delta_latent = zero
+            p.keywords_embedding = (
+                position_weighted_keyword_embedding(list(p.keywords), enc)
+                if p.keywords else None)
+        for obs in self.observators.values():
+            obs.keywords_embedding = None
+        clear_geo_cache()
+        self._text_index = TextIndex()
+        return len(self.points)

@@ -31,6 +31,15 @@ def test_rewrite_body_refs_and_context_tags():
     assert W.context_tags(["fact", "health:x", "refined"]) == ["health:x"]
 
 
+def test_body_tags_parse_paths_and_ignore_headings_and_periods():
+    body = ("# Heading is not a tag\n"
+            "Tags: #module:metacog #file:metacog/memory.py #file:.gitignore #a\n"
+            "ends with #health:fatigue. and #x-y_z, then #Mixed:Case ; PR #10 is not")
+    assert W.body_tags(body) == [
+        "module:metacog", "file:metacog/memory.py", "file:.gitignore", "a",
+        "health:fatigue", "x-y_z", "mixed:case"]
+
+
 # -- feed + bidirectional links -----------------------------------------------
 
 def _mem():
@@ -188,7 +197,7 @@ def test_wiki_noop_without_journal():
     m = Memory(encoder=SimpleEncoder())
     assert m.feed_wiki("d", "t", ["A"])["doc_id"] is None
     assert m.wiki_doc("d") is None
-    assert m.reconcile_wiki() == {"remapped": 0, "stale": 0}
+    assert m.reconcile_wiki() == {"remapped": 0, "stale": 0, "reasons": {}}
     assert m.ingest_from_wiki("d", "x")["node_id"] is None
     assert m.wiki_where("type", "topic") == [] and m.okf_schema() == {}
     assert m.import_okf("d", "---\ntype: x\n---\n")["doc_id"] is None

@@ -43,8 +43,15 @@ CANONICAL: Set[str] = {
     "stats", "inspect", "list_tags",
     # feedback (the supervised signal that calibrates decay)
     "mark_useful",
-    # explicit correction : soft-invalidate a node (mnema's forget)
-    "forget",
+    # explicit correction : soft-invalidate a node (mnema's forget) — and undo
+    # it : every forget / merge is a reversible ledger row.
+    "forget", "revert_merge",
+    # OKF wiki : author / query the RAG-extension knowledge layer, so the agent
+    # can build emergent tools that populate the wiki (reconcile_wiki stays
+    # autonomic in sleep, not exposed). check_wiki is read-only observation ;
+    # okf_proposals / vet_okf_type close the vocabulary proposal loop.
+    "feed_wiki", "wiki_doc", "ingest_from_wiki", "wiki_where", "okf_schema",
+    "import_okf", "docs_for_node", "check_wiki", "okf_proposals", "vet_okf_type",
 }
 
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------
@@ -53,12 +60,13 @@ TOOL_TIER: Set[str] = {
     # create / find / reuse
     "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
     "get_session_skill",
-    # lifecycle : retire / feedback / update (the retract+correct half)
-    "retire_tool", "report_tool", "update_tool",
+    # lifecycle : retire / feedback / update (the retract+correct half) and
+    # promote (proposed -> established : the vetting half of the proposal loop)
+    "retire_tool", "report_tool", "update_tool", "promote_tool",
 }
 _TOOL_TIER_EXPOSED: Set[str] = {
     "ensure_tool", "match_tool", "list_tools_learned", "build_skill",
-    "retire_tool", "report_tool", "update_tool",
+    "retire_tool", "report_tool", "update_tool", "promote_tool",
 }
 
 # -- T3 : internal mechanisms / walk modes / autonomic passes -----------------
@@ -74,7 +82,7 @@ INTERNAL_OBSERVATORS: Set[str] = {
     "route", "list_communities",
 }
 AUTONOMIC: Set[str] = {                    # run by the system, not called outside
-    "sleep", "save", "audit", "crystallize_skills",
+    "sleep", "save", "audit", "crystallize_skills", "infer_wiki",
 }
 INTERNAL_MISC: Set[str] = {
     "observe", "process_turn", "capture_code_tool", "ingest_skill",

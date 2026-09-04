@@ -1,0 +1,12 @@
+{
+  "name": "omnicognition",
+  "owner": { "name": "HoliChrys", "url": "https://github.com/HoliChrys" },
+  "plugins": [
+    {
+      "name": "metacog",
+      "source": { "source": "github", "repo": "HoliChrys/OmniCognition" },
+      "description": "Persistent metacognitive memory for Claude Code — MCP server + hooks (memory discipline at start, gap-forced grounding after a recall, session capture at end).",
+      "version": "0.1.0"
+    }
+  ]
+}

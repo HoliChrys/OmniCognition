@@ -79,6 +79,29 @@ def _install_surface_gate(app, exposed) -> None:
     app.tool = gated_tool
 
 
+#: Machine-detectable GAP sentinel. When a recall finds no sufficiently activated
+#: memory (the ACT-R retrieval threshold, `Memory.abstains`), `retrieve` /
+#: `walk_start` say so IN-BAND in their result. The plugin's PostToolUse hook
+#: (`hooks/recall_gap.py`) greps the tool response for this exact line and
+#: injects a just-in-time "ground first, then ingest" directive — a static rule
+#: read 50 turns ago loses to the model's parametric prior ; a directive in the
+#: tool output it just read does not. Keep in sync with the hook.
+GAP_SENTINEL = "⚠ NO RELEVANT MEMORY (gap)"
+
+
+def _gap_notice(kind: str) -> dict:
+    """The in-band gap entry appended to a recall result."""
+    return {
+        "gap": True,
+        "sentinel": GAP_SENTINEL,
+        "note": (f"{GAP_SENTINEL} — no chunk is sufficiently activated for this "
+                 f"query ({kind}). The hits above, if any, are background noise, "
+                 "not memory. Do NOT answer from training as if remembered : "
+                 "ground first (ask, read the sources, search), THEN `ingest` the "
+                 "durable findings so the gap is filled next time."),
+    }
+
+
 def build_app(
     storage_path: Optional[str] = None,
     memory: Optional[Memory] = None,
@@ -140,7 +163,12 @@ def build_app(
         # triggers (co-retrieval / lateral / Chasles / tag index / decay
         # history) survive restarts. "auto" is a no-op when storage_path is None
         # (ephemeral in-memory server) -> falls back to no journal.
-        memory = Memory(storage_path=storage_path, journal_path="auto")
+        # The encoder + reranker are the PRODUCTION ones (fastembed : mnema's
+        # multilingual MiniLM + jina cross-encoder ; METACOG_ENCODER /
+        # METACOG_RERANKER override) — never the hash test encoder.
+        from metacog.defaults import make_encoder, make_reranker
+        memory = Memory(storage_path=storage_path, journal_path="auto",
+                        encoder=make_encoder(), reranker=make_reranker())
 
     # Apply the ACT-R ranking levers (arg > env > leave as-is). Only assigned
     # when explicitly provided, so an injected memory's own weights survive.
@@ -154,15 +182,27 @@ def build_app(
     walkers = WalkerRegistry()
 
     @app.tool()
-    def ingest(content: str, kind: str = "FACT", id: Optional[str] = None) -> dict:
+    def ingest(content: str, kind: str = "FACT", id: Optional[str] = None,
+               tags: Optional[List[str]] = None) -> dict:
         """Add a new point to the memory.
 
         Args:
           content: the text content (∈ P).
           kind:    one of FACT | THOUGHT | ACTION (default FACT).
           id:      optional explicit id (auto-generated otherwise).
+          tags:    optional indexing tags (open vocabulary, hierarchical
+                   `a:b:c`), e.g. ["module:metacog", "file:README.md"] — they
+                   scope the node for tag-filtered retrieval and become the
+                   context tags of any wiki doc built from it (feed_wiki).
         """
         p = memory.ingest(content, kind=kind, id=id)
+        if tags:
+            p.add_tag(*[str(t) for t in tags])
+            try:
+                if memory.journal is not None:
+                    memory.journal.log_tags(p.id, p.tags)   # SQL tag index
+            except Exception:
+                pass
         if memory.storage_path:
             memory.save()
         return memory.inspect(p.id)
@@ -235,6 +275,7 @@ def build_app(
         use_spreading: bool = True,
         prefer_kind: Optional[str] = None,
         abstain: bool = False,
+        rerank: Optional[bool] = None,
     ) -> List[dict]:
         """Retrieve top-k points for a query.
 
@@ -251,6 +292,9 @@ def build_app(
                         analog of associative spreading; default True).
           prefer_kind:  boost a PointKind in ranking — FACT | THOUGHT |
                         ACTION. Use ACTION for "how do I X" queries.
+          rerank:       cross-encoder second stage (pre-fetch 30 -> joint
+                        (query, doc) scoring -> top-k). Default on when the
+                        server has a reranker ; false = cosine order only.
 
         k is capped at 7 (the system's retrieval budget).
         """
@@ -259,10 +303,10 @@ def build_app(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
-            abstain=abstain,
+            abstain=abstain, rerank=rerank,
         )
         if abstain and not results:
-            return [{"abstained": True,
+            return [{"abstained": True, **_gap_notice("retrieve"),
                      "note": "no chunk sufficiently activated — retrieval failed"}]
         # Log the retrieval (mnema access-log) and hand back a retrieval_id
         # handle so the agent can later mark_useful(...) on it — the supervised
@@ -275,13 +319,29 @@ def build_app(
                     r["retrieval_id"] = rid
         except Exception:
             pass
+        # GAP sentinel (in-band, always evaluated) : even without `abstain`, say
+        # loudly when the best match does not stand out from the background.
+        try:
+            if memory.abstains(query):
+                results = list(results) + [_gap_notice("retrieve")]
+        except Exception:
+            pass
         return results
 
     @app.tool()
-    def retire_tool(tool_id: str, hard: bool = False) -> dict:
+    def retire_tool(tool_id: str, hard: bool = False,
+                    reason: str = "manual") -> dict:
         """Retire a generated tool. Soft (default) deprecates it so it stops
-        being reused ; hard removes it. The removal half of the tool lifecycle."""
-        return memory.retire_tool(tool_id, hard=hard)
+        being reused ; hard removes it. The removal half of the tool lifecycle.
+        `reason` is recorded in the tool's event history."""
+        return memory.retire_tool(tool_id, hard=hard, reason=reason)
+
+    @app.tool()
+    def promote_tool(tool_id: str, reason: str = "manual") -> dict:
+        """Vet a PROPOSED emergent tool as ESTABLISHED (the proposal loop :
+        new tools start proposed, stay usable, and earn their status by use —
+        auto-promoted in sleep after repeated success — or explicitly here)."""
+        return memory.promote_tool(tool_id, reason=reason)
 
     @app.tool()
     def report_tool(tool_id: str, ok: bool) -> dict:
@@ -316,6 +376,96 @@ def build_app(
         explicit on-demand correction — distinct from the autonomic
         decay-forgetting in sleep."""
         return memory.forget_node(node_id, reason, superseded_by=superseded_by)
+
+    @app.tool()
+    def revert_merge(node_id: str) -> dict:
+        """UNDO a forget / merge / collapse of `node_id` from the merge ledger :
+        drops its redirect, restores its pre-op state and tags, and un-rewrites
+        exactly the wiki refs that redirect rewrote. Nothing destructive is
+        final — every identity op is a reversible ledger row."""
+        return memory.revert_merge(node_id)
+
+    # ----------------------------------------------------------------
+    # OKF wiki — author/query the RAG-extension knowledge layer
+    # ----------------------------------------------------------------
+
+    @app.tool()
+    def check_wiki(doc_id: Optional[str] = None) -> dict:
+        """READ-ONLY consistency check of the wiki (one doc or all) : stale refs
+        with their reason, prose/link mismatches, inline tags missing from the
+        frontmatter, empty bodies, schema drift within a type, unvetted types.
+        Writes nothing — surfacing violations is separate from inferring."""
+        v = memory.check_wiki(doc_id)
+        return {"violations": v, "count": len(v)}
+
+    @app.tool()
+    def okf_proposals(status: Optional[str] = "proposed") -> dict:
+        """Out-of-vocabulary OKF concept types preserved as PROPOSALS (never
+        rejected, never silently canonical). status: proposed | accepted |
+        rejected | null for all."""
+        return {"proposals": memory.okf_proposals(status)}
+
+    @app.tool()
+    def vet_okf_type(type: str, accept: bool) -> dict:
+        """Close the vocabulary loop : accept a proposed OKF type into the
+        schema, or reject it (its docs get flagged by check_wiki ; they are
+        never touched)."""
+        return memory.vet_okf_type(type, accept)
+
+    @app.tool()
+    def infer_wiki(apply: bool = False) -> dict:
+        """MATERIALIZED wiki inference : derived fields (related docs via shared
+        refs, tag drift of cited nodes, ids absorbed into cited nodes) go to a
+        SEPARATE table, never into the asserted index ; asserted facts always
+        win. apply=false previews ; run autonomically in sleep when
+        infer_enabled."""
+        return memory.infer_wiki(apply=apply)
+
+    @app.tool()
+    def feed_wiki(doc_id: str, title: str, node_ids: List[str],
+                  type: str = "note", body: Optional[str] = None) -> dict:
+        """RAG → wiki : build/update an OKF doc from RAG nodes. Node ids are
+        recorded in the frontmatter (`refs`) AND inline (`[[id]]`); the union of
+        their tags becomes the doc's tags. Links co-evolve — a merged node's ref
+        is auto-rewritten on the next sleep."""
+        return memory.feed_wiki(doc_id, title, node_ids, type=type, body=body)
+
+    @app.tool()
+    def wiki_doc(doc_id: str) -> dict:
+        """Render the current OKF markdown of a wiki doc (live frontmatter refs +
+        first-order feedback), or {} if absent."""
+        md = memory.wiki_doc(doc_id)
+        return {"doc_id": doc_id, "okf": md} if md else {}
+
+    @app.tool()
+    def ingest_from_wiki(doc_id: str, text: str) -> dict:
+        """wiki → RAG : ingest new wiki prose as a fresh node carrying the doc's
+        tags as context, linked back into the doc."""
+        return memory.ingest_from_wiki(doc_id, text)
+
+    @app.tool()
+    def wiki_where(key: str, value: Optional[str] = None) -> dict:
+        """Query the OKF field index by any frontmatter field — e.g.
+        wiki_where('tags','health:x') or wiki_where('refs', node_id). Returns the
+        matching doc ids."""
+        return {"key": key, "value": value, "docs": memory.wiki_where(key, value)}
+
+    @app.tool()
+    def okf_schema() -> dict:
+        """The recovered wiki schema {type: [frontmatter keys]}, derived from the
+        data (no registry, no migrations)."""
+        return memory.okf_schema()
+
+    @app.tool()
+    def import_okf(doc_id: str, markdown: str) -> dict:
+        """Consume an EXTERNAL OKF doc (parse frontmatter+body, link its refs,
+        index it) so it becomes queryable and evolves with the RAG."""
+        return memory.import_okf(doc_id, markdown)
+
+    @app.tool()
+    def docs_for_node(node_id: str) -> dict:
+        """Reverse link : which wiki docs cite this RAG node (RAG → wiki edge)."""
+        return {"node_id": node_id, "docs": memory.docs_for_node(node_id)}
 
     @app.tool()
     def mark_useful(retrieval_id: int, score: int) -> dict:
@@ -473,6 +623,11 @@ def build_app(
             t.content for t in getattr(walker, "_thought_chain", [])
         ]
         out["done"] = True
+        # GAP sentinel : a walk that composed NO on-target evidence is a gap.
+        out["gap"] = not evidence
+        if out["gap"]:
+            out["sentinel"] = GAP_SENTINEL
+            out["gap_note"] = _gap_notice("walk_start")["note"]
         walkers.close(walk_id)
         return out
 
@@ -1253,6 +1408,10 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.storage:
+        # `~` and a missing parent dir are the plugin's default (~/.metacog/…)
+        args.storage = os.path.expanduser(args.storage)
+        os.makedirs(os.path.dirname(os.path.abspath(args.storage)), exist_ok=True)
     app = build_app(storage_path=args.storage)
     if args.transport in ("sse", "streamable-http"):
         # Configure the HTTP bind for the streaming transports.
