@@ -177,15 +177,27 @@ def build_app(
     walkers = WalkerRegistry()
 
     @app.tool()
-    def ingest(content: str, kind: str = "FACT", id: Optional[str] = None) -> dict:
+    def ingest(content: str, kind: str = "FACT", id: Optional[str] = None,
+               tags: Optional[List[str]] = None) -> dict:
         """Add a new point to the memory.
 
         Args:
           content: the text content (∈ P).
           kind:    one of FACT | THOUGHT | ACTION (default FACT).
           id:      optional explicit id (auto-generated otherwise).
+          tags:    optional indexing tags (open vocabulary, hierarchical
+                   `a:b:c`), e.g. ["module:metacog", "file:README.md"] — they
+                   scope the node for tag-filtered retrieval and become the
+                   context tags of any wiki doc built from it (feed_wiki).
         """
         p = memory.ingest(content, kind=kind, id=id)
+        if tags:
+            p.add_tag(*[str(t) for t in tags])
+            try:
+                if memory.journal is not None:
+                    memory.journal.log_tags(p.id, p.tags)   # SQL tag index
+            except Exception:
+                pass
         if memory.storage_path:
             memory.save()
         return memory.inspect(p.id)

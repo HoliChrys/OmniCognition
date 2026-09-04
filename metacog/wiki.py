@@ -23,7 +23,10 @@ import yaml
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)\]\]")
 
 #: Inline `#tag` in a body (not a markdown heading : no space after the #).
-INLINE_TAG_RE = re.compile(r"(?<![\w#])#([a-z0-9_][a-z0-9_:\-]*)", re.IGNORECASE)
+#: Tags are hierarchical and may carry paths (`#file:metacog/memory.py`,
+#: `#file:.gitignore`) ; a trailing sentence period is NOT part of the tag.
+INLINE_TAG_RE = re.compile(
+    r"(?<![\w#])#([a-z0-9_.][a-z0-9_:\-./]*[a-z0-9_]|[a-z0-9_])", re.IGNORECASE)
 
 #: Structural tags that are plumbing, not knowledge — kept off the wiki surface.
 _STRUCTURAL_TAGS = {
@@ -63,8 +66,11 @@ def body_refs(body: str) -> List[str]:
 
 
 def body_tags(body: str) -> List[str]:
-    """All inline `#tag`s of a doc body, lowercased, in order (dedup)."""
-    return list(dict.fromkeys(t.lower() for t in INLINE_TAG_RE.findall(body or "")))
+    """All inline `#tag`s of a doc body, lowercased, in order (dedup). A
+    purely numeric `#10` (an issue / PR number in prose) is not a tag."""
+    return list(dict.fromkeys(
+        t.lower() for t in INLINE_TAG_RE.findall(body or "")
+        if any(ch.isalpha() for ch in t)))
 
 
 def rewrite_body_refs(body: str, mapping: Dict[str, str]) -> str:

@@ -146,6 +146,15 @@ self-built capability set is also a browsable, queryable part of the deepwiki.
 A new tool starts **`proposed`** (fully usable — a proposal never blocks) and
 earns **`established`** by use (§5.7); the wiki doc exposes that `status`.
 
+The division of labour is strict: **canonical = primitives, emergent =
+workflows.** A task-specific capability such as "index a repository's history
+commit by commit into the wiki" is *not* a hardcoded tool — the agent creates it
+(`ensure_tool`), executes it with the primitives (`ingest` with tags,
+`feed_wiki`, `okf_proposals` / `vet_okf_type`, `wiki_where`, `check_wiki`),
+reuses it through `match_tool` and sees it promoted by the autonomic `sleep`.
+`tests/test_emergent_wiki_tool.py` runs that whole loop over the `external`
+MCP surface only.
+
 ---
 
 ## 2. The epistemic substrate
@@ -1289,7 +1298,9 @@ agent-facing surface — the walk / sleep orchestrate it.
 ```
 #####  T1 — CANONICAL primitives (exposed)  #####
 # feed
-ingest              add a FACT / THOUGHT / ACTION
+ingest              add a FACT / THOUGHT / ACTION (+ optional indexing `tags`,
+                    e.g. module:x / file:y — the scope of the node and the
+                    context tags of any wiki doc built from it)
 ingest_message      EPISODIC: index a message (user/agent), async, timestamped
 push_code           evaluate & route generated code → project doc and/or tool
 # ask

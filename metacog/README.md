@@ -282,7 +282,7 @@ agent-facing surface — the walk / sleep orchestrate it.
 ```
 #####  T1 — CANONICAL primitives (exposed)  #####
 # feed
-ingest              add a FACT / THOUGHT / ACTION
+ingest              add a FACT / THOUGHT / ACTION (+ optional indexing `tags`)
 ingest_message      EPISODIC: index a message (user/agent), async, timestamped
 push_code           evaluate & route generated code → project doc and/or tool
 # ask
