@@ -79,6 +79,29 @@ def _install_surface_gate(app, exposed) -> None:
     app.tool = gated_tool
 
 
+#: Machine-detectable GAP sentinel. When a recall finds no sufficiently activated
+#: memory (the ACT-R retrieval threshold, `Memory.abstains`), `retrieve` /
+#: `walk_start` say so IN-BAND in their result. The plugin's PostToolUse hook
+#: (`hooks/recall_gap.py`) greps the tool response for this exact line and
+#: injects a just-in-time "ground first, then ingest" directive — a static rule
+#: read 50 turns ago loses to the model's parametric prior ; a directive in the
+#: tool output it just read does not. Keep in sync with the hook.
+GAP_SENTINEL = "⚠ NO RELEVANT MEMORY (gap)"
+
+
+def _gap_notice(kind: str) -> dict:
+    """The in-band gap entry appended to a recall result."""
+    return {
+        "gap": True,
+        "sentinel": GAP_SENTINEL,
+        "note": (f"{GAP_SENTINEL} — no chunk is sufficiently activated for this "
+                 f"query ({kind}). The hits above, if any, are background noise, "
+                 "not memory. Do NOT answer from training as if remembered : "
+                 "ground first (ask, read the sources, search), THEN `ingest` the "
+                 "durable findings so the gap is filled next time."),
+    }
+
+
 def build_app(
     storage_path: Optional[str] = None,
     memory: Optional[Memory] = None,
@@ -262,7 +285,7 @@ def build_app(
             abstain=abstain,
         )
         if abstain and not results:
-            return [{"abstained": True,
+            return [{"abstained": True, **_gap_notice("retrieve"),
                      "note": "no chunk sufficiently activated — retrieval failed"}]
         # Log the retrieval (mnema access-log) and hand back a retrieval_id
         # handle so the agent can later mark_useful(...) on it — the supervised
@@ -273,6 +296,13 @@ def build_app(
             if rid is not None:
                 for r in results:
                     r["retrieval_id"] = rid
+        except Exception:
+            pass
+        # GAP sentinel (in-band, always evaluated) : even without `abstain`, say
+        # loudly when the best match does not stand out from the background.
+        try:
+            if memory.abstains(query):
+                results = list(results) + [_gap_notice("retrieve")]
         except Exception:
             pass
         return results
@@ -572,6 +602,11 @@ def build_app(
             t.content for t in getattr(walker, "_thought_chain", [])
         ]
         out["done"] = True
+        # GAP sentinel : a walk that composed NO on-target evidence is a gap.
+        out["gap"] = not evidence
+        if out["gap"]:
+            out["sentinel"] = GAP_SENTINEL
+            out["gap_note"] = _gap_notice("walk_start")["note"]
         walkers.close(walk_id)
         return out
 
@@ -1352,6 +1387,10 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.storage:
+        # `~` and a missing parent dir are the plugin's default (~/.metacog/…)
+        args.storage = os.path.expanduser(args.storage)
+        os.makedirs(os.path.dirname(os.path.abspath(args.storage)), exist_ok=True)
     app = build_app(storage_path=args.storage)
     if args.transport in ("sse", "streamable-http"):
         # Configure the HTTP bind for the streaming transports.

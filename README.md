@@ -1295,7 +1295,9 @@ push_code           evaluate & route generated code → project doc and/or tool
 # ask
 retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
                     abstain=true applies the ACT-R threshold → [] when no
-                    chunk is sufficiently activated ("I don't know") (§5.3)
+                    chunk is sufficiently activated ("I don't know") (§5.3);
+                    always appends the in-band GAP sentinel on such a query
+                    (the plugin's PostToolUse hook forces grounding, §7.4)
 walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
                     user_id/session_id add the double-query section boost. The
                     agent does BREADTH pivots, never micro-drives depth.
@@ -1390,6 +1392,40 @@ uv run python -m benchmarks.locomo.eval \
 ```
 
 ---
+
+### 7.4 Claude Code plugin — the memory as a hook-wired habit
+
+The repo is itself a **Claude Code plugin** (`.claude-plugin/plugin.json`,
+`hooks/hooks.json`, `bin/metacog-mcp.sh`): one install gives the MCP server
+*and* the hooks that turn the memory into a standing habit rather than a tool
+the model has to remember to call. This is the integration layer mnema wires by
+hand (a `~/.claude/CLAUDE.md` rule + `settings.json` hooks); here it ships with
+the package.
+
+```
+/plugin marketplace add HoliChrys/OmniCognition     # then
+/plugin install metacog@omnicognition
+# dev / local checkout :
+claude --plugin-dir /path/to/OmniCognition
+```
+
+| hook | script | what it does |
+|------|--------|--------------|
+| **SessionStart** | `hooks/session_start.py` | injects the **memory discipline** (recall before answering; feed every turn; remember what is durable; `forget` on correction; `mark_useful`; tools are memory) with the brain in use. No LLM, no memory load. |
+| **PostToolUse** on `retrieve` / `walk_start` | `hooks/recall_gap.py` | the **forcing layer**: the server emits an in-band **gap sentinel** (`⚠ NO RELEVANT MEMORY (gap)`) when no chunk is sufficiently activated (`Memory.abstains`, the ACT-R retrieval threshold, §5.3); the hook greps it and injects a just-in-time *"ground first, then `ingest`"* directive. A static rule read 50 turns ago loses to the parametric prior; a directive in the tool output the model just read does not. |
+| **SessionEnd** | `hooks/capture_session.py` | **auto-capture**: the user's own typed messages (tool results, slash commands and harness noise filtered out) are fed as episodic turns with their timestamps, **deduplicated** against what the session already indexed live, then one `sleep` cycle runs and the brain is saved. No LLM. |
+| **UserPromptSubmit** *(opt-in, `METACOG_AUTO_RECALL=1`)* | `hooks/auto_recall.py` | the cheap recall path (`retrieve`, k=5, no walk) injected before every prompt; silent on a gap. Off by default because it opens the brain in a fresh process on every turn — the default discipline is the model calling `retrieve` itself, with the gap hook as the safety net. |
+
+**Which brain.** The launcher and every hook resolve the storage the same way:
+a **`.metacog-brain`** marker file walked up from the project directory (first
+non-empty, non-comment line = the path — so a dev repo keeps its *own* memory
+instead of polluting the shared one; this has to live in the scripts, not in
+settings, because Claude Code merges hooks across scopes), else
+`METACOG_STORAGE`, else `~/.metacog/memory.pkl`. The plugin exposes the
+`external` surface (§5.5) unless `METACOG_SURFACE` says otherwise, and runs
+`python3` unless `METACOG_PYTHON` points elsewhere (a venv with `mcp<2`). Every
+hook is silent and exits 0 on anything unexpected — a hook must never break the
+session.
 
 ## References
 

@@ -1,0 +1,22 @@
+{
+  "name": "metacog",
+  "displayName": "metacog — persistent metacognitive memory",
+  "version": "0.1.0",
+  "description": "A persistent, self-organizing memory for Claude Code: MCP server (feed / ask / own tools / OKF wiki) + hooks that inject the memory discipline at session start, force grounding when a recall hits a gap, and capture every session into the brain at session end.",
+  "author": { "name": "HoliChrys" },
+  "repository": "https://github.com/HoliChrys/OmniCognition",
+  "license": "MIT",
+  "keywords": ["memory", "rag", "mcp", "hooks", "wiki", "okf", "act-r"],
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "metacog": {
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/metacog-mcp.sh"],
+      "env": {
+        "METACOG_STORAGE": "${METACOG_STORAGE}",
+        "METACOG_SURFACE": "${METACOG_SURFACE}",
+        "METACOG_PYTHON": "${METACOG_PYTHON}"
+      }
+    }
+  }
+}

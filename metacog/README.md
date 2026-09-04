@@ -257,6 +257,22 @@ All live in the journal; all no-op without one.
   its wiki doc exposes `status`, so `wiki_where("status", "proposed")` lists
   the unvetted capability set.
 
+## Claude Code plugin (`../.claude-plugin/`, `../hooks/`, `../bin/`)
+
+The repo root is a Claude Code plugin: `plugin.json` declares the MCP server
+(`bin/metacog-mcp.sh` → `python -m metacog.mcp_server --storage <brain>`,
+surface `external`) and `hooks/hooks.json` wires four hooks — **SessionStart**
+(`session_start.py`: inject the memory discipline), **PostToolUse** on
+`retrieve`/`walk_start` (`recall_gap.py`: grep the in-band **gap sentinel**
+`mcp_server.GAP_SENTINEL`, emitted when `Memory.abstains(query)`, and inject a
+"ground first, then ingest" directive), **SessionEnd** (`capture_session.py`:
+feed the user's typed messages as episodic turns, dedup, `sleep`, `save`) and
+**UserPromptSubmit** (`auto_recall.py`, opt-in `METACOG_AUTO_RECALL=1`).
+Brain resolution is shared (`hooks/_common.resolve_storage`): `.metacog-brain`
+marker walked up from cwd > `METACOG_STORAGE` > `~/.metacog/memory.pkl`. Hooks
+are stdlib-only at the edge, import `metacog` from the plugin root, and are
+silent + exit 0 on any error. Tests: `tests/test_plugin_hooks.py`.
+
 ## MCP tools (`mcp_server.py`)
 
 Classified into role tiers (`canonical_tools.py`). The `external` surface
@@ -271,7 +287,8 @@ ingest_message      EPISODIC: index a message (user/agent), async, timestamped
 push_code           evaluate & route generated code → project doc and/or tool
 # ask
 retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
-                    abstain=true → [] when no chunk is sufficiently activated
+                    abstain=true → [] when no chunk is sufficiently activated;
+                    a gap always appends the in-band sentinel (plugin hook)
 walk_start          run a COMPLETE uncertainty-governed walk (depth = σ);
                     user_id/session_id add the double-query section boost
 assemble_set        orchestrated exhaustive-set retrieval ("list every …")
