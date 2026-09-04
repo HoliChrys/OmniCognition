@@ -163,7 +163,11 @@ def build_app(
         # triggers (co-retrieval / lateral / Chasles / tag index / decay
         # history) survive restarts. "auto" is a no-op when storage_path is None
         # (ephemeral in-memory server) -> falls back to no journal.
-        memory = Memory(storage_path=storage_path, journal_path="auto")
+        # The encoder is the PRODUCTION one (fastembed, mnema's multilingual
+        # model ; METACOG_ENCODER overrides) — never the hash test encoder.
+        from metacog.defaults import make_encoder
+        memory = Memory(storage_path=storage_path, journal_path="auto",
+                        encoder=make_encoder())
 
     # Apply the ACT-R ranking levers (arg > env > leave as-is). Only assigned
     # when explicitly provided, so an injected memory's own weights survive.

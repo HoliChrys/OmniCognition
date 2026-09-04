@@ -4714,6 +4714,7 @@ class Memory:
         target = path or self.storage_path
         if target is None:
             raise ValueError("no storage_path configured and none provided")
+        from metacog.defaults import encoder_id
         snapshot = {
             "points": self.points,
             "observators": self.observators,
@@ -4722,6 +4723,9 @@ class Memory:
             "_spike_total_hops": self._spike_total_hops,
             "decay_exponent": self.decay_exponent,
             "_forget_log": getattr(self, "_forget_log", []),
+            # which encoder produced the stored embeddings (mnema's model_id
+            # stamp) : a later process with another encoder must re-encode.
+            "encoder_id": encoder_id(self.encoder),
         }
         with open(target, "wb") as f:
             pickle.dump(snapshot, f)
@@ -4752,3 +4756,50 @@ class Memory:
                            if t.startswith("event:type:")), "")
                 nm = p.content.split(" ", 1)[1] if " " in p.content else ""
                 self._event_registry[f"{et}::{nm.lower()}"] = p.id
+        # ENCODER MISMATCH : the stored embeddings belong to another encoder
+        # (or a legacy snapshot with another dimension) — cosines would be
+        # garbage, so re-encode everything once from content. Never silent.
+        from metacog.defaults import encoder_id
+        saved = snapshot.get("encoder_id")
+        mine = encoder_id(self.encoder)
+        mismatch = saved is not None and saved != mine
+        if saved is None and self.points:
+            try:
+                mismatch = len(self.points[0].embedding_orig) != len(self.encoder.encode("probe"))
+            except Exception:
+                mismatch = False
+        if mismatch:
+            n = self.reencode()
+            self._reencoded_from = saved
+            import sys as _sys
+            print(f"[metacog] encoder changed ({saved or 'unknown'} -> {mine}) : "
+                  f"re-encoded {n} points", file=_sys.stderr)
+
+    def reencode(self) -> int:
+        """Re-embed every point from its content with the CURRENT encoder
+        (and the keyword embeddings from their keywords). Learned geometric
+        pulls (`delta_active` / `delta_latent`) live in the old space and are
+        reset ; observator keyword embeddings are dropped and rebuilt lazily.
+        Returns the number of points re-encoded."""
+        from metacog.keywords import position_weighted_keyword_embedding
+        from metacog.geometry import clear_geo_cache
+        enc = self.encoder
+        batch = getattr(enc, "encode_batch", None)
+        if batch is not None and self.points:
+            embs = batch([p.content for p in self.points])
+        else:
+            embs = [tuple(enc.encode(p.content)) for p in self.points]
+        for p, emb in zip(self.points, embs):
+            emb = tuple(emb)
+            p.embedding_orig = emb
+            zero = tuple(0.0 for _ in emb)
+            p.delta_active = zero
+            p.delta_latent = zero
+            p.keywords_embedding = (
+                position_weighted_keyword_embedding(list(p.keywords), enc)
+                if p.keywords else None)
+        for obs in self.observators.values():
+            obs.keywords_embedding = None
+        clear_geo_cache()
+        self._text_index = TextIndex()
+        return len(self.points)

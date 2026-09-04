@@ -273,6 +273,13 @@ marker walked up from cwd > `METACOG_STORAGE` > `~/.metacog/memory.pkl`. Hooks
 are stdlib-only at the edge, import `metacog` from the plugin root, and are
 silent + exit 0 on any error. Tests: `tests/test_plugin_hooks.py`.
 
+**Encoder.** Server and hooks resolve ONE encoder via `defaults.make_encoder()`
+(`METACOG_ENCODER`: `auto` → `FastEmbedEncoder`, mnema's multilingual
+paraphrase-MiniLM (384d, ONNX/CPU), else a warned `SimpleEncoder` fallback).
+`Memory.save` stamps `encoder_id`; `load` re-encodes all points (`reencode`)
+when the stamp differs — a brain is never read in the wrong embedding space.
+`SimpleEncoder` stays the hermetic test default. Tests: `tests/test_encoder.py`.
+
 ## MCP tools (`mcp_server.py`)
 
 Classified into role tiers (`canonical_tools.py`). The `external` surface

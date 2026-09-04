@@ -1438,6 +1438,17 @@ settings, because Claude Code merges hooks across scopes), else
 hook is silent and exits 0 on anything unexpected — a hook must never break the
 session.
 
+**Which encoder.** The server and the hooks embed with the **production
+encoder** — mnema's stack: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+(384 dims, FR/EN) run locally as ONNX by `fastembed`, no torch, no API
+(`metacog.defaults.FastEmbedEncoder`). `METACOG_ENCODER` overrides (`auto` |
+`fastembed[:model]` | `org/model` | `simple[:dim]`); `auto` falls back to the
+hash `SimpleEncoder` **with a stderr warning** when fastembed is missing, an
+explicit `fastembed` never downgrades silently. A brain is **stamped with its
+encoder id** on save; reopening it with another encoder **re-encodes every
+point once** from content (learned geometric pulls are reset) and says so —
+cosines across two embedding spaces are never silently compared.
+
 ## References
 
 1. Romanchuk & Bondar. *Semantic Laundering in AI Agent Architectures.*

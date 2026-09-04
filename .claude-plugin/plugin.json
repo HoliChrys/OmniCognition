@@ -15,7 +15,8 @@
       "env": {
         "METACOG_STORAGE": "${METACOG_STORAGE}",
         "METACOG_SURFACE": "${METACOG_SURFACE}",
-        "METACOG_PYTHON": "${METACOG_PYTHON}"
+        "METACOG_PYTHON": "${METACOG_PYTHON}",
+        "METACOG_ENCODER": "${METACOG_ENCODER}"
       }
     }
   }

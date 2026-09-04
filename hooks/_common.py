@@ -139,6 +139,10 @@ def load_memory(storage: str):
     installed."""
     if str(PLUGIN_ROOT) not in sys.path:
         sys.path.insert(0, str(PLUGIN_ROOT))
+    from metacog.defaults import make_encoder
     from metacog.memory import Memory
     os.makedirs(os.path.dirname(os.path.abspath(storage)), exist_ok=True)
-    return Memory(storage_path=storage, journal_path="auto")
+    # the SAME encoder resolution as the MCP server (METACOG_ENCODER / auto ->
+    # fastembed), so hook and server agree on the brain's embedding space
+    return Memory(storage_path=storage, journal_path="auto",
+                  encoder=make_encoder())
