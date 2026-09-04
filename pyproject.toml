@@ -25,6 +25,7 @@ bench = [
 
 [project.scripts]
 metacog-mcp = "metacog.mcp_server:main"
+metacog-install = "metacog.install:main"
 
 [tool.setuptools]
 packages = ["metacog", "benchmarks", "benchmarks.locomo"]
