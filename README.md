@@ -831,6 +831,22 @@ a node from a scored retrieval has its `useful`/`useless` counts re-indexed and
 rendered in the OKF frontmatter, so docs can be queried and ranked by real
 feedback (`wiki_where("useful", "2")`).
 
+**Docs follow their sources (drift).** A doc cites the nodes it was generated
+from, so it can tell when they change. Every link stores the node's
+**fingerprint** at link time (`content hash : knowledge-tags hash`); the drift
+pass in `sleep` (`reconcile_wiki`) compares it with the node now and says
+*which* part moved (`content_changed` / `tags_changed`). What happens next
+depends on the body's provenance, stamped as `body_mode`: a **generated** body
+(the deterministic rendering of its refs — `feed_wiki` without prose, every
+auto-registered tool doc) **regenerates itself** from the current nodes, tags
+and index included; an **authored** body (prose someone wrote, `import_okf`)
+is **never overwritten** — its refs are flagged `outdated` with the reason, the
+doc becomes findable (`wiki_where("outdated")`, `check_wiki` → `outdated_ref`)
+and `refresh_wiki(doc)` returns the pending changes (which refs, how, what they
+say now) so the agent can rewrite and store the new prose with
+`refresh_wiki(doc, body)`. `update_tool` triggers the targeted pass at once, so
+a tool's wiki doc never lags its body.
+
 ### 5.7 Safety rails on identity ops — redirects, reversibility, reasons, proposals
 
 The destructive half of the memory — forget, merge, lateral collapse, dedup —
@@ -1339,7 +1355,11 @@ import_okf          consume an external OKF doc (redirects followed, issues
                     reported, never silently dropped)
 docs_for_node       reverse link: which docs cite this node
 check_wiki          READ-ONLY consistency check (stale refs + reason, prose/link
-                    mismatches, schema drift, unvetted types) — writes nothing
+                    mismatches, outdated refs, schema drift, unvetted types) —
+                    writes nothing
+refresh_wiki        re-align a doc with its changed refs: a generated doc
+                    re-renders; an authored doc returns the pending changes
+                    or stores the rewritten `body` (§5.6 drift)
 okf_proposals       out-of-vocabulary OKF types preserved as proposals
 vet_okf_type        accept / reject a proposed type (closes the vocabulary loop)
 
@@ -1367,8 +1387,9 @@ collect · bag · bags · bag_render
 declare_observator · detect_polarized · spawn_observators · route · list_communities
 # autonomic (run by the system, not the caller)
 sleep               consolidation: collision + decay-fit + forget-merge +
-                    wiki reconcile + tool promotion (+ wiki inference when
-                    enabled) (§5.3, §5.6, §5.7)
+                    wiki reconcile (redirects, stale, DRIFT: regenerate /
+                    flag) + tool promotion (+ wiki inference when enabled)
+                    (§5.3, §5.6, §5.7)
 infer_wiki          materialized wiki inference → separate derived table (opt-in)
 save · audit · crystallize_skills
 # internal / admin

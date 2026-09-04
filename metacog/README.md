@@ -212,6 +212,16 @@ An optional wiki layer (`wiki.py` + `memory.py` + `journal.py`) in Google's
   credibility signal: each doc's `useful`/`useless` counts are re-indexed (EAV)
   and rendered in the OKF frontmatter, so docs are queryable/rankable by real
   feedback.
+- **Docs follow their sources (drift)** — each link stores the node's
+  fingerprint (`wiki.node_fingerprint`: content hash : knowledge-tags hash);
+  the drift pass of `reconcile_wiki` (in `sleep`, or targeted by
+  `refresh_wiki_for_node`, which `update_tool` calls) compares it with the node
+  now (`fingerprint_drift` → `content_changed` / `tags_changed`). A
+  **generated** doc (`body_mode`, `feed_wiki` without prose, tool docs)
+  regenerates from its refs; an **authored** doc is never overwritten — refs
+  flagged `outdated` (EAV field, `check_wiki` → `outdated_ref`), and
+  `refresh_wiki(doc[, body])` returns the pending changes or stores the new
+  prose. Tests: `tests/test_wiki_drift.py`.
 
 ## Safety rails on identity ops — redirects, reversibility, reasons, proposals
 
@@ -325,7 +335,9 @@ okf_schema          the schema recovered from the data ({type: [keys]})
 import_okf          consume an external OKF doc (redirects followed, issues reported)
 docs_for_node       reverse link: which docs cite this node
 check_wiki          READ-ONLY consistency check (stale refs + reason, prose/link
-                    mismatches, schema drift, unvetted types) — writes nothing
+                    mismatches, outdated refs, schema drift, unvetted types)
+refresh_wiki        re-align a doc with its changed refs (generated: re-render;
+                    authored: pending changes, or store the rewritten body)
 okf_proposals       out-of-vocabulary OKF types preserved as proposals
 vet_okf_type        accept / reject a proposed type (closes the vocabulary loop)
 

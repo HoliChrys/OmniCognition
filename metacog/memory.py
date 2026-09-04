@@ -1283,18 +1283,31 @@ class Memory:
             for tg in (_w.context_tags(p.tags) if p else []):
                 if tg not in tags:
                     tags.append(tg)
+        mode = _w.BODY_GENERATED if body is None else _w.BODY_AUTHORED
         if body is None:
             items = [(nid, (id2p[nid].content if nid in id2p else nid))
                      for nid in ids]
             body = _w.default_body(items, tags)
         ts = self._now(t)
-        self.journal.upsert_wiki_doc(doc_id, type, title, tags, body, ts)
+        self.journal.upsert_wiki_doc(doc_id, type, title, tags, body, ts,
+                                     body_mode=mode)
         refs = list(dict.fromkeys(ids + _w.body_refs(body)))   # links = union
-        self.journal.set_wiki_refs(doc_id, refs)
+        self.journal.set_wiki_refs(doc_id, refs, self._ref_fingerprints(refs, id2p))
         issues += self._flag_unknown_refs(doc_id, refs, id2p)
         issues += self._vet_type(doc_id, type)
         self._reindex_okf(doc_id)
-        return {"doc_id": doc_id, "refs": refs, "tags": tags, "issues": issues}
+        return {"doc_id": doc_id, "refs": refs, "tags": tags, "issues": issues,
+                "body_mode": mode}
+
+    def _ref_fingerprints(self, refs: Sequence[str],
+                          id2p: Optional[Dict[str, Point]] = None) -> Dict[str, str]:
+        """What the doc sees of each cited node NOW (content + knowledge tags)
+        — stored per link so a later pass can tell what drifted."""
+        from metacog import wiki as _w
+        if id2p is None:
+            id2p = {p.id: p for p in self.points}
+        return {nid: _w.node_fingerprint(id2p[nid].content, id2p[nid].tags)
+                for nid in refs if nid in id2p}
 
     def _flag_unknown_refs(self, doc_id: str, refs: Sequence[str],
                            id2p: Optional[Dict[str, Point]] = None
@@ -1327,6 +1340,11 @@ class Memory:
         st = self._doc_tool_status(doc, refs)
         if st:
             extra["status"] = st
+        extra["body_mode"] = doc.get("body_mode") or "generated"
+        n_out = sum(1 for r in self.journal.wiki_refs_for_doc(doc_id)
+                    if r.get("outdated"))
+        if n_out:
+            extra["outdated"] = n_out
         return _w.render_okf(type=doc["type"], title=doc["title"],
                              tags=doc["tags"], refs=refs, body=doc["body"],
                              timestamp=doc["ts"], extra=extra)
@@ -1337,20 +1355,31 @@ class Memory:
             return []
         return self.journal.docs_referencing(self.resolve_alias(str(node_id)))
 
-    def reconcile_wiki(self) -> Dict[str, Any]:
-        """RAG -> wiki sync (offline, in sleep). For every wiki ref: follow merges
-        (`resolve_alias`) and rewrite old->new in BOTH the DB links and the body
-        `[[…]]`; flag refs whose target is gone or INVALID as stale so the doc is
-        known to need revision. No-op without a journal."""
+    def reconcile_wiki(self, doc_ids: Optional[Sequence[str]] = None
+                       ) -> Dict[str, Any]:
+        """RAG -> wiki sync (offline, in sleep ; or scoped to `doc_ids`). For
+        every wiki ref: follow merges (`resolve_alias`) and rewrite old->new in
+        BOTH the DB links and the body `[[…]]`; flag refs whose target is gone
+        or INVALID as stale so the doc is known to need revision. Then the
+        DRIFT pass : a cited node whose content / knowledge tags changed since
+        the doc linked it (fingerprint) makes a GENERATED doc regenerate itself
+        from its refs, and an AUTHORED doc get its refs flagged `outdated`
+        with the reason (never overwritten — see `refresh_wiki`). No-op
+        without a journal."""
         if self.journal is None:
-            return {"remapped": 0, "stale": 0, "reasons": {}}
+            return {"remapped": 0, "stale": 0, "reasons": {},
+                    "refreshed": 0, "outdated": 0}
         from metacog import wiki as _w
         from metacog.epistemic import EpistemicState
         id2p = {p.id: p for p in self.points}
         remapped = stale = 0
         reasons: Dict[str, int] = {}
-        for doc_id in self.journal.all_wiki_doc_ids():
+        targets = (list(doc_ids) if doc_ids is not None
+                   else self.journal.all_wiki_doc_ids())
+        for doc_id in targets:
             doc = self.journal.get_wiki_doc(doc_id)
+            if doc is None:
+                continue
             mapping: Dict[str, str] = {}
             had_new: Dict[str, bool] = {}
             linked = {r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)}
@@ -1391,7 +1420,138 @@ class Memory:
                     self.journal.log_ref_remap(
                         doc_id, old, new, had_new=had_new.get(old, False),
                         ordinals=trace.get(old, []), ts=self._now())
-        return {"remapped": remapped, "stale": stale, "reasons": reasons}
+        # DRIFT pass : did the cited nodes change since the doc last saw them ?
+        refreshed = outdated = 0
+        for doc_id in targets:
+            r = self._drift_pass(doc_id, id2p)
+            refreshed += r["refreshed"]
+            outdated += r["outdated"]
+            for code, n in r["reasons"].items():
+                reasons[code] = reasons.get(code, 0) + n
+        return {"remapped": remapped, "stale": stale, "reasons": reasons,
+                "refreshed": refreshed, "outdated": outdated}
+
+    def _drift_pass(self, doc_id: str,
+                    id2p: Optional[Dict[str, Point]] = None) -> Dict[str, Any]:
+        """Compare each ref's stored fingerprint with the node NOW. A ref with
+        no baseline (legacy / just remapped) gets one silently. On drift : a
+        GENERATED body is regenerated (the doc IS its refs) ; an AUTHORED body
+        is flagged per ref with the drift code. Returns counts."""
+        from metacog import wiki as _w
+        if self.journal is None:
+            return {"refreshed": 0, "outdated": 0, "reasons": {}}
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"refreshed": 0, "outdated": 0, "reasons": {}}
+        if id2p is None:
+            id2p = {p.id: p for p in self.points}
+        drift: Dict[str, str] = {}
+        cleared = False
+        for r in self.journal.wiki_refs_for_doc(doc_id):
+            p = id2p.get(r["node_id"])
+            if p is None:
+                continue                       # gone/invalid : the stale pass owns it
+            now = _w.node_fingerprint(p.content, p.tags)
+            if not r["fingerprint"]:
+                self.journal.set_ref_fingerprint(doc_id, r["node_id"], now)
+                continue
+            code = _w.fingerprint_drift(r["fingerprint"], now)
+            if code:
+                drift[r["node_id"]] = code
+            elif r["outdated"]:                # drift resolved elsewhere
+                self.journal.mark_wiki_ref_outdated(doc_id, r["node_id"], None)
+                cleared = True
+        reasons: Dict[str, int] = {}
+        for code in drift.values():
+            reasons[code] = reasons.get(code, 0) + 1
+        if not drift:
+            if cleared:
+                self._reindex_okf(doc_id)      # `outdated` leaves the index too
+            return {"refreshed": 0, "outdated": 0, "reasons": reasons}
+        if doc["body_mode"] == _w.BODY_GENERATED:
+            self._regenerate_doc(doc_id, id2p)
+            return {"refreshed": 1, "outdated": 0, "reasons": reasons}
+        for nid, code in drift.items():
+            self.journal.mark_wiki_ref_outdated(doc_id, nid, code)
+        self._reindex_okf(doc_id)
+        return {"refreshed": 0, "outdated": 1, "reasons": reasons}
+
+    def _regenerate_doc(self, doc_id: str,
+                        id2p: Optional[Dict[str, Point]] = None) -> None:
+        """Re-render a GENERATED doc from the CURRENT state of its refs
+        (content + tags), refresh every fingerprint, clear drift flags."""
+        from metacog import wiki as _w
+        doc = self.journal.get_wiki_doc(doc_id)
+        if id2p is None:
+            id2p = {p.id: p for p in self.points}
+        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        tags: List[str] = []
+        for nid in refs:
+            p = id2p.get(nid)
+            for tg in (_w.context_tags(p.tags) if p else []):
+                if tg not in tags:
+                    tags.append(tg)
+        items = [(nid, (id2p[nid].content if nid in id2p else nid)) for nid in refs]
+        body = _w.default_body(items, tags)
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], tags,
+                                     body, self._now(), body_mode=_w.BODY_GENERATED)
+        for nid, fp in self._ref_fingerprints(refs, id2p).items():
+            self.journal.set_ref_fingerprint(doc_id, nid, fp)
+        self._reindex_okf(doc_id)
+
+    def refresh_wiki(self, doc_id: str, body: Optional[str] = None
+                     ) -> Dict[str, Any]:
+        """Bring a doc back in line with its refs. GENERATED doc : re-render
+        from the current nodes. AUTHORED doc : needs the new prose (`body`) —
+        without it, nothing is overwritten and the pending changes are
+        returned (which refs drifted, how, and what they say NOW) so the
+        agent can rewrite. With `body` : store it as the new authored body,
+        link its `[[…]]`, re-baseline the fingerprints, clear the flags."""
+        from metacog import wiki as _w
+        if self.journal is None:
+            return {"doc_id": None, "refreshed": False, "reason": "no_journal"}
+        doc = self.journal.get_wiki_doc(doc_id)
+        if doc is None:
+            return {"doc_id": doc_id, "refreshed": False, "reason": "missing_doc"}
+        id2p = {p.id: p for p in self.points}
+        if body is None and doc["body_mode"] == _w.BODY_GENERATED:
+            self._regenerate_doc(doc_id, id2p)
+            return {"doc_id": doc_id, "refreshed": True, "body_mode": doc["body_mode"]}
+        if body is None:
+            changes = []
+            for r in self.journal.wiki_refs_for_doc(doc_id):
+                p = id2p.get(r["node_id"])
+                code = r["outdated"]
+                if p is not None and not code and r["fingerprint"]:
+                    code = _w.fingerprint_drift(
+                        r["fingerprint"], _w.node_fingerprint(p.content, p.tags))
+                if code:
+                    changes.append({"ref": r["node_id"], "reason": code,
+                                    "content": (p.content if p else None),
+                                    "tags": (_w.context_tags(p.tags) if p else [])})
+            return {"doc_id": doc_id, "refreshed": False,
+                    "reason": "authored_body_needs_text", "changes": changes}
+        refs = list(dict.fromkeys(
+            [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+            + _w.body_refs(body)))
+        self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"], doc["tags"],
+                                     body.strip(), self._now(),
+                                     body_mode=_w.BODY_AUTHORED)
+        self.journal.set_wiki_refs(doc_id, refs, self._ref_fingerprints(refs, id2p))
+        issues = self._flag_unknown_refs(doc_id, refs, id2p)
+        self._reindex_okf(doc_id)
+        return {"doc_id": doc_id, "refreshed": True, "body_mode": _w.BODY_AUTHORED,
+                "refs": refs, "issues": issues}
+
+    def refresh_wiki_for_node(self, node_id: str) -> Dict[str, Any]:
+        """Targeted drift pass over the docs citing ONE node (used right after
+        a node is rewritten, e.g. `update_tool`) — generated docs regenerate
+        now instead of at the next sleep."""
+        if self.journal is None:
+            return {"docs": [], "refreshed": 0, "outdated": 0}
+        docs = self.docs_for_node(node_id)
+        out = self.reconcile_wiki(doc_ids=docs) if docs else {"refreshed": 0, "outdated": 0}
+        return {"docs": docs, "refreshed": out["refreshed"], "outdated": out["outdated"]}
 
     def ingest_from_wiki(self, doc_id: str, text: str, *,
                          kind: str = "FACT") -> Dict[str, Any]:
@@ -1407,10 +1567,14 @@ class Memory:
         for tg in doc["tags"]:                          # carry the doc's context
             if tg not in p.tags:
                 p.tags.append(tg)
-        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        old = {r["node_id"]: r["fingerprint"]
+               for r in self.journal.wiki_refs_for_doc(doc_id)}
+        refs = list(old)
         if p.id not in refs:
             refs.append(p.id)
-        self.journal.set_wiki_refs(doc_id, refs)
+        fps = {k: v for k, v in old.items() if v}
+        fps.update(self._ref_fingerprints([p.id]))
+        self.journal.set_wiki_refs(doc_id, refs, fps)
         new_body = doc["body"].rstrip() + f"\n- {text.strip()} [[{p.id}]]"
         self.journal.upsert_wiki_doc(doc_id, doc["type"], doc["title"],
                                      doc["tags"], new_body, self._now())
@@ -1438,13 +1602,17 @@ class Memory:
         doc = self.journal.get_wiki_doc(doc_id)
         if doc is None:
             return
-        refs = [r["node_id"] for r in self.journal.wiki_refs_for_doc(doc_id)]
+        rows = self.journal.wiki_refs_for_doc(doc_id)
+        refs = [r["node_id"] for r in rows]
         fb = self._doc_usefulness(doc_id)
         fields = {
             "type": doc["type"], "title": doc["title"], "tags": doc["tags"],
             "refs": refs, "useful": fb["useful"], "useless": fb["useless"],
-            "timestamp": doc["ts"],
+            "timestamp": doc["ts"], "body_mode": doc.get("body_mode"),
         }
+        n_out = sum(1 for r in rows if r.get("outdated"))
+        if n_out:
+            fields["outdated"] = n_out                # queryable : needs revision
         st = self._doc_tool_status(doc, refs)      # proposed / established / retired
         if st:
             fields["status"] = st
@@ -1513,6 +1681,10 @@ class Memory:
                     out.append({"doc_id": d, "code": "stale_ref",
                                 "detail": {"ref": r["node_id"],
                                            "reason": r["reason"]}})
+                if r.get("outdated"):
+                    out.append({"doc_id": d, "code": "outdated_ref",
+                                "detail": {"ref": r["node_id"],
+                                           "reason": r["outdated"]}})
             inline = _w.body_refs(doc["body"])
             for nid in inline:
                 if nid not in linked:
@@ -1655,9 +1827,9 @@ class Memory:
                 issues.append({"ref": nid, "to": r, "reason": _w.REF_REDIRECTED})
         body = _w.rewrite_body_refs(d["body"], mapping) if mapping else d["body"]
         self.journal.upsert_wiki_doc(doc_id, d["type"], d["title"], d["tags"],
-                                     body, ts)
+                                     body, ts, body_mode=_w.BODY_AUTHORED)
         refs = list(dict.fromkeys(mapping.get(n, n) for n in raw))
-        self.journal.set_wiki_refs(doc_id, refs)
+        self.journal.set_wiki_refs(doc_id, refs, self._ref_fingerprints(refs))
         issues += self._flag_unknown_refs(doc_id, refs)
         issues += self._vet_type(doc_id, d["type"])
         self._reindex_okf(doc_id)
@@ -3891,10 +4063,12 @@ class Memory:
         # RAG -> wiki sync : rewrite refs of nodes that merged, flag stale ones.
         # Runs AFTER merge_forgotten so the aliases are set. No-op without a wiki.
         wr = self.reconcile_wiki()
-        if wr["remapped"] or wr["stale"]:
+        if wr["remapped"] or wr["stale"] or wr["refreshed"] or wr["outdated"]:
             out["wiki_remapped"] = wr["remapped"]
             out["wiki_stale"] = wr["stale"]
             out["wiki_stale_reasons"] = wr["reasons"]
+            out["wiki_refreshed"] = wr["refreshed"]   # generated docs re-rendered
+            out["wiki_outdated"] = wr["outdated"]     # authored docs flagged
         # PROPOSED -> ESTABLISHED : emergent tools that earned their uses.
         pt = self.promote_tools(t_now)
         if pt["promoted"]:
@@ -4553,8 +4727,12 @@ class Memory:
         tool.n_revision += 1
         self._tool_event(tool_id, "updated",
                          "revived" if revived else f"revision {tool.n_revision}")
-        if self.journal is not None and self.journal.get_wiki_doc(f"tool:{tool_id}"):
-            self._reindex_okf(f"tool:{tool_id}")
+        if self.journal is not None:
+            # the docs citing this tool follow its new body NOW (generated
+            # ones regenerate ; authored ones get flagged)
+            self.refresh_wiki_for_node(tool_id)
+            if self.journal.get_wiki_doc(f"tool:{tool_id}"):
+                self._reindex_okf(f"tool:{tool_id}")
         return {"tool_id": tool_id, "content": tool.content,
                 "n_revision": tool.n_revision}
 

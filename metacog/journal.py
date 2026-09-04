@@ -103,18 +103,21 @@ CREATE INDEX IF NOT EXISTS idx_forget_node   ON forget_events(node_id);
 CREATE INDEX IF NOT EXISTS idx_forget_merged ON forget_events(merged);
 
 CREATE TABLE IF NOT EXISTS wiki_docs (
-    doc_id  TEXT PRIMARY KEY,
-    type    TEXT NOT NULL,
-    title   TEXT NOT NULL,
-    tags    TEXT NOT NULL,                        -- JSON array
-    body    TEXT NOT NULL,                        -- markdown (inline [[refs]]/#tags)
-    ts      REAL NOT NULL
+    doc_id    TEXT PRIMARY KEY,
+    type      TEXT NOT NULL,
+    title     TEXT NOT NULL,
+    tags      TEXT NOT NULL,                      -- JSON array
+    body      TEXT NOT NULL,                      -- markdown (inline [[refs]]/#tags)
+    ts        REAL NOT NULL,
+    body_mode TEXT                                -- 'generated' (from refs) | 'authored'
 );
 CREATE TABLE IF NOT EXISTS wiki_refs (
-    doc_id  TEXT NOT NULL,
-    node_id TEXT NOT NULL,                         -- a RAG node this doc cites
-    stale   INTEGER NOT NULL DEFAULT 0,            -- 1 = target gone/invalid
-    reason  TEXT,                                  -- WHY stale (explicit code)
+    doc_id      TEXT NOT NULL,
+    node_id     TEXT NOT NULL,                     -- a RAG node this doc cites
+    stale       INTEGER NOT NULL DEFAULT 0,        -- 1 = target gone/invalid
+    reason      TEXT,                              -- WHY stale (explicit code)
+    fingerprint TEXT,                              -- node content/tags hash at link time
+    outdated    TEXT,                              -- drift code when the node changed since
     PRIMARY KEY (doc_id, node_id)
 );
 CREATE INDEX IF NOT EXISTS idx_wikiref_node ON wiki_refs(node_id);
@@ -197,7 +200,12 @@ CREATE TABLE IF NOT EXISTS okf_vocab (
 
 #: Columns added after a table first shipped ; applied idempotently on open so an
 #: existing journal file keeps working (the ONLY migration-ish step we do).
-_LATE_COLUMNS = [("wiki_refs", "reason", "TEXT")]
+_LATE_COLUMNS = [
+    ("wiki_refs", "reason", "TEXT"),
+    ("wiki_refs", "fingerprint", "TEXT"),
+    ("wiki_refs", "outdated", "TEXT"),
+    ("wiki_docs", "body_mode", "TEXT"),
+]
 
 
 class Journal:
@@ -350,42 +358,82 @@ class Journal:
 
     def upsert_wiki_doc(self, doc_id: str, type: str, title: str,
                         tags: Sequence[str], body: str,
-                        ts: Optional[float] = None) -> None:
-        """Create or replace a wiki doc's content (frontmatter + body)."""
+                        ts: Optional[float] = None,
+                        body_mode: Optional[str] = None) -> None:
+        """Create or replace a wiki doc's content (frontmatter + body).
+        `body_mode` : 'generated' (the body is the deterministic rendering of
+        its refs — safe to regenerate) or 'authored' (prose someone wrote —
+        never overwritten automatically). None keeps the existing mode
+        (defaulting to 'generated' for a new doc)."""
         ts = time.time() if ts is None else ts
+        if body_mode is None:
+            row = self.conn.execute(
+                "SELECT body_mode FROM wiki_docs WHERE doc_id = ?",
+                (str(doc_id),)).fetchone()
+            body_mode = (row["body_mode"] if row is not None else None) or "generated"
         self.conn.execute(
-            "INSERT INTO wiki_docs(doc_id, type, title, tags, body, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET "
+            "INSERT INTO wiki_docs(doc_id, type, title, tags, body, ts, body_mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET "
             "type=excluded.type, title=excluded.title, tags=excluded.tags, "
-            "body=excluded.body, ts=excluded.ts",
-            (str(doc_id), type, title, json.dumps(list(tags)), body, ts),
+            "body=excluded.body, ts=excluded.ts, body_mode=excluded.body_mode",
+            (str(doc_id), type, title, json.dumps(list(tags)), body, ts, body_mode),
         )
         self.conn.commit()
 
     def get_wiki_doc(self, doc_id: str) -> Optional[dict]:
         row = self.conn.execute(
-            "SELECT doc_id, type, title, tags, body, ts FROM wiki_docs "
+            "SELECT doc_id, type, title, tags, body, ts, body_mode FROM wiki_docs "
             "WHERE doc_id = ?", (str(doc_id),)).fetchone()
         if row is None:
             return None
         return {"doc_id": row["doc_id"], "type": row["type"],
                 "title": row["title"], "tags": json.loads(row["tags"]),
-                "body": row["body"], "ts": row["ts"]}
+                "body": row["body"], "ts": row["ts"],
+                "body_mode": row["body_mode"] or "generated"}
 
-    def set_wiki_refs(self, doc_id: str, node_ids: Sequence[str]) -> None:
-        """Replace a doc's node refs (the canonical wiki<->node links)."""
+    def set_wiki_refs(self, doc_id: str, node_ids: Sequence[str],
+                      fingerprints: Optional[dict] = None) -> None:
+        """Replace a doc's node refs (the canonical wiki<->node links), with
+        each node's fingerprint at link time when known ({node_id: fp})."""
+        fps = fingerprints or {}
         self.conn.execute("DELETE FROM wiki_refs WHERE doc_id = ?", (str(doc_id),))
         self.conn.executemany(
-            "INSERT OR IGNORE INTO wiki_refs(doc_id, node_id, stale) "
-            "VALUES (?, ?, 0)", [(str(doc_id), str(n)) for n in node_ids])
+            "INSERT OR IGNORE INTO wiki_refs(doc_id, node_id, stale, fingerprint) "
+            "VALUES (?, ?, 0, ?)",
+            [(str(doc_id), str(n), fps.get(str(n))) for n in node_ids])
+        self.conn.commit()
+
+    def set_ref_fingerprint(self, doc_id: str, node_id: str,
+                            fingerprint: Optional[str],
+                            clear_outdated: bool = True) -> None:
+        """Record what the doc last saw of this node (and clear its drift)."""
+        if clear_outdated:
+            self.conn.execute(
+                "UPDATE wiki_refs SET fingerprint = ?, outdated = NULL "
+                "WHERE doc_id = ? AND node_id = ?",
+                (fingerprint, str(doc_id), str(node_id)))
+        else:
+            self.conn.execute(
+                "UPDATE wiki_refs SET fingerprint = ? WHERE doc_id = ? AND node_id = ?",
+                (fingerprint, str(doc_id), str(node_id)))
+        self.conn.commit()
+
+    def mark_wiki_ref_outdated(self, doc_id: str, node_id: str,
+                               reason: Optional[str]) -> None:
+        """Flag (reason code) / clear (None) a ref whose node drifted since the
+        doc last saw it."""
+        self.conn.execute(
+            "UPDATE wiki_refs SET outdated = ? WHERE doc_id = ? AND node_id = ?",
+            (reason, str(doc_id), str(node_id)))
         self.conn.commit()
 
     def wiki_refs_for_doc(self, doc_id: str) -> List[dict]:
         rows = self.conn.execute(
-            "SELECT node_id, stale, reason FROM wiki_refs WHERE doc_id = ? "
-            "ORDER BY node_id", (str(doc_id),)).fetchall()
+            "SELECT node_id, stale, reason, fingerprint, outdated FROM wiki_refs "
+            "WHERE doc_id = ? ORDER BY node_id", (str(doc_id),)).fetchall()
         return [{"node_id": r["node_id"], "stale": bool(r["stale"]),
-                 "reason": r["reason"]} for r in rows]
+                 "reason": r["reason"], "fingerprint": r["fingerprint"],
+                 "outdated": r["outdated"]} for r in rows]
 
     def docs_referencing(self, node_id: str) -> List[str]:
         """Reverse link : which wiki docs cite this node (the RAG->wiki edge)."""

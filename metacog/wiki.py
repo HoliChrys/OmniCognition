@@ -54,10 +54,44 @@ DOC_NO_FRONTMATTER = "no_frontmatter"
 TYPE_PROPOSED = "type_proposed"
 #: A doc whose `type` was explicitly REJECTED when vetted.
 TYPE_REJECTED = "type_rejected"
+#: A cited node's CONTENT changed since the doc last saw it (drift).
+REF_CONTENT_CHANGED = "content_changed"
+#: A cited node's knowledge TAGS changed since the doc last saw it (drift).
+REF_TAGS_CHANGED = "tags_changed"
+#: Both.
+REF_CHANGED = "content_and_tags_changed"
 REASON_CODES = frozenset({
     REF_MISSING, REF_INVALIDATED, REF_DEPRECATED, REF_REDIRECTED,
     DOC_NO_FRONTMATTER, TYPE_PROPOSED, TYPE_REJECTED,
+    REF_CONTENT_CHANGED, REF_TAGS_CHANGED, REF_CHANGED,
 })
+
+#: Body provenance : a GENERATED body is the deterministic rendering of the
+#: doc's refs (`default_body`) and may be regenerated when they drift ; an
+#: AUTHORED body is prose someone wrote and is only ever FLAGGED.
+BODY_GENERATED = "generated"
+BODY_AUTHORED = "authored"
+
+
+def node_fingerprint(content: str, tags: Sequence[str]) -> str:
+    """What a doc "saw" of a node when it linked it : two short hashes,
+    `<content>:<knowledge tags>`, so drift can say WHICH part changed."""
+    import hashlib
+    c = hashlib.sha1((content or "").strip().encode("utf-8")).hexdigest()[:12]
+    t = hashlib.sha1(",".join(sorted(context_tags(tags))).encode("utf-8")).hexdigest()[:12]
+    return f"{c}:{t}"
+
+
+def fingerprint_drift(old: Optional[str], new: str) -> Optional[str]:
+    """The drift reason code between two fingerprints (None = unchanged or
+    unknown baseline)."""
+    if not old or old == new:
+        return None
+    oc, _, ot = old.partition(":")
+    nc, _, nt = new.partition(":")
+    if oc != nc and ot != nt:
+        return REF_CHANGED
+    return REF_CONTENT_CHANGED if oc != nc else REF_TAGS_CHANGED
 
 
 def body_refs(body: str) -> List[str]:

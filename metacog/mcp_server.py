@@ -431,6 +431,17 @@ def build_app(
         return memory.feed_wiki(doc_id, title, node_ids, type=type, body=body)
 
     @app.tool()
+    def refresh_wiki(doc_id: str, body: Optional[str] = None) -> dict:
+        """Bring a wiki doc back in line with the nodes it cites after they
+        changed (the drift `sleep` detects via per-ref fingerprints). A
+        GENERATED doc re-renders itself from its refs (also automatic in
+        sleep). An AUTHORED doc is never overwritten : without `body` you get
+        the pending changes (which refs drifted, how, what they say now) ;
+        pass the rewritten prose as `body` to store it and clear the flags.
+        `wiki_where('outdated')` lists the docs waiting for this."""
+        return memory.refresh_wiki(doc_id, body=body)
+
+    @app.tool()
     def wiki_doc(doc_id: str) -> dict:
         """Render the current OKF markdown of a wiki doc (live frontmatter refs +
         first-order feedback), or {} if absent."""

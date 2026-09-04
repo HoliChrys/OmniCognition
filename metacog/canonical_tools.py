@@ -52,6 +52,7 @@ CANONICAL: Set[str] = {
     # okf_proposals / vet_okf_type close the vocabulary proposal loop.
     "feed_wiki", "wiki_doc", "ingest_from_wiki", "wiki_where", "okf_schema",
     "import_okf", "docs_for_node", "check_wiki", "okf_proposals", "vet_okf_type",
+    "refresh_wiki",
 }
 
 # -- T2 : agent-tool machinery (tools live as memory nodes) --------------------
