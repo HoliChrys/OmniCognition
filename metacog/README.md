@@ -280,6 +280,14 @@ paraphrase-MiniLM (384d, ONNX/CPU), else a warned `SimpleEncoder` fallback).
 when the stamp differs — a brain is never read in the wrong embedding space.
 `SimpleEncoder` stays the hermetic test default. Tests: `tests/test_encoder.py`.
 
+**Reranker.** `defaults.make_reranker()` (`METACOG_RERANKER`: `auto` →
+`CrossEncoderReranker`, mnema's jina multilingual cross-encoder, else a warned
+`None`) is wired by the server only. `Memory.retrieve(rerank=None|True|False,
+rerank_pre=30)` runs mnema's pipeline — cosine pre-fetch → joint scoring →
+sigmoid → top-k — *before* the need-odds / spreading blends, and exposes the
+logit as `rerank_score`; failure-safe (cosine order kept). The oblique judge
+(`_proposition_scores`) uses the same object. Tests: `tests/test_reranker.py`.
+
 ## MCP tools (`mcp_server.py`)
 
 Classified into role tiers (`canonical_tools.py`). The `external` surface

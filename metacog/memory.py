@@ -2760,6 +2760,8 @@ class Memory:
         t: Optional[float] = None,
         abstain: bool = False,
         abstain_threshold: Optional[float] = None,
+        rerank: Optional[bool] = None,
+        rerank_pre: int = 30,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -2779,10 +2781,20 @@ class Memory:
         sufficiently activated for `query` (see `abstains`), retrieval FAILS and
         returns [] — an explicit 'I don't know' instead of the least-bad match.
         `abstain_threshold` fixes tau ; None uses the emergent floor.
+
+        `rerank` : the mnema second stage — pre-fetch `rerank_pre` candidates
+        by the mode above, score each (query, content) pair JOINTLY with the
+        cross-encoder `self.reranker`, sigmoid the logits, keep top-k. Default
+        None = on whenever a reranker is wired in ; False forces cosine order.
+        Runs BEFORE the ACT-R blends (need-odds / spreading act on the reranked
+        relevance, as in mnema's `blend_scores`). Failure-safe : a reranker
+        error leaves the cosine order.
         """
         t_now = self._now(t)
         if abstain and self.abstains(query, abstain_threshold):
             return []                            # retrieval failure (ACT-R)
+        rr = getattr(self, "reranker", None)
+        do_rerank = rr is not None and (rerank if rerank is not None else True)
         # When entity beacons exist they act as ingest-time pull agents :
         # their geometric pull already shifted the real facts, so we drop
         # them from the RETURNED ids (over-fetching to backfill to k) — the
@@ -2815,6 +2827,8 @@ class Memory:
             k_fetch = k * 2 + 10
         if atomics:
             k_fetch = max(k_fetch, k * 5 + 20)
+        if do_rerank:
+            k_fetch = max(k_fetch, max(k, rerank_pre))   # the rerank pre-fetch
         if observator_id and observator_id != DEFAULT_OBSERVATOR_ID:
             q_emb = tuple(self.encoder.encode(query))
             results = retrieve_for_observator(
@@ -2907,6 +2921,24 @@ class Memory:
         from metacog.epistemic import EpistemicState as _ES
         results = [(s, p) for s, p in results
                    if p.state not in (_ES.INVALID, _ES.DEPRECATED)]
+        # CROSS-ENCODER RERANK (mnema's second stage) : the pre-fetched
+        # candidates are scored jointly with the query ; sigmoid(logit) becomes
+        # the relevance the ACT-R blends below act on. Top-k after rerank.
+        rerank_logits: Dict[str, float] = {}
+        if do_rerank and results:
+            try:
+                docs = [(p.content or "")[:512] for _, p in results]
+                logits = [float(x) for x in rr.rerank(query, docs)]
+                if len(logits) == len(results):
+                    import math as _m
+                    scored = []
+                    for (_, p), lg in zip(results, logits):
+                        rerank_logits[p.id] = lg
+                        scored.append((1.0 / (1.0 + _m.exp(-lg)), p))
+                    results = sorted(scored, key=lambda sp: sp[0],
+                                     reverse=True)[:k]
+            except Exception:
+                results = results[:k]                # keep the cosine order
         # ACT-R base-level : re-rank by blending the base relevance with each
         # candidate's need-odds (journal access recency×frequency). OFF unless
         # recency_weight > 0 and a journal is present -> default order untouched.
@@ -2947,6 +2979,8 @@ class Memory:
                 "confidence": p.confidence,
                 "n_corrob": p.n_corrob,
                 "n_contra": p.n_contra,
+                **({"rerank_score": rerank_logits[p.id]}
+                   if p.id in rerank_logits else {}),
             }
             for score, p in results
         ]

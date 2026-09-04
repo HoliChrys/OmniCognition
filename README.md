@@ -1304,7 +1304,9 @@ ingest              add a FACT / THOUGHT / ACTION (+ optional indexing `tags`,
 ingest_message      EPISODIC: index a message (user/agent), async, timestamped
 push_code           evaluate & route generated code → project doc and/or tool
 # ask
-retrieve            top-k hybrid retrieval (RRF); returns a retrieval_id.
+retrieve            top-k hybrid retrieval (RRF) + cross-encoder rerank when
+                    a reranker is wired (rerank=false → cosine order);
+                    returns a retrieval_id (+ rerank_score).
                     abstain=true applies the ACT-R threshold → [] when no
                     chunk is sufficiently activated ("I don't know") (§5.3);
                     always appends the in-band GAP sentinel on such a query
@@ -1448,6 +1450,16 @@ explicit `fastembed` never downgrades silently. A brain is **stamped with its
 encoder id** on save; reopening it with another encoder **re-encodes every
 point once** from content (learned geometric pulls are reset) and says so —
 cosines across two embedding spaces are never silently compared.
+
+**Which reranker.** The server also wires mnema's second stage: a **local
+cross-encoder** (`jinaai/jina-reranker-v2-base-multilingual`, ONNX/CPU, ~1.1 GB;
+`METACOG_RERANKER` = `auto` | `fastembed[:model]` | `none`, `auto` falls back to
+cosine-only with a warning). `retrieve` then runs *cosine pre-fetch (30) → joint
+(query, doc) scoring → sigmoid → top-k*, **before** the ACT-R need-odds /
+spreading blends (mnema's `blend_scores` order), and returns the raw logit as
+`rerank_score`; `rerank=false` forces the cosine order. The same model is what
+the oblique judge (§3.4) uses as its zero-token pre-filter. Hooks deliberately
+run without it (a 1 GB model per hook process is not worth a k=5 recall).
 
 ## References
 

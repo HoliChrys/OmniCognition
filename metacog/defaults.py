@@ -22,6 +22,9 @@ from metacog.execution import ExecutionOutcome, ExecutionResult
 #: 17x larger correct-vs-distractor margin than bge-small-en on French
 #: paraphrase recall, same dims.)
 DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+#: mnema's production reranker : a multilingual cross-encoder (FR rerank 9/10
+#: vs bge-base 7/10 in their measurement), ONNX on CPU, ~1.1 GB.
+DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
 
 
 class SimpleEncoder:
@@ -173,17 +176,73 @@ class CrossEncoderReranker:
 
     Backed by fastembed ; imported LAZILY so nothing pays the cost unless a
     reranker is actually wired into Memory(reranker=...). `rerank` returns one
-    score per doc (higher = more relevant), aligned to `docs`."""
+    RAW LOGIT per doc (higher = more relevant), aligned to `docs` — the blend
+    layer applies the sigmoid (mnema keeps this layer dumb). Also the second
+    stage of `Memory.retrieve` (cosine pre-fetch -> cross-encoder rerank ->
+    top-k), the same pipeline as mnema's `search_memory`."""
 
-    def __init__(self, model_name: str =
-                 "jinaai/jina-reranker-v2-base-multilingual") -> None:
+    def __init__(self, model_name: str = DEFAULT_RERANK_MODEL,
+                 cache_dir: Optional[str] = None, max_cache: int = 20_000) -> None:
         from fastembed.rerank.cross_encoder import TextCrossEncoder
-        self._model = TextCrossEncoder(model_name=model_name)
+        self.model_name = model_name
+        self._model = TextCrossEncoder(model_name=model_name, cache_dir=cache_dir)
+        self._cache: dict = {}
+        self._max_cache = max_cache
+
+    @property
+    def reranker_id(self) -> str:
+        return f"fastembed:{self.model_name}"
 
     def rerank(self, query: str, docs: List[str]) -> List[float]:
         if not docs:
             return []
-        return [float(s) for s in self._model.rerank(query, docs)]
+        out: List[Optional[float]] = [self._cache.get((query, d)) for d in docs]
+        todo = [i for i, s in enumerate(out) if s is None]
+        if todo:
+            scores = list(self._model.rerank(query, [docs[i] for i in todo]))
+            if len(self._cache) >= self._max_cache:
+                self._cache.clear()
+            for i, s in zip(todo, scores):
+                out[i] = float(s)
+                self._cache[(query, docs[i])] = float(s)
+        return [float(s) for s in out]  # type: ignore[arg-type]
+
+
+def make_reranker(spec: Optional[str] = None, *, warn: bool = True):
+    """Resolve the production reranker from `spec` or `METACOG_RERANKER` :
+
+      auto (default)      CrossEncoderReranker (mnema's multilingual jina
+                          model) if fastembed + the model are available, else
+                          None with a stderr warning (retrieval stays cosine)
+      fastembed[:model]   or a bare `org/model` : that cross-encoder (raises
+                          if unavailable — no silent downgrade)
+      none | off          no reranker
+
+    Called by the MCP server ; the hooks deliberately skip it (1 GB model per
+    hook process is not worth it for a k=5 recall)."""
+    spec = (spec if spec is not None
+            else os.environ.get("METACOG_RERANKER", "auto")).strip()
+    if spec.lower() in ("none", "off", "0", "false"):
+        return None
+    if spec in ("", "auto", "fastembed") or spec.startswith("fastembed:") or "/" in spec:
+        model = DEFAULT_RERANK_MODEL
+        if spec.startswith("fastembed:") and spec.split(":", 1)[1]:
+            model = spec.split(":", 1)[1]
+        elif "/" in spec:
+            model = spec
+        try:
+            return CrossEncoderReranker(model)
+        except Exception as exc:
+            if spec not in ("", "auto"):
+                raise
+            if warn:
+                print(f"[metacog] cross-encoder reranker unavailable "
+                      f"({type(exc).__name__}: {str(exc)[:80]}) — retrieval stays "
+                      "cosine-only. Install `fastembed` or set "
+                      "METACOG_RERANKER=none to silence.", file=sys.stderr)
+            return None
+    raise ValueError(f"unknown reranker spec {spec!r} "
+                     "(auto | fastembed[:model] | org/model | none)")
 
 
 class NoOpExecutor:

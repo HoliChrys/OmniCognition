@@ -163,11 +163,12 @@ def build_app(
         # triggers (co-retrieval / lateral / Chasles / tag index / decay
         # history) survive restarts. "auto" is a no-op when storage_path is None
         # (ephemeral in-memory server) -> falls back to no journal.
-        # The encoder is the PRODUCTION one (fastembed, mnema's multilingual
-        # model ; METACOG_ENCODER overrides) — never the hash test encoder.
-        from metacog.defaults import make_encoder
+        # The encoder + reranker are the PRODUCTION ones (fastembed : mnema's
+        # multilingual MiniLM + jina cross-encoder ; METACOG_ENCODER /
+        # METACOG_RERANKER override) — never the hash test encoder.
+        from metacog.defaults import make_encoder, make_reranker
         memory = Memory(storage_path=storage_path, journal_path="auto",
-                        encoder=make_encoder())
+                        encoder=make_encoder(), reranker=make_reranker())
 
     # Apply the ACT-R ranking levers (arg > env > leave as-is). Only assigned
     # when explicitly provided, so an injected memory's own weights survive.
@@ -274,6 +275,7 @@ def build_app(
         use_spreading: bool = True,
         prefer_kind: Optional[str] = None,
         abstain: bool = False,
+        rerank: Optional[bool] = None,
     ) -> List[dict]:
         """Retrieve top-k points for a query.
 
@@ -290,6 +292,9 @@ def build_app(
                         analog of associative spreading; default True).
           prefer_kind:  boost a PointKind in ranking — FACT | THOUGHT |
                         ACTION. Use ACTION for "how do I X" queries.
+          rerank:       cross-encoder second stage (pre-fetch 30 -> joint
+                        (query, doc) scoring -> top-k). Default on when the
+                        server has a reranker ; false = cosine order only.
 
         k is capped at 7 (the system's retrieval budget).
         """
@@ -298,7 +303,7 @@ def build_app(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
-            abstain=abstain,
+            abstain=abstain, rerank=rerank,
         )
         if abstain and not results:
             return [{"abstained": True, **_gap_notice("retrieve"),
