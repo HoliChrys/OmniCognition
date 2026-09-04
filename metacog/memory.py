@@ -1525,10 +1525,20 @@ class Memory:
         return {"refreshed": 0, "outdated": 1, "reasons": reasons}
 
     def _kept(self, doc_id: str, target: str = "*") -> bool:
-        """A `keep` annotation on the target (or on the whole doc) protects it
-        from any automatic regeneration / removal."""
+        """A `keep` annotation on the target protects it from any automatic
+        regeneration / removal. A doc-level keep (`*`) protects the doc and
+        every object in it EXCEPT a portion that explicitly declares
+        `mode="generated"` — the author said that block is machine-owned."""
+        from metacog import wiki as _w
         anns = self.journal.annotations_for_doc(doc_id)
-        return any(a["kind"] == "keep" and a["target"] in (target, "*") for a in anns)
+        if any(a["kind"] == "keep" and a["target"] == target for a in anns):
+            return True
+        if target != "*" and any(a["kind"] == "keep" and a["target"] == "*" for a in anns):
+            doc = self.journal.get_wiki_doc(doc_id)
+            p = next((x for x in _w.parse_portions(doc["body"] if doc else "")
+                      if x["id"] == target), None)
+            return not (p is not None and p["mode"] == _w.BODY_GENERATED)
+        return False
 
     def _portion_refs(self, doc_id: str, portion: dict,
                       generated: bool = True) -> List[str]:

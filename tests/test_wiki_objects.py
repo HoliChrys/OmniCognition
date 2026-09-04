@@ -196,6 +196,21 @@ def test_annotations_render_as_bibliography_and_keep_protects():
     assert m.remove_var("doc:ops", "target")["removed"]
 
 
+def test_doc_level_keep_spares_explicitly_generated_portions():
+    m = _mem()
+    m.feed_wiki("doc:ops", "Ops", ["D1"], type="topic", body="human intro [[D1]]")
+    m.set_portion("doc:ops", "auto", body="- [[D2]]", mode="generated")
+    m.set_portion("doc:ops", "notes", body="my notes [[D1]]")            # doc mode: authored
+    m.annotate("doc:ops", "*", "keep the human wording", kind="keep")
+    assert m._kept("doc:ops", "*") and m._kept("doc:ops", "notes") and m._kept("doc:ops", "D1")
+    assert not m._kept("doc:ops", "auto")                              # machine-owned block
+    _node(m, "D2").content = "deploy uses canary rollout"
+    assert m.reconcile_wiki()["refreshed"] == 1
+    assert "canary rollout [[D2]]" in m.wiki_doc("doc:ops") and "human intro [[D1]]" in m.wiki_doc("doc:ops")
+    assert m.remove_portion("doc:ops", "notes")["reason"] == "kept"
+    assert m.remove_portion("doc:ops", "auto")["removed"]
+
+
 def test_generated_portion_regenerates_alone_when_its_ref_drifts():
     m = _mem()
     m.feed_wiki("doc:ops", "Ops", ["D1"], type="topic", body="authored intro [[D1]]")

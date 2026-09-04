@@ -831,60 +831,370 @@ a node from a scored retrieval has its `useful`/`useless` counts re-indexed and
 rendered in the OKF frontmatter, so docs can be queried and ranked by real
 feedback (`wiki_where("useful", "2")`).
 
-**Docs follow their sources (drift).** A doc cites the nodes it was generated
-from, so it can tell when they change. Every link stores the node's
-**fingerprint** at link time (`content hash : knowledge-tags hash`); the drift
-pass in `sleep` (`reconcile_wiki`) compares it with the node now and says
-*which* part moved (`content_changed` / `tags_changed`). What happens next
-depends on the body's provenance, stamped as `body_mode`: a **generated** body
-(the deterministic rendering of its refs — `feed_wiki` without prose, every
-auto-registered tool doc) **regenerates itself** from the current nodes, tags
-and index included; an **authored** body (prose someone wrote, `import_okf`)
-is **never overwritten** — its refs are flagged `outdated` with the reason, the
-doc becomes findable (`wiki_where("outdated")`, `check_wiki` → `outdated_ref`)
-and `refresh_wiki(doc)` returns the pending changes (which refs, how, what they
-say now) so the agent can rewrite and store the new prose with
-`refresh_wiki(doc, body)`. `update_tool` triggers the targeted pass at once, so
-a tool's wiki doc never lags its body.
+#### 5.6.1 Docs follow their sources — drift
 
-**Objects, not character runs — seeds, portions, variables, annotations.**
-Parts of a doc are first-class objects with an identity, so a change is an
-*operation* on the object rather than a text edit:
+A doc cites the nodes it was generated from, so it can tell when they change.
+Every link stores the node's **fingerprint** at link time
+(`content hash : knowledge-tags hash`); the drift pass in `sleep`
+(`reconcile_wiki`) compares it with the node now and says *which* part moved
+(`content_changed` / `tags_changed` / both). What happens next depends on the
+body's provenance, stamped as `body_mode`:
 
-- **Portions** — `<portion id="p" seeds="q1" refs="A,B" mode="generated">…</portion>`
-  is a block that owns its sources: its explicit `refs`, its `<var/>` bindings
-  and the cached results of its **seed queries**. A generated portion is
-  rendered from those sources (its inline `[[…]]` are a rendering, not a
-  source) and re-renders *alone* when one of them drifts; an authored one is
-  only flagged. `wiki_portion(doc, id, set|remove, body, seeds, mode)`.
-- **Seed queries** — `wiki_seed(doc, add, query, target)` attaches a semantic
-  query to a portion (or the doc, `*`); its ranked result is **cached at
+| provenance | how it got there | on drift |
+|---|---|---|
+| **generated** | `feed_wiki` without prose, every auto-registered tool doc, a `mode="generated"` portion | **regenerates itself** from the current nodes — body, frontmatter tags, EAV index, fingerprints |
+| **authored** | `feed_wiki(body=…)`, `import_okf`, a `mode="authored"` portion | **never overwritten** — the ref is flagged `outdated` with the reason; the doc is findable (`wiki_where("outdated")`, `check_wiki` → `outdated_ref`); `refresh_wiki(doc)` returns the pending changes, `refresh_wiki(doc, body)` stores the rewrite |
+
+`update_tool` triggers the targeted pass at once, so a tool's wiki doc never
+lags its body. A ref with no baseline (a legacy link, a ref just remapped by a
+merge) gets one silently — a redirect is not a drift.
+
+#### 5.6.2 Objects, not character runs — portions, seeds, variables, annotations
+
+Parts of a doc are **first-class objects with an identity**. A change is an
+*operation* on the object (set its parameters, remove it, replace it), never a
+text edit — so a ref keeps its identity, its history and its reliability.
+
+```markdown
+# Deploy runbook
+
+We ship to <var name="target" node="D1" field="content"/>.        ← a LIVE binding
+
+Owner: the infra team. See [[D1]].                                  ← authored prose
+
+<portion id="procedure" seeds="q1" mode="generated">                ← a machine-owned block
+- Rollback is `deployctl rollback --to previous` [[D3]]              fed by seed query q1
+- Deploys use a blue/green rollout with a 10-minute soak [[D2]]
+</portion>
+```
+
+- **Portion** — `<portion id seeds refs mode>…</portion>` is a block that
+  **owns its sources**: its explicit `refs`, its `<var/>` bindings and the cached
+  results of its seed queries. For a generated portion the inline `[[…]]` of
+  its body are a *rendering*, not a source — the sources live in the tag — so
+  it can be re-rendered cleanly and **re-renders alone** when one of them
+  drifts; an authored portion is only flagged.
+  `wiki_portion(doc, id, set|remove, body, seeds, mode)`.
+- **Seed query** — `wiki_seed(doc, add, query, target)` attaches a semantic
+  query to a portion (or the doc, `*`). Its ranked result is **cached at
   creation** and becomes part of what the target owns. `sleep` **re-runs**
-  every seed (cheap `retrieve`, no LLM) and diffs it against the cache: a
-  generated target absorbs the new set, an authored or kept one gets a
-  **pending change** carrying the diff (`added` / `removed` / current
-  contents) — `wiki_pending`, `check_wiki` → `pending_change`,
-  `wiki_where("pending")`, and `refresh_wiki(doc)` returns it for rewriting.
-- **Variables** — `<var name="target" node="N42" field="content"/>` is a
-  **live binding**: the rendered view reads the node, nothing is copied, so
-  the text can never go stale. `wiki_var(doc, name, set|remove, node_id)`
-  binds / rebinds / unbinds; binding to a missing node is **refused** (a ref
-  stays reliable), the bound node is a ref like any other (`wiki_where("bindings", id)`).
-- **Reversible ops** — every set / remove of a var or portion is a
-  `wiki_ops` row with its before / after; `wiki_ops(doc, revert_op_id)` undoes
-  one (a removed object comes back, a rebinding is restored). A ref never
-  silently becomes a different string.
-- **Annotations** — `wiki_annotate(doc, target, note, kind)` hangs a typed note
-  on a portion id, a var name, a cited node or the doc: `purpose` ("this
-  variable is the cluster we ship to"), `note`, `todo`, and **`keep`** ("this
-  part must be preserved"), which **protects its target from automatic
-  regeneration and from removal** (the drift is then flagged instead).
-  Annotations render in the OKF frontmatter as a **bibliography**
-  (`annotations: [{target, kind, note}]`, indexed: `wiki_where("keep", …)`)
-  and, in the rendered view, as footnotes `[^target] (kind) note`.
+  every seed (the cheap `retrieve`, no LLM) and **diffs** it against the cache:
+  a generated target absorbs the new set; an authored or kept target gets a
+  **pending change** carrying the diff (`added` / `removed` / what each says
+  now) — `wiki_pending`, `check_wiki` → `pending_change`,
+  `wiki_where("pending")`, and `refresh_wiki(doc)` hands it to the rewriter.
+- **Variable** — `<var name="target" node="D1" field="content"/>` is a **live
+  binding**: the rendered view reads the node, nothing is copied, so the text
+  cannot go stale. `wiki_var(doc, name, set|remove, node_id)` binds, rebinds or
+  unbinds; binding to a **missing node is refused** (a ref stays reliable); the
+  bound node is a ref like any other (`wiki_where("bindings", id)`).
+- **Reversible ops** — every set / remove of a var or portion is a `wiki_ops`
+  row with its **before / after**; `wiki_ops(doc, revert_op_id)` undoes one (a
+  removed object comes back, a rebinding is restored). A ref never silently
+  becomes a different string.
+- **Annotation** — `wiki_annotate(doc, target, note, kind)` hangs a typed note
+  on a portion id, a var name, a cited node, or the doc (`*`):
+  `purpose` (*"this variable is the cluster we ship to"*), `note`, `todo`, and
+  **`keep`** (*"this part must be preserved"*). `keep` **protects its target
+  from automatic regeneration and from removal** — drift is then flagged
+  instead of applied. A doc-level `keep` protects everything except a portion
+  that explicitly declares `mode="generated"` (the author said that block is
+  machine-owned). Annotations render in the OKF frontmatter as a
+  **bibliography** (`annotations: [{target, kind, note}]`, indexed:
+  `wiki_where("keep", target)`, `wiki_where("annotations", kind)`) and, in the
+  rendered view, as footnotes `[^target] (kind) note` — what an interface
+  shows on hover. Unknown targets and kinds are refused so a note never dangles.
 - **Two views** — `wiki_doc(doc, view="source")` keeps the object tags (what
-  you edit); `view="rendered"` resolves every variable to its live value,
-  strips portion tags and appends the footnotes (what you read).
+  you *edit*); `view="rendered"` resolves every variable to its live value,
+  strips the portion tags and appends the footnotes (what you *read*).
+
+#### 5.6.3 Worked example — a deploy runbook that keeps itself honest
+
+Real output (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`,
+no LLM anywhere). Four ops facts are in the memory — `D1` *staging cluster
+eu-west-1*, `D2` *blue/green rollout*, `D3` *rollback command* — plus noise
+(a soup recipe, a guitar lesson). The agent builds the doc:
+
+```python
+feed_wiki("runbook:deploy", "Deploy runbook", ["D1"], type="runbook",
+          body='# Deploy runbook\n\nWe ship to <var name="target" node="D1" field="content"/>.'
+               '\n\nOwner: the infra team. See [[D1]].')
+wiki_portion("runbook:deploy", "procedure", mode="generated")          # an empty machine-owned block
+wiki_seed("runbook:deploy", "add", "how do we deploy and roll back", target="procedure", k=3)
+wiki_annotate("runbook:deploy", "target", "the cluster we ship to; changes only via the infra team", kind="purpose")
+wiki_annotate("runbook:deploy", "*",      "human-owned intro: keep the wording", kind="keep")
+wiki_annotate("runbook:deploy", "D3",     "rollback command verified 2026-09", kind="note")
+```
+
+**Source view** (`wiki_doc(view="source")`) — the frontmatter is the
+bibliography, the body keeps the objects:
+
+```yaml
+---
+type: runbook
+title: Deploy runbook
+tags: [ops:deploy]
+refs: [D1, D2, D3, G1]                 # ← G1 is the guitar line the seed pulled at rank 3
+body_mode: authored
+seeds:
+- {id: q1, query: how do we deploy and roll back, target: procedure, n: 3}
+vars:
+- {name: target, node: D1, field: content}
+annotations:
+- {target: target, kind: purpose, note: the cluster we ship to; changes only via the infra team}
+- {target: '*',    kind: keep,    note: 'human-owned intro: keep the wording'}
+- {target: D3,     kind: note,    note: rollback command verified 2026-09}
+---
+# Deploy runbook
+
+We ship to <var name="target" node="D1" field="content"/>.
+
+Owner: the infra team. See [[D1]].
+
+<portion id="procedure" seeds="q1" mode="generated">
+- Rollback is `deployctl rollback --to previous` [[D3]]
+- Deploys use a blue/green rollout with a 10-minute soak [[D2]]
+- Guitar lesson: barre chords on the fifth fret [[G1]]
+</portion>
+```
+
+**Rendered view** (`view="rendered"`) — the variable is read from the node,
+the portion tags vanish, the annotations become footnotes:
+
+```markdown
+# Deploy runbook
+
+We ship to staging cluster eu-west-1.
+
+Owner: the infra team. See [[D1]].
+
+- Rollback is `deployctl rollback --to previous` [[D3]]
+- Deploys use a blue/green rollout with a 10-minute soak [[D2]]
+- Guitar lesson: barre chords on the fifth fret [[G1]]
+
+Annotations:
+[^target] (purpose) the cluster we ship to; changes only via the infra team
+[^*] (keep) human-owned intro: keep the wording
+[^D3] (note) rollback command verified 2026-09
+```
+
+**Then the world moves.** The target migrates (`D1` is rewritten to *prod
+cluster eu-central-1*), blue/green is retired (`forget(D2, "blue/green
+retired")`) and a canary procedure lands (`ingest(D4)`). Nobody touches the
+doc. The next `sleep` reports:
+
+```python
+{'wiki_stale': 1, 'wiki_stale_reasons': {'invalidated': 1, 'content_changed': 1},
+ 'wiki_refreshed': 0, 'wiki_outdated': 1,
+ 'seeds_changed': 1, 'seeds_refreshed': 1, 'seeds_pending': 0}
+```
+
+and the doc now reads (rendered):
+
+```markdown
+# Deploy runbook
+
+We ship to prod cluster eu-central-1.                     ← the VARIABLE re-rendered itself (live binding)
+
+Owner: the infra team. See [[D1]].                          ← the KEPT intro is untouched
+
+- Rollback is `deployctl rollback --to previous` [[D3]]   ← the GENERATED portion absorbed the seed diff:
+- Deploy with `deployctl ship --canary 5%`, then promote     −D2 (invalidated) −G1 (out-ranked) +D4 (new)
+  once the canary is healthy [[D4]]
+```
+
+Three different things happened to three different objects, each by its own
+rule, and the one thing the machine was *not* allowed to do is reported, not
+done: the authored prose cites `[[D1]]`, whose content changed — so the doc
+carries `outdated: 1`, `check_wiki` says `('outdated_ref', {ref: D1, reason:
+content_changed})`, and `refresh_wiki(doc)` answers with the change instead
+of rewriting:
+
+```python
+{'refreshed': False, 'reason': 'authored_body_needs_text',
+ 'changes': [{'ref': 'D1', 'reason': 'content_changed',
+              'content': 'prod cluster eu-central-1', 'tags': ['ops:deploy']}]}
+```
+
+The agent (or a human) rewrites the sentence and stores it with
+`refresh_wiki(doc, body=…)` — flags cleared, fingerprints re-baselined.
+
+**Objects stay reliable.** Rebinding the variable to the new procedure node
+is an operation with a before and an after; undoing it is one call; removing
+it is refused while the doc-level `keep` stands:
+
+```python
+wiki_var("runbook:deploy", "target", "set", node_id="D4")
+# → {'bound': True, 'node': 'D4', 'previous': {'name': 'target', 'node': 'D1', 'field': 'content'}}
+wiki_ops("runbook:deploy")
+# → [(2, 'set', 'var:target', before={node: D1}, after={node: D4}), (1, 'set', 'portion:procedure', None, {...})]
+wiki_ops("runbook:deploy", revert_op_id=2)     # → {'reverted': True}  — bound to D1 again
+wiki_var("runbook:deploy", "target", "remove")  # → {'removed': False, 'reason': 'kept'}
+wiki_var("runbook:deploy", "target", "set", node_id="ZZZ")   # → {'bound': False, 'reason': 'missing_node'}
+```
+
+And everything above is queryable through the EAV index, because it is all
+frontmatter: `wiki_where("keep")`, `wiki_where("bindings", "D1")`,
+`wiki_where("annotations", "purpose")`, `wiki_where("seeds", "how do we deploy and roll back")`,
+`wiki_where("outdated")`, `wiki_where("pending")`.
+
+#### 5.6.4 The lifecycle in one picture
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#FAF7F0",
+    "primaryColor": "#FAF7F0",
+    "primaryBorderColor": "#5B5B5B",
+    "primaryTextColor": "#1F1F1F",
+    "lineColor": "#7A7A7A",
+    "fontFamily": "ui-serif, Georgia, serif",
+    "fontSize": "13px"
+  },
+  "flowchart": { "htmlLabels": true, "curve": "linear", "padding": 10 }
+}}%%
+flowchart TB
+
+subgraph LEGEND["legend"]
+  direction LR
+  LG1["&nbsp;<b>FACT</b>&nbsp;·&nbsp;RAG node&nbsp;"]:::fact
+  LG2["&nbsp;<b>WIKI OBJECT</b>&nbsp;·&nbsp;portion / var / doc&nbsp;"]:::wiki
+  LG3["&nbsp;<b>SEED</b>&nbsp;·&nbsp;cached query&nbsp;"]:::seed
+  LG4["&nbsp;<b>ANNOTATION</b>&nbsp;·&nbsp;keep / purpose / note&nbsp;"]:::ann
+  LG5["&nbsp;<b>JOURNAL</b>&nbsp;·&nbsp;SQL, append-only&nbsp;"]:::journal
+  LG6["&nbsp;<b>TOOL CALL</b>&nbsp;"]:::tool
+  LG7["&nbsp;<b>GENERATED</b>&nbsp;·&nbsp;re-rendered&nbsp;"]:::gen
+  LG8["&nbsp;<b>FLAGGED</b>&nbsp;·&nbsp;reported, not done&nbsp;"]:::flag
+  LG1 ~~~ LG2 ~~~ LG3 ~~~ LG4 ~~~ LG5 ~~~ LG6 ~~~ LG7 ~~~ LG8
+end
+
+subgraph T0["<b>① build</b>     the agent composes the doc from objects · 0 LLM calls"]
+  direction LR
+  subgraph T0L["RAG manifold"]
+    direction TB
+    N1["<b>D1</b> staging cluster eu-west-1<br/><i>tag ops:deploy</i>"]:::fact
+    N2["<b>D2</b> blue/green rollout, 10-min soak"]:::fact
+    N3["<b>D3</b> deployctl rollback --to previous"]:::fact
+    NX["G1 guitar lesson · K1 soup recipe<br/><i>(noise)</i>"]:::dots
+    N1 -.- N2 -.- N3 -.- NX
+  end
+  subgraph T0M["tools"]
+    direction TB
+    C1["feed_wiki(runbook:deploy, body=prose)<br/><i>→ body_mode: authored</i>"]:::tool
+    C2["wiki_portion(procedure, mode=generated)"]:::tool
+    C3["wiki_seed(add, 'how do we deploy<br/>and roll back', target=procedure, k=3)<br/><i>retrieve → cache [D3, D2, G1]</i>"]:::tool
+    C4["wiki_annotate(target, purpose)<br/>wiki_annotate(*, <b>keep</b>)<br/>wiki_annotate(D3, note)"]:::tool
+    C1 --> C2 --> C3 --> C4
+  end
+  subgraph T0R["the doc — runbook:deploy (OKF)"]
+    direction TB
+    W0["<b>frontmatter</b> = bibliography<br/>refs · seeds · vars · annotations · body_mode"]:::wiki
+    W1["We ship to <b>&lt;var target → D1&gt;</b>."]:::wiki
+    W2["Owner: the infra team. See [[D1]].<br/><i>authored prose</i>"]:::wiki
+    W3["<b>&lt;portion procedure seeds=q1 generated&gt;</b><br/>- rollback … [[D3]]<br/>- blue/green … [[D2]]<br/>- guitar … [[G1]]"]:::gen
+    A1["★ keep — human-owned intro"]:::ann
+    A2["purpose — the cluster we ship to"]:::ann
+    W0 -.- W1 -.- W2 -.- W3
+    A1 -.-> W2
+    A2 -.-> W1
+  end
+end
+T0L -.->|"nodes"| T0M
+T0M -.->|"objects + links + fingerprints"| T0R
+
+subgraph J["<b>journal</b>     one row per fact about the doc — SQL, EAV-indexed, queryable"]
+  direction LR
+  J1["wiki_refs<br/><i>node · fingerprint · stale · outdated</i>"]:::journal
+  J2["wiki_seeds<br/><i>q1 · query · target · cached [D3,D2,G1]</i>"]:::journal
+  J3["wiki_annotations<br/><i>target · kind · note</i>"]:::journal
+  J4["wiki_ops<br/><i>set portion:procedure (before → after)</i>"]:::journal
+  J5["wiki_pending<br/><i>(empty)</i>"]:::journal
+  J1 ~~~ J2 ~~~ J3 ~~~ J4 ~~~ J5
+end
+T0R --> J
+
+subgraph T1["<b>② the world moves</b>     nobody touches the doc"]
+  direction LR
+  M1["<b>D1</b> rewritten →<br/>prod cluster eu-central-1"]:::fact
+  M2["forget(<b>D2</b>, 'blue/green retired')<br/>→ INVALID"]:::fact
+  M3["ingest(<b>D4</b>) deployctl ship<br/>--canary 5%, then promote"]:::fact
+  M1 ~~~ M2 ~~~ M3
+end
+J --> T1
+
+subgraph T2["<b>③ sleep</b>     reconcile_wiki (stale · drift) + rerun_seeds · offline · 0 LLM calls"]
+  direction LR
+  subgraph T2L["passes"]
+    direction TB
+    P1["<b>stale pass</b><br/>D2 INVALID → stale_ref(invalidated)"]:::tool
+    P2["<b>drift pass</b><br/>fingerprint(D1) ≠ stored<br/>→ content_changed"]:::tool
+    P3["<b>seed rerun</b> q1 → [D3, D4]<br/>diff: −D2 −G1 +D4"]:::tool
+    P1 --> P2 --> P3
+  end
+  subgraph T2M["decisions — per object, by its own rule"]
+    direction TB
+    D1["portion <i>procedure</i> is generated<br/>and not kept → <b>regenerate</b>"]:::decision
+    D2["var <i>target</i> is a live binding<br/>→ nothing to store, <b>renders D1 now</b>"]:::decision
+    D3["prose citing [[D1]] is authored + kept<br/>→ <b>flag</b>, never rewrite"]:::decision
+    D1 ~~~ D2 ~~~ D3
+  end
+  subgraph T2R["outcome"]
+    direction TB
+    O1["<b>&lt;portion procedure&gt;</b><br/>- rollback … [[D3]]<br/>- canary 5%, then promote … [[D4]]"]:::gen
+    O2["We ship to <b>prod cluster eu-central-1</b>."]:::gen
+    O3["Owner: the infra team. See [[D1]].<br/><i>unchanged</i>"]:::wiki
+    O4["<b>outdated: 1</b> · stale_ref(D2)<br/>check_wiki → outdated_ref(D1, content_changed)"]:::flag
+    O1 -.- O2 -.- O3 -.- O4
+  end
+end
+T1 --> T2
+T2L -.->|"reason codes"| T2M
+T2M -.->|"keep ★ wins"| T2R
+
+subgraph T3["<b>④ close the loop</b>     the agent reads what changed and acts on objects"]
+  direction LR
+  R1["refresh_wiki(doc)<br/>→ changes: [D1 content_changed:<br/>'prod cluster eu-central-1']"]:::tool
+  R2["refresh_wiki(doc, body=rewritten prose)<br/>→ flags cleared, fingerprints re-baselined"]:::tool
+  R3["wiki_var(target, set, D4) → op 2<br/>wiki_ops(revert_op_id=2) → bound to D1 again<br/>wiki_var(target, remove) → <b>kept</b>"]:::tool
+  R4["wiki_where('outdated') · ('pending')<br/>('keep') · ('bindings', D1) · ('seeds', q)"]:::tool
+  R5["every op above = one more reversible<br/><b>wiki_ops</b> row in the journal"]:::journal
+  R1 --> R2
+  R3 ~~~ R4 ~~~ R5
+end
+T2R --> T3
+
+classDef fact     fill:#EEF3EC,stroke:#5B7C56,color:#1F1F1F,stroke-width:1px;
+classDef wiki     fill:#EFE7F3,stroke:#7A4E8C,color:#1F1F1F,stroke-width:1px;
+classDef seed     fill:#FFF2B0,stroke:#A07A00,color:#1F1F1F,stroke-width:1px;
+classDef ann      fill:#FBE9E7,stroke:#B23A3A,color:#1F1F1F,stroke-width:1px,font-style:italic;
+classDef journal  fill:#ECECEC,stroke:#5B5B5B,color:#1F1F1F,stroke-width:1px;
+classDef tool     fill:#FFFFFF,stroke:#1F1F1F,color:#1F1F1F,stroke-width:1.4px;
+classDef decision fill:#FFFFFF,stroke:#7A7A7A,color:#1F1F1F,stroke-dasharray:3 3;
+classDef gen      fill:#F7E7D8,stroke:#B5663A,color:#1F1F1F,stroke-width:1px;
+classDef flag     fill:#FDECEC,stroke:#B23A3A,color:#1F1F1F,stroke-width:2px;
+classDef dots     fill:#FAF7F0,stroke:#7A7A7A,color:#7A7A7A,stroke-dasharray:1 3;
+class T0,T1,T2,T3,J round;
+classDef round fill:#FAF7F0,stroke:#9A9A9A,color:#1F1F1F,stroke-width:1px,stroke-dasharray:6 4;
+class T0L,T0M,T0R,T2L,T2M,T2R lane;
+classDef lane fill:#FAF7F0,stroke:#C8C8C8,color:#4B4B4B,stroke-width:1px;
+class LEGEND legend;
+classDef legend fill:#FFFFFF,stroke:#1F1F1F,color:#1F1F1F,stroke-width:1px;
+```
+
+#### 5.6.5 The rules, in one table
+
+| the machine may… | when | never when |
+|---|---|---|
+| **regenerate** a body / a portion | it is `generated` (the doc's mode, or the portion's own `mode="generated"`) | a `keep` annotation targets it (or the doc, unless the portion says `mode="generated"` itself) |
+| **absorb** a seed's new result | the seed's target is generated and not kept | the target is authored or kept → a **pending change** with the diff |
+| **re-render** a variable | always — it is a binding, there is nothing to store | — (binding to a missing node is refused up front) |
+| **rewrite** authored prose | never | — it **flags** (`outdated`, `pending`) and hands the change to `refresh_wiki(doc)` |
+| **remove** an object | on an explicit `wiki_var` / `wiki_portion` remove | the object is kept — and every removal is a reversible `wiki_ops` row |
+
+Nothing above needs an LLM: the drift and seed passes are hashes and cheap
+retrieval, run offline in `sleep`. The LLM comes back in only where it belongs
+— rewriting the authored sentence the machine refused to touch.
 
 ### 5.7 Safety rails on identity ops — redirects, reversibility, reasons, proposals
 
