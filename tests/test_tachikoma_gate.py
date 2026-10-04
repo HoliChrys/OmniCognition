@@ -296,6 +296,74 @@ def test_a_context_without_notes_says_so(tmp_path):
     assert report["folder"] == str(root / "notes")
 
 
+def _eagain_on(monkeypatch, fn_name, target):
+    """`os.<fn_name>(target)` raises EAGAIN — the FUSE timing out under load
+    (measured on holistix-baremetal, TAC-243); every other path is real."""
+    import errno
+    real = getattr(os, fn_name)
+
+    def flaky(path, *args, **kwargs):
+        if os.fspath(path) == str(target):
+            raise OSError(errno.EAGAIN, "resource-fuse op timed out", str(target))
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(os, fn_name, flaky)
+
+
+@pytest.mark.parametrize("fn_name, where", [
+    ("stat", ""),          # the notes/ folder itself does not answer
+    ("scandir", ""),       # it answers stat, not its listing
+    ("scandir", "trace"),  # a sub-folder does not answer: 14 notes measured there
+])
+def test_an_unreadable_folder_is_never_an_absence(tmp_path, monkeypatch,
+                                                  fn_name, where):
+    """MEASURED (TAC-243): the FUSE rendered EAGAIN, `os.path.isdir` read it
+    as "absent" and the pass removed all 16 docs of GenAI, then saved. A read
+    error says `error`: nothing removed, nothing forgotten, nothing saved —
+    and the next pass, the folder readable again, finds everything in place."""
+    root, p, m = _wiki(tmp_path)
+    folder = _notes_of(root, "a")
+    (folder / "trace").mkdir()
+    _write(folder / "top.md", "# Top\n\nTop note body.")
+    _write(folder / "trace" / "wot.md", "# WOT\n\nTrace note body.")
+    assert len(p._refresh_notes("tachikoma.a", m)["added"]) == 2
+    saved = os.stat(m.storage_path).st_mtime_ns
+    saves = []
+    monkeypatch.setattr(m, "save", lambda *a, **k: saves.append(1))
+    with monkeypatch.context() as mp:
+        _eagain_on(mp, fn_name, folder / where if where else folder)
+        report = p._refresh_notes("tachikoma.a", m)
+    assert report["state"] == "error"
+    assert "timed out" in report["errors"][0]["error"]
+    assert (report["removed"], report["added"], report["updated"]) == ([], [], [])
+    assert saves == [] and os.stat(m.storage_path).st_mtime_ns == saved
+    assert {"notes:top", "notes:trace/wot"} <= set(m.journal.all_wiki_doc_ids())
+    assert len(_live_note_points(m, "Top note body")) == 1
+    assert len(_live_note_points(m, "Trace note body")) == 1
+    again = p._refresh_notes("tachikoma.a", m)        # the FUSE answers again
+    assert (again["state"], again["removed"], again["unchanged"]) == ("ok", [], 2)
+
+
+def test_a_note_that_comes_back_is_live_again_and_saved(tmp_path):
+    """The -16 then +16 cycle measured on GenAI (TAC-243 §3): a note removed
+    then back with the SAME body gets a fresh live point (suffixed id — never
+    the forgotten node reused), and that point reaches the store on disk."""
+    root, p, m = _wiki(tmp_path)
+    note = _notes_of(root, "a") / "port.md"
+    body = "# Port\n\nThe probe port is 48217."
+    _write(note, body)
+    p._refresh_notes("tachikoma.a", m)
+    (first,) = _live_note_points(m, "48217")
+    note.unlink()
+    assert p._refresh_notes("tachikoma.a", m)["removed"] == ["notes:port"]
+    assert _live_note_points(m, "48217") == []
+    _write(note, body)
+    assert p._refresh_notes("tachikoma.a", m)["added"] == ["notes:port"]
+    (back,) = _live_note_points(m, "48217")
+    assert back.id == f"{first.id}.2"
+    reloaded = Memory(storage_path=m.storage_path, encoder=SimpleEncoder())
+    assert [q.id for q in _live_note_points(reloaded, "48217")] == [back.id]
+
+
 def test_outside_the_tree_and_disabled_are_said(tmp_path):
     root, p, m = _wiki(tmp_path, ctx="demo.sandbox")
     assert p._refresh_notes("demo.sandbox", m)["state"] == "outside"

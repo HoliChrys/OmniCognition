@@ -563,8 +563,9 @@ def build_app(
     def ingest_notes() -> dict:
         """Re-read the served context's `notes/` folder into its deepwiki NOW
         (added / corrected / deleted notes) and report what the folder holds:
-        `state` ok | no_notes (this context HAS no notes) | outside | disabled,
-        with the doc ids added / updated / removed. The memory contract's
+        `state` ok | no_notes (this context HAS no notes) | outside | disabled
+        | error (the folder could not be read: nothing changed, retried next
+        pass), with the doc ids added / updated / removed. The memory contract's
         `ingest_notes(ctx)` (TAC-938). Only the tachikoma gate serves notes:
         a bare memory answers `state: unsupported` — said, never an empty list."""
         fn = getattr(type(memory), "ingest_notes", None)

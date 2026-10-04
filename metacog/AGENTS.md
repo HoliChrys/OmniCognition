@@ -129,7 +129,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   points `forget_node`d, superseded by the new; deleted → doc removed
   (`Journal.delete_wiki_doc`) + points forgotten. `ingest_notes()` (MCP tool,
   T1) is the explicit form; its report `state` is ok | no_notes | outside |
-  disabled — a bare `Memory` answers `unsupported`.
+  disabled | error — a bare `Memory` answers `unsupported`. A read error is
+  never an absence (TAC-243): only ENOENT/ENOTDIR on the folder is
+  `no_notes`; any other `OSError` (folder or sub-folder, e.g. the FUSE's
+  EAGAIN) is `error` with nothing removed, forgotten or saved.
   Context/account names are validated BEFORE the ACL call (400). The right to
   read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
   context memory + deepwiki; a narrower account must equal the authenticated

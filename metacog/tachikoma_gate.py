@@ -62,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 from contextvars import ContextVar
 from typing import Any, Optional
 
@@ -376,9 +377,10 @@ class ContextualMemory:
         Returns the REPORT — `state` says what the folder is:
         `ok` (notes indexed), `no_notes` (the folder is absent or holds no
         `.md`: this context HAS no notes), `outside` (the context's notes do
-        not live under this notes_root), `disabled` (no notes_root at all).
-        A note that cannot be read is listed in `errors`, never skipped
-        silently, and is retried on the next pass.
+        not live under this notes_root), `disabled` (no notes_root at all),
+        `error` (the folder could not be READ — nothing was removed, nothing
+        saved, the next pass retries). A note that cannot be read is listed
+        in `errors`, never skipped silently, and is retried on the next pass.
         """
         folder = notes_folder(self._notes_root, ctx) if self._notes_root else None
         report: dict = {"ctx": ctx, "folder": folder, "state": "ok", "notes": 0,
@@ -391,7 +393,20 @@ class ContextualMemory:
             report["state"] = "outside"
             return report
 
-        on_disk = _scan_notes(folder)
+        try:
+            on_disk = _scan_notes(folder)
+        except OSError as exc:
+            # A READ ERROR IS NEVER AN ABSENCE (TAC-243). Measured: the FUSE
+            # answered EAGAIN under load, the folder read as "absent", and the
+            # pass removed all 16 docs of GenAI. Nothing is touched; the
+            # fingerprints stay those of the last good pass, so the next one
+            # retries.
+            report["state"] = "error"
+            report["errors"].append({"doc_id": None,
+                                     "error": f"{type(exc).__name__}: {exc}"})
+            print(f"[gate] deepwiki of {ctx!r}: folder unreadable, nothing "
+                  f"changed: {report['errors'][0]['error']}", flush=True)
+            return report
         report["notes"] = len(on_disk)
         fingerprints = {doc: fp for doc, (_path, fp) in on_disk.items()}
         seen = self._notes_seen.get(ctx)
@@ -521,11 +536,25 @@ def _scan_notes(folder: str) -> dict[str, tuple[str, tuple[int, int]]]:
     """{doc_id: (path, (mtime_ns, size))} for every `.md` under `folder`,
     recursively (measured: GenAI's `notes/trace/` held 14 notes a flat read
     missed). The doc id keeps the RELATIVE path — collision-proof. An absent
-    folder is an empty dict: a context without notes."""
+    folder is an empty dict: a context without notes.
+
+    ONLY an absent folder is absent (TAC-243): `ENOENT` / `ENOTDIR`, or a
+    path that is not a directory. Any other `OSError` — on the folder or on
+    any sub-folder (`EAGAIN` of the FUSE, `EIO`, `ENOTCONN`) — RAISES: an
+    unreadable folder read as empty would remove every note it holds.
+    `os.path.isdir` and a bare `os.walk` both swallow those errors."""
     out: dict[str, tuple[str, tuple[int, int]]] = {}
-    if not os.path.isdir(folder):
+    try:
+        st = os.stat(folder)
+    except (FileNotFoundError, NotADirectoryError):
         return out
-    for root, _dirs, files in sorted(os.walk(folder)):
+    if not stat.S_ISDIR(st.st_mode):
+        return out
+
+    def _fail(exc: OSError) -> None:
+        raise exc
+
+    for root, _dirs, files in sorted(os.walk(folder, onerror=_fail)):
         for filename in sorted(files):
             if not filename.endswith(".md"):
                 continue
