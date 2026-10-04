@@ -121,13 +121,15 @@ def test_audit_clean_on_fresh_memory():
 
 
 class _TopicReranker:
-    """Deterministic cross-encoder stand-in : a positive logit when the doc
-    shares a word with the query, a negative one otherwise (a raw logit, as
-    `CrossEncoderReranker.rerank` returns)."""
+    """Deterministic cross-encoder stand-in returning RAW logits, as
+    `CrossEncoderReranker.rerank` does. The values are the top-1 logits
+    measured on the real GenAI corpus (TAC-217) : a doc sharing a word with the
+    query scores like the in-domain "push" query (−1.585), any other like the
+    off-topic kouign-amann recipe (−1.866) — just under the floor."""
 
     def rerank(self, query, docs):
         q = set(query.lower().split())
-        return [2.0 if q & set(d.lower().split()) else -1.1596 for d in docs]
+        return [-1.585 if q & set(d.lower().split()) else -1.866 for d in docs]
 
 
 def _blocks(r):
@@ -137,8 +139,11 @@ def _blocks(r):
 def test_retrieve_relevance_floor_answers_gap_not_least_bad():
     """TAC-941 : an off-topic recall (a kouign-amann recipe against an ACL
     corpus) used to return its least-bad candidate first, rerank −1.16. Every
-    candidate under the reranker's logit-0 floor → the gap verdict, alone."""
-    from metacog.mcp_server import GAP_SENTINEL
+    candidate under RERANK_FLOOR → the gap verdict, alone ; a candidate at the
+    measured in-domain logit stays."""
+    from metacog.mcp_server import GAP_SENTINEL, RERANK_FLOOR
+
+    assert -1.866 < RERANK_FLOOR <= -1.585   # the calibration this test encodes
 
     async def go():
         mem = Memory(encoder=SimpleEncoder(), reranker=_TopicReranker())
@@ -158,6 +163,6 @@ def test_retrieve_relevance_floor_answers_gap_not_least_bad():
             on = _blocks(await s.call_tool("retrieve", {"query": "acl", "k": 3}))
             hits = [b for b in on if "id" in b]
             assert {h["id"] for h in hits} == {"A0", "A1"}   # A2 is under the floor
-            assert all(h["rerank_score"] >= 0 for h in hits)
+            assert all(h["rerank_score"] >= RERANK_FLOOR for h in hits)
 
     _run(go())

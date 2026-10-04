@@ -89,6 +89,20 @@ def _install_surface_gate(app, exposed) -> None:
 GAP_SENTINEL = "⚠ NO RELEVANT MEMORY (gap)"
 
 
+#: The reranker's relevance floor, a RAW cross-encoder logit (TAC-941). CALIBRATED,
+#: not derived — the documented exception to the hyperparameter-free rule
+#: (decision TAC-219, recorded in TAC-190's `decisions` document) : the LOWEST
+#: floor that serves no memory on the versioned off-topic queries against the
+#: real `tachikoma.paralelle.GenAI` corpus (jina-reranker-v2-base-multilingual,
+#: measured 2026-10-04, TAC-217) :
+#:     off-topic top-1 : kouign-amann FR −1.866 · météo −2.162 · kouign-amann EN −3.064
+#:     in-domain top-1 : ACL FR −1.148 · push FR −1.585 · ACL EN −1.756 · port −2.094
+#: −1.86 is the lowest two-decimal value above −1.866 ; it loses 1 of the 4
+#: in-domain queries (port, 25 % < the 50 % that would switch to a relative floor).
+#: Recalibrate on the same off-topic set when the model or the corpus changes.
+RERANK_FLOOR = -1.86
+
+
 def _gap_notice(kind: str) -> dict:
     """The in-band gap entry appended to a recall result."""
     return {
@@ -308,20 +322,17 @@ def build_app(
         if abstain and not results:
             return [{"abstained": True, **_gap_notice("retrieve"),
                      "note": "no chunk sufficiently activated — retrieval failed"}]
-        # RELEVANCE FLOOR (TAC-941) : the cross-encoder's own verdict. A rerank
-        # logit < 0 is sigmoid < 1/2 — the reranker judges the pair more likely
-        # irrelevant than relevant. The bound is the logit's decision boundary,
-        # a mathematical constant, not a tuned threshold. A hit under it is not
-        # a memory : it is dropped, and when nothing is left the answer is the
-        # gap verdict — never the least-bad candidate (a "kouign-amann recipe"
-        # served first against an ACL corpus). Hits without a rerank score (no
-        # reranker wired) are untouched.
-        kept = [r for r in results if r.get("rerank_score", 0.0) >= 0.0]
+        # RELEVANCE FLOOR (TAC-941) : a hit whose cross-encoder logit is under
+        # RERANK_FLOOR is not a memory. It is dropped, and when nothing is left
+        # the answer is the gap verdict alone — never the least-bad candidate
+        # (a "kouign-amann recipe" served first against an ACL corpus). Hits
+        # without a rerank score (no reranker wired) are untouched.
+        kept = [r for r in results if r.get("rerank_score", 0.0) >= RERANK_FLOOR]
         if results and not kept:
             return [{"abstained": True, **_gap_notice("retrieve"),
                      "note": (f"{GAP_SENTINEL} — all {len(results)} candidates "
-                              "scored under the reranker's relevance floor "
-                              "(logit < 0) : no relevant memory.")}]
+                              f"scored under the reranker's relevance floor "
+                              f"(logit < {RERANK_FLOOR}) : no relevant memory.")}]
         results = kept
         # Log the retrieval (mnema access-log) and hand back a retrieval_id
         # handle so the agent can later mark_useful(...) on it — the supervised

@@ -111,9 +111,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
-  `retrieve` applies the reranker's relevance floor (logit < 0 = sigmoid < ½,
-  the decision boundary, not a tuned value): hits under it are dropped and an
-  all-under-floor recall answers the gap verdict alone (TAC-941).
+  `retrieve` applies the reranker's relevance floor `RERANK_FLOOR` (a raw
+  logit): hits under it are dropped and an all-under-floor recall answers the
+  gap verdict alone (TAC-941). The value is CALIBRATED, not a constant: the
+  lowest floor that serves no memory on the versioned off-topic queries
+  against the `tachikoma.paralelle.GenAI` corpus (decision TAC-219 / TAC-190).
+  Documented exception to the hyperparameter-free invariant — recalibrate on
+  the same off-topic set when the reranker model or the corpus changes.
 - `tachikoma_gate.py` — the tachikoma deployment (`python -m
   metacog.tachikoma_gate`): one `Memory` per context behind the
   `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
