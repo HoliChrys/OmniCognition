@@ -23,7 +23,11 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `geometric_spread`'s O(n²) emergent threshold (median−σ) is cached on
   (subset ids, epoch) — any pull/ingest/subset change falls back to the exact
   recompute; only pure-decay drift between hits is accepted. `clear_geo_cache()`
-  is called by `sleep()` and `load()`.
+  is called by `sleep()` and `load()`. The all-pairs statistic and the
+  seeds × points scan are numpy-vectorised (`_pairwise_spread_threshold`, Gram
+  form) and must stay equal to the scalar definition to 1e-9
+  (`tests/test_spread_vectorised.py`); never reintroduce a pure-Python O(n²)
+  loop on the recall path.
 - `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
