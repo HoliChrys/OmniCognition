@@ -103,6 +103,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
+  `retrieve` applies the reranker's relevance floor (logit < 0 = sigmoid < ½,
+  the decision boundary, not a tuned value): hits under it are dropped and an
+  all-under-floor recall answers the gap verdict alone (TAC-941).
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

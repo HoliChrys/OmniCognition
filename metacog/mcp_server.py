@@ -308,6 +308,21 @@ def build_app(
         if abstain and not results:
             return [{"abstained": True, **_gap_notice("retrieve"),
                      "note": "no chunk sufficiently activated — retrieval failed"}]
+        # RELEVANCE FLOOR (TAC-941) : the cross-encoder's own verdict. A rerank
+        # logit < 0 is sigmoid < 1/2 — the reranker judges the pair more likely
+        # irrelevant than relevant. The bound is the logit's decision boundary,
+        # a mathematical constant, not a tuned threshold. A hit under it is not
+        # a memory : it is dropped, and when nothing is left the answer is the
+        # gap verdict — never the least-bad candidate (a "kouign-amann recipe"
+        # served first against an ACL corpus). Hits without a rerank score (no
+        # reranker wired) are untouched.
+        kept = [r for r in results if r.get("rerank_score", 0.0) >= 0.0]
+        if results and not kept:
+            return [{"abstained": True, **_gap_notice("retrieve"),
+                     "note": (f"{GAP_SENTINEL} — all {len(results)} candidates "
+                              "scored under the reranker's relevance floor "
+                              "(logit < 0) : no relevant memory.")}]
+        results = kept
         # Log the retrieval (mnema access-log) and hand back a retrieval_id
         # handle so the agent can later mark_useful(...) on it — the supervised
         # feedback that calibrates decay. Failure-safe / no-op without a journal.
