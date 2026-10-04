@@ -120,6 +120,16 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
+  rule (no candidate cascade; `global` and the tree root read
+  `<notes_root>/notes`, other trees → None). The context's OWN notes are kept
+  in step with the folder once per request (mtime+size fingerprints; after a
+  restart the store is the reference): added → doc (`import_okf`) + content
+  point whose id cites the note (`<doc_id>#<sha256[:12]>`); corrected → old
+  points `forget_node`d, superseded by the new; deleted → doc removed
+  (`Journal.delete_wiki_doc`) + points forgotten. `ingest_notes()` (MCP tool,
+  T1) is the explicit form; its report `state` is ok | no_notes | outside |
+  disabled — a bare `Memory` answers `unsupported`.
   Context/account names are validated BEFORE the ACL call (400). The right to
   read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
   context memory + deepwiki; a narrower account must equal the authenticated
