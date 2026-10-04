@@ -103,6 +103,15 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
+- `tachikoma_gate.py` — the tachikoma deployment (`python -m
+  metacog.tachikoma_gate`): one `Memory` per context behind the
+  `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
+  `notes/` deepwiki). EVERY HTTP request passes the gate: no header → 400, then
+  `authorize(token, ctx)` (mnema's ACL, ported) against the tachikoma API —
+  `/api/auth/me` (no/invalid bearer → 401), `general` exempt from authorization
+  only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
+  `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
+  must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

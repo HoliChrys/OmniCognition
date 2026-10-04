@@ -176,3 +176,132 @@ def test_ancestor_notes_seed_the_child_wiki(tmp_path):
     p._ingest_notes("tachikoma.sub.Child", m)
     assert m.journal.get_wiki_doc("notes:own") is not None          # own
     assert m.journal.get_wiki_doc("notes:tachikoma/root") is not None  # ancestor
+
+
+# ── the ACL: who may read which memory (TAC-214) ──────────────────────
+
+from metacog import tachikoma_gate as gate  # noqa: E402
+
+
+def _fake_api(monkeypatch, answers):
+    """Route `_api(path, …)` to canned (code, body) answers, record the calls."""
+    calls = []
+
+    def api(path, token, payload=None):
+        calls.append((path, payload))
+        for prefix, answer in answers.items():
+            if path.startswith(prefix):
+                return answer
+        raise AssertionError(f"unexpected ACL call {path}")
+
+    monkeypatch.setattr(gate, "_api", api)
+    return calls
+
+
+ME = {"/api/auth/me": (200, {"user_id": "manager-GenAI-1545c4"})}
+
+
+def test_no_token_is_refused_401(monkeypatch):
+    _fake_api(monkeypatch, {})
+    with pytest.raises(gate.Denied) as e:
+        gate.authorize("", "tachikoma.paralelle.GenAI")
+    assert e.value.status == 401
+
+
+def test_a_rejected_token_is_refused_401(monkeypatch):
+    _fake_api(monkeypatch, {"/api/auth/me": (401, None)})
+    with pytest.raises(gate.Denied) as e:
+        gate.authorize("forged", "tachikoma.paralelle.GenAI")
+    assert e.value.status == 401
+
+
+def test_general_needs_a_valid_token_but_no_right(monkeypatch):
+    calls = _fake_api(monkeypatch, ME)
+    assert gate.authorize("t", gate.GENERAL) == "manager-GenAI-1545c4"
+    assert [c[0] for c in calls] == ["/api/auth/me"]
+
+
+def test_an_unknown_context_is_never_born(monkeypatch, tmp_path):
+    """The measured hole: an unknown name created `contexts/<name>/`. The
+    hierarchy 404 refuses BEFORE `_resolve` could `makedirs`."""
+    _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    with pytest.raises(gate.Denied, match="n'existe pas") as e:
+        gate.authorize("t", "contexte.inconnu.personne")
+    assert e.value.status == 403
+
+
+def test_the_context_name_cannot_leave_the_route(monkeypatch):
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    with pytest.raises(gate.Denied):
+        gate.authorize("t", "../users/ubuntu/accesses")
+    assert calls[1][0] == "/api/hierarchy/..%2Fusers%2Fubuntu%2Faccesses"
+
+
+def test_an_outage_is_not_called_a_verdict(monkeypatch):
+    _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (503, None)})
+    with pytest.raises(gate.Denied, match="panne") as e:
+        gate.authorize("t", "demo.sandbox.alice")
+    assert e.value.status == 503
+
+
+def test_a_context_without_read_right_is_refused(monkeypatch):
+    """The measured case: a GenAI-only token wrote into demo.sandbox.alice."""
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (200, {}),
+                                    "/api/acl/check": (200, {"allowed": False})})
+    with pytest.raises(gate.Denied, match="n'a pas 'read'") as e:
+        gate.authorize("t", "demo.sandbox.alice")
+    assert e.value.status == 403
+    assert calls[-1][1] == {"user": "manager-GenAI-1545c4", "action": "read",
+                            "resource": "demo.sandbox.alice"}
+
+
+def test_a_granted_context_goes_through(monkeypatch):
+    _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (200, {}),
+                            "/api/acl/check": (200, {"allowed": True})})
+    assert gate.authorize("t", "tachikoma.paralelle.GenAI") == "manager-GenAI-1545c4"
+
+
+# ── the middleware: header, then ACL, before ANY handler runs ──────────
+
+def _gated_client(allowed):
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    seen = []
+
+    def fake_authorize(token, ctx):
+        seen.append((token, ctx))
+        if ctx not in allowed:
+            raise gate.Denied(f"no read on {ctx}")
+        return "u"
+
+    async def handler(request):
+        return PlainTextResponse(_current_ctx.get())
+
+    app = Starlette(routes=[Route("/mcp", handler, methods=["POST"])],
+                    middleware=[Middleware(gate.context_gate(fake_authorize))])
+    return TestClient(app), seen
+
+
+def test_the_gate_refuses_before_the_handler():
+    client, seen = _gated_client({"tachikoma.paralelle.GenAI"})
+    r = client.post("/mcp", headers={CTX_HEADER: "demo.sandbox.alice",
+                                     "Authorization": "Bearer tok"})
+    assert r.status_code == 403 and "demo.sandbox.alice" in r.json()["detail"]
+    assert seen == [("tok", "demo.sandbox.alice")]
+
+
+def test_the_gate_serves_a_granted_context():
+    client, _ = _gated_client({"tachikoma.paralelle.GenAI"})
+    r = client.post("/mcp", headers={CTX_HEADER: "tachikoma.paralelle.GenAI",
+                                     "Authorization": "Bearer tok"})
+    assert r.status_code == 200 and r.text == "tachikoma.paralelle.GenAI"
+
+
+def test_the_gate_still_wants_the_header_first():
+    client, seen = _gated_client(set())
+    assert client.post("/mcp").status_code == 400
+    assert seen == []
