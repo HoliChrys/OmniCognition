@@ -51,6 +51,13 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    in its own memory — the safe direction (the manager sees less, nobody sees
    more).
 
+5. THE MODELS ARE THE PROCESS'S, NOT THE CONTEXT'S (TAC-237) — every
+   `Memory` of the gate shares ONE encoder and ONE reranker (`models()`). They
+   hold no per-context state. Measured before: each context and each narrow
+   account built its own pair, ~2.0 GB of ONNX sessions per key, never freed
+   — omni idled at 7.16 GB. The pair is loaded ONCE, in a worker thread by the
+   middleware, so the event loop never freezes for the 4-10 s of the load.
+
 Storage: `<storage_root>/<ctx>/memory.pkl` — one memory per context, isolated,
 persistent. `global` and `tachikoma.paralelle.GenAI` share NOTHING by accident.
 Context and account names are VALIDATED before any path is built or any ACL
@@ -63,6 +70,7 @@ import hashlib
 import os
 import re
 import stat
+import threading
 from contextvars import ContextVar
 from typing import Any, Optional
 
@@ -263,6 +271,28 @@ class ContextualMemory:
         self._notes_seen: dict[str, dict[str, tuple[int, int]]] = {}
         #: ctx → the request stamp of its last notes check (once per request).
         self._notes_checked: dict[str, Optional[object]] = {}
+        #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
+        self._models: Optional[tuple[Any, Any]] = None
+        self._models_lock = threading.Lock()
+
+    # ── the models: ONE pair per gate, shared by every memory ───────────
+    def models(self) -> tuple[Any, Any]:
+        """`(encoder, reranker)` — built on first call, then shared.
+
+        Every `Memory` of the gate gets THESE instances: the encoder maps a
+        text to its vector and the reranker a (query, doc) pair to its score,
+        whatever the context — their memo caches are context-free too.
+        Measured before (TAC-237): one pair per context AND per narrow
+        account, encoder +640 MB, reranker +1.33 GB, never released.
+
+        Locked: the middleware loads them in a worker thread while a tool on
+        the event loop may ask for them — one load, never two.
+        """
+        with self._models_lock:
+            if self._models is None:
+                from metacog.defaults import make_encoder, make_reranker
+                self._models = (make_encoder(), make_reranker())
+            return self._models
 
     # ── resolution ────────────────────────────────────────────────────
     def _ctx_name(self) -> str:
@@ -287,7 +317,6 @@ class ContextualMemory:
 
     def _memory_at(self, key: str) -> Any:
         """The `Memory` stored under `<root>/<key>/`, created on first use."""
-        from metacog.defaults import make_encoder, make_reranker
         from metacog.memory import Memory
 
         m = self._memories.get(key)
@@ -299,8 +328,9 @@ class ContextualMemory:
             if not os.path.realpath(path).startswith(root + os.sep):
                 raise RuntimeError(f"store {key!r} escapes the storage root")
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            encoder, reranker = self.models()
             m = Memory(storage_path=path, journal_path="auto",
-                       encoder=make_encoder(), reranker=make_reranker())
+                       encoder=encoder, reranker=reranker)
             self._memories[key] = m
         return m
 
@@ -653,12 +683,17 @@ class _MirroredPoint:
         return getattr(self._own, name)
 
 
-def context_gate(authorize_fn: Any = None) -> Any:
+def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
     """The middleware class: context header, then the ACL, on EVERY request.
 
     `authorize_fn(token, ctx) -> user` defaults to `authorize` (resolved at call
     time); tests inject a fake. The check is blocking urllib — run in a thread
     so a cold 17 s ACL never freezes the other contexts' requests.
+
+    `warm()` (the gate's `models`) runs in a thread too, AFTER the ACL said
+    yes: the first authorized request loads the ONNX models there — 4-10 s
+    measured on the event loop before (TAC-237), omni deaf to everyone. Once
+    loaded it returns at once. Only an authorized caller can trigger the load.
     """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
@@ -696,6 +731,8 @@ def context_gate(authorize_fn: Any = None) -> Any:
                     {"detail": f"{user!r} ne peut pas opérer sous le compte "
                                f"{account!r} : seul son propre compte (ou celui "
                                "du contexte) est permis"}, status_code=403)
+            if warm is not None:
+                await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
             # A fresh stamp: this request re-reads the notes once (TAC-938).
@@ -737,7 +774,7 @@ def build_gated_app(storage_root: str, notes_root: str,
     return Starlette(
         # THE SAME LIFESPAN as the MCP app (the session manager lives there).
         lifespan=inner.router.lifespan_context,
-        middleware=[Middleware(context_gate(authorize_fn))],
+        middleware=[Middleware(context_gate(authorize_fn, warm=proxy.models))],
         routes=[Mount("/", app=inner)]), mcp_app, inner
 
 

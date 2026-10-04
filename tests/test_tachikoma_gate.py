@@ -763,3 +763,73 @@ def test_a_caller_never_borrows_another_account():
     r = client.post("/mcp", headers={CTX_HEADER: "ctx-a",
                                      ACCOUNT_HEADER: "agent-b"})
     assert r.status_code == 403 and "agent-b" in r.json()["detail"]
+
+
+# ── TAC-237: ONE encoder + ONE reranker per gate, loaded off the loop ───
+
+def _counting_models(monkeypatch):
+    """Fake `make_encoder`/`make_reranker` that count their calls — a real
+    pair is ~2.0 GB of ONNX sessions, the count is what the test pins."""
+    import metacog.defaults as D
+    calls = {"encoder": 0, "reranker": 0}
+
+    def make_encoder():
+        calls["encoder"] += 1
+        return SimpleEncoder()
+
+    def make_reranker():
+        calls["reranker"] += 1
+        return None
+
+    monkeypatch.setattr(D, "make_encoder", make_encoder)
+    monkeypatch.setattr(D, "make_reranker", make_reranker)
+    return calls
+
+
+def test_every_memory_shares_one_model_pair(tmp_path, monkeypatch):
+    """Measured before: each context AND each narrow account built its own
+    pair — 2 GB per key, omni idle at 7.16 GB. One pair per gate."""
+    calls = _counting_models(monkeypatch)
+    p = _make_proxy(tmp_path)
+    mems = [p._memory_at(k) for k in
+            ("global", "tachikoma.paralelle.GenAI",
+             os.path.join("tachikoma.paralelle.GenAI", "accounts", "agent-a"))]
+    assert calls == {"encoder": 1, "reranker": 1}
+    assert len({id(m.encoder) for m in mems}) == 1
+    assert mems[0].encoder is p.models()[0]
+
+
+def test_the_gate_loads_the_models_off_the_event_loop():
+    """The load ran on the asyncio thread (py-spy, TAC-237): 4-10 s deaf.
+    The middleware runs `warm` in a worker thread, after the ACL said yes —
+    and never for a refused caller."""
+    import threading
+
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    warmed = []
+
+    def warm():
+        warmed.append(threading.get_ident())
+
+    def fake_authorize(token, ctx):
+        if ctx != "ctx-a":
+            raise gate.Denied(f"no read on {ctx}")
+        return "u"
+
+    async def handler(request):
+        return PlainTextResponse(str(threading.get_ident()))
+
+    app = Starlette(routes=[Route("/mcp", handler, methods=["POST"])],
+                    middleware=[Middleware(gate.context_gate(fake_authorize,
+                                                             warm=warm))])
+    client = TestClient(app)
+    assert client.post("/mcp", headers={CTX_HEADER: "ctx-b"}).status_code == 403
+    assert warmed == []
+    r = client.post("/mcp", headers={CTX_HEADER: "ctx-a"})
+    assert r.status_code == 200
+    assert len(warmed) == 1 and warmed[0] != int(r.text)

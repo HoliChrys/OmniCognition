@@ -8,8 +8,6 @@ subset change alters the key → exact recompute. sleep()/load() clear the cache
 
 from __future__ import annotations
 
-import time
-
 from metacog import geometry
 from metacog.defaults import SimpleEncoder
 from metacog.geometry import apply_pull, geometric_spread
@@ -70,15 +68,19 @@ def test_load_clears_cache(tmp_path):
     assert geometry._SPREAD_THR_CACHE == {}
 
 
-def test_perf_cached_repeat_calls_faster():
+def test_cache_hit_skips_pairwise_recompute(monkeypatch):
+    # Deterministic form of "hits are cheaper" : since TAC-940 the O(n²)
+    # statistic is numpy-fast, so a wall-clock race between a miss and a
+    # hit is noise. What the cache must guarantee is that a hit does NOT
+    # recompute the all-pairs statistic.
     m = _mem(n=80)
     geometry.clear_geo_cache()
     pts = list(m.points)
-    t0 = time.time()
-    geometric_spread(pts[:2], pts, 100.0)           # cold : pays O(n²)
-    cold = time.time() - t0
-    t0 = time.time()
+    calls = []
+    real = geometry._pairwise_spread_threshold
+    monkeypatch.setattr(geometry, "_pairwise_spread_threshold",
+                        lambda X: calls.append(1) or real(X))
+    geometric_spread(pts[:2], pts, 100.0)           # miss : pays O(n²)
     for _ in range(10):
         geometric_spread(pts[:2], pts, 100.0)       # hits : O(n) only
-    warm_each = (time.time() - t0) / 10
-    assert warm_each < cold                          # strictly cheaper per call
+    assert len(calls) == 1

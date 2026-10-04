@@ -23,7 +23,11 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `geometric_spread`'s O(n²) emergent threshold (median−σ) is cached on
   (subset ids, epoch) — any pull/ingest/subset change falls back to the exact
   recompute; only pure-decay drift between hits is accepted. `clear_geo_cache()`
-  is called by `sleep()` and `load()`.
+  is called by `sleep()` and `load()`. The all-pairs statistic and the
+  seeds × points scan are numpy-vectorised (`_pairwise_spread_threshold`, Gram
+  form) and must stay equal to the scalar definition to 1e-9
+  (`tests/test_spread_vectorised.py`); never reintroduce a pure-Python O(n²)
+  loop on the recall path.
 - `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
@@ -111,6 +115,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
+  `retrieve` applies the reranker's relevance floor `RERANK_FLOOR` (a raw
+  logit): hits under it are dropped and an all-under-floor recall answers the
+  gap verdict alone (TAC-941). The value is CALIBRATED, not a constant: the
+  lowest floor that serves no memory on the versioned off-topic queries
+  against the `tachikoma.paralelle.GenAI` corpus (decision TAC-219 / TAC-190).
+  Documented exception to the hyperparameter-free invariant — recalibrate on
+  the same off-topic set when the reranker model or the corpus changes.
 - `tachikoma_gate.py` — the tachikoma deployment (`python -m
   metacog.tachikoma_gate`): one `Memory` per context behind the
   `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
@@ -138,7 +149,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   context memory + deepwiki; a narrower account must equal the authenticated
   user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
   and its `ingest` is mirrored into the context memory tagged
-  `account:<account>`.
+  `account:<account>`. ONE encoder + ONE reranker per gate
+  (`ContextualMemory.models()`), shared by every context and account memory
+  — never a pair per key (~2 GB each); the middleware loads them in a worker
+  thread after the ACL (`context_gate(warm=…)`), never on the event loop.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

@@ -18,6 +18,8 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
+
 Vector = Tuple[float, ...]
 
 # Smallest vector norm we accept as non-degenerate before refusing to
@@ -330,6 +332,24 @@ def retrieve_with_lineage(
     return [(score, points_by_id[pid]) for pid, score in ranked]
 
 
+def _pairwise_spread_threshold(X: "np.ndarray") -> float:
+    """(median − σ) of all pairwise Euclidean distances between rows of X.
+
+    Same statistic as the scalar definition (upper-median of the sorted
+    distances, population σ), computed with the Gram identity
+    ‖a − b‖² = ‖a‖² + ‖b‖² − 2a·b over the strict upper triangle. Rounding
+    noise can push a near-zero d² slightly negative : clipped to 0.
+    """
+    sq = np.einsum("ij,ij->i", X, X)
+    iu, ju = np.triu_indices(X.shape[0], k=1)
+    d2 = sq[iu] + sq[ju] - 2.0 * (X @ X.T)[iu, ju]
+    dists = np.sqrt(np.clip(d2, 0.0, None))
+    mid = dists.size // 2
+    median = float(np.partition(dists, mid)[mid])
+    sigma = float(dists.std())
+    return max(0.0, median - sigma)
+
+
 def geometric_spread(
     seed_points: Sequence["Point"],  # noqa: F821
     all_points: Sequence["Point"],  # noqa: F821
@@ -363,37 +383,35 @@ def geometric_spread(
     # falls back to this exact recompute.
     embs = {p.id: effective_keyword_embedding(p, t_now) for p in all_points}
     pts = list(all_points)
+    # One row per point of `pts` (a repeated id reuses its `embs` entry).
+    # Vectorised with numpy (TAC-940) : the pure-Python O(n²) loop cost
+    # ~170 s per cache miss on a 1 830-point context.
+    X = np.asarray([embs[p.id] for p in pts], dtype=np.float64)
     cache_key = (len(pts), hash(tuple(p.id for p in pts)))
     hit = _SPREAD_THR_CACHE.get(cache_key)
     if hit is not None and hit[0] == GEO_EPOCH:
         threshold = hit[1]
     else:
-        dists: List[float] = []
-        for i in range(len(pts)):
-            for j in range(i + 1, len(pts)):
-                dists.append(distance(embs[pts[i].id], embs[pts[j].id]))
-        if not dists:
-            return []
-        dists.sort()
-        median = dists[len(dists) // 2]
-        mean = sum(dists) / len(dists)
-        sigma = math.sqrt(sum((d - mean) ** 2 for d in dists) / len(dists))
-        threshold = max(0.0, median - sigma)
+        threshold = _pairwise_spread_threshold(X)
         _SPREAD_THR_CACHE[cache_key] = (GEO_EPOCH, threshold)
 
     seed_ids = {p.id for p in seed_points}
+    row_of = {p.id: i for i, p in enumerate(pts)}
+    candidate = np.array([p.id not in seed_ids for p in pts], dtype=bool)
     found: dict[str, float] = {}
     for seed in seed_points:
-        es = embs.get(seed.id)
-        if es is None:
+        r = row_of.get(seed.id)
+        if r is None:
             continue
-        for p in all_points:
-            if p.id in seed_ids:
-                continue
-            d = distance(es, embs[p.id])
-            if d < threshold:
-                if p.id not in found or d < found[p.id]:
-                    found[p.id] = d
+        # Direct ‖a − b‖ per row (not the Gram form) : the returned
+        # distances and the `< threshold` cut match the scalar loop.
+        d_row = np.sqrt(((X - X[r]) ** 2).sum(axis=1))
+        # Hits in point order, so `found` keeps the scalar insertion order.
+        for j in np.nonzero(candidate & (d_row < threshold))[0]:
+            pid = pts[j].id
+            d = float(d_row[j])
+            if pid not in found or d < found[pid]:
+                found[pid] = d
     by_id = {p.id: p for p in all_points}
     ranked = sorted(found.items(), key=lambda x: x[1])
     return [(d, by_id[pid]) for pid, d in ranked]
