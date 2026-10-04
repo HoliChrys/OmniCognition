@@ -24,7 +24,9 @@ import pytest
 
 from metacog.defaults import SimpleEncoder
 from metacog.memory import Memory
-from metacog.tachikoma_gate import CTX_HEADER, ContextualMemory, _current_ctx
+from metacog.tachikoma_gate import (
+    ACCOUNT_HEADER, CTX_HEADER, ContextualMemory, _current_account, _current_ctx,
+    valid_account_name, valid_context_name)
 
 
 def _make_proxy(tmp_path, notes=False):
@@ -176,3 +178,179 @@ def test_ancestor_notes_seed_the_child_wiki(tmp_path):
     p._ingest_notes("tachikoma.sub.Child", m)
     assert m.journal.get_wiki_doc("notes:own") is not None          # own
     assert m.journal.get_wiki_doc("notes:tachikoma/root") is not None  # ancestor
+
+
+# ── TAC-213: names are validated before any path is built ──────────────
+
+@pytest.mark.parametrize("name", [
+    "global", "tachikoma", "tachikoma.paralelle.GenAI", "demo.sandbox.alice",
+    "ctx-a", "a_b.c-d"])
+def test_valid_context_names_pass(name):
+    assert valid_context_name(name)
+
+
+@pytest.mark.parametrize("name", [
+    "", "..", "../etc", "a/b", "tachikoma/paralelle/GenAI", "/abs", "a..b",
+    ".a", "a.", "a b", "a\\b", "ctx\x00"])
+def test_invalid_context_names_are_refused(name):
+    """Measured on disk: a name with `/` created nested folders, and `..`
+    would leave the storage root. Refused before any path is built."""
+    assert not valid_context_name(name)
+
+
+def test_the_proxy_refuses_an_invalid_context(tmp_path):
+    p = _make_proxy(tmp_path)
+    _current_ctx.set("../outside")
+    with pytest.raises(RuntimeError, match="invalid context"):
+        p._ctx_name()
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize("name", [
+    "ubuntu", "manager-GenAI-1545c4", "tachikoma-T-001", "alice@x.io"])
+def test_valid_account_names_pass(name):
+    assert valid_account_name(name)
+
+
+@pytest.mark.parametrize("name", ["", "..", ".hidden", "a/b", "a..b", "../x"])
+def test_invalid_account_names_are_refused(name):
+    assert not valid_account_name(name)
+
+
+def test_a_store_never_escapes_the_root(tmp_path):
+    p = _make_proxy(tmp_path)
+    with pytest.raises(RuntimeError, match="escapes"):
+        p._memory_at("../outside")
+
+
+# ── TAC-213: the right to read is the ACCOUNT's ────────────────────────
+
+def _test_store(p, key):
+    """A test-encoder memory at `<root>/<key>/memory.pkl` (account stores)."""
+    m = p._memories.get(key)
+    if m is None:
+        path = os.path.join(p._root, key, "memory.pkl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        m = Memory(storage_path=path, journal_path=path + ".journal.db",
+                   encoder=SimpleEncoder())
+        p._memories[key] = m
+    return m
+
+
+def _contents(m):
+    return [pt.content for pt in m.points]
+
+
+def _as(ctx, account=""):
+    _current_ctx.set(ctx)
+    _current_account.set(account)
+
+
+def _ingest_like_the_tool(p, content, tags=None):
+    """What the `ingest` MCP tool does with `memory` (the proxy)."""
+    pt = p.ingest(content, kind="FACT", id=None)
+    if tags:
+        pt.add_tag(*tags)
+    if p.storage_path:
+        p.save()
+    return pt
+
+
+def test_the_default_account_is_the_contexts(tmp_path):
+    """No account header (or the context's name): the context memory, as
+    before — `par défaut ils sont sur le context`."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, "ctx-a")
+    _as("ctx-a", "")
+    assert p._resolve() is ctx_mem
+    _as("ctx-a", "ctx-a")
+    assert p._resolve() is ctx_mem
+
+
+def test_a_narrow_account_reads_only_its_own(tmp_path):
+    """An agent operating under its own account reads what its account
+    wrote — not the context's facts, not another agent's."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, "ctx-a")
+    a_mem = _test_store(p, os.path.join("ctx-a", "accounts", "agent-a"))
+    b_mem = _test_store(p, os.path.join("ctx-a", "accounts", "agent-b"))
+
+    _as("ctx-a", "")
+    _ingest_like_the_tool(p, "the manager's private plan")
+    _as("ctx-a", "agent-a")
+    _ingest_like_the_tool(p, "agent a learned the port is 8788")
+
+    _as("ctx-a", "agent-a")
+    assert p._resolve() is a_mem
+    assert _contents(a_mem) == ["agent a learned the port is 8788"]
+    _as("ctx-a", "agent-b")
+    assert p._resolve() is b_mem
+    assert _contents(b_mem) == []
+    assert "the manager's private plan" in _contents(ctx_mem)
+
+
+def test_a_narrow_write_also_carries_the_context_tag(tmp_path):
+    """What an agent writes under its own account ALSO lands in the
+    context memory, tagged with its account: the manager reads it."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, "ctx-a")
+    a_mem = _test_store(p, os.path.join("ctx-a", "accounts", "agent-a"))
+    _as("ctx-a", "agent-a")
+    pt = _ingest_like_the_tool(p, "agent a learned the port is 8788",
+                               tags=["module:gate"])
+
+    mirror = [x for x in ctx_mem.points
+              if x.content == "agent a learned the port is 8788"]
+    assert len(mirror) == 1
+    assert "account:agent-a" in mirror[0].tags
+    assert "module:gate" in mirror[0].tags          # the tool's tags follow
+    own = [x for x in a_mem.points if x.id == pt.id]
+    assert own and "account:agent-a" in own[0].tags
+    # both stores were saved
+    assert os.path.exists(a_mem.storage_path)
+    assert os.path.exists(ctx_mem.storage_path)
+
+
+def test_accounts_are_scoped_by_context(tmp_path):
+    """The same account id under two contexts: two memories, not one."""
+    p = _make_proxy(tmp_path)
+    _test_instance(p, "ctx-a")
+    _test_instance(p, "ctx-b")
+    in_a = _test_store(p, os.path.join("ctx-a", "accounts", "agent-a"))
+    _as("ctx-a", "agent-a")
+    _ingest_like_the_tool(p, "only in a")
+    _as("ctx-b", "agent-a")
+    in_b = p._resolve()
+    assert in_b is not in_a
+    assert "only in a" not in _contents(in_b)
+
+
+def test_the_proxy_refuses_an_invalid_account(tmp_path):
+    p = _make_proxy(tmp_path)
+    _as("ctx-a", "../ctx-b")
+    with pytest.raises(RuntimeError, match="invalid account"):
+        p._resolve()
+
+
+# ── TAC-213: the HTTP gate refuses bad names before any tool runs ──────
+
+def _gate_client(tmp_path):
+    pytest.importorskip("mcp")
+    from starlette.testclient import TestClient
+    from metacog.tachikoma_gate import build_gated_app
+    outer, _mcp, _inner = build_gated_app(str(tmp_path / "store"), "")
+    return TestClient(outer)
+
+
+@pytest.mark.parametrize("headers, needle", [
+    ({}, "obligatoire"),
+    ({CTX_HEADER: "../etc"}, "contexte invalide"),
+    ({CTX_HEADER: "tachikoma/paralelle/GenAI"}, "contexte invalide"),
+    ({CTX_HEADER: "ctx-a", ACCOUNT_HEADER: "../ctx-b"}, "compte invalide"),
+])
+def test_the_gate_refuses_bad_names_in_400(tmp_path, headers, needle):
+    with _gate_client(tmp_path) as client:
+        r = client.post("/mcp", headers=headers, json={})
+    assert r.status_code == 400
+    assert needle in r.json()["detail"]
+    assert not (tmp_path / "etc").exists()

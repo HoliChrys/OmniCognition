@@ -125,6 +125,17 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   tags), `wiki_where`/`okf_schema`/`okf_fields` (query the EAV index, recover
   the schema from data), `import_okf` (consume an external OKF bundle). All
   no-op without a journal ; refs are resolved through `_merge_aliases`.
+- `tachikoma_gate.py` — the multi-context HTTP deployment (`python -m
+  metacog.tachikoma_gate`). `ContextualMemory` proxies every `memory.*` call
+  to the `Memory` of the current context (`x-tachikoma-context`, mandatory)
+  and ACCOUNT (`x-tachikoma-account`, optional). The right to read is the
+  account's: no header (or the context's own name) = the context memory
+  `<root>/<ctx>/memory.pkl` + its deepwiki; a narrower account reads ONLY
+  `<root>/<ctx>/accounts/<account>/memory.pkl`, and its `ingest` is mirrored
+  into the context memory tagged `account:<account>`. Names are validated
+  fail-closed (400 in the middleware, `RuntimeError` in the proxy) before any
+  path is built. The gate trusts the headers: authentication and the choice
+  of account belong to the tachikoma router in front of it.
 - `canonical_tools.py` — the tool-tier manifest (T1 CANONICAL / T2 TOOL_TIER /
   T3 INTERNAL / DEPRECATED) + surfaces (`EXTERNAL`, `EXTERNAL_LIGHT`,
   `canonical`, `all`). `surface_tools(name)`, `classify(name)`. Must partition

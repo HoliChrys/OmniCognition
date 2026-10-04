@@ -26,21 +26,68 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    of that context is touched, its refs linked into the RAG. The wiki lives
    where the notes already live — not in a parallel store that would drift.
 
+4. THE ACCOUNT (TAC-213) — the right to read is the ACCOUNT's, not the
+   context's. Every caller operates under an account, carried by the
+   `x-tachikoma-account` header. By default (header absent, or equal to the
+   context) the account IS the context's — its manager's — and the caller
+   is served the context memory, as before. A NARROWER account (an agent
+   operating in a lobby under its own account) is served ITS OWN memory,
+   `<storage_root>/<ctx>/accounts/<account>/memory.pkl`: it reads only what
+   its account wrote. What it ingests is ALSO filed in the context memory,
+   tagged `account:<account>` — the context tag, so the manager sees what
+   the agents of its context learned. Mirrored today: `ingest` (and
+   `remember`, which delegates to it). Other writes of a narrow account stay
+   in its own memory — the safe direction (the manager sees less, nobody
+   sees more).
+
+   The gate does not VERIFY that the caller owns the account it claims: it
+   listens on loopback behind the tachikoma router, which authenticates the
+   token and decides the account (same trust boundary as the context
+   header).
+
 Storage: `<storage_root>/<ctx>/memory.pkl` — one memory per context, isolated,
 persistent. `global` and `tachikoma.paralelle.GenAI` share NOTHING by accident.
+Context and account names are VALIDATED before any path is built (fail-closed):
+a name carrying `/` or `..` would otherwise create folders anywhere.
 """
 from __future__ import annotations
 
 import os
+import re
 from contextvars import ContextVar
 from typing import Any, Optional
 
 #: The contextvar of the served context. Set by the middleware, read by the proxy.
 _current_ctx: ContextVar[str] = ContextVar("tachikoma_context", default="")
 
+#: The contextvar of the caller's account ("" = the context's own account).
+_current_account: ContextVar[str] = ContextVar("tachikoma_account", default="")
+
 #: The header tachikoma sends — same value as mnema's `CTX_HEADER`, taken
 #: verbatim so a proxy never speaks a dialect the server does not listen to.
 CTX_HEADER = "x-tachikoma-context"
+
+#: The account the caller operates under (TAC-213). Absent = the context's.
+ACCOUNT_HEADER = "x-tachikoma-account"
+
+#: A tachikoma context name: dotted segments, no `/`, no empty segment — so no
+#: `..` and no absolute path can ever reach `os.path.join`.
+_CTX_NAME = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*")
+
+#: An account id (user or agent id, e-mail-like ids included): ONE path
+#: component — no `/`, never starting with a dot, no `..`.
+_ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_@-][A-Za-z0-9_.@-]*")
+
+
+def valid_context_name(name: str) -> bool:
+    """True when `name` is a context name safe to use as a storage path."""
+    return bool(name) and _CTX_NAME.fullmatch(name) is not None
+
+
+def valid_account_name(name: str) -> bool:
+    """True when `name` is an account id safe to use as ONE path component."""
+    return (bool(name) and _ACCOUNT_NAME.fullmatch(name) is not None
+            and ".." not in name)
 
 
 class ContextualMemory:
@@ -71,20 +118,43 @@ class ContextualMemory:
             raise RuntimeError(
                 "no context served — the x-tachikoma-context header is "
                 "mandatory (fail-closed, like mnema)")
+        if not valid_context_name(name):
+            raise RuntimeError(f"invalid context name {name!r} — refused "
+                               "(fail-closed: no path is built from it)")
         return name
 
-    def _resolve(self) -> Any:
+    def _account_name(self, ctx: str) -> str:
+        """The NARROW account of the caller, or "" when it is the context's."""
+        account = _current_account.get().strip()
+        if not account or account == ctx:
+            return ""
+        if not valid_account_name(account):
+            raise RuntimeError(f"invalid account name {account!r} — refused")
+        return account
+
+    def _memory_at(self, key: str) -> Any:
+        """The `Memory` stored under `<root>/<key>/`, created on first use."""
         from metacog.defaults import make_encoder, make_reranker
         from metacog.memory import Memory
 
-        name = self._ctx_name()
-        m = self._memories.get(name)
+        m = self._memories.get(key)
         if m is None:
-            path = os.path.join(self._root, name, "memory.pkl")
+            path = os.path.join(self._root, key, "memory.pkl")
+            # Belt and braces after the name validation: the store never
+            # leaves the root, whatever reached here.
+            root = os.path.realpath(self._root)
+            if not os.path.realpath(path).startswith(root + os.sep):
+                raise RuntimeError(f"store {key!r} escapes the storage root")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             m = Memory(storage_path=path, journal_path="auto",
                        encoder=make_encoder(), reranker=make_reranker())
-            self._memories[name] = m
+            self._memories[key] = m
+        return m
+
+    def _context_memory(self) -> Any:
+        """The memory of the context ITSELF — its account's, the manager's."""
+        name = self._ctx_name()
+        m = self._memory_at(name)
         # THE DEEPWIKI IS INGESTED ON EVERY FIRST ACCESS OF THE PROCESS, not
         # only at creation: a memory loaded from the pickle (server restart)
         # must find ITS notes too — otherwise the wiki only lives in the
@@ -92,6 +162,19 @@ class ContextualMemory:
         # `_ingested` bounds it to once per (process, context).
         self._ingest_notes(name, m)
         return m
+
+    def _resolve(self) -> Any:
+        """The memory the caller READS: its account's, under its context.
+
+        The context's own account gets the context memory (deepwiki
+        included). A narrow account gets ONLY its own memory — no notes, no
+        other account's facts: it reads what its account wrote.
+        """
+        name = self._ctx_name()
+        account = self._account_name(name)
+        if not account:
+            return self._context_memory()
+        return self._memory_at(os.path.join(name, "accounts", account))
 
     def _ingest_notes(self, ctx: str, m: Any) -> None:
         """The context's deepwiki: its `notes/` folder, ingested once.
@@ -203,15 +286,80 @@ class ContextualMemory:
                 out.append((src, folder))
         return out
 
+    # ── the context tag of a narrow account's writes ──────────────────
+    def _mirrored_ingest(self, own: Any, account: str):
+        """`ingest` for a narrow account: its memory, AND the context's.
+
+        The point lands in the account's memory (what it will read back)
+        and a copy lands in the context memory tagged `account:<account>`
+        (what the manager reads). The tool adds its tags to the returned
+        point afterwards: `_MirroredPoint` forwards them to both copies.
+        """
+        def ingest(content: str, *args: Any, **kwargs: Any) -> Any:
+            p = own.ingest(content, *args, **kwargs)
+            p.add_tag(f"account:{account}")
+            _log_tags(own, p)
+            ctx_mem = self._context_memory()
+            # The explicit id stays the account's: in the context memory it
+            # could collide with another account's — the engine names it.
+            q = ctx_mem.ingest(content, kind=kwargs.get("kind", "FACT"))
+            q.add_tag(f"account:{account}")
+            _log_tags(ctx_mem, q)
+            return _MirroredPoint(p, q, ctx_mem)
+        return ingest
+
+    def _mirrored_save(self, own: Any):
+        """`save` for a narrow account: both stores the write touched."""
+        def save(*args: Any, **kwargs: Any) -> Any:
+            out = own.save(*args, **kwargs)
+            ctx_mem = self._context_memory()
+            if ctx_mem.storage_path:
+                ctx_mem.save()
+            return out
+        return save
+
     # ── delegation ────────────────────────────────────────────────────
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._resolve(), name)
+        m = self._resolve()
+        account = self._account_name(self._ctx_name())
+        if account and name == "ingest":
+            return self._mirrored_ingest(m, account)
+        if account and name == "save":
+            return self._mirrored_save(m)
+        return getattr(m, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name.startswith("_"):
             super().__setattr__(name, value)
             return
         setattr(self._resolve(), name, value)
+
+
+def _log_tags(m: Any, p: Any) -> None:
+    """Index a point's tags in its memory's journal (no-op without one)."""
+    try:
+        if m.journal is not None:
+            m.journal.log_tags(p.id, p.tags)
+    except Exception:  # noqa: BLE001 — the tag index is an index, not the store
+        pass
+
+
+class _MirroredPoint:
+    """The account's point, whose tags also reach its context-memory copy."""
+
+    def __init__(self, own: Any, mirror: Any, mirror_memory: Any):
+        self._own = own
+        self._mirror = mirror
+        self._mirror_memory = mirror_memory
+
+    def add_tag(self, *tags: str) -> "_MirroredPoint":
+        self._own.add_tag(*tags)
+        self._mirror.add_tag(*tags)
+        _log_tags(self._mirror_memory, self._mirror)
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._own, name)
 
 
 def build_gated_app(storage_root: str, notes_root: str,
@@ -245,13 +393,24 @@ def build_gated_app(storage_root: str, notes_root: str,
 
     class _ContextGate(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
+            from starlette.responses import JSONResponse
             ctx = (request.headers.get(CTX_HEADER) or "").strip()
             if not ctx:
-                from starlette.responses import JSONResponse
                 return JSONResponse(
                     {"detail": "en HTTP le contexte est obligatoire : "
                                f"l'en-tête {CTX_HEADER} est absent"}, status_code=400)
+            if not valid_context_name(ctx):
+                return JSONResponse(
+                    {"detail": f"nom de contexte invalide dans {CTX_HEADER} : "
+                               f"{ctx!r} (segments [A-Za-z0-9_-] séparés par "
+                               "des points)"}, status_code=400)
+            account = (request.headers.get(ACCOUNT_HEADER) or "").strip()
+            if account and not valid_account_name(account):
+                return JSONResponse(
+                    {"detail": f"nom de compte invalide dans {ACCOUNT_HEADER} : "
+                               f"{account!r}"}, status_code=400)
             _current_ctx.set(ctx)
+            _current_account.set(account)
             return await call_next(request)
 
     return Starlette(
