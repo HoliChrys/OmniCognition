@@ -125,7 +125,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   context memory + deepwiki; a narrower account must equal the authenticated
   user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
   and its `ingest` is mirrored into the context memory tagged
-  `account:<account>`.
+  `account:<account>`. ONE encoder + ONE reranker per gate
+  (`ContextualMemory.models()`), shared by every context and account memory
+  — never a pair per key (~2 GB each); the middleware loads them in a worker
+  thread after the ACL (`context_gate(warm=…)`), never on the event loop.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
