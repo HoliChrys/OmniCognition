@@ -24,7 +24,9 @@ import pytest
 
 from metacog.defaults import SimpleEncoder
 from metacog.memory import Memory
-from metacog.tachikoma_gate import CTX_HEADER, ContextualMemory, _current_ctx
+from metacog.tachikoma_gate import (
+    ACCOUNT_HEADER, CTX_HEADER, ContextualMemory, _current_account, _current_ctx,
+    valid_account_name, valid_context_name)
 
 
 def _make_proxy(tmp_path, notes=False):
@@ -305,3 +307,213 @@ def test_the_gate_still_wants_the_header_first():
     client, seen = _gated_client(set())
     assert client.post("/mcp").status_code == 400
     assert seen == []
+
+
+# ── TAC-213: names are validated before any path is built ──────────────
+
+@pytest.mark.parametrize("name", [
+    "global", "tachikoma", "tachikoma.paralelle.GenAI", "demo.sandbox.alice",
+    "ctx-a", "a_b.c-d"])
+def test_valid_context_names_pass(name):
+    assert valid_context_name(name)
+
+
+@pytest.mark.parametrize("name", [
+    "", "..", "../etc", "a/b", "tachikoma/paralelle/GenAI", "/abs", "a..b",
+    ".a", "a.", "a b", "a\\b", "ctx\x00"])
+def test_invalid_context_names_are_refused(name):
+    """Measured on disk: a name with `/` created nested folders, and `..`
+    would leave the storage root. Refused before any path is built."""
+    assert not valid_context_name(name)
+
+
+def test_the_proxy_refuses_an_invalid_context(tmp_path):
+    p = _make_proxy(tmp_path)
+    _current_ctx.set("../outside")
+    with pytest.raises(RuntimeError, match="invalid context"):
+        p._ctx_name()
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize("name", [
+    "ubuntu", "manager-GenAI-1545c4", "tachikoma-T-001", "alice@x.io"])
+def test_valid_account_names_pass(name):
+    assert valid_account_name(name)
+
+
+@pytest.mark.parametrize("name", ["", "..", ".hidden", "a/b", "a..b", "../x"])
+def test_invalid_account_names_are_refused(name):
+    assert not valid_account_name(name)
+
+
+def test_a_store_never_escapes_the_root(tmp_path):
+    p = _make_proxy(tmp_path)
+    with pytest.raises(RuntimeError, match="escapes"):
+        p._memory_at("../outside")
+
+
+# ── TAC-213: the right to read is the ACCOUNT's ────────────────────────
+
+def _test_store(p, key):
+    """A test-encoder memory at `<root>/<key>/memory.pkl` (account stores)."""
+    m = p._memories.get(key)
+    if m is None:
+        path = os.path.join(p._root, key, "memory.pkl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        m = Memory(storage_path=path, journal_path=path + ".journal.db",
+                   encoder=SimpleEncoder())
+        p._memories[key] = m
+    return m
+
+
+def _contents(m):
+    return [pt.content for pt in m.points]
+
+
+def _as(ctx, account=""):
+    _current_ctx.set(ctx)
+    _current_account.set(account)
+
+
+def _ingest_like_the_tool(p, content, tags=None):
+    """What the `ingest` MCP tool does with `memory` (the proxy)."""
+    pt = p.ingest(content, kind="FACT", id=None)
+    if tags:
+        pt.add_tag(*tags)
+    if p.storage_path:
+        p.save()
+    return pt
+
+
+def test_the_default_account_is_the_contexts(tmp_path):
+    """No account header (or the context's name): the context memory, as
+    before — `par défaut ils sont sur le context`."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, "ctx-a")
+    _as("ctx-a", "")
+    assert p._resolve() is ctx_mem
+    _as("ctx-a", "ctx-a")
+    assert p._resolve() is ctx_mem
+
+
+def test_a_narrow_account_reads_only_its_own(tmp_path):
+    """An agent operating under its own account reads what its account
+    wrote — not the context's facts, not another agent's."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, "ctx-a")
+    a_mem = _test_store(p, os.path.join("ctx-a", "accounts", "agent-a"))
+    b_mem = _test_store(p, os.path.join("ctx-a", "accounts", "agent-b"))
+
+    _as("ctx-a", "")
+    _ingest_like_the_tool(p, "the manager's private plan")
+    _as("ctx-a", "agent-a")
+    _ingest_like_the_tool(p, "agent a learned the port is 8788")
+
+    _as("ctx-a", "agent-a")
+    assert p._resolve() is a_mem
+    assert _contents(a_mem) == ["agent a learned the port is 8788"]
+    _as("ctx-a", "agent-b")
+    assert p._resolve() is b_mem
+    assert _contents(b_mem) == []
+    assert "the manager's private plan" in _contents(ctx_mem)
+
+
+def test_a_narrow_write_also_carries_the_context_tag(tmp_path):
+    """What an agent writes under its own account ALSO lands in the
+    context memory, tagged with its account: the manager reads it."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, "ctx-a")
+    a_mem = _test_store(p, os.path.join("ctx-a", "accounts", "agent-a"))
+    _as("ctx-a", "agent-a")
+    pt = _ingest_like_the_tool(p, "agent a learned the port is 8788",
+                               tags=["module:gate"])
+
+    mirror = [x for x in ctx_mem.points
+              if x.content == "agent a learned the port is 8788"]
+    assert len(mirror) == 1
+    assert "account:agent-a" in mirror[0].tags
+    assert "module:gate" in mirror[0].tags          # the tool's tags follow
+    own = [x for x in a_mem.points if x.id == pt.id]
+    assert own and "account:agent-a" in own[0].tags
+    # both stores were saved
+    assert os.path.exists(a_mem.storage_path)
+    assert os.path.exists(ctx_mem.storage_path)
+
+
+def test_accounts_are_scoped_by_context(tmp_path):
+    """The same account id under two contexts: two memories, not one."""
+    p = _make_proxy(tmp_path)
+    _test_instance(p, "ctx-a")
+    _test_instance(p, "ctx-b")
+    in_a = _test_store(p, os.path.join("ctx-a", "accounts", "agent-a"))
+    _as("ctx-a", "agent-a")
+    _ingest_like_the_tool(p, "only in a")
+    _as("ctx-b", "agent-a")
+    in_b = p._resolve()
+    assert in_b is not in_a
+    assert "only in a" not in _contents(in_b)
+
+
+def test_the_proxy_refuses_an_invalid_account(tmp_path):
+    p = _make_proxy(tmp_path)
+    _as("ctx-a", "../ctx-b")
+    with pytest.raises(RuntimeError, match="invalid account"):
+        p._resolve()
+
+
+# ── TAC-213: the HTTP gate — names first, then the ACL, then the account ──
+
+def _account_client(user="agent-a"):
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    seen = []
+
+    def fake_authorize(token, ctx):
+        seen.append(ctx)
+        return user
+
+    async def handler(request):
+        return PlainTextResponse(f"{_current_ctx.get()}|{_current_account.get()}")
+
+    app = Starlette(routes=[Route("/mcp", handler, methods=["POST"])],
+                    middleware=[Middleware(gate.context_gate(fake_authorize))])
+    return TestClient(app), seen
+
+
+@pytest.mark.parametrize("headers, needle", [
+    ({CTX_HEADER: "../etc"}, "contexte invalide"),
+    ({CTX_HEADER: "tachikoma/paralelle/GenAI"}, "contexte invalide"),
+    ({CTX_HEADER: "ctx-a", ACCOUNT_HEADER: "../ctx-b"}, "compte invalide"),
+])
+def test_the_gate_refuses_bad_names_before_the_acl(headers, needle):
+    """A bad name never reaches the ACL API, nor a path."""
+    client, seen = _account_client()
+    r = client.post("/mcp", headers={**headers, "Authorization": "Bearer t"})
+    assert r.status_code == 400 and needle in r.json()["detail"]
+    assert seen == []
+
+
+def test_no_account_header_is_the_contexts_account():
+    client, _ = _account_client()
+    r = client.post("/mcp", headers={CTX_HEADER: "ctx-a"})
+    assert r.status_code == 200 and r.text == "ctx-a|"
+
+
+def test_a_caller_narrows_to_its_own_account():
+    client, _ = _account_client(user="agent-a")
+    r = client.post("/mcp", headers={CTX_HEADER: "ctx-a",
+                                     ACCOUNT_HEADER: "agent-a"})
+    assert r.status_code == 200 and r.text == "ctx-a|agent-a"
+
+
+def test_a_caller_never_borrows_another_account():
+    """The account is VERIFIED against the authenticated user: naming
+    another agent's account would read its memory."""
+    client, _ = _account_client(user="agent-a")
+    r = client.post("/mcp", headers={CTX_HEADER: "ctx-a",
+                                     ACCOUNT_HEADER: "agent-b"})
+    assert r.status_code == 403 and "agent-b" in r.json()["detail"]

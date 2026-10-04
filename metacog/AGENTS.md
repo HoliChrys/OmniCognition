@@ -120,6 +120,12 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  Context/account names are validated BEFORE the ACL call (400). The right to
+  read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
+  context memory + deepwiki; a narrower account must equal the authenticated
+  user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
+  and its `ingest` is mirrored into the context memory tagged
+  `account:<account>`.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
