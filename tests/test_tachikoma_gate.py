@@ -12,7 +12,9 @@ What we pin here, in the order it would break in production:
    `build_app` (the ACT-R levers), which a swallowing proxy would break
    without a test noticing.
 4. The DEEPWIKI: the context's `notes/` folder is ingested (every .md becomes
-   a doc), once, and one unreadable note never stops the rest.
+   a doc AND a content point), kept in step with the folder without a restart
+   (added / corrected / deleted), its name→folder mapping written once, and
+   one unreadable note never stops the rest — it is said.
 
 The test encoder is SimpleEncoder (hash): deterministic, no model download.
 """
@@ -102,82 +104,258 @@ def test_the_proxy_delegates_to_the_current_context(tmp_path):
         assert p._resolve() is ma
 
 
-# ── the deepwiki: the context's notes folder ───────────────────────────
+# ── the deepwiki: the context's notes folder (TAC-938) ─────────────────
+#
+# The notes root is the folder of the TREE ROOT context, named like it
+# (deployed: `/opt/tachikoma-fs/global/tachikoma`). Contexts below are
+# `tachikoma.<a>.<b>` → `<root>/<a>/<b>/notes`.
 
-def test_the_contexts_notes_are_ingested(tmp_path):
-    """The context's deepwiki is ITS notes/ folder: every .md becomes a doc —
-    wiki docs live in the JOURNAL, that's where we read them."""
-    folder = tmp_path / "notes" / "ctx-a" / "notes"
-    folder.mkdir(parents=True)
-    (folder / "proj.md").write_text("# The proj-03 port\n\nNote content.",
-                                    encoding="utf-8")
-    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
-    m = _test_instance(p, "ctx-a")
-    p._ingest_notes("ctx-a", m)
-    doc = m.journal.get_wiki_doc("notes:proj")
-    assert doc is not None, "notes:proj missing from the journal"
+def _tree(tmp_path):
+    root = tmp_path / "fs" / "tachikoma"
+    root.mkdir(parents=True)
+    return root
 
 
-def test_one_unreadable_note_never_stops_the_wiki(tmp_path):
-    folder = tmp_path / "notes" / "ctx-a" / "notes"
-    folder.mkdir(parents=True)
-    (folder / "good.md").write_text("# Good", encoding="utf-8")
-    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
-    m = _test_instance(p, "ctx-a")
-    # must not raise, whatever the note
-    p._ingest_notes("ctx-a", m)
+def _notes_of(root, *segments):
+    folder = root.joinpath(*segments, "notes")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
-def test_notes_are_ingested_only_once(tmp_path):
-    folder = tmp_path / "notes" / "ctx-a" / "notes"
-    folder.mkdir(parents=True)
-    (folder / "x.md").write_text("# X", encoding="utf-8")
-    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
-    m = _test_instance(p, "ctx-a")
-    p._ingest_notes("ctx-a", m)
-    p._ingest_notes("ctx-a", m)   # second call: no-op
-    assert p._ingested == {"ctx-a"}
+def _write(path, text, bump=0):
+    """Write a note; `bump` moves its mtime forward so a same-size rewrite
+    is still a change (a real edit always moves mtime)."""
+    path.write_text(text, encoding="utf-8")
+    if bump:
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + bump * 10**9))
 
 
-def test_the_dotted_name_maps_to_the_folder_path(tmp_path):
-    """tachikoma.paralelle.GenAI lives at <root>/paralelle/GenAI (first
-    segment repeats the root) — the mapping tries without it first."""
-    folder = tmp_path / "notes" / "paralelle" / "GenAI" / "notes"
-    folder.mkdir(parents=True)
-    (folder / "iris.md").write_text("# IRIS", encoding="utf-8")
-    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
-    m = _test_instance(p, "tachikoma.paralelle.GenAI")
-    p._ingest_notes("tachikoma.paralelle.GenAI", m)
-    assert m.journal.get_wiki_doc("notes:iris") is not None
+def _wiki(tmp_path, ctx="tachikoma.a"):
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    m = _test_instance(p, ctx)
+    return root, p, m
+
+
+def _live_note_points(m, needle):
+    from metacog.epistemic import EpistemicState
+    return [q for q in m.points if needle in (q.content or "")
+            and q.state is not EpistemicState.INVALID]
+
+
+@pytest.mark.parametrize("ctx, expected", [
+    ("tachikoma.paralelle.GenAI", "paralelle/GenAI/notes"),   # measured: 16 docs
+    ("tachikoma.paradigm", "paradigm/notes"),
+    ("tachikoma", "notes"),                                    # the tree root
+    ("global", "notes"),                                       # the hierarchy root
+])
+def test_the_dotted_name_maps_to_one_folder(ctx, expected):
+    """THE MAPPING IS WRITTEN, not rediscovered: one folder per name, the
+    first segment IS the root folder, the roots read `<notes_root>/notes`."""
+    root = "/opt/tachikoma-fs/global/tachikoma"
+    assert gate.notes_folder(root, ctx) == os.path.join(root, *expected.split("/"))
+
+
+@pytest.mark.parametrize("ctx", ["demo.sandbox.alice", "other", "", "a/../b"])
+def test_a_name_outside_the_tree_has_no_folder_here(ctx):
+    """No cascade of candidates: a context of another tree is not given the
+    root's notes (the old fallback did, for any single-segment name)."""
+    assert gate.notes_folder("/opt/tachikoma-fs/global/tachikoma", ctx) is None
+
+
+def test_the_contexts_notes_are_ingested_twice_doc_and_content(tmp_path):
+    """TWO ingestions per note: the DOC (journal, wiki_list/wiki_doc) and the
+    CONTENT point (the RAG) — whose id CITES the note."""
+    root, p, m = _wiki(tmp_path)
+    _write(_notes_of(root, "a") / "proj.md", "# The proj-03 port\n\nPort detail.")
+    report = p._refresh_notes("tachikoma.a", m)
+    assert report["state"] == "ok" and report["added"] == ["notes:proj"]
+    assert m.journal.get_wiki_doc("notes:proj") is not None
+    (point,) = _live_note_points(m, "Port detail")
+    assert point.id.startswith("notes:proj#")
+    assert {"deepwiki", "ctx:tachikoma.a"} <= set(point.tags)
 
 
 def test_subfolder_notes_are_ingested(tmp_path):
     """Measured gap: GenAI/notes/trace/ carried 14 .md the flat read silently
     missed. A note ANYWHERE under notes/ is a note of the context."""
-    folder = tmp_path / "notes" / "ctx-a" / "notes"
-    (folder / "trace").mkdir(parents=True)
-    (folder / "trace" / "wot.md").write_text("# WOT", encoding="utf-8")
-    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
-    m = _test_instance(p, "ctx-a")
-    p._ingest_notes("ctx-a", m)
+    root, p, m = _wiki(tmp_path)
+    folder = _notes_of(root, "a")
+    (folder / "trace").mkdir()
+    _write(folder / "trace" / "wot.md", "# WOT")
+    p._refresh_notes("tachikoma.a", m)
     assert m.journal.get_wiki_doc("notes:trace/wot") is not None
 
 
-def test_ancestor_notes_seed_the_child_wiki(tmp_path):
-    """Inheritance at ingestion: a child context's wiki also carries its
-    ancestors' notes, marked by doc id (mnema marks them '← hérité' at
-    query; the wiki answers the same question its own way)."""
-    root_notes = tmp_path / "notes" / "notes"
-    root_notes.mkdir(parents=True)
-    (root_notes / "root.md").write_text("# Root note", encoding="utf-8")
-    child = tmp_path / "notes" / "sub" / "Child" / "notes"
-    child.mkdir(parents=True)
-    (child / "own.md").write_text("# Own note", encoding="utf-8")
-    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
-    m = _test_instance(p, "tachikoma.sub.Child")
-    p._ingest_notes("tachikoma.sub.Child", m)
-    assert m.journal.get_wiki_doc("notes:own") is not None          # own
-    assert m.journal.get_wiki_doc("notes:tachikoma/root") is not None  # ancestor
+def test_one_unreadable_note_never_stops_the_wiki_and_is_said(tmp_path):
+    root, p, m = _wiki(tmp_path)
+    folder = _notes_of(root, "a")
+    _write(folder / "good.md", "# Good")
+    _write(folder / "bad.md", "# Bad")
+    os.chmod(folder / "bad.md", 0)
+    try:
+        report = p._refresh_notes("tachikoma.a", m)
+    finally:
+        os.chmod(folder / "bad.md", 0o644)
+    assert report["added"] == ["notes:good"]
+    assert [e["doc_id"] for e in report["errors"]] == ["notes:bad"]
+    # retried on the next pass, not forgotten
+    assert p._refresh_notes("tachikoma.a", m)["added"] == ["notes:bad"]
+
+
+def test_a_note_added_later_enters_without_restart(tmp_path):
+    """THE BUG: `_ingested` was a set — a note added after the first access
+    never entered until the [omni] process restarted."""
+    root, p, m = _wiki(tmp_path)
+    folder = _notes_of(root, "a")
+    _write(folder / "first.md", "# First")
+    assert p._context_memory() is m
+    _write(folder / "later.md", "# Later note body")
+    p._context_memory()                      # same process, next access
+    assert m.journal.get_wiki_doc("notes:later") is not None
+    assert len(_live_note_points(m, "Later note body")) == 1
+
+
+def test_a_corrected_note_replaces_the_old_version(tmp_path):
+    """A note corrected is corrected in the wiki — the old version is no
+    longer retrievable (soft-forgotten, superseded by the new point)."""
+    root, p, m = _wiki(tmp_path)
+    note = _notes_of(root, "a") / "deploy.md"
+    _write(note, "# Deploy\n\nThe deploy port is 8101.")
+    p._refresh_notes("tachikoma.a", m)
+    _write(note, "# Deploy\n\nThe deploy port is 8202.", bump=5)
+    report = p._refresh_notes("tachikoma.a", m)
+    assert report["updated"] == ["notes:deploy"] and not report["added"]
+    assert "8202" in m.journal.get_wiki_doc("notes:deploy")["body"]
+    assert _live_note_points(m, "8101") == []
+    assert len(_live_note_points(m, "8202")) == 1
+    hits = m.retrieve("deploy port", k=7, rerank=False)
+    assert all("8101" not in (h.get("content") or "") for h in hits)
+
+
+def test_a_deleted_note_leaves_the_wiki(tmp_path):
+    root, p, m = _wiki(tmp_path)
+    note = _notes_of(root, "a") / "gone.md"
+    _write(note, "# Gone\n\nObsolete fact.")
+    p._refresh_notes("tachikoma.a", m)
+    note.unlink()
+    report = p._refresh_notes("tachikoma.a", m)
+    assert report["removed"] == ["notes:gone"] and report["state"] == "no_notes"
+    assert m.journal.get_wiki_doc("notes:gone") is None
+    assert _live_note_points(m, "Obsolete fact") == []
+
+
+def test_an_unchanged_folder_costs_no_ingest(tmp_path):
+    root, p, m = _wiki(tmp_path)
+    _write(_notes_of(root, "a") / "x.md", "# X")
+    p._refresh_notes("tachikoma.a", m)
+    n = len(m.points)
+    report = p._refresh_notes("tachikoma.a", m)
+    assert (report["unchanged"], report["added"], report["updated"]) == (1, [], [])
+    assert len(m.points) == n
+
+
+def test_a_restart_recognises_what_the_store_holds(tmp_path):
+    """No fingerprints after a restart: the store is the reference — the
+    content-addressed id says the note is already there, current."""
+    root, p, m = _wiki(tmp_path)
+    _write(_notes_of(root, "a") / "x.md", "# X\n\nStable body.")
+    p._refresh_notes("tachikoma.a", m)
+    n = len(m.points)
+    restarted = ContextualMemory(str(tmp_path / "store"), str(root))
+    restarted._memories["tachikoma.a"] = m
+    report = restarted._refresh_notes("tachikoma.a", m)
+    assert report["unchanged"] == 1 and len(m.points) == n
+
+
+def test_the_copies_of_a_once_per_process_gate_collapse_to_one(tmp_path):
+    """Before TAC-938 every restart re-ingested every note (auto ids): the
+    duplicates are superseded by the one current, content-addressed point."""
+    root, p, m = _wiki(tmp_path)
+    body = "# Dup\n\nDuplicated note body."
+    _write(_notes_of(root, "a") / "dup.md", body)
+    for _ in range(3):   # three restarts of the old gate
+        q = m.ingest(body, kind="FACT")
+        q.add_tag("note:notes:dup", "ctx:tachikoma.a", "deepwiki")
+    m.import_okf("notes:dup", body)
+    report = p._refresh_notes("tachikoma.a", m)
+    assert report["updated"] == ["notes:dup"]
+    (live,) = _live_note_points(m, "Duplicated note body")
+    assert live.id.startswith("notes:dup#")
+
+
+def test_a_context_without_notes_says_so(tmp_path):
+    """`global` measured `{"docs": []}` — exact, its folder is empty. The
+    report says NO NOTES, distinct from an engine that did not answer."""
+    root, p, m = _wiki(tmp_path, ctx="global")
+    assert p._refresh_notes("global", m)["state"] == "no_notes"   # folder absent
+    _notes_of(root)                                               # folder empty
+    report = p._refresh_notes("global", m)
+    assert (report["state"], report["notes"]) == ("no_notes", 0)
+    assert report["folder"] == str(root / "notes")
+
+
+def test_outside_the_tree_and_disabled_are_said(tmp_path):
+    root, p, m = _wiki(tmp_path, ctx="demo.sandbox")
+    assert p._refresh_notes("demo.sandbox", m)["state"] == "outside"
+    bare = ContextualMemory(str(tmp_path / "store2"))
+    assert bare._refresh_notes("demo.sandbox", m)["state"] == "disabled"
+
+
+def test_ancestor_notes_are_not_copied_into_the_child(tmp_path):
+    """Inheritance is served AT QUERY TIME (C3): the child's wiki holds its
+    OWN notes only — a copy would go stale when the ancestor's note moves."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
+    _write(_notes_of(root) / "root.md", "# Root note")
+    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
+    p._refresh_notes("tachikoma.sub.Child", m)
+    assert m.journal.get_wiki_doc("notes:own") is not None
+    assert [d for d in m.journal.all_wiki_doc_ids()] == ["notes:own"]
+
+
+def test_the_folder_is_read_once_per_request(tmp_path):
+    """Every tool call touches `memory.<attr>` many times: the folder is
+    stat'ed once per REQUEST (the stamp the middleware sets), not per access."""
+    root, p, m = _wiki(tmp_path)
+    folder = _notes_of(root, "a")
+    token = gate._request_stamp.set(object())
+    try:
+        p._context_memory()
+        _write(folder / "mid.md", "# Mid-request note")
+        p._context_memory()                       # same request: not re-read
+        assert m.journal.get_wiki_doc("notes:mid") is None
+        gate._request_stamp.set(object())         # the next request
+        p._context_memory()
+        assert m.journal.get_wiki_doc("notes:mid") is not None
+    finally:
+        gate._request_stamp.reset(token)
+
+
+def test_ingest_notes_is_a_tool_and_a_bare_memory_says_unsupported(tmp_path):
+    """The contract operation over MCP: the gate's proxy answers the report;
+    a bare memory (no notes root) says `unsupported` — never an empty list."""
+    import asyncio
+    import json
+
+    from metacog.mcp_server import build_app
+
+    async def call(memory):
+        from mcp.shared.memory import create_connected_server_and_client_session
+        app = build_app(memory=memory, surface="external")
+        async with create_connected_server_and_client_session(app) as s:
+            await s.initialize()
+            r = await s.call_tool("ingest_notes", {})
+            return json.loads("".join(c.text for c in r.content))
+
+    bare = Memory(encoder=SimpleEncoder())
+    assert asyncio.run(call(bare))["state"] == "unsupported"
+
+    root, p, m = _wiki(tmp_path)
+    _write(_notes_of(root, "a") / "x.md", "# X")
+    report = asyncio.run(call(p))
+    assert (report["state"], report["notes"]) == ("ok", 1)
+    assert m.journal.get_wiki_doc("notes:x") is not None
 
 
 # ── the ACL: who may read which memory (TAC-214) ──────────────────────
