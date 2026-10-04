@@ -19,7 +19,11 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
 2. The Starlette middleware — reads `x-tachikoma-context` from EVERY HTTP
    request and sets the contextvar. No header: 400, like mnema ("en HTTP le
    contexte est obligatoire") — fail-closed, never a default memory that would
-   mix contexts.
+   mix contexts. Then THE ACL, on every request (`authorize`, mnema's
+   `acl.authorize_read` ported): WHO (`/api/auth/me`), the context EXISTS
+   (`/api/hierarchy/<ctx>` — else `_resolve` would `makedirs` a memory under
+   any name), and MAY READ it (`/api/acl/check`). Measured before (TAC-214):
+   a token with rights on GenAI only wrote into `demo.sandbox.alice`, HTTP 200.
 
 3. The PER-CONTEXT DEEPWIKI — the `notes/` folder of the tachikoma context IS
    its wiki: every `.md` is ingested (`import_okf`) the first time the memory
@@ -41,6 +45,104 @@ _current_ctx: ContextVar[str] = ContextVar("tachikoma_context", default="")
 #: The header tachikoma sends — same value as mnema's `CTX_HEADER`, taken
 #: verbatim so a proxy never speaks a dialect the server does not listen to.
 CTX_HEADER = "x-tachikoma-context"
+
+# ── THE ACL — who may read which memory (mnema's `acl.py`, ported) ──────────
+#
+# omni replaced mnema and kept its header but not its ACL: the gate checked the
+# header's PRESENCE, nothing else (TAC-214). The router (`/api/memory`) does no
+# authorization by design — "l'autorisation est celle du MOTEUR" — and forwards
+# the bearer token for exactly this. Same three questions, same sources, same
+# fail-closed answers as mnema: the policy is tachikoma's, not re-invented here.
+
+_API = os.environ.get("TACHIKOMA_API_URL", "http://127.0.0.1:8000").rstrip("/")
+
+#: The COMMON NOTEBOOK — the ONLY name that escapes authorization (not
+#: authentication). `general` is no tachikoma context: no hierarchy, no ACL
+#: resource — there is nothing to ask. Anything written there is readable by
+#: ANY valid token, by construction (mnema's documented exception, kept as is).
+GENERAL = os.environ.get("MNEMA_GENERAL_CTX", "general")
+
+#: 30 s, mnema's measured ceiling: warm the check costs ~13 ms, but the first
+#: rights resolution of a fresh API was measured at 17.8 s. A timeout yields a
+#: REFUSAL (fail-closed) — too short protects no one, it lies.
+_ACL_TIMEOUT = float(os.environ.get("OMNI_ACL_TIMEOUT", "30"))
+
+
+class Denied(PermissionError):
+    """An authorization refusal. ALWAYS carries the reason and the HTTP code."""
+
+    def __init__(self, reason: str, status: int = 403):
+        super().__init__(reason)
+        self.status = status
+
+
+def _api(path: str, token: str, payload: Optional[dict] = None) -> tuple[int, Any]:
+    """One call to the tachikoma API with the caller's token. (code, json)."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{_API}{path}", data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=_ACL_TIMEOUT) as r:
+            return r.status, json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except OSError as e:
+        raise Denied(f"ACL injoignable ({_API}) : {e}", 503) from e
+
+
+def authorize(token: str, ctx: str) -> str:
+    """The `user_id` if the token's bearer may READ the memory of `ctx`.
+
+    Raises `Denied` otherwise — no fallback, no default context. Serving the
+    wrong memory in silence is worse than refusing. Writes go through the same
+    check, exactly like mnema (it gated every tool on `read`).
+    """
+    if not token:
+        raise Denied("aucun jeton fourni", 401)
+    # 1. WHO — never decode the token ourselves: the authority checks the signature.
+    code, body = _api("/api/auth/me", token)
+    if code != 200 or not isinstance(body, dict) or not body.get("user_id"):
+        raise Denied(f"jeton rejeté par l'ACL (HTTP {code})", 401)
+    user = str(body["user_id"])
+
+    # Authentication required, authorization does not apply — `general` only.
+    if ctx == GENERAL:
+        return user
+
+    # 2. WHERE — existence FIRST, it is a guard: `_resolve` does `os.makedirs`,
+    # so an authorized unknown name would GIVE BIRTH to a memory (measured:
+    # `contexts/contexte.inconnu.personne/`, 2026-09-18). `quote(safe="")`: the
+    # name comes from the caller — `../x` must not leave the route.
+    import urllib.parse
+    code, _ = _api(f"/api/hierarchy/{urllib.parse.quote(ctx, safe='')}", token)
+    if code == 404:
+        raise Denied(f"le contexte {ctx!r} n'existe pas")
+    if code != 200:
+        # We could NOT ASK: refuse (fail-closed), but never call an outage a fact.
+        raise Denied(f"impossible de vérifier le contexte {ctx!r} : l'API a rendu "
+                     f"HTTP {code} — panne en amont, refus par prudence", 503)
+
+    # 3. WHAT — ask the ACL; the resource is the BARE context name (mnema measured
+    # that `ctx:<name>` only "works" for admins through the bypass).
+    code, body = _api("/api/acl/check", token,
+                      {"user": user, "action": "read", "resource": ctx})
+    if code != 200 or not isinstance(body, dict):
+        raise Denied(f"contrôle d'accès indisponible pour {user!r} (HTTP {code})", 503)
+    if body.get("allowed") is True:
+        return user
+    raise Denied(f"{user!r} n'a pas 'read' sur le contexte {ctx!r}")
+
+
+def _bearer(headers: Any) -> str:
+    auth = headers.get("authorization") or ""
+    return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
 
 
 class ContextualMemory:
@@ -214,15 +316,45 @@ class ContextualMemory:
         setattr(self._resolve(), name, value)
 
 
+def context_gate(authorize_fn: Any = None) -> Any:
+    """The middleware class: context header, then the ACL, on EVERY request.
+
+    `authorize_fn(token, ctx) -> user` defaults to `authorize` (resolved at call
+    time); tests inject a fake. The check is blocking urllib — run in a thread
+    so a cold 17 s ACL never freezes the other contexts' requests.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    class _ContextGate(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            ctx = (request.headers.get(CTX_HEADER) or "").strip()
+            if not ctx:
+                return JSONResponse(
+                    {"detail": "en HTTP le contexte est obligatoire : "
+                               f"l'en-tête {CTX_HEADER} est absent"}, status_code=400)
+            import anyio
+            try:
+                await anyio.to_thread.run_sync(
+                    authorize_fn or authorize, _bearer(request.headers), ctx)
+            except Denied as e:
+                return JSONResponse({"detail": str(e)}, status_code=e.status)
+            _current_ctx.set(ctx)
+            return await call_next(request)
+
+    return _ContextGate
+
+
 def build_gated_app(storage_root: str, notes_root: str,
-                    surface: Optional[str] = None) -> Any:
+                    surface: Optional[str] = None,
+                    authorize_fn: Any = None) -> Any:
     """The omni MCP app, GATED per context — ready to serve over HTTP.
 
     This is the tachikoma deployment entry point: the FastMCP app of
     `build_app` (no tool changed), wrapped in a middleware that sets the
-    context. `storage_root` isolates memories (`<root>/<ctx>/memory.pkl`);
-    `notes_root` is the root of tachikoma context folders (`<root>/<ctx>/notes`
-    is the context's wiki).
+    context after the ACL said yes. `storage_root` isolates memories
+    (`<root>/<ctx>/memory.pkl`); `notes_root` is the root of tachikoma context
+    folders (`<root>/<ctx>/notes` is the context's wiki).
     """
     from metacog.mcp_server import build_app
 
@@ -240,24 +372,12 @@ def build_gated_app(storage_root: str, notes_root: str,
     # 500, server alive but deaf.
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.routing import Mount
-
-    class _ContextGate(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            ctx = (request.headers.get(CTX_HEADER) or "").strip()
-            if not ctx:
-                from starlette.responses import JSONResponse
-                return JSONResponse(
-                    {"detail": "en HTTP le contexte est obligatoire : "
-                               f"l'en-tête {CTX_HEADER} est absent"}, status_code=400)
-            _current_ctx.set(ctx)
-            return await call_next(request)
 
     return Starlette(
         # THE SAME LIFESPAN as the MCP app (the session manager lives there).
         lifespan=inner.router.lifespan_context,
-        middleware=[Middleware(_ContextGate)],
+        middleware=[Middleware(context_gate(authorize_fn))],
         routes=[Mount("/", app=inner)]), mcp_app, inner
 
 
