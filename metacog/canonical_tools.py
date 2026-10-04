@@ -50,7 +50,14 @@ CANONICAL: Set[str] = {
     # can build emergent tools that populate the wiki (reconcile_wiki stays
     # autonomic in sleep, not exposed). check_wiki is read-only observation ;
     # okf_proposals / vet_okf_type close the vocabulary proposal loop.
-    "feed_wiki", "wiki_doc", "ingest_from_wiki", "wiki_where", "okf_schema",
+    # wiki_list : the deepwiki tree of a context (the `notes:` namespace) —
+    # the Paradigm memory screen browses from it. recall / remember : the
+    # mnema-contract aliases of retrieve / ingest (TAC-492) — the tachikoma
+    # bridge and its sessions speak ONE dialect, so with METACOG_SURFACE=external
+    # (the [omni] process) they must be in the canonical set or the gate would
+    # serve an engine the bridge cannot call.
+    "feed_wiki", "wiki_doc", "wiki_list", "ingest_from_wiki", "wiki_where", "okf_schema",
+    "recall", "remember",
     "import_okf", "docs_for_node", "check_wiki", "okf_proposals", "vet_okf_type",
     "refresh_wiki",
     # wiki OBJECTS : seed queries, variables, portions, annotations, pending
