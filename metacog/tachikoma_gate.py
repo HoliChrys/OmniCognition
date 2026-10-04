@@ -221,6 +221,10 @@ class ContextualMemory:
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
         self._models: Optional[tuple[Any, Any]] = None
         self._models_lock = threading.Lock()
+        #: key → the lock that makes its `Memory` be born ONCE (TAC-228).
+        #: Per key: the first access of one context never waits on another's.
+        self._key_locks: dict[str, threading.Lock] = {}
+        self._key_locks_lock = threading.Lock()
 
     # ── the models: ONE pair per gate, shared by every memory ───────────
     def models(self) -> tuple[Any, Any]:
@@ -263,23 +267,40 @@ class ContextualMemory:
         return account
 
     def _memory_at(self, key: str) -> Any:
-        """The `Memory` stored under `<root>/<key>/`, created on first use."""
+        """The `Memory` stored under `<root>/<key>/`, created on first use.
+
+        ONE instance per key, whatever the concurrency (TAC-228). Measured
+        before: 20 concurrent `remember` at the first access of a context
+        built several `Memory` for it, one kept in the cache — the orphans
+        still wrote the same `memory.pkl`, and since the merge-on-save (C2)
+        each fact landed TWICE (+40 for 20). Double-checked under a lock PER
+        KEY: the creation of one context never serialises another's.
+        """
+        m = self._memories.get(key)
+        if m is not None:
+            return m
+        with self._key_locks_lock:
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            m = self._memories.get(key)
+            if m is None:
+                m = self._new_memory(key)
+                self._memories[key] = m
+        return m
+
+    def _new_memory(self, key: str) -> Any:
         from metacog.memory import Memory
 
-        m = self._memories.get(key)
-        if m is None:
-            path = os.path.join(self._root, key, "memory.pkl")
-            # Belt and braces after the name validation: the store never
-            # leaves the root, whatever reached here.
-            root = os.path.realpath(self._root)
-            if not os.path.realpath(path).startswith(root + os.sep):
-                raise RuntimeError(f"store {key!r} escapes the storage root")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            encoder, reranker = self.models()
-            m = Memory(storage_path=path, journal_path="auto",
-                       encoder=encoder, reranker=reranker)
-            self._memories[key] = m
-        return m
+        path = os.path.join(self._root, key, "memory.pkl")
+        # Belt and braces after the name validation: the store never
+        # leaves the root, whatever reached here.
+        root = os.path.realpath(self._root)
+        if not os.path.realpath(path).startswith(root + os.sep):
+            raise RuntimeError(f"store {key!r} escapes the storage root")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        encoder, reranker = self.models()
+        return Memory(storage_path=path, journal_path="auto",
+                      encoder=encoder, reranker=reranker)
 
     def _context_memory(self) -> Any:
         """The memory of the context ITSELF — its account's, the manager's."""
