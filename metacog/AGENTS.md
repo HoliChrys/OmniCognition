@@ -108,10 +108,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
   `notes/` deepwiki). EVERY HTTP request passes the gate: no header → 400, then
   `authorize(token, ctx)` (mnema's ACL, ported) against the tachikoma API —
-  `/api/auth/me` (no/invalid bearer → 401), `general` exempt from authorization
-  only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
-  `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
-  must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  `/api/auth/me` (no/invalid bearer → 401), `/api/hierarchy/<ctx>` existence
+  (unknown → 403, never `makedirs`; no `general` exception), `/api/acl/check`
+  `read` (refused → 403; outage → 503). Fail-closed; callers must forward the
+  caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`. A store holds ONLY
+  its own context (TAC-936, rule C3): the deepwiki ingests the context's own
+  `notes/`, never an ancestor's — inheritance is served at query time by
+  tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the
+  older gate are soft-forgotten on first access.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
