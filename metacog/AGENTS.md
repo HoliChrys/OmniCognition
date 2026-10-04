@@ -143,7 +143,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   disabled | error — a bare `Memory` answers `unsupported`. A read error is
   never an absence (TAC-243): only ENOENT/ENOTDIR on the folder is
   `no_notes`; any other `OSError` (folder or sub-folder, e.g. the FUSE's
-  EAGAIN) is `error` with nothing removed, forgotten or saved.
+  EAGAIN) is `error` with nothing removed, forgotten or saved. And ENOENT is
+  an absence only once CONFIRMED (TAC-255 — the FUSE answers ENOENT for a
+  folder that exists while its backend is down): by the folder's real path
+  recorded at the last good pass (the disk behind the FUSE link; absent
+  there too → absent, present → `error`), or by a folder that is its own
+  real path. Unconfirmed (nothing read since the start) is `error` when the
+  context has known notes; a folder deleted while the gate was down is
+  removed once it is read again (e.g. recreated empty).
   Context/account names are validated BEFORE the ACL call (400). The right to
   read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
   context memory + deepwiki; a narrower account must equal the authenticated

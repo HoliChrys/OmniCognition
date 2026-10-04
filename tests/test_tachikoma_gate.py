@@ -343,6 +343,105 @@ def test_an_unreadable_folder_is_never_an_absence(tmp_path, monkeypatch,
     assert (again["state"], again["removed"], again["unchanged"]) == ("ok", [], 2)
 
 
+def _linked_wiki(tmp_path, ctx="tachikoma.a"):
+    """The DEPLOYED layout: `<notes_root>/<a>/notes` is a LINK (the FUSE's)
+    to the real folder on the local disk."""
+    root, p, m = _wiki(tmp_path, ctx)
+    disk = tmp_path / "disk" / "notes"
+    disk.mkdir(parents=True)
+    (root / "a").mkdir()
+    (root / "a" / "notes").symlink_to(disk, target_is_directory=True)
+    _write(disk / "one.md", "# One\n\nFirst note body.")
+    _write(disk / "two.md", "# Two\n\nSecond note body.")
+    assert len(p._refresh_notes(ctx, m)["added"]) == 2
+    return root, p, m, disk
+
+
+def _fuse_enoent_on(monkeypatch, target):
+    """`os.stat(target)` raises ENOENT — the FUSE whose backend cannot
+    resolve the folder (measured on holistix-baremetal, TAC-255)."""
+    import errno
+    real = os.stat
+
+    def lying(path, *args, **kwargs):
+        if os.fspath(path) == str(target):
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory",
+                                    str(target))
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(os, "stat", lying)
+
+
+def _assert_wiki_intact(m, report):
+    assert report["state"] == "error"
+    assert (report["removed"], report["added"], report["updated"]) == ([], [], [])
+    assert {"notes:one", "notes:two"} <= set(m.journal.all_wiki_doc_ids())
+    assert len(_live_note_points(m, "First note body")) == 1
+    assert len(_live_note_points(m, "Second note body")) == 1
+
+
+def test_a_fuse_enoent_on_a_folder_present_on_disk_is_never_an_absence(
+        tmp_path, monkeypatch):
+    """MEASURED (TAC-255): `tachikoma-api` restarting, the FUSE answered
+    ENOENT for GenAI's notes/ — which existed — and the pass removed its 17
+    docs (`-17`), re-added a minute later (`+17`). The disk says the folder
+    is there: nothing removed, nothing saved, the next pass finds all."""
+    root, p, m, _disk = _linked_wiki(tmp_path)
+    saves = []
+    monkeypatch.setattr(m, "save", lambda *a, **k: saves.append(1))
+    with monkeypatch.context() as mp:
+        _fuse_enoent_on(mp, root / "a" / "notes")
+        report = p._refresh_notes("tachikoma.a", m)
+    _assert_wiki_intact(m, report)
+    assert "present on disk" in report["errors"][0]["error"] and saves == []
+    again = p._refresh_notes("tachikoma.a", m)
+    assert (again["state"], again["removed"], again["unchanged"]) == ("ok", [], 2)
+
+
+def test_after_a_restart_an_enoent_is_unconfirmed_and_removes_nothing(
+        tmp_path, monkeypatch):
+    """A gate that just started has read no folder: the FUSE's ENOENT has
+    nothing to be checked against. The context HAS notes in its store —
+    they stay. Recreating the folder EMPTY is the positive observation that
+    removes them."""
+    root, _p, m, disk = _linked_wiki(tmp_path)
+    restarted = ContextualMemory(str(tmp_path / "store"), str(root))
+    with monkeypatch.context() as mp:
+        _fuse_enoent_on(mp, root / "a" / "notes")
+        report = restarted._refresh_notes("tachikoma.a", m)
+    _assert_wiki_intact(m, report)
+    assert "unconfirmed" in report["errors"][0]["error"]
+    for note in disk.iterdir():          # really deleted, gate restarted
+        note.unlink()
+    disk.rmdir()
+    _assert_wiki_intact(m, restarted._refresh_notes("tachikoma.a", m))
+    disk.mkdir()                         # recreated empty: read, confirmed
+    report = restarted._refresh_notes("tachikoma.a", m)
+    assert (report["state"], sorted(report["removed"])) == (
+        "no_notes", ["notes:one", "notes:two"])
+    assert _live_note_points(m, "First note body") == []
+
+
+@pytest.mark.parametrize("linked", [True, False])
+def test_a_folder_really_deleted_leaves_the_wiki(tmp_path, linked):
+    """The absence CONFIRMED — by the disk behind the link, or by a plain
+    folder that is its own real path — still removes the notes."""
+    if linked:
+        _root, p, m, folder = _linked_wiki(tmp_path)
+    else:
+        root, p, m = _wiki(tmp_path)
+        folder = _notes_of(root, "a")
+        _write(folder / "one.md", "# One\n\nFirst note body.")
+        _write(folder / "two.md", "# Two\n\nSecond note body.")
+        assert len(p._refresh_notes("tachikoma.a", m)["added"]) == 2
+    for note in folder.iterdir():
+        note.unlink()
+    folder.rmdir()
+    report = p._refresh_notes("tachikoma.a", m)
+    assert (report["state"], sorted(report["removed"])) == (
+        "no_notes", ["notes:one", "notes:two"])
+    assert _live_note_points(m, "Second note body") == []
+
+
 def test_a_note_that_comes_back_is_live_again_and_saved(tmp_path):
     """The -16 then +16 cycle measured on GenAI (TAC-243 §3): a note removed
     then back with the SAME body gets a fresh live point (suffixed id — never

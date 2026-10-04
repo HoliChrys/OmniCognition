@@ -269,6 +269,12 @@ class ContextualMemory:
         #: In memory only: after a restart the first read compares with the
         #: STORE (content-addressed point ids), so nothing is re-ingested twice.
         self._notes_seen: dict[str, dict[str, tuple[int, int]]] = {}
+        #: ctx → the REAL path of its notes folder, as resolved by the last
+        #: pass that read it (TAC-255). Deployed, `notes/` is a FUSE link to
+        #: the local disk, and the FUSE answers ENOENT for it while its
+        #: backend is down: only the real path can CONFIRM an absence.
+        #: In memory only — unknown after a restart (see `_scan_notes`).
+        self._notes_real: dict[str, str] = {}
         #: ctx → the request stamp of its last notes check (once per request).
         self._notes_checked: dict[str, Optional[object]] = {}
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
@@ -424,19 +430,31 @@ class ContextualMemory:
             return report
 
         try:
-            on_disk = _scan_notes(folder)
+            on_disk = _scan_notes(folder, self._notes_real.get(ctx))
         except OSError as exc:
-            # A READ ERROR IS NEVER AN ABSENCE (TAC-243). Measured: the FUSE
-            # answered EAGAIN under load, the folder read as "absent", and the
-            # pass removed all 16 docs of GenAI. Nothing is touched; the
-            # fingerprints stay those of the last good pass, so the next one
-            # retries.
-            report["state"] = "error"
-            report["errors"].append({"doc_id": None,
-                                     "error": f"{type(exc).__name__}: {exc}"})
-            print(f"[gate] deepwiki of {ctx!r}: folder unreadable, nothing "
-                  f"changed: {report['errors'][0]['error']}", flush=True)
-            return report
+            # An unconfirmed absence of a context whose notes are UNKNOWN
+            # removes nothing either way: it is a context without notes.
+            if not (isinstance(exc, _UnconfirmedAbsence)
+                    and not self._notes_seen.get(ctx)
+                    and not _own_note_points(ctx, m)):
+                # A READ ERROR IS NEVER AN ABSENCE (TAC-243, TAC-255).
+                # Measured: the FUSE answered EAGAIN under load (TAC-243),
+                # then ENOENT during a `tachikoma-api` restart (TAC-255) —
+                # each time the pass removed all the docs of GenAI. Nothing
+                # is touched; the fingerprints stay those of the last good
+                # pass, so the next one retries.
+                report["state"] = "error"
+                report["errors"].append({"doc_id": None,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                print(f"[gate] deepwiki of {ctx!r}: folder unreadable, nothing "
+                      f"changed: {report['errors'][0]['error']}", flush=True)
+                return report
+            on_disk = {}
+        else:
+            try:   # strict: a component that does not answer keeps the old one
+                self._notes_real[ctx] = os.path.realpath(folder, strict=True)
+            except OSError:
+                pass
         report["notes"] = len(on_disk)
         fingerprints = {doc: fp for doc, (_path, fp) in on_disk.items()}
         seen = self._notes_seen.get(ctx)
@@ -562,7 +580,12 @@ class ContextualMemory:
         setattr(self._resolve(), name, value)
 
 
-def _scan_notes(folder: str) -> dict[str, tuple[str, tuple[int, int]]]:
+class _UnconfirmedAbsence(OSError):
+    """The notes folder answered ENOENT / ENOTDIR and nothing confirms it."""
+
+
+def _scan_notes(folder: str, real: Optional[str] = None,
+                ) -> dict[str, tuple[str, tuple[int, int]]]:
     """{doc_id: (path, (mtime_ns, size))} for every `.md` under `folder`,
     recursively (measured: GenAI's `notes/trace/` held 14 notes a flat read
     missed). The doc id keeps the RELATIVE path — collision-proof. An absent
@@ -572,11 +595,36 @@ def _scan_notes(folder: str) -> dict[str, tuple[str, tuple[int, int]]]:
     path that is not a directory. Any other `OSError` — on the folder or on
     any sub-folder (`EAGAIN` of the FUSE, `EIO`, `ENOTCONN`) — RAISES: an
     unreadable folder read as empty would remove every note it holds.
-    `os.path.isdir` and a bare `os.walk` both swallow those errors."""
+    `os.path.isdir` and a bare `os.walk` both swallow those errors.
+
+    And ENOENT itself is only an absence once CONFIRMED (TAC-255): the FUSE
+    ResourceFS answers ENOENT for a folder that exists whenever its backend
+    cannot resolve it (measured: `tachikoma-api` restarting, 17 docs of
+    GenAI removed then re-added). `real` is the folder's real path at the
+    last pass that read it — deployed, the local disk the FUSE link points
+    at. The disk confirms: absent there too → absent; present there → the
+    FUSE lied, RAISES. A folder that is its own real path (no link) is
+    answered by the filesystem that holds it → absent. No `real` (nothing
+    read since the start) → `_UnconfirmedAbsence`: the caller removes
+    nothing if the context has known notes. A notes folder deleted while
+    the gate was down is therefore confirmed by no pass — its docs stay
+    until the folder is read again, e.g. recreated EMPTY."""
     out: dict[str, tuple[str, tuple[int, int]]] = {}
     try:
         st = os.stat(folder)
-    except (FileNotFoundError, NotADirectoryError):
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if real is None:
+            raise _UnconfirmedAbsence(
+                exc.errno, f"{exc.strerror}, unconfirmed: its real path is "
+                "unknown (not read since the start)", folder) from exc
+        if real != folder:
+            try:
+                st = os.stat(real)
+            except (FileNotFoundError, NotADirectoryError):
+                return out          # the disk itself says absent
+            if stat.S_ISDIR(st.st_mode):
+                raise OSError(exc.errno, f"{exc.strerror} through the FUSE, "
+                              f"yet present on disk at {real}", folder) from exc
         return out
     if not stat.S_ISDIR(st.st_mode):
         return out
