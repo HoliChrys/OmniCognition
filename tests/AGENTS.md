@@ -23,6 +23,8 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   `test_store_concurrency.py` guards the store write path: stale instances and
   20 concurrent processes/threads lose no fact, a SIGKILL mid-dump leaves a
   loadable store, a corrupt store raises `CorruptStoreError` and is untouched.
+  `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
+  access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20).
 - `test_canonical_tools.py` asserts the tool-tier manifest partitions the live
   `@app.tool()` set EXACTLY — a new tool must be classified or it fails. The
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,
