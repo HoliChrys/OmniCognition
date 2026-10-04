@@ -57,6 +57,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   clear matches before the batch — never overturned, skipped on sets < 4;
   `stance_of(fact_id)` reads the card's stance THOUGHT.
   The default bag mirrors into `_bag` for backwards compatibility.
+  **Persistence** (`save`/`load`, TAC-935): `_store_lock(path)` is the one
+  lock per store in a process (RLock + `flock` on `<store>.lock`, lock file
+  never deleted); `save` = lock → `_merge_from_disk` (3-way: keys on disk
+  absent from the `_synced` base were added by another writer and are merged —
+  points/observators/turns/forget-log; keys removed here stay removed; id
+  clash keeps ours) → `<store>.tmp` + fsync + `os.replace`. `_read_store`
+  turns any unreadable file into `CorruptStoreError`; `__post_init__`
+  re-raises it (refuse to serve, file untouched).
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
@@ -106,6 +114,21 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `retrieve` applies the reranker's relevance floor (logit < 0 = sigmoid < ½,
   the decision boundary, not a tuned value): hits under it are dropped and an
   all-under-floor recall answers the gap verdict alone (TAC-941).
+- `tachikoma_gate.py` — the tachikoma deployment (`python -m
+  metacog.tachikoma_gate`): one `Memory` per context behind the
+  `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
+  `notes/` deepwiki). EVERY HTTP request passes the gate: no header → 400, then
+  `authorize(token, ctx)` (mnema's ACL, ported) against the tachikoma API —
+  `/api/auth/me` (no/invalid bearer → 401), `general` exempt from authorization
+  only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
+  `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
+  must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  Context/account names are validated BEFORE the ACL call (400). The right to
+  read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
+  context memory + deepwiki; a narrower account must equal the authenticated
+  user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
+  and its `ingest` is mirrored into the context memory tagged
+  `account:<account>`.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

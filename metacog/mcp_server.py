@@ -547,6 +547,34 @@ def build_app(
         return {"pending": p, "count": len(p)}
 
     @app.tool()
+    def recall(query: str, k: int = 5) -> list:
+        """The mnema-contract name for `retrieve` (TAC-492): the bridge and the
+        sessions speak recall/remember — one dialect, not two. Delegates."""
+        return retrieve(query=query, k=k)
+
+    @app.tool()
+    def remember(content: str, tags: Optional[List[str]] = None,
+                 source: str = "extracted_fact") -> dict:
+        """The mnema-contract name for `ingest` (TAC-492). Delegates; `source`
+        is accepted (the mnema contract carries it) and noted in the tags."""
+        t = list(tags or [])
+        if source:
+            t.append(f"src:{source}")
+        return ingest(content=content, kind="FACT", tags=t[:8])
+
+    @app.tool()
+    def wiki_list(prefix: Optional[str] = "notes:") -> dict:
+        """Every wiki doc id (optionally prefixed — the deepwiki of a context
+        is the ``notes:`` namespace). T1 surface: the Paradigm memory screen
+        browses the tree from THIS list."""
+        if memory.journal is None:
+            return {"docs": [], "count": 0}
+        rows = memory.journal.conn.execute(
+            "SELECT doc_id FROM wiki_docs ORDER BY doc_id").fetchall()
+        ids = [r[0] for r in rows if not prefix or str(r[0]).startswith(prefix)]
+        return {"docs": [{"doc_id": i} for i in ids], "count": len(ids)}
+
+    @app.tool()
     def wiki_ops(doc_id: str, revert_op_id: Optional[int] = None) -> dict:
         """The reversible history of object edits (vars / portions) on a doc ;
         pass revert_op_id to undo one (a removed object comes back, a created
