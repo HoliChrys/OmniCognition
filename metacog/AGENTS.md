@@ -160,6 +160,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
+  ONE `Memory` per key (context or account store), even at a concurrent first
+  access: `_memory_at` is double-checked under a lock PER KEY (TAC-228) — an
+  orphan instance would still write the same store, and the merge-on-save
+  would keep its facts twice.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

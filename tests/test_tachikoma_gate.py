@@ -932,3 +932,104 @@ def test_the_gate_loads_the_models_off_the_event_loop():
     r = client.post("/mcp", headers={CTX_HEADER: "ctx-a"})
     assert r.status_code == 200
     assert len(warmed) == 1 and warmed[0] != int(r.text)
+
+
+# ── TAC-228: ONE Memory per context, even at a concurrent first access ──
+
+def _slow_counting_memory(monkeypatch):
+    """`Memory` whose construction is slow (as a real load is: pickle +
+    journal) and counted — the slowness opens the race window wide, so the
+    test fails reliably WITHOUT the lock; the count is what it pins."""
+    import time
+
+    import metacog.memory as M
+    born = []
+
+    class SlowMemory(M.Memory):
+        def __init__(self, *a, **kw):
+            born.append(1)
+            time.sleep(0.2)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(M, "Memory", SlowMemory)
+    return born
+
+
+def _concurrently(n, fn):
+    """Run `fn(i)` in `n` threads released together; return the results."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    start = threading.Barrier(n)
+
+    def run(i):
+        start.wait()
+        return fn(i)
+
+    with ThreadPoolExecutor(n) as pool:
+        return list(pool.map(run, range(n)))
+
+
+def test_a_concurrent_first_access_builds_one_memory(tmp_path, monkeypatch):
+    """Measured before (TAC-228): 3 threads at the first access of one
+    context gave 3 distinct `Memory`, one kept in the cache."""
+    _counting_models(monkeypatch)
+    born = _slow_counting_memory(monkeypatch)
+    p = _make_proxy(tmp_path)
+    mems = _concurrently(20, lambda i: p._memory_at("demo.sandbox.alice"))
+    assert len({id(m) for m in mems}) == 1
+    assert len(born) == 1
+    assert mems[0] is p._memories["demo.sandbox.alice"]
+
+
+def test_the_lock_is_per_context(tmp_path, monkeypatch):
+    """Two contexts first-accessed together are built side by side: the
+    lock is per key, one context's load never waits on another's."""
+    import threading
+    _counting_models(monkeypatch)
+    _slow_counting_memory(monkeypatch)
+    p = _make_proxy(tmp_path)
+    inside, peak, guard = [0], [0], threading.Lock()
+    real = p._new_memory
+
+    def watched(key):
+        with guard:
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+        try:
+            return real(key)
+        finally:
+            with guard:
+                inside[0] -= 1
+
+    monkeypatch.setattr(p, "_new_memory", watched)
+    _concurrently(2, lambda i: p._memory_at(f"ctx-{i}"))
+    assert peak[0] == 2
+
+
+def test_20_concurrent_remember_at_first_access_write_20(tmp_path,
+                                                         monkeypatch):
+    """The production measure (TAC-228): 20 concurrent `remember` at the
+    first access of a context took its store from 1 to 41 points — each
+    fact twice. Exactly +20 now, each fact once, read back from the disk."""
+    _counting_models(monkeypatch)
+    _slow_counting_memory(monkeypatch)
+    ctx = "demo.sandbox.alice"
+    seed = _make_proxy(tmp_path)
+    _as(ctx)
+    _ingest_like_the_tool(seed, "le point déjà là")
+
+    p = _make_proxy(tmp_path)          # a restarted gate: first access again
+
+    def remember(i):
+        _as(ctx)
+        return _ingest_like_the_tool(p, f"fait concurrent numéro {i}").id
+
+    ids = _concurrently(20, remember)
+    on_disk = Memory(storage_path=os.path.join(p._root, ctx, "memory.pkl"),
+                     encoder=SimpleEncoder())
+    contents = _contents(on_disk)
+    assert len(contents) == 1 + 20
+    for i in range(20):
+        assert contents.count(f"fait concurrent numéro {i}") == 1
+    assert set(ids) <= {pt.id for pt in on_disk.points}
