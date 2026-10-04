@@ -57,6 +57,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   clear matches before the batch — never overturned, skipped on sets < 4;
   `stance_of(fact_id)` reads the card's stance THOUGHT.
   The default bag mirrors into `_bag` for backwards compatibility.
+  **Persistence** (`save`/`load`, TAC-935): `_store_lock(path)` is the one
+  lock per store in a process (RLock + `flock` on `<store>.lock`, lock file
+  never deleted); `save` = lock → `_merge_from_disk` (3-way: keys on disk
+  absent from the `_synced` base were added by another writer and are merged —
+  points/observators/turns/forget-log; keys removed here stay removed; id
+  clash keeps ours) → `<store>.tmp` + fsync + `os.replace`. `_read_store`
+  turns any unreadable file into `CorruptStoreError`; `__post_init__`
+  re-raises it (refuse to serve, file untouched).
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
