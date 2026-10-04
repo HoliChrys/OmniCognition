@@ -92,6 +92,13 @@ bind every subtree; child docs add local detail but may not weaken them.
   threads are rebuilt in `load()`. The SQL **usage journal is a SEPARATE SQLite
   file** (`<storage>.journal.db`), never pickled — it persists on its own and is
   re-attached on construction.
+- **Store writes are atomic, single-writer, merge-on-stale.** `save()` writes
+  `<store>.tmp` + fsync + `os.replace` under the per-store lock (thread RLock +
+  `flock` on `<store>.lock`); if the file changed since this instance synced,
+  it re-reads it and merges what the other writer ADDED before writing. Never
+  write the store in place. A store that cannot be read raises
+  `CorruptStoreError` (fail-closed: the context is refused, the file left
+  untouched) — never an empty memory passed off as a loaded one.
 - **mnema usage journal (opt-in, failure-safe).** `metacog/journal.py` is an
   append-only access-log separate from the store. Structural signals are SQL
   queries (co-retrieval self-join, `path_traversals` for Chasles, hierarchical

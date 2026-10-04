@@ -19,6 +19,9 @@ encoder/LLM/executor, persistence, and audit reporting.
 
 from __future__ import annotations
 
+import os
+import pickle
+import threading
 import time
 import uuid
 import re
@@ -123,6 +126,121 @@ def query_date_tags(question: str) -> List[str]:
     if ym:
         tags.append(f"time:year:{ym.group(0)}")
     return tags
+
+
+# ---------------------------------------------------------------------------
+# Store persistence primitives (TAC-935) : one writer per store, atomic files,
+# corruption named — never an empty memory passed off as a loaded one.
+# ---------------------------------------------------------------------------
+
+
+class CorruptStoreError(RuntimeError):
+    """The store file exists but cannot be read back (truncated, not a pickle,
+    wrong shape). Raised instead of serving an empty memory ; the file is left
+    untouched for recovery."""
+
+
+def _read_store(path: str) -> Tuple[Dict[str, Any], os.stat_result]:
+    """Unpickle the store at `path` and return (snapshot, stat of the version
+    read). FileNotFoundError propagates ; every other failure is a
+    `CorruptStoreError` naming the file. The stat comes from the open fd, so it
+    describes exactly the bytes that were read (an atomic replace in between
+    cannot desynchronise them)."""
+    with open(path, "rb") as f:
+        st = os.fstat(f.fileno())
+        try:
+            snapshot = pickle.load(f)
+        except Exception as e:
+            raise CorruptStoreError(
+                f"unreadable memory store {path} ({st.st_size} bytes) : "
+                f"{type(e).__name__}: {e}") from e
+    if not isinstance(snapshot, dict):
+        raise CorruptStoreError(
+            f"unreadable memory store {path} : expected a dict snapshot, "
+            f"got {type(snapshot).__name__}")
+    return snapshot, st
+
+
+def _fsync_dir(path: str) -> None:
+    """fsync the directory holding `path`, so the os.replace itself is durable."""
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class _StoreLock:
+    """Exclusive, re-entrant lock on ONE store file : a thread RLock (threads
+    of this process) + an `flock` on `<store>.lock` (other processes) taken at
+    the outermost level only. The lock file is never deleted (deleting it would
+    let two processes lock two different inodes)."""
+
+    def __init__(self, store_path: str) -> None:
+        self.lock_path = f"{store_path}.lock"
+        self.rlock = threading.RLock()
+        self.depth = 0
+        self.fd: Optional[int] = None
+
+    def __enter__(self) -> "_StoreLock":
+        self.rlock.acquire()
+        try:
+            if self.depth == 0 and _fcntl is not None:
+                fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                self.fd = fd
+        except BaseException:
+            self.rlock.release()
+            raise
+        self.depth += 1
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.depth -= 1
+        try:
+            if self.depth == 0 and self.fd is not None:
+                fd, self.fd = self.fd, None
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        finally:
+            self.rlock.release()
+
+
+try:                                    # POSIX ; elsewhere the thread lock alone
+    import fcntl as _fcntl
+except ImportError:                     # pragma: no cover - non-POSIX
+    _fcntl = None
+
+_STORE_LOCKS: Dict[str, _StoreLock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _store_lock(path: str) -> _StoreLock:
+    """The ONE lock of a store, shared by every Memory of this process that
+    points at it (keyed by real path)."""
+    key = os.path.realpath(path)
+    with _STORE_LOCKS_GUARD:
+        lk = _STORE_LOCKS.get(key)
+        if lk is None:
+            lk = _STORE_LOCKS[key] = _StoreLock(key)
+        return lk
+
+
+def _turn_key(t: Any) -> tuple:
+    return (getattr(t, "timestamp", None), getattr(t, "speaker", None),
+            getattr(t, "text", None))
+
+
+def _forget_key(e: Any) -> tuple:
+    if isinstance(e, dict):
+        return (e.get("id"), e.get("reason"), e.get("t"))
+    return (repr(e),)
 
 
 @dataclass
@@ -287,6 +405,16 @@ class Memory:
                 self.load()
             except FileNotFoundError:
                 pass  # first run
+            except CorruptStoreError as e:
+                # DECISION (TAC-935) : REFUSE TO SERVE this store — fail-closed.
+                # Starting empty would let the next save() overwrite whatever
+                # is recoverable, and pass a lost memory off as a new one. The
+                # file is left untouched ; the caller (one context of the gate)
+                # fails loudly, the other contexts keep serving.
+                import sys as _sys
+                print(f"[metacog] REFUSING TO SERVE {self.storage_path} : {e}",
+                      file=_sys.stderr)
+                raise
 
     def _open_persistent_journal(self) -> None:
         """Attach a persistent Journal from `journal_path` so the SQL triggers
@@ -5468,12 +5596,51 @@ class Memory:
     # ------------------------------------------------------------------
 
     def save(self, path: Optional[str] = None) -> None:
-        import pickle
+        """Persist the whitelisted state to `path` (default `storage_path`).
+
+        CONCURRENCY-SAFE (TAC-935). Three guarantees :
+        1. ATOMIC : the snapshot is written to `<target>.tmp`, fsynced, then
+           `os.replace`d over the target. A process killed mid-write leaves
+           either the previous complete file or the new complete one — never a
+           truncated pickle.
+        2. ONE WRITER PER STORE : the whole read-merge-write runs under the
+           per-store lock (thread RLock + `flock` on `<target>.lock`), so two
+           threads or two processes never interleave on the same file.
+        3. NO LOST UPDATE : if the file on disk changed since this instance
+           last loaded/saved it (another writer got there first), it is RE-READ
+           under the lock and the entries that writer added are merged in
+           before writing (`_merge_from_disk`). The second writer adds to the
+           first instead of overwriting it with a stale snapshot.
+        """
         target = path or self.storage_path
         if target is None:
             raise ValueError("no storage_path configured and none provided")
+        own_store = self.storage_path is not None and (
+            os.path.abspath(target) == os.path.abspath(self.storage_path))
+        with _store_lock(target):
+            idx_lock = getattr(self, "_index_lock", None)
+            if idx_lock is not None:
+                idx_lock.acquire()        # no merge/pickle while the indexer mutates
+            try:
+                if own_store:
+                    self._merge_from_disk(target)
+                snapshot = self._persist_snapshot()
+                tmp = f"{target}.tmp"
+                with open(tmp, "wb") as f:
+                    pickle.dump(snapshot, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, target)
+                _fsync_dir(target)
+                if own_store:
+                    self._mark_synced(os.stat(target), snapshot)
+            finally:
+                if idx_lock is not None:
+                    idx_lock.release()
+
+    def _persist_snapshot(self) -> Dict[str, Any]:
         from metacog.defaults import encoder_id
-        snapshot = {
+        return {
             "points": self.points,
             "observators": self.observators,
             "conversation_log": self.conversation_log,
@@ -5485,16 +5652,109 @@ class Memory:
             # stamp) : a later process with another encoder must re-encode.
             "encoder_id": encoder_id(self.encoder),
         }
-        with open(target, "wb") as f:
-            pickle.dump(snapshot, f)
+
+    def _mark_synced(self, st: os.stat_result, snapshot: Dict[str, Any]) -> None:
+        """Remember WHICH file version this instance mirrors (its signature)
+        and the keys it held then — the merge BASE. A key present on disk but
+        absent from the base was added by another writer ; a key in the base
+        but absent from memory was removed here on purpose (not resurrected)."""
+        self._synced = {
+            "sig": (st.st_ino, st.st_size, st.st_mtime_ns),
+            "points": {p.id for p in snapshot.get("points", [])},
+            "observators": set(snapshot.get("observators", {})),
+            "turns": {_turn_key(t) for t in
+                      getattr(snapshot.get("conversation_log"), "turns", [])},
+            "forget": {_forget_key(e) for e in snapshot.get("_forget_log", [])},
+        }
+
+    def _merge_from_disk(self, target: str) -> int:
+        """Under the store lock : if the file changed since this instance last
+        synced, re-read it and fold in what the other writer ADDED (points,
+        observators, conversation turns, forget-log entries — keyed, never
+        duplicated). Returns the number of points merged. Loud, never silent.
+        A corrupt file on disk raises `CorruptStoreError` : we refuse to write
+        over it (the evidence stays for recovery)."""
+        try:
+            st = os.stat(target)
+        except FileNotFoundError:
+            return 0
+        if st.st_size == 0:
+            return 0                            # an empty file holds nothing to lose
+        synced = getattr(self, "_synced", None)
+        sig = (st.st_ino, st.st_size, st.st_mtime_ns)
+        if synced is not None and synced["sig"] == sig:
+            return 0                            # nobody wrote since : fast path
+        disk, _st = _read_store(target)
+        base = synced or {"points": set(), "observators": set(),
+                          "turns": set(), "forget": set()}
+        mine = {p.id for p in self.points}
+        added: List[Point] = []
+        clashes = 0
+        for p in disk.get("points", []):
+            if p.id in base["points"]:
+                continue                        # known (kept or removed here)
+            if p.id in mine:
+                clashes += 1                    # same id minted twice : keep ours
+                continue
+            added.append(p)
+        self.points.extend(added)
+        for k, o in disk.get("observators", {}).items():
+            if k not in base["observators"] and k not in self.observators:
+                self.observators[k] = o
+        my_turns = {_turn_key(t) for t in self.conversation_log.turns}
+        new_turns = [t for t in getattr(disk.get("conversation_log"), "turns", [])
+                     if _turn_key(t) not in base["turns"]
+                     and _turn_key(t) not in my_turns]
+        if new_turns:
+            self.conversation_log.turns.extend(new_turns)
+            self.conversation_log.turns.sort(key=lambda t: t.timestamp)
+        if not hasattr(self, "_forget_log") or self._forget_log is None:
+            self._forget_log = []
+        my_forget = {_forget_key(e) for e in self._forget_log}
+        self._forget_log.extend(
+            e for e in disk.get("_forget_log", [])
+            if _forget_key(e) not in base["forget"]
+            and _forget_key(e) not in my_forget)
+        self._t_clock = max(self._t_clock, disk.get("_t_clock", 0.0))
+        self._spike_total_hops = max(self._spike_total_hops,
+                                     disk.get("_spike_total_hops", 0))
+        if added:
+            self._rebuild_event_registry()
+            from metacog.geometry import clear_geo_cache
+            clear_geo_cache()
+        import sys as _sys
+        print(f"[metacog] {target} changed on disk since this process synced : "
+              f"merged {len(added)} point(s), {len(new_turns)} turn(s) written "
+              f"by another writer"
+              + (f" ; {clashes} id clash(es) kept as ours" if clashes else ""),
+              file=_sys.stderr)
+        return len(added)
+
+    def _rebuild_event_registry(self) -> None:
+        """The EVENT-hub registry is not serialised — the points carry the
+        canonical event:type tags ; rebuild it from them."""
+        self._event_registry = {}
+        for p in self.points:
+            if p.kind is PointKind.EVENT:
+                et = next((t.split(":", 2)[2] for t in p.tags
+                           if t.startswith("event:type:")), "")
+                nm = p.content.split(" ", 1)[1] if " " in p.content else ""
+                self._event_registry[f"{et}::{nm.lower()}"] = p.id
 
     def load(self, path: Optional[str] = None) -> None:
-        import pickle
+        """Restore the state from `path` (default `storage_path`).
+
+        FileNotFoundError propagates (first run). Any OTHER failure to read
+        the file — truncated, not a pickle, wrong shape — raises
+        `CorruptStoreError` naming the file : never an empty memory passed off
+        as a loaded one."""
         source = path or self.storage_path
         if source is None:
             raise ValueError("no storage_path configured and none provided")
-        with open(source, "rb") as f:
-            snapshot = pickle.load(f)
+        snapshot, st = _read_store(source)
+        if path is None or (self.storage_path is not None and
+                            os.path.abspath(path) == os.path.abspath(self.storage_path)):
+            self._mark_synced(st, snapshot)
         self.points = snapshot.get("points", [])
         self._text_index = TextIndex()          # refills lazily (not pickled)
         from metacog.geometry import clear_geo_cache
@@ -5505,15 +5765,7 @@ class Memory:
         self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
         self.decay_exponent = snapshot.get("decay_exponent", 0.5)
         self._forget_log = snapshot.get("_forget_log", [])
-        # Rebuild the EVENT-hub registry from the restored points (it is not
-        # serialised — the points carry the canonical event:type tags).
-        self._event_registry = {}
-        for p in self.points:
-            if p.kind is PointKind.EVENT:
-                et = next((t.split(":", 2)[2] for t in p.tags
-                           if t.startswith("event:type:")), "")
-                nm = p.content.split(" ", 1)[1] if " " in p.content else ""
-                self._event_registry[f"{et}::{nm.lower()}"] = p.id
+        self._rebuild_event_registry()
         # ENCODER MISMATCH : the stored embeddings belong to another encoder
         # (or a legacy snapshot with another dimension) — cosines would be
         # garbage, so re-encode everything once from content. Never silent.
