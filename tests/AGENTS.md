@@ -23,6 +23,10 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   `test_store_concurrency.py` guards the store write path: stale instances and
   20 concurrent processes/threads lose no fact, a SIGKILL mid-dump leaves a
   loadable store, a corrupt store raises `CorruptStoreError` and is untouched.
+  `test_forget_durable.py` (TAC-323) guards that a forget survives a restart:
+  MCP `forget` → a new instance does not serve the id; a pickle that lost a
+  forget (pending or merged event) is replayed INVALID at `load`; a reverted
+  or already-pickled forget is not replayed; a stale writer keeps the forget.
 - `test_canonical_tools.py` asserts the tool-tier manifest partitions the live
   `@app.tool()` set EXACTLY — a new tool must be classified or it fails. The
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,
