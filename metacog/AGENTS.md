@@ -27,7 +27,15 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   seeds × points scan are numpy-vectorised (`_pairwise_spread_threshold`, Gram
   form) and must stay equal to the scalar definition to 1e-9
   (`tests/test_spread_vectorised.py`); never reintroduce a pure-Python O(n²)
-  loop on the recall path.
+  loop on the recall path. The O(n) signals of `retrieve_hybrid` are numpy too:
+  `_effective_matrix` (rows bit-identical to `effective_(keyword_)embedding`;
+  float64 rows cached by `_stack` on the identity of each vector TUPLE, so
+  point vectors must be REPLACED, never mutated in place — lists are never
+  cached; `clear_geo_cache()` drops it),
+  `_cosines` + `_top_pool` (stable descending, same order as the former list
+  sort); `fuzzy.fuzzy_score` runs `fuzzy_match` once per DISTINCT document token
+  and `fuzzy_match` stops its Levenshtein DP once a row exceeds the budget —
+  all guarded against the former code by `tests/test_recall_vectorised.py`.
 - `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
@@ -107,7 +115,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `{{name}}` placeholder per list, unplaced lists appended). `strategy="auto"`/
   `placement="auto"` let the agent decide.
 - `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
-  excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
+  excluded from `retrieve`'s search pool. Every `retrieve` entry carries the
+  recall's cost (`pool_size`, `spread_ms`, `rerank_n`, `rerank_ms` from
+  `Memory.retrieve(cost=…)`; a key only when its stage ran, never a fake 0). Bag-domain tools: `collect(ids, bag,
   description)`, `bag(name)`, `bags()` (overview with description/schema for
   decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
   `scoped_answer`, `scoped_list` (non-kNN filtered listing), `search_nodes`
@@ -127,13 +137,15 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
   `notes/` deepwiki). EVERY HTTP request passes the gate: no header → 400, then
   `authorize(token, ctx)` (mnema's ACL, ported) against the tachikoma API —
-  `/api/auth/me` (no/invalid bearer → 401), `general` exempt from authorization
-  only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
+  `/api/auth/me` (no/invalid bearer → 401), `/api/hierarchy/<ctx>` existence
+  (unknown → 403, never `makedirs`; no `general` exception),
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
-  rule (no candidate cascade; `global` and the tree root read
-  `<notes_root>/notes`, other trees → None). The context's OWN notes are kept
+  rule, chosen by the name only (no candidate cascade): `global` and the
+  tree root (basename of notes_root) read `<notes_root>/notes`, its
+  descendants drop the first segment, another tree keeps every segment
+  under the root. The context's OWN notes are kept
   in step with the folder once per request (mtime+size fingerprints; after a
   restart the store is the reference): added → doc (`import_okf`) + content
   point whose id cites the note (`<doc_id>#<sha256[:12]>`); corrected → old
@@ -160,6 +172,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
+  A store holds ONLY its own context (TAC-936, rule C3): the deepwiki ingests
+  the context's own `notes/`, never an ancestor's — inheritance is served at query time by
+  tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the
+  older gate are soft-forgotten on first access. An MCP session serves the
+  context it was opened under (its server task copies the `initialize`
+  request's contextvars): the middleware binds each `mcp-session-id` to its
+  (context, account) and refuses a call naming another pair (409) or an
+  unbound session (404) (TAC-934).
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

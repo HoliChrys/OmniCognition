@@ -149,6 +149,10 @@ def _live_note_points(m, needle):
     ("tachikoma.paradigm", "paradigm/notes"),
     ("tachikoma", "notes"),                                    # the tree root
     ("global", "notes"),                                       # the hierarchy root
+    # Another tree lives in its own folder under the root, every segment
+    # kept (TAC-934's layout): chosen by the NAME, whatever exists.
+    ("demo.sandbox.alice", "demo/sandbox/alice/notes"),
+    ("other", "other/notes"),
 ])
 def test_the_dotted_name_maps_to_one_folder(ctx, expected):
     """THE MAPPING IS WRITTEN, not rediscovered: one folder per name, the
@@ -157,11 +161,20 @@ def test_the_dotted_name_maps_to_one_folder(ctx, expected):
     assert gate.notes_folder(root, ctx) == os.path.join(root, *expected.split("/"))
 
 
-@pytest.mark.parametrize("ctx", ["demo.sandbox.alice", "other", "", "a/../b"])
-def test_a_name_outside_the_tree_has_no_folder_here(ctx):
-    """No cascade of candidates: a context of another tree is not given the
-    root's notes (the old fallback did, for any single-segment name)."""
+@pytest.mark.parametrize("ctx", ["", "a/../b", "../x", "a..b"])
+def test_an_invalid_name_has_no_folder(ctx):
+    """No path is ever built from a name that is not a context name."""
     assert gate.notes_folder("/opt/tachikoma-fs/global/tachikoma", ctx) is None
+
+
+def test_the_rule_never_depends_on_which_folder_exists(tmp_path):
+    """The old cascade tried `<root>/sandbox/notes` then `<root>/demo/sandbox/
+    notes` and took the first that EXISTED: one stray folder moved a context's
+    wiki. The rule reads the name only."""
+    root = _tree(tmp_path)
+    (root / "sandbox" / "notes").mkdir(parents=True)          # a decoy
+    assert gate.notes_folder(str(root), "demo.sandbox") == \
+        str(root / "demo" / "sandbox" / "notes")
 
 
 def test_the_contexts_notes_are_ingested_twice_doc_and_content(tmp_path):
@@ -204,15 +217,17 @@ def test_one_unreadable_note_never_stops_the_wiki_and_is_said(tmp_path):
     assert p._refresh_notes("tachikoma.a", m)["added"] == ["notes:bad"]
 
 
-def test_a_note_added_later_enters_without_restart(tmp_path):
+def test_a_note_added_later_enters_without_restart(tmp_path, monkeypatch):
     """THE BUG: `_ingested` was a set — a note added after the first access
     never entered until the [omni] process restarted."""
     root, p, m = _wiki(tmp_path)
     folder = _notes_of(root, "a")
     _write(folder / "first.md", "# First")
+    monkeypatch.setattr(gate, "_requests_seen", 1)          # a request
     assert p._context_memory() is m
     _write(folder / "later.md", "# Later note body")
-    p._context_memory()                      # same process, next access
+    monkeypatch.setattr(gate, "_requests_seen", 2)          # the next one
+    p._context_memory()                      # same process, next request
     assert m.journal.get_wiki_doc("notes:later") is not None
     assert len(_live_note_points(m, "Later note body")) == 1
 
@@ -463,40 +478,34 @@ def test_a_note_that_comes_back_is_live_again_and_saved(tmp_path):
     assert [q.id for q in _live_note_points(reloaded, "48217")] == [back.id]
 
 
-def test_outside_the_tree_and_disabled_are_said(tmp_path):
+def test_another_tree_and_disabled_are_said(tmp_path):
     root, p, m = _wiki(tmp_path, ctx="demo.sandbox")
-    assert p._refresh_notes("demo.sandbox", m)["state"] == "outside"
+    report = p._refresh_notes("demo.sandbox", m)
+    assert report["state"] == "no_notes"
+    assert report["folder"] == str(root / "demo" / "sandbox" / "notes")
+    _write(_notes_of(root, "demo", "sandbox") / "d.md", "# Demo note")
+    assert p._refresh_notes("demo.sandbox", m)["added"] == ["notes:d"]
     bare = ContextualMemory(str(tmp_path / "store2"))
     assert bare._refresh_notes("demo.sandbox", m)["state"] == "disabled"
 
 
-def test_ancestor_notes_are_not_copied_into_the_child(tmp_path):
-    """Inheritance is served AT QUERY TIME (C3): the child's wiki holds its
-    OWN notes only — a copy would go stale when the ancestor's note moves."""
-    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
-    _write(_notes_of(root) / "root.md", "# Root note")
-    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
-    p._refresh_notes("tachikoma.sub.Child", m)
-    assert m.journal.get_wiki_doc("notes:own") is not None
-    assert [d for d in m.journal.all_wiki_doc_ids()] == ["notes:own"]
-
-
 def test_the_folder_is_read_once_per_request(tmp_path):
     """Every tool call touches `memory.<attr>` many times: the folder is
-    stat'ed once per REQUEST (the stamp the middleware sets), not per access."""
-    root, p, m = _wiki(tmp_path)
+    stat'ed once per REQUEST (the count the middleware bumps), not per access."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.a")
     folder = _notes_of(root, "a")
-    token = gate._request_stamp.set(object())
+    before = gate._requests_seen
+    gate._requests_seen = before + 1              # a request
     try:
         p._context_memory()
         _write(folder / "mid.md", "# Mid-request note")
         p._context_memory()                       # same request: not re-read
         assert m.journal.get_wiki_doc("notes:mid") is None
-        gate._request_stamp.set(object())         # the next request
+        gate._requests_seen += 1                  # the next request
         p._context_memory()
         assert m.journal.get_wiki_doc("notes:mid") is not None
     finally:
-        gate._request_stamp.reset(token)
+        gate._requests_seen = before
 
 
 def test_ingest_notes_is_a_tool_and_a_bare_memory_says_unsupported(tmp_path):
@@ -523,6 +532,41 @@ def test_ingest_notes_is_a_tool_and_a_bare_memory_says_unsupported(tmp_path):
     report = asyncio.run(call(p))
     assert (report["state"], report["notes"]) == ("ok", 1)
     assert m.journal.get_wiki_doc("notes:x") is not None
+
+
+def test_ancestor_notes_are_never_copied_into_the_child(tmp_path):
+    """Rule C3 (TAC-936): inheritance is served AT QUERY TIME, never copied at
+    ingestion — a copy goes stale the day the ancestor's note is corrected.
+    The child's memory holds its OWN notes, and nothing of its ancestors'."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
+    _write(_notes_of(root) / "root.md", "# Root note")
+    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
+    p._refresh_notes("tachikoma.sub.Child", m)
+    assert m.journal.get_wiki_doc("notes:own") is not None
+    assert m.journal.all_wiki_doc_ids() == ["notes:own"]
+    assert [p_.content for p_ in m.points] == ["# Own note"]
+    assert "ctx:tachikoma.sub.child" in m.points[0].tags   # add_tag lowercases
+    # …and the ancestor's note lives in the ANCESTOR's memory, where a
+    # query-time recall reads it.
+    ancestor = _test_instance(p, "tachikoma")
+    p._refresh_notes("tachikoma", ancestor)
+    assert [p_.content for p_ in ancestor.points] == ["# Root note"]
+
+
+def test_copies_left_by_an_older_gate_are_soft_forgotten(tmp_path):
+    """The older gate copied ancestor notes into the child (`ctx:<ancestor>`
+    tag). A recall would serve them as LOCAL memories, stale and mislabeled:
+    the first access soft-forgets them (reversible, never deleted)."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
+    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
+    copy = m.ingest("# Root note, copied", kind="FACT")
+    copy.add_tag("note:notes:tachikoma/root", "ctx:tachikoma", "deepwiki")
+    fact = m.ingest("a fact written by an agent", kind="FACT")
+    p._refresh_notes("tachikoma.sub.Child", m)
+    (own,) = _live_note_points(m, "# Own note")
+    assert "invalidated" in copy.tags
+    assert "invalidated" not in own.tags
+    assert "invalidated" not in fact.tags
 
 
 # ── the ACL: who may read which memory (TAC-214) ──────────────────────
@@ -562,10 +606,16 @@ def test_a_rejected_token_is_refused_401(monkeypatch):
     assert e.value.status == 401
 
 
-def test_general_needs_a_valid_token_but_no_right(monkeypatch):
-    calls = _fake_api(monkeypatch, ME)
-    assert gate.authorize("t", gate.GENERAL) == "manager-GenAI-1545c4"
-    assert [c[0] for c in calls] == ["/api/auth/me"]
+def test_general_is_no_longer_a_common_notebook(monkeypatch):
+    """Rule C3 (TAC-936): `general` was the one name readable by any valid
+    token, outside the chain. It is an ordinary name now — no hierarchy
+    entry, refused like any unknown context; what all must read goes in
+    `global`."""
+    assert not hasattr(gate, "GENERAL")
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    with pytest.raises(gate.Denied, match="n'existe pas"):
+        gate.authorize("t", "general")
+    assert [c[0] for c in calls] == ["/api/auth/me", "/api/hierarchy/general"]
 
 
 def test_an_unknown_context_is_never_born(monkeypatch, tmp_path):

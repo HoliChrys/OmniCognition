@@ -311,16 +311,24 @@ def build_app(
                         server has a reranker ; false = cosine order only.
 
         k is capped at 7 (the system's retrieval budget).
+
+        Every entry (hit or gap notice) also carries what the recall cost :
+        `pool_size`, `spread_ms`, `rerank_n`, `rerank_ms` — a key present only
+        when that stage ran (absent = did not run, never 0). Read by the
+        tachikoma recall telemetry (TAC-233 / TAC-265).
         """
         k = min(max(1, k), 7)
+        spent: dict = {}
         results = memory.retrieve(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
-            abstain=abstain, rerank=rerank,
+            abstain=abstain, rerank=rerank, cost=spent,
         )
+        cost = {key: (round(v, 1) if isinstance(v, float) else v)
+                for key, v in spent.items()}
         if abstain and not results:
-            return [{"abstained": True, **_gap_notice("retrieve"),
+            return [{"abstained": True, **_gap_notice("retrieve"), **cost,
                      "note": "no chunk sufficiently activated — retrieval failed"}]
         # RELEVANCE FLOOR (TAC-941) : a hit whose cross-encoder logit is under
         # RERANK_FLOOR is not a memory. It is dropped, and when nothing is left
@@ -329,7 +337,7 @@ def build_app(
         # without a rerank score (no reranker wired) are untouched.
         kept = [r for r in results if r.get("rerank_score", 0.0) >= RERANK_FLOOR]
         if results and not kept:
-            return [{"abstained": True, **_gap_notice("retrieve"),
+            return [{"abstained": True, **_gap_notice("retrieve"), **cost,
                      "note": (f"{GAP_SENTINEL} — all {len(results)} candidates "
                               f"scored under the reranker's relevance floor "
                               f"(logit < {RERANK_FLOOR}) : no relevant memory.")}]
@@ -352,7 +360,7 @@ def build_app(
                 results = list(results) + [_gap_notice("retrieve")]
         except Exception:
             pass
-        return results
+        return [{**r, **cost} for r in results]
 
     @app.tool()
     def retire_tool(tool_id: str, hard: bool = False,

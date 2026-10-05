@@ -164,5 +164,9 @@ def test_retrieve_relevance_floor_answers_gap_not_least_bad():
             hits = [b for b in on if "id" in b]
             assert {h["id"] for h in hits} == {"A0", "A1"}   # A2 is under the floor
             assert all(h["rerank_score"] >= RERANK_FLOOR for h in hits)
+            # TAC-265 : every entry, the gap verdict included, says the cost
+            for b in on + off:
+                assert b["pool_size"] == 3 and b["rerank_n"] == 3
+                assert b["rerank_ms"] >= 0.0 and b["spread_ms"] >= 0.0
 
     _run(go())

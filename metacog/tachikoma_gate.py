@@ -34,6 +34,9 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    corrected or deleted is reflected WITHOUT a restart. `ingest_notes()` is
    the explicit form, and its report says what the folder holds — including
    "this context has no notes", never an empty list read as an outage.
+   ONLY THE CONTEXT'S OWN NOTES (TAC-936, rule C3): inheritance is served AT
+   QUERY TIME by the caller, which asks each ancestor's memory in turn
+   (`memory_engines.recall_inherited` in tachikoma) — never copied here.
 
 4. THE ACCOUNT (TAC-213) — the right to read is the ACCOUNT's, not only the
    context's. Every caller operates under an account. By default (no
@@ -58,6 +61,14 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    — omni idled at 7.16 GB. The pair is loaded ONCE, in a worker thread by the
    middleware, so the event loop never freezes for the 4-10 s of the load.
 
+6. ONE SESSION, ONE CONTEXT (TAC-934) — an MCP session runs every call under
+   the context of the `initialize` that opened it (its server task copied
+   that request's contextvars). The gate binds each session id to its
+   (context, account) and refuses (409) a call whose headers name another
+   pair: the header and the memory served can never disagree. The four
+   isolation lanes (recall, capture, wiki, index) are pinned end to end in
+   `tests/test_context_isolation.py`.
+
 Storage: `<storage_root>/<ctx>/memory.pkl` — one memory per context, isolated,
 persistent. `global` and `tachikoma.paralelle.GenAI` share NOTHING by accident.
 Context and account names are VALIDATED before any path is built or any ACL
@@ -80,11 +91,14 @@ _current_ctx: ContextVar[str] = ContextVar("tachikoma_context", default="")
 #: The contextvar of the caller's NARROW account ("" = the context's own).
 _current_account: ContextVar[str] = ContextVar("tachikoma_account", default="")
 
-#: One fresh object PER HTTP REQUEST (set by the middleware): the notes folder
-#: is re-read once per request, not once per attribute access of the proxy.
-#: `None` (no request — library use, tests) re-reads on every access.
-_request_stamp: ContextVar[Optional[object]] = ContextVar(
-    "tachikoma_request", default=None)
+#: The number of HTTP requests the middleware let through (TAC-938): the
+#: notes folder is re-read once per request, not once per attribute access of
+#: the proxy. NOT a contextvar: a tool call runs in its MCP session's task,
+#: whose contextvars were copied at `initialize` (TAC-934) — a per-request
+#: contextvar would freeze the wiki for the whole session (measured by
+#: `test_a_note_added_mid_session_is_listed_in_that_session`). 0 = no request
+#: yet (library use): every access re-reads.
+_requests_seen = 0
 
 #: The root of the tachikoma context hierarchy — every ancestor chain ends
 #: there. Its notes folder IS the notes_root's own `notes/` (see `notes_folder`).
@@ -133,8 +147,12 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
     - a descendant `tachikoma.paralelle.GenAI` →
       `<notes_root>/paralelle/GenAI/notes` — the dots are the slashes, and
       the first segment IS the root folder, never repeated in the path.
-    - any other name (`demo.sandbox.alice`) → None: its notes do not live
-      under this root. Not "no notes" — "not mine to read".
+    - a context of ANOTHER tree (`iso-alpha.child`, `demo.sandbox.alice`)
+      lives in its own folder UNDER the notes root, every segment kept:
+      `<notes_root>/iso-alpha/child/notes` (TAC-934's layout, C3's second
+      candidate). The rule is chosen by the NAME, never by which folder
+      happens to exist.
+    - an invalid name → None: no path is ever built from it.
     """
     if not notes_root or not valid_context_name(ctx):
         return None
@@ -143,9 +161,9 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
     if ctx in (tree, ROOT_CONTEXT):
         return os.path.join(root, "notes")
     head, _, rest = ctx.partition(".")
-    if head != tree or not rest:
-        return None
-    return os.path.join(root, *rest.split("."), "notes")
+    if head == tree:
+        return os.path.join(root, *rest.split("."), "notes")
+    return os.path.join(root, *ctx.split("."), "notes")
 
 # ── THE ACL — who may read which memory (mnema's `acl.py`, ported) ──────────
 #
@@ -157,11 +175,12 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
 
 _API = os.environ.get("TACHIKOMA_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-#: The COMMON NOTEBOOK — the ONLY name that escapes authorization (not
-#: authentication). `general` is no tachikoma context: no hierarchy, no ACL
-#: resource — there is nothing to ask. Anything written there is readable by
-#: ANY valid token, by construction (mnema's documented exception, kept as is).
-GENERAL = os.environ.get("MNEMA_GENERAL_CTX", "general")
+# NO COMMON NOTEBOOK (TAC-936, rule C3). mnema's `general` — readable by any
+# valid token, outside the hierarchy — was the one name that escaped
+# authorization (`MNEMA_GENERAL_CTX`). It is gone: a recall climbs ctx → its
+# ancestors → `global`, nothing beside the chain. What everyone must read is
+# written in `global`. `general` is now an ordinary name: no hierarchy entry,
+# so the existence check refuses it like any unknown context.
 
 #: 30 s, mnema's measured ceiling: warm the check costs ~13 ms, but the first
 #: rights resolution of a fresh API was measured at 17.8 s. A timeout yields a
@@ -212,10 +231,6 @@ def authorize(token: str, ctx: str) -> str:
     if code != 200 or not isinstance(body, dict) or not body.get("user_id"):
         raise Denied(f"jeton rejeté par l'ACL (HTTP {code})", 401)
     user = str(body["user_id"])
-
-    # Authentication required, authorization does not apply — `general` only.
-    if ctx == GENERAL:
-        return user
 
     # 2. WHERE — existence FIRST, it is a guard: `_resolve` does `os.makedirs`,
     # so an authorized unknown name would GIVE BIRTH to a memory (measured:
@@ -275,8 +290,10 @@ class ContextualMemory:
         #: backend is down: only the real path can CONFIRM an absence.
         #: In memory only — unknown after a restart (see `_scan_notes`).
         self._notes_real: dict[str, str] = {}
-        #: ctx → the request stamp of its last notes check (once per request).
-        self._notes_checked: dict[str, Optional[object]] = {}
+        #: contexts whose inherited note copies (pre-C3) were purged.
+        self._inherited_purged: set[str] = set()
+        #: ctx → the request number of its last notes check (once per request).
+        self._notes_checked: dict[str, int] = {}
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
         self._models: Optional[tuple[Any, Any]] = None
         self._models_lock = threading.Lock()
@@ -348,9 +365,9 @@ class ContextualMemory:
         # process: a note added or corrected after the first access used to
         # stay out — or stale — until the `[omni]` process restarted. The
         # check is a stat of the folder; only a changed note costs an ingest.
-        stamp = _request_stamp.get()
-        if stamp is None or self._notes_checked.get(name) is not stamp:
-            self._notes_checked[name] = stamp
+        seq = _requests_seen
+        if not seq or self._notes_checked.get(name) != seq:
+            self._notes_checked[name] = seq
             self._refresh_notes(name, m)
         return m
 
@@ -363,7 +380,7 @@ class ContextualMemory:
         """
         name = self._ctx_name()
         m = self._memory_at(name)
-        self._notes_checked[name] = _request_stamp.get()
+        self._notes_checked[name] = _requests_seen
         return self._refresh_notes(name, m)
 
     def _resolve(self) -> Any:
@@ -412,8 +429,9 @@ class ContextualMemory:
 
         Returns the REPORT — `state` says what the folder is:
         `ok` (notes indexed), `no_notes` (the folder is absent or holds no
-        `.md`: this context HAS no notes), `outside` (the context's notes do
-        not live under this notes_root), `disabled` (no notes_root at all),
+        `.md`: this context HAS no notes), `outside` (no folder can be built
+        from the name — an invalid name, which the gate refuses before any
+        tool runs), `disabled` (no notes_root at all),
         `error` (the folder could not be READ — nothing was removed, nothing
         saved, the next pass retries). A note that cannot be read is listed
         in `errors`, never skipped silently, and is retried on the next pass.
@@ -463,6 +481,10 @@ class ContextualMemory:
             report["state"] = "ok" if on_disk else "no_notes"
             return report
 
+        if ctx not in self._inherited_purged:
+            # Rule C3 (TAC-936): ancestor notes an older gate COPIED here.
+            self._forget_inherited_copies(ctx, m)
+            self._inherited_purged.add(ctx)
         own = _own_note_points(ctx, m)
         known_ids = {p.id for p in getattr(m, "points", [])}
         new_seen: dict[str, tuple[int, int]] = {}
@@ -530,6 +552,30 @@ class ContextualMemory:
                   f"note(s) not ingested: {report['errors']}", flush=True)
         report["state"] = "ok" if on_disk else "no_notes"
         return report
+
+    @staticmethod
+    def _forget_inherited_copies(ctx: str, m: Any) -> None:
+        """Soft-forget the ancestor notes an older gate COPIED into `ctx`.
+
+        Those content points carry `deepwiki` and the `ctx:<ancestor>` tag of
+        their source. Left in place, a recall from the child would serve them
+        as LOCAL memories — stale, and mislabeled. `forget_node` is reversible
+        (state INVALID + ledger row), never a deletion; idempotent, since an
+        invalidated point already carries `invalidated`.
+        """
+        # `add_tag` lowercases: `ctx:tachikoma.paralelle.GenAI` is stored as
+        # `ctx:tachikoma.paralelle.genai` — compare in that form, or the
+        # context's OWN notes would read as foreign and be forgotten.
+        own = f"ctx:{ctx}".lower()
+        stale = [p.id for p in getattr(m, "points", [])
+                 if "deepwiki" in p.tags and "invalidated" not in p.tags
+                 and any(t.startswith("ctx:") and t != own for t in p.tags)]
+        for node_id in stale:
+            m.forget_node(node_id, "TAC-936: ancestor note copied at ingestion; "
+                                   "inheritance is served at query time")
+        if stale:
+            print(f"[gate] {ctx!r}: {len(stale)} inherited note copie(s) "
+                  f"soft-forgotten (rule C3)", flush=True)
 
     # ── the context tag of a narrow account's writes ──────────────────
     def _mirrored_ingest(self, own: Any, account: str):
@@ -731,6 +777,38 @@ class _MirroredPoint:
         return getattr(self._own, name)
 
 
+#: The MCP session header (streamable HTTP transport).
+SESSION_HEADER = "mcp-session-id"
+
+
+class _SessionBindings:
+    """session id → the (context, account) it was opened under.
+
+    Bounded like the SDK's own session table (`max_sessions`, 10 000 by
+    default): past the bound the OLDEST binding is dropped, and a call on
+    that session gets a 404 from the gate — the client re-initializes, as
+    MCP prescribes for an unknown session. Fail-closed: a session the gate
+    does not know is never served.
+    """
+
+    BOUND = 10_000
+
+    def __init__(self) -> None:
+        from collections import OrderedDict
+        self._map: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def bind(self, session: str, pair: tuple[str, str]) -> None:
+        with self._lock:
+            self._map[session] = pair
+            while len(self._map) > self.BOUND:
+                self._map.popitem(last=False)
+
+    def get(self, session: str) -> Optional[tuple[str, str]]:
+        with self._lock:
+            return self._map.get(session)
+
+
 def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
     """The middleware class: context header, then the ACL, on EVERY request.
 
@@ -745,6 +823,8 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
     """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
+
+    sessions = _SessionBindings()
 
     class _ContextGate(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -779,15 +859,48 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                     {"detail": f"{user!r} ne peut pas opérer sous le compte "
                                f"{account!r} : seul son propre compte (ou celui "
                                "du contexte) est permis"}, status_code=403)
+            # A SESSION SERVES THE CONTEXT IT WAS OPENED UNDER (TAC-934). The
+            # MCP session's server task is started by the `initialize`
+            # request and copies ITS contextvars: every later call of that
+            # session runs under the context of the initialize, whatever
+            # header it carries. Measured: a session opened under `iso-alpha`,
+            # called with `x-tachikoma-context: iso-beta` (authorized for
+            # beta), was served alpha's fact. So a session is bound to its
+            # (context, account) and a request that names another pair is
+            # refused — never served a memory its header did not ask for.
+            # The context's own account is "" whether the header is absent
+            # or names the context — the proxy reads both as the same memory.
+            pair = (ctx, "" if account == ctx else account)
+            session = (request.headers.get(SESSION_HEADER) or "").strip()
+            if session:
+                bound = sessions.get(session)
+                if bound is None:
+                    return JSONResponse(
+                        {"detail": f"session MCP inconnue du gate : {session!r} "
+                                   "— rouvrir une session (initialize)"},
+                        status_code=404)
+                if bound != pair:
+                    return JSONResponse(
+                        {"detail": f"la session {session!r} a été ouverte sous le "
+                                   f"contexte {bound[0]!r} (compte {bound[1]!r}) : "
+                                   f"elle ne sert pas {ctx!r} (compte {pair[1]!r}) "
+                                   "— une session par contexte"}, status_code=409)
             if warm is not None:
                 await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
-            # A fresh stamp: this request re-reads the notes once (TAC-938).
-            _request_stamp.set(object())
-            return await call_next(request)
+            # A new request: the notes are re-read once (TAC-938).
+            global _requests_seen
+            _requests_seen += 1
+            response = await call_next(request)
+            opened = (response.headers.get(SESSION_HEADER) or "").strip()
+            if opened and not session:
+                sessions.bind(opened, pair)
+            return response
 
     return _ContextGate
+
+
 
 
 def build_gated_app(storage_root: str, notes_root: str,
