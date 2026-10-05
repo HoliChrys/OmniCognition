@@ -525,6 +525,43 @@ def test_ingest_notes_is_a_tool_and_a_bare_memory_says_unsupported(tmp_path):
     assert m.journal.get_wiki_doc("notes:x") is not None
 
 
+def test_ancestor_notes_are_never_copied_into_the_child(tmp_path):
+    """Rule C3 (TAC-936): inheritance is served AT QUERY TIME, never copied at
+    ingestion — a copy goes stale the day the ancestor's note is corrected.
+    The child's memory holds its OWN notes, and nothing of its ancestors'."""
+    root, p, m = _wiki(tmp_path, "tachikoma.sub.Child")
+    _write(_notes_of(root) / "root.md", "# Root note")
+    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
+    p._refresh_notes("tachikoma.sub.Child", m)
+    assert m.journal.get_wiki_doc("notes:own") is not None
+    assert m.journal.all_wiki_doc_ids() == ["notes:own"]
+    assert [p_.content for p_ in m.points] == ["# Own note"]
+    assert "ctx:tachikoma.sub.child" in m.points[0].tags   # add_tag lowercases
+    # …and the ancestor's note lives in the ANCESTOR's memory, where a
+    # query-time recall reads it.
+    root = _test_instance(p, "tachikoma")
+    p._refresh_notes("tachikoma", root)
+    assert [p_.content for p_ in root.points] == ["# Root note"]
+
+
+def test_copies_left_by_an_older_gate_are_soft_forgotten(tmp_path):
+    """The older gate copied ancestor notes into the child (`ctx:<ancestor>`
+    tag). A recall would serve them as LOCAL memories, stale and mislabeled:
+    the first access soft-forgets them (reversible, never deleted)."""
+    p = ContextualMemory(str(tmp_path / "store"), str(tmp_path / "notes"))
+    (tmp_path / "notes").mkdir()
+    m = _test_instance(p, "tachikoma.sub.Child")
+    copy = m.ingest("# Root note, copied", kind="FACT")
+    copy.add_tag("note:notes:tachikoma/root", "ctx:tachikoma", "deepwiki")
+    own = m.ingest("# Own note", kind="FACT")
+    own.add_tag("note:notes:own", "ctx:tachikoma.sub.Child", "deepwiki")
+    fact = m.ingest("a fact written by an agent", kind="FACT")
+    p._forget_inherited_copies("tachikoma.sub.Child", m)
+    assert "invalidated" in copy.tags
+    assert "invalidated" not in own.tags
+    assert "invalidated" not in fact.tags
+
+
 # ── the ACL: who may read which memory (TAC-214) ──────────────────────
 
 from metacog import tachikoma_gate as gate  # noqa: E402
@@ -562,10 +599,16 @@ def test_a_rejected_token_is_refused_401(monkeypatch):
     assert e.value.status == 401
 
 
-def test_general_needs_a_valid_token_but_no_right(monkeypatch):
-    calls = _fake_api(monkeypatch, ME)
-    assert gate.authorize("t", gate.GENERAL) == "manager-GenAI-1545c4"
-    assert [c[0] for c in calls] == ["/api/auth/me"]
+def test_general_is_no_longer_a_common_notebook(monkeypatch):
+    """Rule C3 (TAC-936): `general` was the one name readable by any valid
+    token, outside the chain. It is an ordinary name now — no hierarchy
+    entry, refused like any unknown context; what all must read goes in
+    `global`."""
+    assert not hasattr(gate, "GENERAL")
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    with pytest.raises(gate.Denied, match="n'existe pas"):
+        gate.authorize("t", "general")
+    assert [c[0] for c in calls] == ["/api/auth/me", "/api/hierarchy/general"]
 
 
 def test_an_unknown_context_is_never_born(monkeypatch, tmp_path):
