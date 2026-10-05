@@ -68,6 +68,12 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    pair: the header and the memory served can never disagree. The four
    isolation lanes (recall, capture, wiki, index) are pinned end to end in
    `tests/test_context_isolation.py`.
+7. A RECALL CLIMBS ITS CHAIN READ-ONLY (TAC-272) — tachikoma asks each
+   ancestor stage with `x-tachikoma-recall-for: <asked ctx>`. The ACL is then
+   asked about the ASKED context (its rights only descend, so `read` on a child
+   never reached its parents), the stage must be a strict ancestor of it, and
+   only the handshake, `tools/list` and the recall/search tools pass — any
+   write under the header is a 403. The account check stays per stage.
 
 Storage: `<storage_root>/<ctx>/memory.pkl` — one memory per context, isolated,
 persistent. `global` and `tachikoma.paralelle.GenAI` share NOTHING by accident.
@@ -107,6 +113,18 @@ CTX_HEADER = "x-tachikoma-context"
 
 #: The account the caller operates under (TAC-213). Absent = the context's.
 ACCOUNT_HEADER = "x-tachikoma-account"
+
+#: The context a recall was ASKED for, sent on each ANCESTOR stage of its
+#: inheritance chain (TAC-272, rule C3). Under it, `read` on the asked context
+#: is enough to READ an ancestor's memory — the ACL's SUB_RESOURCE rights only
+#: descend, so a per-stage check stopped a non-admin's chain at `global`. The
+#: stage must be a strict ancestor of the asked context, and only the methods
+#: below pass: never a write.
+RECALL_FOR_HEADER = "x-tachikoma-recall-for"
+
+#: What a recall stage needs: the handshake, the listing, the recall/search tools.
+_RECALL_FOR_METHODS = frozenset({"initialize", "notifications/initialized", "tools/list"})
+_RECALL_FOR_TOOLS = frozenset({"recall", "retrieve", "search_nodes"})
 
 #: A tachikoma context name: dotted segments, no `/`, no empty segment — so no
 #: `..` and no absolute path can ever reach `os.path.join`.
@@ -247,6 +265,39 @@ def authorize(token: str, ctx: str) -> str:
     if body.get("allowed") is True:
         return user
     raise Denied(f"{user!r} n'a pas 'read' sur le contexte {ctx!r}")
+
+
+def is_strict_ancestor(stage: str, ctx: str) -> bool:
+    """`stage` is above `ctx` in its chain: a dotted prefix of it, or `global`.
+
+    The chain of tachikoma's `credential_inheritance.ancestor_chain`
+    (`a.b.c` → `a.b`, `a`, `global`) — never a sibling, a child, or `ctx`.
+    """
+    return stage != ctx and (stage == "global" or ctx.startswith(stage + "."))
+
+
+def recall_for_refusal(body: bytes) -> str:
+    """"" when every JSON-RPC message of `body` only READS, else what is refused."""
+    import json
+    try:
+        payload = json.loads(body or b"null")
+    except ValueError:
+        return "un corps illisible"
+    messages = payload if isinstance(payload, list) else [payload]
+    if not messages:
+        return "un lot vide"
+    for m in messages:
+        method = m.get("method") if isinstance(m, dict) else None
+        if method in _RECALL_FOR_METHODS:
+            continue
+        if method == "tools/call":
+            params = m.get("params")
+            name = params.get("name") if isinstance(params, dict) else None
+            if name in _RECALL_FOR_TOOLS:
+                continue
+            return f"l'outil {name!r}"
+        return f"la méthode {method!r}"
+    return ""
 
 
 def _bearer(headers: Any) -> str:
@@ -864,10 +915,35 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                 return JSONResponse(
                     {"detail": f"nom de compte invalide dans {ACCOUNT_HEADER} : "
                                f"{account!r}"}, status_code=400)
+            # AN ANCESTOR STAGE OF A RECALL (TAC-272): authorized on the
+            # context the recall was asked for, READ-ONLY, and only on its
+            # chain. Checked before the ACL: a structural refusal costs no call.
+            auth_ctx = ctx
+            recall_for = (request.headers.get(RECALL_FOR_HEADER) or "").strip()
+            if recall_for:
+                if not valid_context_name(recall_for):
+                    return JSONResponse(
+                        {"detail": f"nom de contexte invalide dans "
+                                   f"{RECALL_FOR_HEADER} : {recall_for!r}"},
+                        status_code=400)
+                if not is_strict_ancestor(ctx, recall_for):
+                    return JSONResponse(
+                        {"detail": f"{ctx!r} n'est pas un ancêtre de "
+                                   f"{recall_for!r} : {RECALL_FOR_HEADER} ne "
+                                   "sert que la chaîne d'héritage"}, status_code=403)
+                refused = ("la méthode HTTP " + request.method
+                           if request.method != "POST"
+                           else recall_for_refusal(await request.body()))
+                if refused:
+                    return JSONResponse(
+                        {"detail": f"sous {RECALL_FOR_HEADER} la mémoire de "
+                                   f"{ctx!r} est en lecture seule : {refused} "
+                                   "est refusé"}, status_code=403)
+                auth_ctx = recall_for
             import anyio
             try:
                 user = await anyio.to_thread.run_sync(
-                    authorize_fn or authorize, _bearer(request.headers), ctx)
+                    authorize_fn or authorize, _bearer(request.headers), auth_ctx)
             except Denied as e:
                 return JSONResponse({"detail": str(e)}, status_code=e.status)
             # THE ACCOUNT IS VERIFIED, never trusted: a caller narrows to ITS
