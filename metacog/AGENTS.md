@@ -162,11 +162,15 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   context has known notes; a folder deleted while the gate was down is
   removed once it is read again (e.g. recreated empty).
   Context/account names are validated BEFORE the ACL call (400). The right to
-  read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
-  context memory + deepwiki; a narrower account must equal the authenticated
-  user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
+  read is the ACCOUNT's, taken from the TOKEN: a lobby member's token (scope
+  `lobby`, read from the token's payload after `/api/auth/me` accepted it) is
+  ALWAYS served its own account, header or not; any other token with no
+  `x-tachikoma-account` (or the context's name) = the context memory +
+  deepwiki. A header naming another account than the token's is a 403 both
+  ways. A narrow account reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
   and its `ingest` is mirrored into the context memory tagged
-  `account:<account>`. ONE encoder + ONE reranker per gate
+  `account:<account>` in the id's EXACT case (tag matching is
+  case-insensitive, so older lowercased tags still match). ONE encoder + ONE reranker per gate
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
