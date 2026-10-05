@@ -138,7 +138,8 @@ _current_account: ContextVar[str] = ContextVar("tachikoma_account", default="")
 _requests_seen = 0
 
 #: The root of the tachikoma context hierarchy — every ancestor chain ends
-#: there. Its notes folder IS the notes_root's own `notes/` (see `notes_folder`).
+#: there. It sits ABOVE the tree root: its notes folder is the `notes/` of the
+#: notes_root's PARENT, never the tree root's own (see `notes_folder`).
 ROOT_CONTEXT = "global"
 
 #: The header tachikoma sends — same value as mnema's `CTX_HEADER`, taken
@@ -190,9 +191,14 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
     - `notes_root` is the folder of the TREE ROOT context, named by its last
       path component. Deployed: `/opt/tachikoma-fs/global/tachikoma` → the
       tree root is `tachikoma`.
-    - the tree root (`tachikoma`) and the hierarchy root (`global`, above
-      it) → `<notes_root>/notes`. Both read the same folder: `global` has no
-      folder of its own under this root (measured layout, 2026-10-04).
+    - the tree root (`tachikoma`) → `<notes_root>/notes`.
+    - the hierarchy root (`global`, above the tree root) → the `notes/` of
+      the notes_root's PARENT folder. Deployed:
+      `/opt/tachikoma-fs/global/notes` — the FUSE layout already names
+      `global` as the parent of `tachikoma` (TAC-329 / TAC-330). The two
+      roots NEVER read the same folder: a recall of `tachikoma` climbs to
+      `global`, and one shared folder served every note twice. Absent, it
+      is a `global` without notes — never `<notes_root>/notes` in its place.
     - a descendant `tachikoma.paralelle.GenAI` →
       `<notes_root>/paralelle/GenAI/notes` — the dots are the slashes, and
       the first segment IS the root folder, never repeated in the path.
@@ -207,7 +213,9 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
         return None
     root = os.path.normpath(os.path.expanduser(notes_root))
     tree = os.path.basename(root)
-    if ctx in (tree, ROOT_CONTEXT):
+    if ctx == ROOT_CONTEXT:
+        return os.path.join(os.path.dirname(root), "notes")
+    if ctx == tree:
         return os.path.join(root, "notes")
     head, _, rest = ctx.partition(".")
     if head == tree:
