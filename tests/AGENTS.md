@@ -34,7 +34,9 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
 - `test_llm_errors.py` (TAC-209) pins that `ClaudeLLM.generate` never fails
   silently: a client failure (incl. a missing `anthropic` package) answers
   `""`, increments `llm_errors` and warns once. `test_d3_wiki_bench.py`
-  pins the D3 harness guards: no write under a live root, LLM cap, build cap.
+  pins the D3 harness guards: no write under a live root, LLM cap (failed
+  calls back off and do not spend it), `llm_unavailable` stop, build cap, and
+  a summary written with RC 0 on every stop (TAC-401).
 - `test_canonical_tools.py` asserts the tool-tier manifest partitions the live
   `@app.tool()` set EXACTLY — a new tool must be classified or it fails. The
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,
