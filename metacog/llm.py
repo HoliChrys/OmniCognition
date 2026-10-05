@@ -17,6 +17,11 @@ Cor. 5 holds at the architectural level : ClaudeLLM outputs are always
 treated as GENERATOR. Callers that wrap them into Point objects mark
 `source=SourceClass.GENERATOR` ; they NEVER enter the observation set.
 
+Failures : `generate` answers "" on a client failure (callers keep their
+fallback), but never silently — each one increments `llm_errors` (reason in
+`last_error`) and the first one logs a warning. `MissingCredential` is the
+only exception that propagates.
+
 Credential resolution :
   api_key arg  →  ANTHROPIC_API_KEY  →  ANTHROPIC_AUTH_TOKEN
 sk-ant-oat* tokens go through auth_token= (OAuth bearer), everything
@@ -25,9 +30,12 @@ else through api_key= (x-api-key).
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import List, Optional, Sequence, Tuple
+
+_log = logging.getLogger(__name__)
 
 try:
     import anthropic as _ant_module
@@ -109,6 +117,11 @@ class ClaudeLLM:
         self.tokens_in = 0
         self.tokens_out = 0
         self.n_calls = 0
+        # Client failures `generate` absorbed into "" (missing `anthropic`
+        # package, auth refused, retries exhausted…). Without it an LLM that
+        # never answers is indistinguishable from one that answers "" (D3).
+        self.llm_errors = 0
+        self.last_error: Optional[str] = None
 
     @property
     def client(self):
@@ -133,6 +146,16 @@ class ClaudeLLM:
     # Core generation
     # ------------------------------------------------------------------
 
+    def _record_error(self, exc: BaseException) -> None:
+        """Count a client failure; warn on the FIRST one only (the return
+        value stays "" so callers' fallbacks are unchanged)."""
+        self.llm_errors += 1
+        self.last_error = f"{type(exc).__name__}: {exc}"
+        if self.llm_errors == 1:
+            _log.warning("ClaudeLLM.generate failed, answering \"\" "
+                         "(model=%s): %s — further failures are only "
+                         "counted in llm_errors", self.model, self.last_error)
+
     def generate(self, prompt: str, max_tokens: Optional[int] = None) -> str:
         if not prompt:
             return ""
@@ -151,12 +174,12 @@ class ClaudeLLM:
                 raise
             except Exception as exc:
                 # Retry on transient server errors (529 overloaded, 5xx).
-                if _RETRYABLE_ERRORS and isinstance(exc, _RETRYABLE_ERRORS):
+                if (_RETRYABLE_ERRORS and isinstance(exc, _RETRYABLE_ERRORS)
+                        and attempt < 3):
                     time.sleep(2 ** attempt)
                     continue
+                self._record_error(exc)
                 return ""
-        else:
-            return ""
         self.n_calls += 1
         if hasattr(resp, "usage"):
             self.tokens_in += getattr(resp.usage, "input_tokens", 0) or 0
