@@ -204,6 +204,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   access: `_memory_at` is double-checked under a lock PER KEY (TAC-228) — an
   orphan instance would still write the same store, and the merge-on-save
   would keep its facts twice.
+  A narrow account's mirror also carries `mirror_of:<own id>`, and its
+  `forget_node` forgets the mirror too (TAC-353): found by `mirror_of:`, or
+  for an older mirror by account + same content; the answer lists
+  `mirrors_forgotten` (`[]` = none found).
   A store holds ONLY its own context (TAC-936, rule C3): the deepwiki ingests
   the context's own `notes/`, never an ancestor's — inheritance is served at query time by
   tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the
