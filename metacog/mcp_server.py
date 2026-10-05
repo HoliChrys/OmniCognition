@@ -290,6 +290,7 @@ def build_app(
         prefer_kind: Optional[str] = None,
         abstain: bool = False,
         rerank: Optional[bool] = None,
+        exclude_tags: Optional[List[str]] = None,
     ) -> List[dict]:
         """Retrieve top-k points for a query.
 
@@ -309,6 +310,9 @@ def build_app(
           rerank:       cross-encoder second stage (pre-fetch 30 -> joint
                         (query, doc) scoring -> top-k). Default on when the
                         server has a reranker ; false = cosine order only.
+          exclude_tags: points carrying any of these tags are left out of the
+                        search pool (e.g. `session:<id>` : a session's own
+                        captured turns, TAC-930).
 
         k is capped at 7 (the system's retrieval budget).
 
@@ -324,6 +328,7 @@ def build_app(
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
             abstain=abstain, rerank=rerank, cost=spent,
+            exclude_tags=exclude_tags,
         )
         cost = {key: (round(v, 1) if isinstance(v, float) else v)
                 for key, v in spent.items()}
