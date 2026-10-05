@@ -167,7 +167,12 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   A store holds ONLY its own context (TAC-936, rule C3): the deepwiki ingests
   the context's own `notes/`, never an ancestor's — inheritance is served at query time by
   tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the
-  older gate are soft-forgotten on first access.
+  older gate are soft-forgotten on first access. An ancestor stage of a recall carries
+  `x-tachikoma-recall-for: <asked ctx>` (TAC-272): the ACL is asked about the
+  ASKED context, the stage must be its strict ancestor (prefix or `global`,
+  else 403), and only POST `initialize` / `notifications/initialized` /
+  `tools/list` / `tools/call` of `recall`·`retrieve`·`search_nodes` pass — any
+  write under the header → 403. The account check still applies per stage.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
