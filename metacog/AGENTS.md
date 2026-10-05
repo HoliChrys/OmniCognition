@@ -142,8 +142,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
-  rule (no candidate cascade; `global` and the tree root read
-  `<notes_root>/notes`, other trees → None). The context's OWN notes are kept
+  rule, chosen by the name only (no candidate cascade): `global` and the
+  tree root (basename of notes_root) read `<notes_root>/notes`, its
+  descendants drop the first segment, another tree keeps every segment
+  under the root. The context's OWN notes are kept
   in step with the folder once per request (mtime+size fingerprints; after a
   restart the store is the reference): added → doc (`import_okf`) + content
   point whose id cites the note (`<doc_id>#<sha256[:12]>`); corrected → old

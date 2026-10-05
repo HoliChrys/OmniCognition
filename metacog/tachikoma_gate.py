@@ -112,11 +112,14 @@ _current_ctx: ContextVar[str] = ContextVar("tachikoma_context", default="")
 #: The contextvar of the caller's NARROW account ("" = the context's own).
 _current_account: ContextVar[str] = ContextVar("tachikoma_account", default="")
 
-#: One fresh object PER HTTP REQUEST (set by the middleware): the notes folder
-#: is re-read once per request, not once per attribute access of the proxy.
-#: `None` (no request — library use, tests) re-reads on every access.
-_request_stamp: ContextVar[Optional[object]] = ContextVar(
-    "tachikoma_request", default=None)
+#: The number of HTTP requests the middleware let through (TAC-938): the
+#: notes folder is re-read once per request, not once per attribute access of
+#: the proxy. NOT a contextvar: a tool call runs in its MCP session's task,
+#: whose contextvars were copied at `initialize` (TAC-934) — a per-request
+#: contextvar would freeze the wiki for the whole session (measured by
+#: `test_a_note_added_mid_session_is_listed_in_that_session`). 0 = no request
+#: yet (library use): every access re-reads.
+_requests_seen = 0
 
 #: The root of the tachikoma context hierarchy — every ancestor chain ends
 #: there. Its notes folder IS the notes_root's own `notes/` (see `notes_folder`).
@@ -177,8 +180,12 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
     - a descendant `tachikoma.paralelle.GenAI` →
       `<notes_root>/paralelle/GenAI/notes` — the dots are the slashes, and
       the first segment IS the root folder, never repeated in the path.
-    - any other name (`demo.sandbox.alice`) → None: its notes do not live
-      under this root. Not "no notes" — "not mine to read".
+    - a context of ANOTHER tree (`iso-alpha.child`, `demo.sandbox.alice`)
+      lives in its own folder UNDER the notes root, every segment kept:
+      `<notes_root>/iso-alpha/child/notes` (TAC-934's layout, C3's second
+      candidate). The rule is chosen by the NAME, never by which folder
+      happens to exist.
+    - an invalid name → None: no path is ever built from it.
     """
     if not notes_root or not valid_context_name(ctx):
         return None
@@ -187,9 +194,9 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
     if ctx in (tree, ROOT_CONTEXT):
         return os.path.join(root, "notes")
     head, _, rest = ctx.partition(".")
-    if head != tree or not rest:
-        return None
-    return os.path.join(root, *rest.split("."), "notes")
+    if head == tree:
+        return os.path.join(root, *rest.split("."), "notes")
+    return os.path.join(root, *ctx.split("."), "notes")
 
 # ── THE ACL — who may read which memory (mnema's `acl.py`, ported) ──────────
 #
@@ -354,10 +361,10 @@ class ContextualMemory:
         #: backend is down: only the real path can CONFIRM an absence.
         #: In memory only — unknown after a restart (see `_scan_notes`).
         self._notes_real: dict[str, str] = {}
-        #: ctx → the request stamp of its last notes check (once per request).
-        self._notes_checked: dict[str, Optional[object]] = {}
-        #: Contexts whose ancestor copies were swept (C3), once per process.
-        self._c3_swept: set[str] = set()
+        #: contexts whose inherited note copies (pre-C3) were purged.
+        self._inherited_purged: set[str] = set()
+        #: ctx → the request number of its last notes check (once per request).
+        self._notes_checked: dict[str, int] = {}
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
         self._models: Optional[tuple[Any, Any]] = None
         self._models_lock = threading.Lock()
@@ -446,16 +453,13 @@ class ContextualMemory:
         """The memory of the context ITSELF — its account's, the manager's."""
         name = self._ctx_name()
         m = self._memory_at(name)
-        if name not in self._c3_swept:
-            self._c3_swept.add(name)
-            self._forget_inherited_copies(name, m)
         # THE DEEPWIKI IS CHECKED ONCE PER REQUEST (TAC-938), not once per
         # process: a note added or corrected after the first access used to
         # stay out — or stale — until the `[omni]` process restarted. The
         # check is a stat of the folder; only a changed note costs an ingest.
-        stamp = _request_stamp.get()
-        if stamp is None or self._notes_checked.get(name) is not stamp:
-            self._notes_checked[name] = stamp
+        seq = _requests_seen
+        if not seq or self._notes_checked.get(name) != seq:
+            self._notes_checked[name] = seq
             self._refresh_notes(name, m)
         return m
 
@@ -468,7 +472,7 @@ class ContextualMemory:
         """
         name = self._ctx_name()
         m = self._memory_at(name)
-        self._notes_checked[name] = _request_stamp.get()
+        self._notes_checked[name] = _requests_seen
         return self._refresh_notes(name, m)
 
     def _resolve(self) -> Any:
@@ -510,11 +514,6 @@ class ContextualMemory:
         - a note DELETED leaves the wiki (doc removed) and its points are
           soft-forgotten.
 
-        NO ANCESTOR SEEDING (TAC-936, rule C3): only `ctx`'s own folder is
-        read. The ancestor copies an older gate left behind are swept by
-        `_forget_inherited_copies`, once per (ctx, process), in
-        `_context_memory`.
-
         Cheap when nothing moved: one stat per note, compared with the
         fingerprints (mtime_ns, size) of the last pass. After a restart there
         are no fingerprints: the store is the reference (content-addressed
@@ -522,8 +521,9 @@ class ContextualMemory:
 
         Returns the REPORT — `state` says what the folder is:
         `ok` (notes indexed), `no_notes` (the folder is absent or holds no
-        `.md`: this context HAS no notes), `outside` (the context's notes do
-        not live under this notes_root), `disabled` (no notes_root at all),
+        `.md`: this context HAS no notes), `outside` (no folder can be built
+        from the name — an invalid name, which the gate refuses before any
+        tool runs), `disabled` (no notes_root at all),
         `error` (the folder could not be READ — nothing was removed, nothing
         saved, the next pass retries). A note that cannot be read is listed
         in `errors`, never skipped silently, and is retried on the next pass.
@@ -573,6 +573,10 @@ class ContextualMemory:
             report["state"] = "ok" if on_disk else "no_notes"
             return report
 
+        if ctx not in self._inherited_purged:
+            # Rule C3 (TAC-936): ancestor notes an older gate COPIED here.
+            self._forget_inherited_copies(ctx, m)
+            self._inherited_purged.add(ctx)
         own = _own_note_points(ctx, m)
         known_ids = {p.id for p in getattr(m, "points", [])}
         new_seen: dict[str, tuple[int, int]] = {}
@@ -661,8 +665,6 @@ class ContextualMemory:
         for node_id in stale:
             m.forget_node(node_id, "TAC-936: ancestor note copied at ingestion; "
                                    "inheritance is served at query time")
-        if stale and getattr(m, "storage_path", None):
-            m.save()
         if stale:
             print(f"[gate] {ctx!r}: {len(stale)} inherited note copie(s) "
                   f"soft-forgotten (rule C3)", flush=True)
@@ -1035,8 +1037,9 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                 await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
-            # A fresh stamp: this request re-reads the notes once (TAC-938).
-            _request_stamp.set(object())
+            # A new request: the notes are re-read once (TAC-938).
+            global _requests_seen
+            _requests_seen += 1
             response = await call_next(request)
             opened = (response.headers.get(SESSION_HEADER) or "").strip()
             if opened and not session:

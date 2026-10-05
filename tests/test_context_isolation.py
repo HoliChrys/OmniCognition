@@ -479,3 +479,26 @@ def test_the_yes_dies_with_the_session(gate):
     r = gate.raw_call(session, "retrieve", {"query": QUERY, "k": 5})
     # Closed: the gate no longer knows the session, and asked the ACL anew.
     assert r.status_code == 404 and gate.acl_calls == [("test-token", C)]
+
+
+# ── the deepwiki of a LONG session follows its notes (TAC-938) ─────────
+
+def _session_wiki(gate, headers) -> list[str]:
+    r = gate.raw_call(headers, "wiki_list", {"prefix": "notes:"})
+    assert r.status_code == 200, r.text
+    frames = [ln[5:].strip() for ln in r.text.splitlines() if ln.startswith("data:")]
+    result = json.loads(frames[0] if frames else r.text)["result"]
+    sc = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    return [d["doc_id"] for d in sc.get("result", sc)["docs"]]
+
+
+def test_a_note_added_mid_session_is_listed_in_that_session(gate, tmp_path):
+    """A tool call runs in the session's task, whose contextvars were copied
+    at `initialize` (TAC-934): a per-request stamp held in a contextvar would
+    freeze the wiki for the whole session. The note added between two calls
+    of ONE session must be listed by the second."""
+    headers = gate.open(C)
+    assert _session_wiki(gate, headers) == ["notes:alpha-runbook"]
+    _notes(tmp_path / "tachikoma", "iso-alpha", "alpha-late",
+           "# Late note\n\nAdded while the session was open.")
+    assert _session_wiki(gate, headers) == ["notes:alpha-late", "notes:alpha-runbook"]
