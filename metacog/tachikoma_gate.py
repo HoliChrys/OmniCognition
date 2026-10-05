@@ -38,21 +38,37 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    QUERY TIME by the caller, which asks each ancestor's memory in turn
    (`memory_engines.recall_inherited` in tachikoma) — never copied here.
 
-4. THE ACCOUNT (TAC-213) — the right to read is the ACCOUNT's, not only the
-   context's. Every caller operates under an account. By default (no
-   `x-tachikoma-account` header, or the context's own name) it is the
-   context's account — its manager's — and the caller is served the context
-   memory, as before. A NARROWER account (an agent operating in a lobby under
-   its own account) sends `x-tachikoma-account: <its user_id>` and is served
-   ITS OWN memory, `<storage_root>/<ctx>/accounts/<account>/memory.pkl`: it
-   reads only what its account wrote. The claim is VERIFIED: the account must
-   be the user the ACL authenticated — one can narrow to oneself, never borrow
-   another account (403). What a narrow account ingests is ALSO filed in the
-   context memory, tagged `account:<account>`: the context tag, so the manager
-   sees what the agents of its context learned. Mirrored: `ingest` (and
-   `remember`, which delegates to it). Other writes of a narrow account stay
-   in its own memory — the safe direction (the manager sees less, nobody sees
-   more).
+4. THE ACCOUNT (TAC-213, TAC-274) — the right to read is the ACCOUNT's, and
+   the account comes from the TOKEN, not from the header. Board rule: « un
+   agent de salon sous son propre compte ne lit que son compte ».
+   - A LOBBY MEMBER's token (tachikoma's `mint-lobby-member-token`, scope
+     `lobby`, its `user_id` the member's id) is ALWAYS served its own memory,
+     `<storage_root>/<ctx>/accounts/<user_id>/memory.pkl` — header absent or
+     naming itself, same memory. Measured before (TAC-262): a member token
+     sent without `x-tachikoma-account` was served the context memory and
+     read the manager's facts; isolation only held if the caller restricted
+     itself. The scope is read from the token's own payload, and only AFTER
+     `/api/auth/me` accepted that very token: the authority checked the
+     signature, which covers the scopes.
+   - Any other token — the context's own account (the manager's, the one
+     a lobby turn and an agent token run under) and a human the ACL lets
+     read the context through `/api/memory` — is served the context memory
+     by default, as before. It may still narrow itself to its own `user_id`.
+     The member is told apart by its TOKEN's scope, not by comparing its
+     `user_id` to the context account: omni cannot resolve that account
+     (`tachi-ctx-user` lives in tachikoma), and a human's `user_id` is not
+     it either.
+   - A header naming ANOTHER account than the token's is a 403, both ways:
+     a member naming the context (or its manager), a manager naming a
+     member. One narrows to oneself, never borrows another account.
+   What a narrow account ingests is ALSO filed in the context memory, tagged
+   `account:<user_id>` with the EXACT case of the id — the same name as its
+   folder (`accounts/tachikoma-GenAI-archiviste`, never a lowercased twin).
+   Tag reads (`metacog.tags.match_tag`) compare case-insensitively, so the
+   lowercased tags an older gate wrote are still found: no migration. Mirrored:
+   `ingest` (and `remember`, which delegates to it). Other writes of a narrow
+   account stay in its own memory — the safe direction (the manager sees
+   less, nobody sees more).
 
 5. THE MODELS ARE THE PROCESS'S, NOT THE CONTEXT'S (TAC-237) — every
    `Memory` of the gate shares ONE encoder and ONE reranker (`models()`). They
@@ -122,7 +138,8 @@ _current_account: ContextVar[str] = ContextVar("tachikoma_account", default="")
 _requests_seen = 0
 
 #: The root of the tachikoma context hierarchy — every ancestor chain ends
-#: there. Its notes folder IS the notes_root's own `notes/` (see `notes_folder`).
+#: there. It sits ABOVE the tree root: its notes folder is the `notes/` of the
+#: notes_root's PARENT, never the tree root's own (see `notes_folder`).
 ROOT_CONTEXT = "global"
 
 #: The header tachikoma sends — same value as mnema's `CTX_HEADER`, taken
@@ -174,9 +191,14 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
     - `notes_root` is the folder of the TREE ROOT context, named by its last
       path component. Deployed: `/opt/tachikoma-fs/global/tachikoma` → the
       tree root is `tachikoma`.
-    - the tree root (`tachikoma`) and the hierarchy root (`global`, above
-      it) → `<notes_root>/notes`. Both read the same folder: `global` has no
-      folder of its own under this root (measured layout, 2026-10-04).
+    - the tree root (`tachikoma`) → `<notes_root>/notes`.
+    - the hierarchy root (`global`, above the tree root) → the `notes/` of
+      the notes_root's PARENT folder. Deployed:
+      `/opt/tachikoma-fs/global/notes` — the FUSE layout already names
+      `global` as the parent of `tachikoma` (TAC-329 / TAC-330). The two
+      roots NEVER read the same folder: a recall of `tachikoma` climbs to
+      `global`, and one shared folder served every note twice. Absent, it
+      is a `global` without notes — never `<notes_root>/notes` in its place.
     - a descendant `tachikoma.paralelle.GenAI` →
       `<notes_root>/paralelle/GenAI/notes` — the dots are the slashes, and
       the first segment IS the root folder, never repeated in the path.
@@ -191,7 +213,9 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
         return None
     root = os.path.normpath(os.path.expanduser(notes_root))
     tree = os.path.basename(root)
-    if ctx in (tree, ROOT_CONTEXT):
+    if ctx == ROOT_CONTEXT:
+        return os.path.join(os.path.dirname(root), "notes")
+    if ctx == tree:
         return os.path.join(root, "notes")
     head, _, rest = ctx.partition(".")
     if head == tree:
@@ -332,6 +356,33 @@ def _token_digest(token: str) -> bytes:
     return hashlib.sha256(token.encode()).digest()
 
 
+#: The scope tachikoma's `mint-lobby-member-token` stamps on a lobby member's
+#: token (TAC-241): `["ctx:<ctx>", "agent", "lobby"]`.
+LOBBY_SCOPE = "lobby"
+
+
+def token_scopes(token: str) -> list[str]:
+    """The scopes a tachikoma token carries, read from its own payload.
+
+    A tachikoma token is base64 JSON (`TokenManager.serialize_token`); its
+    signature covers `scopes`. Only meaningful for a token `/api/auth/me` has
+    ALREADY accepted — WHO stays the authority's answer, never ours. Anything
+    that does not decode carries no scope: `[]`.
+    """
+    import base64
+    import binascii
+    import json
+
+    try:
+        data = json.loads(base64.b64decode(token, validate=True))
+    except (binascii.Error, ValueError):
+        return []
+    scopes = data.get("scopes") if isinstance(data, dict) else None
+    if not isinstance(scopes, list):
+        return []
+    return [s for s in scopes if isinstance(s, str)]
+
+
 class ContextualMemory:
     """A delegate: every call goes to the `Memory` of the current context.
 
@@ -368,6 +419,10 @@ class ContextualMemory:
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
         self._models: Optional[tuple[Any, Any]] = None
         self._models_lock = threading.Lock()
+        #: key → the lock that makes its `Memory` be born ONCE (TAC-228).
+        #: Per key: the first access of one context never waits on another's.
+        self._key_locks: dict[str, threading.Lock] = {}
+        self._key_locks_lock = threading.Lock()
 
     # ── the models: ONE pair per gate, shared by every memory ───────────
     def models(self) -> tuple[Any, Any]:
@@ -410,23 +465,40 @@ class ContextualMemory:
         return account
 
     def _memory_at(self, key: str) -> Any:
-        """The `Memory` stored under `<root>/<key>/`, created on first use."""
+        """The `Memory` stored under `<root>/<key>/`, created on first use.
+
+        ONE instance per key, whatever the concurrency (TAC-228). Measured
+        before: 20 concurrent `remember` at the first access of a context
+        built several `Memory` for it, one kept in the cache — the orphans
+        still wrote the same `memory.pkl`, and since the merge-on-save (C2)
+        each fact landed TWICE (+40 for 20). Double-checked under a lock PER
+        KEY: the creation of one context never serialises another's.
+        """
+        m = self._memories.get(key)
+        if m is not None:
+            return m
+        with self._key_locks_lock:
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            m = self._memories.get(key)
+            if m is None:
+                m = self._new_memory(key)
+                self._memories[key] = m
+        return m
+
+    def _new_memory(self, key: str) -> Any:
         from metacog.memory import Memory
 
-        m = self._memories.get(key)
-        if m is None:
-            path = os.path.join(self._root, key, "memory.pkl")
-            # Belt and braces after the name validation: the store never
-            # leaves the root, whatever reached here.
-            root = os.path.realpath(self._root)
-            if not os.path.realpath(path).startswith(root + os.sep):
-                raise RuntimeError(f"store {key!r} escapes the storage root")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            encoder, reranker = self.models()
-            m = Memory(storage_path=path, journal_path="auto",
-                       encoder=encoder, reranker=reranker)
-            self._memories[key] = m
-        return m
+        path = os.path.join(self._root, key, "memory.pkl")
+        # Belt and braces after the name validation: the store never
+        # leaves the root, whatever reached here.
+        root = os.path.realpath(self._root)
+        if not os.path.realpath(path).startswith(root + os.sep):
+            raise RuntimeError(f"store {key!r} escapes the storage root")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        encoder, reranker = self.models()
+        return Memory(storage_path=path, journal_path="auto",
+                      encoder=encoder, reranker=reranker)
 
     def _context_memory(self) -> Any:
         """The memory of the context ITSELF — its account's, the manager's."""
@@ -659,16 +731,47 @@ class ContextualMemory:
         """
         def ingest(content: str, *args: Any, **kwargs: Any) -> Any:
             p = own.ingest(content, *args, **kwargs)
-            p.add_tag(f"account:{account}")
+            _tag_account(p, account)
             _log_tags(own, p)
             ctx_mem = self._context_memory()
             # The explicit id stays the account's: in the context memory it
             # could collide with another account's — the engine names it.
             q = ctx_mem.ingest(content, kind=kwargs.get("kind", "FACT"))
-            q.add_tag(f"account:{account}")
+            _tag_account(q, account)
+            q.tags.append(_mirror_tag(p.id))   # exact case: ids may carry capitals
             _log_tags(ctx_mem, q)
             return _MirroredPoint(p, q, ctx_mem)
         return ingest
+
+    def _mirrored_forget(self, own: Any, account: str):
+        """`forget_node` for a narrow account: its point AND its mirror (TAC-353).
+
+        Measured on GenAI: a member's `forget` answered `forgotten` while the
+        copy `_mirrored_ingest` left in the context memory stayed live — the
+        manager kept recalling the fact. The mirror is found by its
+        `mirror_of:<id>` tag, or, for a mirror written before that tag, by
+        the account tag and the same content (one per forget). The answer
+        names the mirrors forgotten: `[]` says none was found.
+        """
+        def forget_node(node_id: str, reason: str,
+                        superseded_by: Optional[str] = None) -> dict:
+            p = next((x for x in own.points if x.id == node_id), None)
+            out = own.forget_node(node_id, reason, superseded_by=superseded_by)
+            if not out.get("forgotten") or p is None:
+                return out
+            ctx_mem = self._context_memory()
+            successor = None
+            if superseded_by:
+                q = _mirror_of(ctx_mem, superseded_by, None, account)
+                successor = q.id if q is not None else None
+            done = []
+            q = _mirror_of(ctx_mem, node_id, p.content, account)
+            if q is not None and ctx_mem.forget_node(
+                    q.id, reason, superseded_by=successor).get("forgotten"):
+                done.append(q.id)
+            out["mirrors_forgotten"] = done
+            return out
+        return forget_node
 
     def _mirrored_save(self, own: Any):
         """`save` for a narrow account: both stores the write touched."""
@@ -686,6 +789,8 @@ class ContextualMemory:
         account = self._account_name(self._ctx_name())
         if account and name == "ingest":
             return self._mirrored_ingest(m, account)
+        if account and name == "forget_node":
+            return self._mirrored_forget(m, account)
         if account and name == "save":
             return self._mirrored_save(m)
         return getattr(m, name)
@@ -819,6 +924,47 @@ def _ingest_note(m: Any, ctx: str, doc_id: str, body: str, pid: str,
     p.add_tag(f"note:{doc_id}", f"ctx:{ctx}", "deepwiki")
     _log_tags(m, p)
     return p
+
+
+def _tag_account(p: Any, account: str) -> None:
+    """Tag `p` with `account:<account>` in the EXACT case of the id (TAC-274).
+
+    `Point.add_tag` lowercases: the tag read `account:tachikoma-genai-archiviste`
+    while the folder kept `accounts/tachikoma-GenAI-archiviste`. The tag is
+    the folder's name; reads match tags case-insensitively (`match_tag`).
+    """
+    tag = f"account:{account}"
+    if tag not in p.tags:
+        p.tags.append(tag)
+
+
+def _mirror_tag(own_id: str) -> str:
+    """The tag naming the account point a context-memory mirror copies."""
+    return f"mirror_of:{own_id}"
+
+
+def _mirror_of(ctx_mem: Any, own_id: str, content: Optional[str],
+               account: str) -> Any:
+    """The live mirror of the account point `own_id` in the context memory.
+
+    By its `mirror_of:` tag; failing that, when `content` is given, a mirror
+    written before the tag (TAC-213 → TAC-353): the same account (any case,
+    `match_tag`'s rule), the same content, and no `mirror_of:` of its own.
+    """
+    tag, acct = _mirror_tag(own_id), f"account:{account}".lower()
+    live = [q for q in getattr(ctx_mem, "points", [])
+            if "invalidated" not in q.tags]
+    for q in live:
+        if tag in q.tags:
+            return q
+    if content is None:
+        return None
+    for q in live:
+        if (q.content == content
+                and any(t.lower() == acct for t in q.tags)
+                and not any(t.startswith("mirror_of:") for t in q.tags)):
+            return q
+    return None
 
 
 def _log_tags(m: Any, p: Any) -> None:
@@ -982,10 +1128,28 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                         authorize_fn or authorize, token, auth_ctx)
                 except Denied as e:
                     return JSONResponse({"detail": str(e)}, status_code=e.status)
+            # A LOBBY MEMBER IS ITS TOKEN'S ACCOUNT (TAC-274): with or
+            # without the header, it is served its own memory, never the
+            # context's. Measured before (TAC-262): a member token without
+            # the header read the manager's facts. A header naming anything
+            # else — the context, its manager, another member — is a 403.
+            if LOBBY_SCOPE in token_scopes(token):
+                if account and account != user:
+                    return JSONResponse(
+                        {"detail": f"{user!r} est membre de salon : il opère sous "
+                                   f"son propre compte, jamais sous {account!r}"},
+                        status_code=403)
+                if not valid_account_name(user) or user == ctx:
+                    # Its id names its folder: fail-closed, never a path
+                    # built from it, never the context memory by accident.
+                    return JSONResponse(
+                        {"detail": f"membre de salon au compte inutilisable : "
+                                   f"{user!r}"}, status_code=403)
+                account = user
             # THE ACCOUNT IS VERIFIED, never trusted: a caller narrows to ITS
             # OWN account (the user the ACL just authenticated), or stays on
             # the context's. Naming another account would read its memory.
-            if account and account != ctx and account != user:
+            elif account and account != ctx and account != user:
                 return JSONResponse(
                     {"detail": f"{user!r} ne peut pas opérer sous le compte "
                                f"{account!r} : seul son propre compte (ou celui "

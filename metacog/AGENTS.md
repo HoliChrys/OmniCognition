@@ -77,6 +77,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   clash keeps ours) → `<store>.tmp` + fsync + `os.replace`. `_read_store`
   turns any unreadable file into `CorruptStoreError`; `__post_init__`
   re-raises it (refuse to serve, file untouched).
+  **A forget is durable** (TAC-323): the MCP `forget` tool saves after
+  `forget_node`; `forget_node` stamps the log entry and the `forget_events`
+  row with ONE instant; `load` of the own store replays every journal forget
+  event (merged or not) whose (id, reason, t) is absent from the pickled
+  `_forget_log` and whose newest `forget` ledger row is not reverted
+  (`_replay_forgets` → INVALID, never deleted); `_merge_from_disk` applies a
+  forget another writer saved to our copy of the node.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
@@ -125,6 +132,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
+  `retrieve(exclude_tags=…)` (TAC-930) leaves every point carrying one of
+  the tags (case-insensitive) out of the SEARCH POOL — before top-k, rerank
+  and spreading, so the slots it would take go to the rest; tachikoma's
+  pre-turn recall passes `session:<id>` to skip the session's own captures.
   `retrieve` applies the reranker's relevance floor `RERANK_FLOOR` (a raw
   logit): hits under it are dropped and an all-under-floor recall answers the
   gap verdict alone (TAC-941). The value is CALIBRATED, not a constant: the
@@ -142,9 +153,12 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
-  rule, chosen by the name only (no candidate cascade): `global` and the
-  tree root (basename of notes_root) read `<notes_root>/notes`, its
-  descendants drop the first segment, another tree keeps every segment
+  rule, chosen by the name only (no candidate cascade): the tree root
+  (basename of notes_root) reads `<notes_root>/notes`; `global` reads the
+  `notes/` of notes_root's PARENT (deployed `/opt/tachikoma-fs/global/notes`,
+  TAC-330) — never the tree root's, so a `tachikoma` recall climbing to
+  `global` serves each note once, and an absent folder is a `global` without
+  notes; descendants drop the first segment, another tree keeps every segment
   under the root. The context's OWN notes are kept
   in step with the folder once per request (mtime+size fingerprints; after a
   restart the store is the reference): added → doc (`import_okf`) + content
@@ -164,14 +178,26 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   context has known notes; a folder deleted while the gate was down is
   removed once it is read again (e.g. recreated empty).
   Context/account names are validated BEFORE the ACL call (400). The right to
-  read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
-  context memory + deepwiki; a narrower account must equal the authenticated
-  user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
+  read is the ACCOUNT's, taken from the TOKEN: a lobby member's token (scope
+  `lobby`, read from the token's payload after `/api/auth/me` accepted it) is
+  ALWAYS served its own account, header or not; any other token with no
+  `x-tachikoma-account` (or the context's name) = the context memory +
+  deepwiki. A header naming another account than the token's is a 403 both
+  ways. A narrow account reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
   and its `ingest` is mirrored into the context memory tagged
-  `account:<account>`. ONE encoder + ONE reranker per gate
+  `account:<account>` in the id's EXACT case (tag matching is
+  case-insensitive, so older lowercased tags still match). ONE encoder + ONE reranker per gate
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
+  ONE `Memory` per key (context or account store), even at a concurrent first
+  access: `_memory_at` is double-checked under a lock PER KEY (TAC-228) — an
+  orphan instance would still write the same store, and the merge-on-save
+  would keep its facts twice.
+  A narrow account's mirror also carries `mirror_of:<own id>`, and its
+  `forget_node` forgets the mirror too (TAC-353): found by `mirror_of:`, or
+  for an older mirror by account + same content; the answer lists
+  `mirrors_forgotten` (`[]` = none found).
   A store holds ONLY its own context (TAC-936, rule C3): the deepwiki ingests
   the context's own `notes/`, never an ancestor's — inheritance is served at query time by
   tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the

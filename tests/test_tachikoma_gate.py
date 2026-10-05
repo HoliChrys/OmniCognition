@@ -148,7 +148,6 @@ def _live_note_points(m, needle):
     ("tachikoma.paralelle.GenAI", "paralelle/GenAI/notes"),   # measured: 16 docs
     ("tachikoma.paradigm", "paradigm/notes"),
     ("tachikoma", "notes"),                                    # the tree root
-    ("global", "notes"),                                       # the hierarchy root
     # Another tree lives in its own folder under the root, every segment
     # kept (TAC-934's layout): chosen by the NAME, whatever exists.
     ("demo.sandbox.alice", "demo/sandbox/alice/notes"),
@@ -156,9 +155,79 @@ def _live_note_points(m, needle):
 ])
 def test_the_dotted_name_maps_to_one_folder(ctx, expected):
     """THE MAPPING IS WRITTEN, not rediscovered: one folder per name, the
-    first segment IS the root folder, the roots read `<notes_root>/notes`."""
+    first segment IS the root folder, the tree root reads `<notes_root>/notes`."""
     root = "/opt/tachikoma-fs/global/tachikoma"
     assert gate.notes_folder(root, ctx) == os.path.join(root, *expected.split("/"))
+
+
+def test_global_reads_the_notes_of_the_parent_folder():
+    """TAC-329 option (a), TAC-330: `global` is the PARENT of the tree root in
+    the FUSE layout, its notes are `<parent>/notes` — never the tree root's,
+    which `tachikoma` reads. Deployed: `/opt/tachikoma-fs/global/notes`."""
+    root = "/opt/tachikoma-fs/global/tachikoma"
+    assert gate.notes_folder(root, "global") == "/opt/tachikoma-fs/global/notes"
+    assert gate.notes_folder(root, "global") != gate.notes_folder(root, "tachikoma")
+    assert gate.notes_folder(root + "/", "global") == "/opt/tachikoma-fs/global/notes"
+
+
+def _wiki_ids(m):
+    rows = m.journal.conn.execute("SELECT doc_id FROM wiki_docs").fetchall()
+    return sorted(r[0] for r in rows if str(r[0]).startswith("notes:"))
+
+
+def test_the_wiki_of_global_is_the_parent_notes_and_not_tachikomas(tmp_path):
+    """N notes in `<parent>/notes` are the N `notes:*` docs of `global` — and
+    none of them is listed by `tachikoma`, which lists its own folder only."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    names = [f"g{i}" for i in range(5)]
+    for name in names:
+        _write(_notes_of(root.parent) / f"{name}.md", f"# {name}\n\nGlobal note {name}.")
+    _write(_notes_of(root) / "t0.md", "# t0\n\nTree root note.")
+    mg = _test_instance(p, "global")
+    mt = _test_instance(p, "tachikoma")
+    report = p._refresh_notes("global", mg)
+    assert (report["state"], report["notes"]) == ("ok", len(names))
+    assert report["folder"] == str(root.parent / "notes")
+    p._refresh_notes("tachikoma", mt)
+    assert _wiki_ids(mg) == [f"notes:{n}" for n in names]
+    assert _wiki_ids(mt) == ["notes:t0"]
+
+
+def test_global_never_falls_back_on_the_tree_roots_notes(tmp_path):
+    """No existence cascade: `<parent>/notes` absent → `global` has NO notes,
+    even though `<notes_root>/notes` holds some."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    _write(_notes_of(root) / "t0.md", "# t0\n\nTree root note.")
+    mg = _test_instance(p, "global")
+    report = p._refresh_notes("global", mg)
+    assert (report["state"], report["notes"]) == ("no_notes", 0)
+    assert report["folder"] == str(root.parent / "notes")
+    assert _wiki_ids(mg) == [] and _live_note_points(mg, "Tree root note") == []
+
+
+def test_the_chain_of_tachikoma_sees_globals_notes_once_as_ancestor(tmp_path):
+    """The recall of `tachikoma` climbs `tachikoma` → `global` (tachikoma's
+    `recall_inherited`). Both read the same folder before TAC-330: every note
+    came back twice, once per stage. Now a `global` note lives in `global`'s
+    memory only — served once, by the ancestor stage."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    _write(_notes_of(root.parent) / "beacon.md",
+           "# Beacon\n\nThe global beacon colour is cobalt-9921.")
+    _write(_notes_of(root) / "port.md", "# Port\n\nThe tachikoma port is 8101.")
+    chain = ["tachikoma", "global"]
+    assert all(gate.is_strict_ancestor(s, "tachikoma") for s in chain[1:])
+    mems = {ctx: _test_instance(p, ctx) for ctx in chain}
+    for ctx in chain:
+        p._refresh_notes(ctx, mems[ctx])
+    per_stage = {ctx: len(_live_note_points(mems[ctx], "cobalt-9921")) for ctx in chain}
+    assert per_stage == {"tachikoma": 0, "global": 1}
+    served = [ctx for ctx in chain
+              for h in mems[ctx].retrieve("global beacon colour cobalt", k=7, rerank=False)
+              if "cobalt-9921" in (h.get("content") or "")]
+    assert served == ["global"]
 
 
 @pytest.mark.parametrize("ctx", ["", "a/../b", "../x", "a..b"])
@@ -305,10 +374,10 @@ def test_a_context_without_notes_says_so(tmp_path):
     report says NO NOTES, distinct from an engine that did not answer."""
     root, p, m = _wiki(tmp_path, ctx="global")
     assert p._refresh_notes("global", m)["state"] == "no_notes"   # folder absent
-    _notes_of(root)                                               # folder empty
+    _notes_of(root.parent)                                        # folder empty
     report = p._refresh_notes("global", m)
     assert (report["state"], report["notes"]) == ("no_notes", 0)
-    assert report["folder"] == str(root / "notes")
+    assert report["folder"] == str(root.parent / "notes")
 
 
 def _eagain_on(monkeypatch, fn_name, target):
@@ -914,6 +983,198 @@ def test_a_caller_never_borrows_another_account():
     assert r.status_code == 403 and "agent-b" in r.json()["detail"]
 
 
+# ── TAC-274: a lobby member's account is its TOKEN's, not its header's ──
+
+_CTX = "tachikoma.paralelle.GenAI"
+_MANAGER = "manager-GenAI-1545c4"
+_MEMBER = "tachikoma-GenAI-archiviste"
+
+
+def _token(user, scopes):
+    """A token in tachikoma's wire format (`serialize_token`: base64 JSON)."""
+    import base64
+    import json
+    return base64.b64encode(json.dumps(
+        {"user_id": user, "scopes": scopes, "signature": "sig"}).encode()).decode()
+
+
+def _member_token(user=_MEMBER):
+    """What `mint-lobby-member-token` hands a member (TAC-241)."""
+    return _token(user, [f"ctx:{_CTX}", "agent", "lobby"])
+
+
+def _call_as(user, token, account=None):
+    client, _ = _account_client(user=user)
+    headers = {CTX_HEADER: _CTX, "Authorization": f"Bearer {token}"}
+    if account is not None:
+        headers[ACCOUNT_HEADER] = account
+    return client.post("/mcp", headers=headers)
+
+
+def test_a_member_without_header_is_served_its_own_account():
+    """Measured before (TAC-262): served the context memory, it read the
+    manager's `fact_79014e81`. The token decides, not the header."""
+    r = _call_as(_MEMBER, _member_token())
+    assert r.status_code == 200 and r.text == f"{_CTX}|{_MEMBER}"
+
+
+def test_a_member_naming_its_own_account_is_served_it():
+    r = _call_as(_MEMBER, _member_token(), account=_MEMBER)
+    assert r.status_code == 200 and r.text == f"{_CTX}|{_MEMBER}"
+
+
+@pytest.mark.parametrize("target", [_CTX, _MANAGER, "tachikoma-GenAI-autre"])
+def test_a_member_never_reaches_the_managers_memory(target):
+    """The context's own name used to mean « the context's account » for
+    anyone; for a member it is another account than its token's: 403."""
+    r = _call_as(_MEMBER, _member_token(), account=target)
+    assert r.status_code == 403 and target in r.json()["detail"]
+
+
+def test_the_manager_never_reaches_a_members_memory():
+    manager_token = _token(_MANAGER, [f"ctx:{_CTX}", "agent"])
+    r = _call_as(_MANAGER, manager_token, account=_MEMBER)
+    assert r.status_code == 403 and _MEMBER in r.json()["detail"]
+
+
+def test_the_managers_token_stays_on_the_context_memory():
+    """No `lobby` scope: the context's account, header absent or its own."""
+    manager_token = _token(_MANAGER, [f"ctx:{_CTX}", "agent"])
+    assert _call_as(_MANAGER, manager_token).text == f"{_CTX}|"
+    # The context's name as account: the proxy reads it as the context's own.
+    assert _call_as(_MANAGER, manager_token, account=_CTX).text == f"{_CTX}|{_CTX}"
+
+
+def test_a_member_whose_id_cannot_name_a_folder_is_refused():
+    r = _call_as("../x", _member_token("../x"))
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("token", ["", "t", "not base64 !", "bnVsbA==",
+                                   "eyJ1c2VyX2lkIjogIngifQ=="])
+def test_a_token_that_carries_no_scope_reads_as_none(token):
+    """Undecodable, `null`, no `scopes` key: no scope, never an exception."""
+    assert gate.token_scopes(token) == []
+
+
+def test_the_account_tag_keeps_the_case_of_the_id(tmp_path):
+    """Measured before (TAC-262): `account:tachikoma-genai-archiviste` in the
+    tags, `accounts/tachikoma-GenAI-archiviste` on disk. Same name now."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    own_mem = _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "the archivist filed the minutes",
+                               tags=["module:gate"])
+    tag = f"account:{_MEMBER}"
+    own = [x for x in own_mem.points if x.id == pt.id][0]
+    mirror = [x for x in ctx_mem.points
+              if x.content == "the archivist filed the minutes"][0]
+    assert tag in own.tags and tag in mirror.tags
+    assert tag.lower() not in mirror.tags
+    # …the folder's very name
+    assert own_mem.storage_path == os.path.join(
+        p._root, _CTX, "accounts", _MEMBER, "memory.pkl")
+
+
+def test_reads_find_the_exact_case_tag_and_the_older_lowercased_one(tmp_path):
+    """No migration: a tag an older gate lowercased is still found, by the
+    exact id and by its lowercased form, on both read paths (the in-memory
+    `filter_list` and the journal's SQL `tag_scoped`)."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    _ingest_like_the_tool(p, "written by the new gate")
+    mirror_new = [x for x in ctx_mem.points
+                  if x.content == "written by the new gate"][0]
+    _as(_CTX, "")
+    old = _ingest_like_the_tool(p, "written by an older gate")
+    old.add_tag(f"account:{_MEMBER}")            # lowercased, as before
+    assert f"account:{_MEMBER}".lower() in old.tags
+    ctx_mem.reindex_tags()
+    want = {mirror_new.id, old.id}
+    for needle in (f"account:{_MEMBER}", f"account:{_MEMBER}".lower()):
+        assert {x.id for x in ctx_mem.filter_list(tags=[needle])} == want
+        assert {x.id for x in ctx_mem.tag_scoped(needle)} == want
+
+
+# ── TAC-353: a member's forget also forgets its mirror ─────────────────
+
+def _forget_like_the_tool(p, node_id, reason="member retracted it",
+                          superseded_by=None):
+    """What the `forget` MCP tool does with `memory` (the proxy)."""
+    out = p.forget_node(node_id, reason, superseded_by=superseded_by)
+    if out.get("forgotten") and p.storage_path:
+        p.save()
+    return out
+
+
+def _context_recalls(ctx_mem, query):
+    return [h["id"] for h in ctx_mem.retrieve(query, k=7, rerank=False)]
+
+
+def test_a_member_forget_also_forgets_the_mirror(tmp_path):
+    """Measured on GenAI: `forget` under charts answered `forgotten`, and
+    the manager still recalled the context copy (score 0.968). Write,
+    forget, recall under the context's account: the copy is gone, on disk
+    too."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    own_mem = _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "the charts palette is cobalt and amber")
+    mirror = [x for x in ctx_mem.points
+              if x.content == "the charts palette is cobalt and amber"][0]
+    _as(_CTX, "")
+    assert mirror.id in _context_recalls(ctx_mem, "charts palette cobalt amber")
+
+    _as(_CTX, _MEMBER)
+    out = _forget_like_the_tool(p, pt.id)
+    assert out["forgotten"] == pt.id
+    assert out["mirrors_forgotten"] == [mirror.id]
+
+    _as(_CTX, "")
+    assert mirror.id not in _context_recalls(ctx_mem, "charts palette cobalt amber")
+    assert pt.id not in [h["id"] for h in own_mem.retrieve(
+        "charts palette cobalt amber", k=7, rerank=False)]
+    # saved: a fresh read of the context store holds the forget
+    again = Memory(storage_path=ctx_mem.storage_path, encoder=SimpleEncoder())
+    assert "invalidated" in next(x for x in again.points if x.id == mirror.id).tags
+
+
+def test_a_member_forget_finds_a_mirror_written_before_the_tag(tmp_path):
+    """A mirror written before TAC-353 has no `mirror_of:` tag: it is found
+    by account and content — one per forget, never another account's."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "an older member fact")
+    mirror = [x for x in ctx_mem.points if x.content == "an older member fact"][0]
+    mirror.tags.remove(f"mirror_of:{pt.id}")      # as the older gate wrote it
+    _as(_CTX, "")
+    other = _ingest_like_the_tool(p, "an older member fact")
+    other.tags.append("account:someone-else")
+
+    _as(_CTX, _MEMBER)
+    assert _forget_like_the_tool(p, pt.id)["mirrors_forgotten"] == [mirror.id]
+    assert "invalidated" in mirror.tags
+    assert "invalidated" not in other.tags
+
+
+def test_a_member_forget_of_an_unknown_id_touches_no_mirror(tmp_path):
+    """A refused forget (unknown id) says so and forgets nothing anywhere."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    _ingest_like_the_tool(p, "kept fact")
+    out = _forget_like_the_tool(p, "fact_nope")
+    assert out["forgotten"] is None and "mirrors_forgotten" not in out
+    assert not any("invalidated" in x.tags for x in ctx_mem.points)
+
+
 # ── TAC-237: ONE encoder + ONE reranker per gate, loaded off the loop ───
 
 def _counting_models(monkeypatch):
@@ -982,6 +1243,107 @@ def test_the_gate_loads_the_models_off_the_event_loop():
     r = client.post("/mcp", headers={CTX_HEADER: "ctx-a"})
     assert r.status_code == 200
     assert len(warmed) == 1 and warmed[0] != int(r.text)
+
+
+# ── TAC-228: ONE Memory per context, even at a concurrent first access ──
+
+def _slow_counting_memory(monkeypatch):
+    """`Memory` whose construction is slow (as a real load is: pickle +
+    journal) and counted — the slowness opens the race window wide, so the
+    test fails reliably WITHOUT the lock; the count is what it pins."""
+    import time
+
+    import metacog.memory as M
+    born = []
+
+    class SlowMemory(M.Memory):
+        def __init__(self, *a, **kw):
+            born.append(1)
+            time.sleep(0.2)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(M, "Memory", SlowMemory)
+    return born
+
+
+def _concurrently(n, fn):
+    """Run `fn(i)` in `n` threads released together; return the results."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    start = threading.Barrier(n)
+
+    def run(i):
+        start.wait()
+        return fn(i)
+
+    with ThreadPoolExecutor(n) as pool:
+        return list(pool.map(run, range(n)))
+
+
+def test_a_concurrent_first_access_builds_one_memory(tmp_path, monkeypatch):
+    """Measured before (TAC-228): 3 threads at the first access of one
+    context gave 3 distinct `Memory`, one kept in the cache."""
+    _counting_models(monkeypatch)
+    born = _slow_counting_memory(monkeypatch)
+    p = _make_proxy(tmp_path)
+    mems = _concurrently(20, lambda i: p._memory_at("demo.sandbox.alice"))
+    assert len({id(m) for m in mems}) == 1
+    assert len(born) == 1
+    assert mems[0] is p._memories["demo.sandbox.alice"]
+
+
+def test_the_lock_is_per_context(tmp_path, monkeypatch):
+    """Two contexts first-accessed together are built side by side: the
+    lock is per key, one context's load never waits on another's."""
+    import threading
+    _counting_models(monkeypatch)
+    _slow_counting_memory(monkeypatch)
+    p = _make_proxy(tmp_path)
+    inside, peak, guard = [0], [0], threading.Lock()
+    real = p._new_memory
+
+    def watched(key):
+        with guard:
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+        try:
+            return real(key)
+        finally:
+            with guard:
+                inside[0] -= 1
+
+    monkeypatch.setattr(p, "_new_memory", watched)
+    _concurrently(2, lambda i: p._memory_at(f"ctx-{i}"))
+    assert peak[0] == 2
+
+
+def test_20_concurrent_remember_at_first_access_write_20(tmp_path,
+                                                         monkeypatch):
+    """The production measure (TAC-228): 20 concurrent `remember` at the
+    first access of a context took its store from 1 to 41 points — each
+    fact twice. Exactly +20 now, each fact once, read back from the disk."""
+    _counting_models(monkeypatch)
+    _slow_counting_memory(monkeypatch)
+    ctx = "demo.sandbox.alice"
+    seed = _make_proxy(tmp_path)
+    _as(ctx)
+    _ingest_like_the_tool(seed, "le point déjà là")
+
+    p = _make_proxy(tmp_path)          # a restarted gate: first access again
+
+    def remember(i):
+        _as(ctx)
+        return _ingest_like_the_tool(p, f"fait concurrent numéro {i}").id
+
+    ids = _concurrently(20, remember)
+    on_disk = Memory(storage_path=os.path.join(p._root, ctx, "memory.pkl"),
+                     encoder=SimpleEncoder())
+    contents = _contents(on_disk)
+    assert len(contents) == 1 + 20
+    for i in range(20):
+        assert contents.count(f"fait concurrent numéro {i}") == 1
+    assert set(ids) <= {pt.id for pt in on_disk.points}
 
 
 # ── TAC-272: a recall climbs its chain READ-ONLY under `recall-for` ────
