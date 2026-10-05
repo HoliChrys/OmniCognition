@@ -1,0 +1,11 @@
+{
+  "name": "metacog-memory",
+  "version": "0.1.0",
+  "description": "Persistent metacognitive memory for OpenClaw — MCP server (feed / ask / own tools / OKF wiki) + an internal hook that feeds every turn and consolidates the memory offline.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/HoliChrys/OmniCognition",
+  "openclaw": {
+    "hooks": ["./hooks/metacog-memory"]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "metacog": {
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/../../bin/metacog-mcp.sh"],
+      "env": {
+        "METACOG_STORAGE": "${METACOG_STORAGE}",
+        "METACOG_SURFACE": "${METACOG_SURFACE}"
+      }
+    }
+  }
+}

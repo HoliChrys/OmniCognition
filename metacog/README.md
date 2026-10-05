@@ -296,6 +296,17 @@ marker walked up from cwd > `METACOG_STORAGE` > `~/.metacog/memory.pkl`. Hooks
 are stdlib-only at the edge, import `metacog` from the plugin root, and are
 silent + exit 0 on any error. Tests: `tests/test_plugin_hooks.py`.
 
+**Other hosts** (`../integrations/`). `install.py` is the install/uninstall CLI
+(`python -m metacog.install install claude|hermes|openclaw|all`, idempotent both
+ways, `--dry-run`, removes only what it wrote). `hooks/host_bridge.py` is the
+host-agnostic CLI (`status` · `recall` · `feed` · `consolidate`) non-Python
+hosts shell out to. `integrations/hermes/` implements Hermes'
+`MemoryProvider` (prefetch / sync_turn / on_pre_compress / on_session_end +
+tools) by importing metacog directly; `integrations/openclaw/` is an internal
+hook pack (`HOOK.md` + `handler.js` → the bridge) plus `.mcp.json`, since
+OpenClaw hooks are observers and cannot inject context. Tests:
+`tests/test_integrations.py`.
+
 **Encoder.** Server and hooks resolve ONE encoder via `defaults.make_encoder()`
 (`METACOG_ENCODER`: `auto` → `FastEmbedEncoder`, mnema's multilingual
 paraphrase-MiniLM (384d, ONNX/CPU), else a warned `SimpleEncoder` fallback).
