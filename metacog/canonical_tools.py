@@ -58,6 +58,9 @@ CANONICAL: Set[str] = {
     # serve an engine the bridge cannot call.
     "feed_wiki", "wiki_doc", "wiki_list", "ingest_from_wiki", "wiki_where", "okf_schema",
     "recall", "remember",
+    # ingest_notes : the contract's notes refresh + report (TAC-938) — the
+    # tachikoma bridge calls it before listing a context's deepwiki.
+    "ingest_notes",
     "import_okf", "docs_for_node", "check_wiki", "okf_proposals", "vet_okf_type",
     "refresh_wiki",
     # wiki OBJECTS : seed queries, variables, portions, annotations, pending
