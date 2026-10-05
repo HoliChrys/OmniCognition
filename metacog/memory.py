@@ -243,6 +243,14 @@ def _forget_key(e: Any) -> tuple:
     return (repr(e),)
 
 
+def _mark_forgotten(p: Point) -> None:
+    """The `forget` contract : INVALID + tagged 'invalidated', never deleted."""
+    from metacog.epistemic import EpistemicState
+    p.state = EpistemicState.INVALID
+    if "invalidated" not in p.tags:
+        p.tags.append("invalidated")
+
+
 @dataclass
 class Memory:
     """High-level service object that orchestrates the whole pipeline."""
@@ -1167,32 +1175,90 @@ class Memory:
         LATENT merge in sleep can consume it. `superseded_by` (optional) names the
         successor node the forgotten one should merge into. Returns
         {forgotten, reason} or {forgotten: None}."""
-        from metacog.epistemic import EpistemicState
         if not reason or not str(reason).strip():
             return {"forgotten": None, "error": "reason required"}
         p = next((q for q in self.points if q.id == node_id), None)
         if p is None:
             return {"forgotten": None, "reason": "missing_node"}
         snap = self._node_snapshot(p)             # what a revert restores
-        p.state = EpistemicState.INVALID          # hidden, not deleted
-        if "invalidated" not in p.tags:
-            p.tags.append("invalidated")
+        _mark_forgotten(p)                        # hidden, not deleted
         if not hasattr(self, "_forget_log") or self._forget_log is None:
             self._forget_log = []
-        self._forget_log.append(
-            {"id": node_id, "reason": str(reason), "t": self._now()})
+        # ONE instant for the log entry and the DB event : `load` recognises
+        # the event as already in the pickle by (id, reason, t) (TAC-323).
+        t = self._now()
+        self._forget_log.append({"id": node_id, "reason": str(reason), "t": t})
         # DB event : lets the offline merge in sleep pick it up (no-op w/o journal)
         if self.journal is not None:
             try:
-                self.journal.log_forget(node_id, str(reason), superseded_by,
-                                        self._now())
+                self.journal.log_forget(node_id, str(reason), superseded_by, t)
                 # ledger row (keeper None) : the forget itself is reversible
                 self.journal.log_merge(node_id, None, "forget", str(reason),
-                                       snap, self._now())
+                                       snap, t)
             except Exception:
                 pass
         return {"forgotten": node_id, "reason": str(reason),
                 "superseded_by": superseded_by}
+
+    def _forget_is_live(self, node_id: str) -> bool:
+        """False when the newest `forget` ledger row of `node_id` was reverted
+        (`revert_merge`) : that forget must not be re-applied. True otherwise,
+        and without a journal (nothing says it was undone)."""
+        if self.journal is None:
+            return True
+        try:
+            rows = [r for r in self.journal.merge_history(node_id)
+                    if r["kind"] == "forget"]
+        except Exception:
+            return True
+        return not rows or not rows[0]["reverted"]
+
+    def _replay_forgets(self) -> List[str]:
+        """TAC-323 : re-apply the journal's forget events the loaded pickle
+        does not reflect. `forget_events` outlives the pickle (separate SQLite,
+        committed at `forget_node`), so a forget whose `save()` never happened
+        before a restart is still there. An event is replayed when its
+        (node, reason, t) entry is absent from the pickled `_forget_log` — the
+        pickle was written before the forget, so its state is stale — merged or
+        not (a sleep may have merged an event whose state was already lost),
+        unless that forget was reverted since. The node is set INVALID (never
+        deleted) and the log entry restored. Returns the replayed ids. No-op
+        and failure-safe without a journal."""
+        if self.journal is None:
+            return []
+        try:
+            events = self.journal.forget_history()
+        except Exception:
+            return []
+        logged: Dict[tuple, List[float]] = {}
+        for e in self._forget_log:
+            if isinstance(e, dict):
+                logged.setdefault((e.get("id"), e.get("reason")), []).append(
+                    float(e.get("t") or 0.0))
+        by_id = {p.id: p for p in self.points}
+        replayed: List[str] = []
+        for ev in events:
+            ts = float(ev["ts"])
+            # the pickle holds this forget : same t, or t = ts - 1 for the
+            # entries written before log and event shared one instant
+            if any(ts - 1.0 - 1e-6 <= t <= ts + 1e-6
+                   for t in logged.get((ev["node_id"], ev["reason"]), ())):
+                continue
+            p = by_id.get(ev["node_id"])
+            if p is None or not self._forget_is_live(p.id):
+                continue
+            _mark_forgotten(p)
+            self._forget_log.append(
+                {"id": ev["node_id"], "reason": ev["reason"], "t": ts})
+            logged.setdefault((ev["node_id"], ev["reason"]), []).append(ts)
+            if p.id not in replayed:
+                replayed.append(p.id)
+        if replayed:
+            import sys as _sys
+            print(f"[metacog] {self.storage_path} : replayed {len(replayed)} "
+                  f"forget(s) the store had lost : {', '.join(replayed)}",
+                  file=_sys.stderr)
+        return replayed
 
     def merge_forgotten(self) -> Dict[str, Any]:
         """LATENT merge : consume pending forget events from the DB and, for each
@@ -5725,10 +5791,17 @@ class Memory:
         if not hasattr(self, "_forget_log") or self._forget_log is None:
             self._forget_log = []
         my_forget = {_forget_key(e) for e in self._forget_log}
-        self._forget_log.extend(
-            e for e in disk.get("_forget_log", [])
-            if _forget_key(e) not in base["forget"]
-            and _forget_key(e) not in my_forget)
+        new_forgets = [e for e in disk.get("_forget_log", [])
+                       if _forget_key(e) not in base["forget"]
+                       and _forget_key(e) not in my_forget]
+        self._forget_log.extend(new_forgets)
+        # A forget the other writer saved applies to OUR copy of the node too
+        # (TAC-323) : the point list keeps ours, which would re-validate it.
+        by_id = {p.id: p for p in self.points}
+        for e in new_forgets:
+            p = by_id.get(e.get("id")) if isinstance(e, dict) else None
+            if p is not None and self._forget_is_live(p.id):
+                _mark_forgotten(p)
         self._t_clock = max(self._t_clock, disk.get("_t_clock", 0.0))
         self._spike_total_hops = max(self._spike_total_hops,
                                      disk.get("_spike_total_hops", 0))
@@ -5766,8 +5839,9 @@ class Memory:
         if source is None:
             raise ValueError("no storage_path configured and none provided")
         snapshot, st = _read_store(source)
-        if path is None or (self.storage_path is not None and
-                            os.path.abspath(path) == os.path.abspath(self.storage_path)):
+        own_store = path is None or (self.storage_path is not None and
+                                     os.path.abspath(path) == os.path.abspath(self.storage_path))
+        if own_store:
             self._mark_synced(st, snapshot)
         self.points = snapshot.get("points", [])
         self._text_index = TextIndex()          # refills lazily (not pickled)
@@ -5779,6 +5853,8 @@ class Memory:
         self._spike_total_hops = snapshot.get("_spike_total_hops", 0)
         self.decay_exponent = snapshot.get("decay_exponent", 0.5)
         self._forget_log = snapshot.get("_forget_log", [])
+        if own_store:                           # the journal is this store's
+            self._replay_forgets()              # forgets the pickle lost (TAC-323)
         self._rebuild_event_registry()
         # ENCODER MISMATCH : the stored embeddings belong to another encoder
         # (or a legacy snapshot with another dimension) — cosines would be

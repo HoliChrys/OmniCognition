@@ -400,6 +400,16 @@ class Journal:
                  "superseded_by": r["superseded_by"], "ts": r["ts"]}
                 for r in rows]
 
+    def forget_history(self) -> List[dict]:
+        """Every forget event, merged or not, oldest first — what `load`
+        replays onto a pickle that lost them (TAC-323)."""
+        rows = self.conn.execute(
+            "SELECT id, node_id, reason, superseded_by, ts, merged "
+            "FROM forget_events ORDER BY id ASC").fetchall()
+        return [{"id": r["id"], "node_id": r["node_id"], "reason": r["reason"],
+                 "superseded_by": r["superseded_by"], "ts": r["ts"],
+                 "merged": bool(r["merged"])} for r in rows]
+
     def mark_forget_merged(self, event_id: int) -> None:
         """Mark a forget event as processed by the latent merge (idempotent)."""
         self.conn.execute(
