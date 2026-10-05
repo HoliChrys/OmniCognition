@@ -38,21 +38,37 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    QUERY TIME by the caller, which asks each ancestor's memory in turn
    (`memory_engines.recall_inherited` in tachikoma) — never copied here.
 
-4. THE ACCOUNT (TAC-213) — the right to read is the ACCOUNT's, not only the
-   context's. Every caller operates under an account. By default (no
-   `x-tachikoma-account` header, or the context's own name) it is the
-   context's account — its manager's — and the caller is served the context
-   memory, as before. A NARROWER account (an agent operating in a lobby under
-   its own account) sends `x-tachikoma-account: <its user_id>` and is served
-   ITS OWN memory, `<storage_root>/<ctx>/accounts/<account>/memory.pkl`: it
-   reads only what its account wrote. The claim is VERIFIED: the account must
-   be the user the ACL authenticated — one can narrow to oneself, never borrow
-   another account (403). What a narrow account ingests is ALSO filed in the
-   context memory, tagged `account:<account>`: the context tag, so the manager
-   sees what the agents of its context learned. Mirrored: `ingest` (and
-   `remember`, which delegates to it). Other writes of a narrow account stay
-   in its own memory — the safe direction (the manager sees less, nobody sees
-   more).
+4. THE ACCOUNT (TAC-213, TAC-274) — the right to read is the ACCOUNT's, and
+   the account comes from the TOKEN, not from the header. Board rule: « un
+   agent de salon sous son propre compte ne lit que son compte ».
+   - A LOBBY MEMBER's token (tachikoma's `mint-lobby-member-token`, scope
+     `lobby`, its `user_id` the member's id) is ALWAYS served its own memory,
+     `<storage_root>/<ctx>/accounts/<user_id>/memory.pkl` — header absent or
+     naming itself, same memory. Measured before (TAC-262): a member token
+     sent without `x-tachikoma-account` was served the context memory and
+     read the manager's facts; isolation only held if the caller restricted
+     itself. The scope is read from the token's own payload, and only AFTER
+     `/api/auth/me` accepted that very token: the authority checked the
+     signature, which covers the scopes.
+   - Any other token — the context's own account (the manager's, the one
+     a lobby turn and an agent token run under) and a human the ACL lets
+     read the context through `/api/memory` — is served the context memory
+     by default, as before. It may still narrow itself to its own `user_id`.
+     The member is told apart by its TOKEN's scope, not by comparing its
+     `user_id` to the context account: omni cannot resolve that account
+     (`tachi-ctx-user` lives in tachikoma), and a human's `user_id` is not
+     it either.
+   - A header naming ANOTHER account than the token's is a 403, both ways:
+     a member naming the context (or its manager), a manager naming a
+     member. One narrows to oneself, never borrows another account.
+   What a narrow account ingests is ALSO filed in the context memory, tagged
+   `account:<user_id>` with the EXACT case of the id — the same name as its
+   folder (`accounts/tachikoma-GenAI-archiviste`, never a lowercased twin).
+   Tag reads (`metacog.tags.match_tag`) compare case-insensitively, so the
+   lowercased tags an older gate wrote are still found: no migration. Mirrored:
+   `ingest` (and `remember`, which delegates to it). Other writes of a narrow
+   account stay in its own memory — the safe direction (the manager sees
+   less, nobody sees more).
 
 5. THE MODELS ARE THE PROCESS'S, NOT THE CONTEXT'S (TAC-237) — every
    `Memory` of the gate shares ONE encoder and ONE reranker (`models()`). They
@@ -338,6 +354,33 @@ def _bearer(headers: Any) -> str:
 def _token_digest(token: str) -> bytes:
     """What the gate keeps of a bearer: its SHA-256, never the token itself."""
     return hashlib.sha256(token.encode()).digest()
+
+
+#: The scope tachikoma's `mint-lobby-member-token` stamps on a lobby member's
+#: token (TAC-241): `["ctx:<ctx>", "agent", "lobby"]`.
+LOBBY_SCOPE = "lobby"
+
+
+def token_scopes(token: str) -> list[str]:
+    """The scopes a tachikoma token carries, read from its own payload.
+
+    A tachikoma token is base64 JSON (`TokenManager.serialize_token`); its
+    signature covers `scopes`. Only meaningful for a token `/api/auth/me` has
+    ALREADY accepted — WHO stays the authority's answer, never ours. Anything
+    that does not decode carries no scope: `[]`.
+    """
+    import base64
+    import binascii
+    import json
+
+    try:
+        data = json.loads(base64.b64decode(token, validate=True))
+    except (binascii.Error, ValueError):
+        return []
+    scopes = data.get("scopes") if isinstance(data, dict) else None
+    if not isinstance(scopes, list):
+        return []
+    return [s for s in scopes if isinstance(s, str)]
 
 
 class ContextualMemory:
@@ -667,13 +710,13 @@ class ContextualMemory:
         """
         def ingest(content: str, *args: Any, **kwargs: Any) -> Any:
             p = own.ingest(content, *args, **kwargs)
-            p.add_tag(f"account:{account}")
+            _tag_account(p, account)
             _log_tags(own, p)
             ctx_mem = self._context_memory()
             # The explicit id stays the account's: in the context memory it
             # could collide with another account's — the engine names it.
             q = ctx_mem.ingest(content, kind=kwargs.get("kind", "FACT"))
-            q.add_tag(f"account:{account}")
+            _tag_account(q, account)
             _log_tags(ctx_mem, q)
             return _MirroredPoint(p, q, ctx_mem)
         return ingest
@@ -827,6 +870,18 @@ def _ingest_note(m: Any, ctx: str, doc_id: str, body: str, pid: str,
     p.add_tag(f"note:{doc_id}", f"ctx:{ctx}", "deepwiki")
     _log_tags(m, p)
     return p
+
+
+def _tag_account(p: Any, account: str) -> None:
+    """Tag `p` with `account:<account>` in the EXACT case of the id (TAC-274).
+
+    `Point.add_tag` lowercases: the tag read `account:tachikoma-genai-archiviste`
+    while the folder kept `accounts/tachikoma-GenAI-archiviste`. The tag is
+    the folder's name; reads match tags case-insensitively (`match_tag`).
+    """
+    tag = f"account:{account}"
+    if tag not in p.tags:
+        p.tags.append(tag)
 
 
 def _log_tags(m: Any, p: Any) -> None:
@@ -990,10 +1045,28 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                         authorize_fn or authorize, token, auth_ctx)
                 except Denied as e:
                     return JSONResponse({"detail": str(e)}, status_code=e.status)
+            # A LOBBY MEMBER IS ITS TOKEN'S ACCOUNT (TAC-274): with or
+            # without the header, it is served its own memory, never the
+            # context's. Measured before (TAC-262): a member token without
+            # the header read the manager's facts. A header naming anything
+            # else — the context, its manager, another member — is a 403.
+            if LOBBY_SCOPE in token_scopes(token):
+                if account and account != user:
+                    return JSONResponse(
+                        {"detail": f"{user!r} est membre de salon : il opère sous "
+                                   f"son propre compte, jamais sous {account!r}"},
+                        status_code=403)
+                if not valid_account_name(user) or user == ctx:
+                    # Its id names its folder: fail-closed, never a path
+                    # built from it, never the context memory by accident.
+                    return JSONResponse(
+                        {"detail": f"membre de salon au compte inutilisable : "
+                                   f"{user!r}"}, status_code=403)
+                account = user
             # THE ACCOUNT IS VERIFIED, never trusted: a caller narrows to ITS
             # OWN account (the user the ACL just authenticated), or stays on
             # the context's. Naming another account would read its memory.
-            if account and account != ctx and account != user:
+            elif account and account != ctx and account != user:
                 return JSONResponse(
                     {"detail": f"{user!r} ne peut pas opérer sous le compte "
                                f"{account!r} : seul son propre compte (ou celui "
