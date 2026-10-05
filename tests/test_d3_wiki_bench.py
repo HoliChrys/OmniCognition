@@ -9,6 +9,7 @@ query p95 <= 2 s; none eligible -> walk (omni); a gap under 10 points -> walk.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 import yaml
@@ -125,7 +126,8 @@ class _ScriptedLLM:
         return ""
 
 
-def test_end_to_end_on_a_tiny_corpus_never_touches_the_source_store(tmp_path):
+def _tiny(tmp_path):
+    """A live store + 2 pinned notes + 1 in-topic and 1 off-topic question."""
     from metacog.defaults import SimpleEncoder
     from metacog.memory import Memory
 
@@ -146,12 +148,161 @@ def test_end_to_end_on_a_tiny_corpus_never_touches_the_source_store(tmp_path):
     off = [{"id": "o1", "q": "recette du kouign-amann", "absent_marker": "(?i)kouign"}]
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    res = d3.run_context("tachikoma.c", spec, off, str(scratch),
+    return spec, off, str(scratch)
+
+
+def test_end_to_end_on_a_tiny_corpus_never_touches_the_source_store(tmp_path):
+    from metacog.defaults import SimpleEncoder
+
+    spec, off, scratch = _tiny(tmp_path)
+    res = d3.run_context("tachikoma.c", spec, off, scratch,
                          (SimpleEncoder(), None), _ScriptedLLM)
-    assert res["live_store_untouched"] is True
+    assert res["bench_writes_under_live_root"] == []
+    assert res["live_store_changed_by_other_process"] is False
+    assert res["stopped"] is None and res["ineligible"] == {}
+    assert res["llm"]["errors"] == 0 and not res["llm"]["cap_reached"]
     assert res["build_empty"]["sleep"]["seeds"] == 2
     assert res["build_empty"]["walk"]["ingest"]["added"] == 2
     got = {(r["strategy"], r["qid"]) for r in res["records"]}
     assert got == {(s, q) for s in ("walk", "sleep", "deployed") for q in ("q1", "o1")}
     scores = d3.score(res["records"], {"contexts": {"tachikoma.c": spec}})
     assert set(scores["tachikoma.c"]) == {"walk", "sleep", "deployed"}
+
+
+# ── guards (decision Proxy, TAC-209, 2026-10-05) ────────────────────────
+
+def test_live_write_guard_refuses_and_records_writes_but_not_reads(tmp_path):
+    live, elsewhere = tmp_path / "live", tmp_path / "scratch"
+    live.mkdir()
+    elsewhere.mkdir()
+    (live / "memory.pkl").write_bytes(b"live")
+    with d3.live_write_guard([str(live)]) as violations:
+        assert (live / "memory.pkl").read_bytes() == b"live"     # read: fine
+        (elsewhere / "x").write_text("ok")                       # outside: fine
+        for attempt in (lambda: open(live / "memory.pkl", "ab"),
+                        lambda: open(live / "new", "w"),
+                        lambda: os.open(str(live / "memory.pkl"), os.O_RDWR),
+                        lambda: os.remove(str(live / "memory.pkl")),
+                        lambda: os.replace(str(elsewhere / "x"), str(live / "x"))):
+            with pytest.raises(PermissionError):
+                attempt()
+    assert [v["event"] for v in violations] == [
+        "open", "open", "open", "os.remove", "os.rename"]
+    assert (live / "memory.pkl").read_bytes() == b"live"
+    assert sorted(os.listdir(live)) == ["memory.pkl"]
+    # outside the `with`, the (unremovable) hook is idle
+    with open(live / "after", "w") as fh:
+        fh.write("free again")
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10),
+                    reason="sqlite3.connect is audited from Python 3.10")
+def test_live_write_guard_refuses_a_sqlite_connection_unless_read_only(tmp_path):
+    import sqlite3
+    db = tmp_path / "memory.pkl.journal.db"
+    sqlite3.connect(str(db)).close()
+    with d3.live_write_guard([str(tmp_path)]) as violations:
+        with pytest.raises(PermissionError):
+            sqlite3.connect(str(db))
+        sqlite3.connect(f"file:{db}?mode=ro", uri=True).close()
+    assert [v["event"] for v in violations] == ["sqlite3.connect"]
+
+
+def test_a_write_swallowed_by_failure_safe_code_still_fails_the_run(tmp_path, monkeypatch):
+    from metacog.defaults import SimpleEncoder
+
+    spec, off, scratch = _tiny(tmp_path)
+    live_store = spec["store_source"]
+    real_build = d3._build
+
+    def leaky(*a, **kw):
+        try:                                   # a failure-safe library path
+            open(os.path.join(live_store, "memory.pkl"), "ab").close()
+        except Exception:
+            pass
+        return real_build(*a, **kw)
+    monkeypatch.setattr(d3, "_build", leaky)
+    with pytest.raises(SystemExit, match="write under a live root"):
+        d3.run_context("tachikoma.c", spec, off, scratch,
+                       (SimpleEncoder(), None), _ScriptedLLM)
+
+
+class _BrokenClientLLM:
+    """Absorbs its failure into "" like ClaudeLLM.generate, but counts it."""
+
+    def __init__(self):
+        self.llm_errors = 0
+
+    def generate(self, prompt, max_tokens=None):
+        self.llm_errors += 1
+        return ""
+
+
+def test_counting_llm_counts_absorbed_errors_and_enforces_the_cap():
+    budget = d3.new_budget(2)
+    llm = d3.CountingLLM(_BrokenClientLLM(), budget)
+    assert llm.generate("a") == "" and llm.generate("b") == ""
+    assert (llm.calls, llm.errors) == (2, 2)
+    with pytest.raises(d3.LLMCapReached):
+        llm.generate("c")                     # NOT made: inner not called
+    assert budget == {"cap": 2, "used": 2, "errors": 2, "refused": 1,
+                      "reached": True}
+    assert llm._inner.llm_errors == 2
+
+
+def test_llm_cap_stops_the_context_and_says_so(tmp_path):
+    from metacog.defaults import SimpleEncoder
+
+    spec, off, scratch = _tiny(tmp_path)
+    res = d3.run_context("tachikoma.c", spec, off, scratch,
+                         (SimpleEncoder(), None), _ScriptedLLM, llm_cap=0)
+    assert res["llm"]["cap_reached"] and res["llm"]["calls"] == 0
+    assert res["stopped"] and "LLM cap" in res["stopped"]
+    assert set(res["ineligible"]) == {"walk", "sleep"}
+    v = d3.decide({}, {"tachikoma.c": res["ineligible"]})["tachikoma.c"]
+    assert v["strategy"] == "walk" and not v["eligible"]
+
+
+def test_sleep_over_its_build_cap_is_ineligible_and_walk_still_measured(tmp_path, monkeypatch):
+    import time as _time
+
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+
+    monkeypatch.setattr(Memory, "sleep", lambda self, t=None: _time.sleep(5) or {})
+    spec, off, scratch = _tiny(tmp_path)
+    res = d3.run_context("tachikoma.c", spec, off, scratch,
+                         (SimpleEncoder(), None), _ScriptedLLM, sleep_cap_s=0.3)
+    assert res["build_empty"]["sleep"]["cap_exceeded_s"] == 0.3
+    assert res["build_empty"]["sleep"]["elapsed_s"] < 5
+    assert "sleep" in res["ineligible"] and "sleep" not in res["build_live"]
+    assert {r["strategy"] for r in res["records"]} == {"walk", "deployed"}
+    scores = d3.score(res["records"], {"contexts": {"tachikoma.c": spec}})
+    v = d3.decide({"tachikoma.c": {s: c for s, c in scores["tachikoma.c"].items()
+                                   if s in d3.STRATEGIES}},
+                  {"tachikoma.c": res["ineligible"]})["tachikoma.c"]
+    assert "cap" in v["breaches"]["sleep"][0]
+
+
+def test_decide_applies_the_rule_among_strategies_that_finished():
+    v = d3.decide({"c": {"walk": _cell(40.0)}},
+                  {"c": {"sleep": "build(sleep) exceeded the 5400 s cap"}})["c"]
+    assert v["strategy"] == "walk" and v["eligible"] == {"walk": 40.0}
+    assert v["breaches"]["sleep"] == ["build(sleep) exceeded the 5400 s cap"]
+
+
+class _ControlLLM:
+    def __init__(self, out, errors=0):
+        self.out, self.llm_errors, self.model = out, errors, "m"
+        self.last_error = "ModuleNotFoundError: No module named 'anthropic'" if errors else None
+
+    def generate(self, prompt, max_tokens=None):
+        return self.out
+
+
+def test_control_call_refuses_to_start_on_an_llm_that_does_not_answer():
+    assert d3.control_call(_ControlLLM("OK"))["ok"] is True
+    with pytest.raises(SystemExit, match="anthropic"):
+        d3.control_call(_ControlLLM("", errors=1))
+    with pytest.raises(SystemExit, match="empty answer"):
+        d3.control_call(_ControlLLM("  "))

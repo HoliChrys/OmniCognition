@@ -29,8 +29,9 @@ strategies therefore run in one omni process.
   root at the folder `notes_folder()` maps the context to.
 - The notes are pinned by sha256 in `questions.yaml`. The harness refuses a
   corpus that differs (fail-closed).
-- The live store is only read. Its sha256 is taken before and after the run,
-  and any change fails the run.
+- The live store is only read: any write the bench attempts under a live root
+  is refused and fails the run (see the amendment below; the sha256 before and
+  after are informational).
 - `global`: the folder omni reads for it (`<root>/notes` → `contexts/tachikoma/notes`)
   is **empty** (TAC-327). The bench corpus is `contexts/global/notes` (80 `.md`).
   omni does not read that folder in production. This is a bench choice, not a
@@ -82,3 +83,32 @@ both conditions:
 `tests/test_d3_wiki_bench.py`. The kept strategy is written as a
 **per-context configuration entry** that the API can read. It is never a
 global variable.
+
+## Amendment — Proxy, 2026-10-05 (TAC-209), before the rerun
+
+The first run (`c852ba2`) is void: GenAI was measured without an LLM (the
+venv had no `anthropic`; `generate` turned every failure into `""` without
+counting it), and `global` failed twice on the live-store hash, which the
+served gate legitimately changes while the bench runs. The rules, the
+measures and the question set above are unchanged. The guard rails become:
+
+- **Live store.** The run fails if the **bench** writes under a live root:
+  the stores' root (parent of `store_source`) or `notes_source`. An audit
+  hook refuses and records every such attempt (`open` in a write mode or with
+  `O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`/`O_APPEND`, `sqlite3.connect`
+  without `mode=ro`, path-mutating `os`/`shutil` events). The sha256 before
+  and after are kept for information (`live_store_changed_by_other_process`)
+  and no longer fail the run. The gate keeps serving: no write window is cut.
+- **LLM.** One control call before anything else; if it fails or answers
+  nothing, the bench does not start. Every client failure is counted
+  (`ClaudeLLM.llm_errors`, per answer and per context). The bench runs in its
+  own venv (or a `--target` overlay on `PYTHONPATH`), never the served one.
+  Credentials: the host's LiteLLM gateway if it serves the model omni asks
+  (`CLAUDE_MODEL`), else the operator's `ANTHROPIC_*`.
+- **LLM cap.** At most 1 000 LLM calls per context (`--llm-cap`). Beyond, the
+  call is refused, the context stops, `stopped` says where, and a strategy
+  whose answers did not all come back is not measured.
+- **Build cap.** `build(sleep)` is capped at 90 min (`--sleep-build-cap-s`),
+  one attempt per context. Beyond, sleep is **ineligible on that context for
+  build cost** — a result, not a failure — and the rule applies among the
+  strategies that finished (`decide(scores, ineligible)`).

@@ -31,6 +31,10 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   MCP `forget` → a new instance does not serve the id; a pickle that lost a
   forget (pending or merged event) is replayed INVALID at `load`; a reverted
   or already-pickled forget is not replayed; a stale writer keeps the forget.
+- `test_llm_errors.py` (TAC-209) pins that `ClaudeLLM.generate` never fails
+  silently: a client failure (incl. a missing `anthropic` package) answers
+  `""`, increments `llm_errors` and warns once. `test_d3_wiki_bench.py`
+  pins the D3 harness guards: no write under a live root, LLM cap, build cap.
 - `test_canonical_tools.py` asserts the tool-tier manifest partitions the live
   `@app.tool()` set EXACTLY — a new tool must be classified or it fails. The
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,

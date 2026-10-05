@@ -31,6 +31,12 @@ cross-benchmark conventions.
   sweeps `recency_weight`/`spreading_weight` on curated oblique probes with the
   real MiniLM encoder (`--favorable` = the spreading-bridge regime). Measures
   mechanism efficacy, not a LoCoMo/OBLIQ score.
+- **D3 deep-wiki bench (`d3_wiki/`):** protocol, frozen question set and
+  harness for `sleep` vs `walk` per context. It runs against COPIES of live
+  stores and must never write under a live root (audit hook, run fails); it
+  starts only after a successful LLM control call, counts every LLM error,
+  caps LLM calls per context and `build(sleep)` time. Rules in
+  `d3_wiki/PROTOCOL.md`; tests in `tests/test_d3_wiki_bench.py`.
 
 ## Work Guidance
 
