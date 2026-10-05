@@ -89,6 +89,20 @@ def _install_surface_gate(app, exposed) -> None:
 GAP_SENTINEL = "⚠ NO RELEVANT MEMORY (gap)"
 
 
+#: The reranker's relevance floor, a RAW cross-encoder logit (TAC-941). CALIBRATED,
+#: not derived — the documented exception to the hyperparameter-free rule
+#: (decision TAC-219, recorded in TAC-190's `decisions` document) : the LOWEST
+#: floor that serves no memory on the versioned off-topic queries against the
+#: real `tachikoma.paralelle.GenAI` corpus (jina-reranker-v2-base-multilingual,
+#: measured 2026-10-04, TAC-217) :
+#:     off-topic top-1 : kouign-amann FR −1.866 · météo −2.162 · kouign-amann EN −3.064
+#:     in-domain top-1 : ACL FR −1.148 · push FR −1.585 · ACL EN −1.756 · port −2.094
+#: −1.86 is the lowest two-decimal value above −1.866 ; it loses 1 of the 4
+#: in-domain queries (port, 25 % < the 50 % that would switch to a relative floor).
+#: Recalibrate on the same off-topic set when the model or the corpus changes.
+RERANK_FLOOR = -1.86
+
+
 def _gap_notice(kind: str) -> dict:
     """The in-band gap entry appended to a recall result."""
     return {
@@ -297,17 +311,37 @@ def build_app(
                         server has a reranker ; false = cosine order only.
 
         k is capped at 7 (the system's retrieval budget).
+
+        Every entry (hit or gap notice) also carries what the recall cost :
+        `pool_size`, `spread_ms`, `rerank_n`, `rerank_ms` — a key present only
+        when that stage ran (absent = did not run, never 0). Read by the
+        tachikoma recall telemetry (TAC-233 / TAC-265).
         """
         k = min(max(1, k), 7)
+        spent: dict = {}
         results = memory.retrieve(
             query, k=k, observator_id=observator_id,
             use_hybrid=use_hybrid, use_lineage=use_lineage,
             use_spreading=use_spreading, prefer_kind=prefer_kind,
-            abstain=abstain, rerank=rerank,
+            abstain=abstain, rerank=rerank, cost=spent,
         )
+        cost = {key: (round(v, 1) if isinstance(v, float) else v)
+                for key, v in spent.items()}
         if abstain and not results:
-            return [{"abstained": True, **_gap_notice("retrieve"),
+            return [{"abstained": True, **_gap_notice("retrieve"), **cost,
                      "note": "no chunk sufficiently activated — retrieval failed"}]
+        # RELEVANCE FLOOR (TAC-941) : a hit whose cross-encoder logit is under
+        # RERANK_FLOOR is not a memory. It is dropped, and when nothing is left
+        # the answer is the gap verdict alone — never the least-bad candidate
+        # (a "kouign-amann recipe" served first against an ACL corpus). Hits
+        # without a rerank score (no reranker wired) are untouched.
+        kept = [r for r in results if r.get("rerank_score", 0.0) >= RERANK_FLOOR]
+        if results and not kept:
+            return [{"abstained": True, **_gap_notice("retrieve"), **cost,
+                     "note": (f"{GAP_SENTINEL} — all {len(results)} candidates "
+                              f"scored under the reranker's relevance floor "
+                              f"(logit < {RERANK_FLOOR}) : no relevant memory.")}]
+        results = kept
         # Log the retrieval (mnema access-log) and hand back a retrieval_id
         # handle so the agent can later mark_useful(...) on it — the supervised
         # feedback that calibrates decay. Failure-safe / no-op without a journal.
@@ -326,7 +360,7 @@ def build_app(
                 results = list(results) + [_gap_notice("retrieve")]
         except Exception:
             pass
-        return results
+        return [{**r, **cost} for r in results]
 
     @app.tool()
     def retire_tool(tool_id: str, hard: bool = False,
@@ -375,7 +409,10 @@ def build_app(
         names the successor node to merge into during the next latent sleep. The
         explicit on-demand correction — distinct from the autonomic
         decay-forgetting in sleep."""
-        return memory.forget_node(node_id, reason, superseded_by=superseded_by)
+        out = memory.forget_node(node_id, reason, superseded_by=superseded_by)
+        if out.get("forgotten") and memory.storage_path:
+            memory.save()           # a forget holds from the answer on (TAC-323)
+        return out
 
     @app.tool()
     def revert_merge(node_id: str) -> dict:
@@ -563,8 +600,9 @@ def build_app(
     def ingest_notes() -> dict:
         """Re-read the served context's `notes/` folder into its deepwiki NOW
         (added / corrected / deleted notes) and report what the folder holds:
-        `state` ok | no_notes (this context HAS no notes) | outside | disabled,
-        with the doc ids added / updated / removed. The memory contract's
+        `state` ok | no_notes (this context HAS no notes) | outside | disabled
+        | error (the folder could not be read: nothing changed, retried next
+        pass), with the doc ids added / updated / removed. The memory contract's
         `ingest_notes(ctx)` (TAC-938). Only the tachikoma gate serves notes:
         a bare memory answers `state: unsupported` — said, never an empty list."""
         fn = getattr(type(memory), "ingest_notes", None)

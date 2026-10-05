@@ -23,7 +23,19 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `geometric_spread`'s O(n²) emergent threshold (median−σ) is cached on
   (subset ids, epoch) — any pull/ingest/subset change falls back to the exact
   recompute; only pure-decay drift between hits is accepted. `clear_geo_cache()`
-  is called by `sleep()` and `load()`.
+  is called by `sleep()` and `load()`. The all-pairs statistic and the
+  seeds × points scan are numpy-vectorised (`_pairwise_spread_threshold`, Gram
+  form) and must stay equal to the scalar definition to 1e-9
+  (`tests/test_spread_vectorised.py`); never reintroduce a pure-Python O(n²)
+  loop on the recall path. The O(n) signals of `retrieve_hybrid` are numpy too:
+  `_effective_matrix` (rows bit-identical to `effective_(keyword_)embedding`;
+  float64 rows cached by `_stack` on the identity of each vector TUPLE, so
+  point vectors must be REPLACED, never mutated in place — lists are never
+  cached; `clear_geo_cache()` drops it),
+  `_cosines` + `_top_pool` (stable descending, same order as the former list
+  sort); `fuzzy.fuzzy_score` runs `fuzzy_match` once per DISTINCT document token
+  and `fuzzy_match` stops its Levenshtein DP once a row exceeds the budget —
+  all guarded against the former code by `tests/test_recall_vectorised.py`.
 - `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
@@ -65,6 +77,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   clash keeps ours) → `<store>.tmp` + fsync + `os.replace`. `_read_store`
   turns any unreadable file into `CorruptStoreError`; `__post_init__`
   re-raises it (refuse to serve, file untouched).
+  **A forget is durable** (TAC-323): the MCP `forget` tool saves after
+  `forget_node`; `forget_node` stamps the log entry and the `forget_events`
+  row with ONE instant; `load` of the own store replays every journal forget
+  event (merged or not) whose (id, reason, t) is absent from the pickled
+  `_forget_log` and whose newest `forget` ledger row is not reverted
+  (`_replay_forgets` → INVALID, never deleted); `_merge_from_disk` applies a
+  forget another writer saved to our copy of the node.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
@@ -103,7 +122,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `{{name}}` placeholder per list, unplaced lists appended). `strategy="auto"`/
   `placement="auto"` let the agent decide.
 - `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
-  excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
+  excluded from `retrieve`'s search pool. Every `retrieve` entry carries the
+  recall's cost (`pool_size`, `spread_ms`, `rerank_n`, `rerank_ms` from
+  `Memory.retrieve(cost=…)`; a key only when its stage ran, never a fake 0). Bag-domain tools: `collect(ids, bag,
   description)`, `bag(name)`, `bags()` (overview with description/schema for
   decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
   `scoped_answer`, `scoped_list` (non-kNN filtered listing), `search_nodes`
@@ -111,34 +132,85 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
+  `retrieve` applies the reranker's relevance floor `RERANK_FLOOR` (a raw
+  logit): hits under it are dropped and an all-under-floor recall answers the
+  gap verdict alone (TAC-941). The value is CALIBRATED, not a constant: the
+  lowest floor that serves no memory on the versioned off-topic queries
+  against the `tachikoma.paralelle.GenAI` corpus (decision TAC-219 / TAC-190).
+  Documented exception to the hyperparameter-free invariant — recalibrate on
+  the same off-topic set when the reranker model or the corpus changes.
 - `tachikoma_gate.py` — the tachikoma deployment (`python -m
   metacog.tachikoma_gate`): one `Memory` per context behind the
   `x-tachikoma-context` header (`ContextualMemory` proxy + the context's
   `notes/` deepwiki). EVERY HTTP request passes the gate: no header → 400, then
   `authorize(token, ctx)` (mnema's ACL, ported) against the tachikoma API —
-  `/api/auth/me` (no/invalid bearer → 401), `general` exempt from authorization
-  only, `/api/hierarchy/<ctx>` existence (unknown → 403, never `makedirs`),
+  `/api/auth/me` (no/invalid bearer → 401), `/api/hierarchy/<ctx>` existence
+  (unknown → 403, never `makedirs`; no `general` exception),
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
-  rule (no candidate cascade; `global` and the tree root read
-  `<notes_root>/notes`, other trees → None). The context's OWN notes are kept
+  rule, chosen by the name only (no candidate cascade): the tree root
+  (basename of notes_root) reads `<notes_root>/notes`; `global` reads the
+  `notes/` of notes_root's PARENT (deployed `/opt/tachikoma-fs/global/notes`,
+  TAC-330) — never the tree root's, so a `tachikoma` recall climbing to
+  `global` serves each note once, and an absent folder is a `global` without
+  notes; descendants drop the first segment, another tree keeps every segment
+  under the root. The context's OWN notes are kept
   in step with the folder once per request (mtime+size fingerprints; after a
   restart the store is the reference): added → doc (`import_okf`) + content
   point whose id cites the note (`<doc_id>#<sha256[:12]>`); corrected → old
   points `forget_node`d, superseded by the new; deleted → doc removed
   (`Journal.delete_wiki_doc`) + points forgotten. `ingest_notes()` (MCP tool,
   T1) is the explicit form; its report `state` is ok | no_notes | outside |
-  disabled — a bare `Memory` answers `unsupported`.
+  disabled | error — a bare `Memory` answers `unsupported`. A read error is
+  never an absence (TAC-243): only ENOENT/ENOTDIR on the folder is
+  `no_notes`; any other `OSError` (folder or sub-folder, e.g. the FUSE's
+  EAGAIN) is `error` with nothing removed, forgotten or saved. And ENOENT is
+  an absence only once CONFIRMED (TAC-255 — the FUSE answers ENOENT for a
+  folder that exists while its backend is down): by the folder's real path
+  recorded at the last good pass (the disk behind the FUSE link; absent
+  there too → absent, present → `error`), or by a folder that is its own
+  real path. Unconfirmed (nothing read since the start) is `error` when the
+  context has known notes; a folder deleted while the gate was down is
+  removed once it is read again (e.g. recreated empty).
   Context/account names are validated BEFORE the ACL call (400). The right to
-  read is the ACCOUNT's: no `x-tachikoma-account` (or the context's name) = the
-  context memory + deepwiki; a narrower account must equal the authenticated
-  user (else 403), reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
+  read is the ACCOUNT's, taken from the TOKEN: a lobby member's token (scope
+  `lobby`, read from the token's payload after `/api/auth/me` accepted it) is
+  ALWAYS served its own account, header or not; any other token with no
+  `x-tachikoma-account` (or the context's name) = the context memory +
+  deepwiki. A header naming another account than the token's is a 403 both
+  ways. A narrow account reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
   and its `ingest` is mirrored into the context memory tagged
-  `account:<account>`. ONE encoder + ONE reranker per gate
+  `account:<account>` in the id's EXACT case (tag matching is
+  case-insensitive, so older lowercased tags still match). ONE encoder + ONE reranker per gate
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
+  ONE `Memory` per key (context or account store), even at a concurrent first
+  access: `_memory_at` is double-checked under a lock PER KEY (TAC-228) — an
+  orphan instance would still write the same store, and the merge-on-save
+  would keep its facts twice.
+  A store holds ONLY its own context (TAC-936, rule C3): the deepwiki ingests
+  the context's own `notes/`, never an ancestor's — inheritance is served at query time by
+  tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the
+  older gate are soft-forgotten on first access. An MCP session serves the
+  context it was opened under (its server task copies the `initialize`
+  request's contextvars): the middleware binds each `mcp-session-id` to its
+  (context, account) and refuses a call naming another pair (409) or an
+  unbound session (404) (TAC-934). An ancestor stage of a recall carries
+  `x-tachikoma-recall-for: <asked ctx>` (TAC-272): the ACL is asked about the
+  ASKED context, the stage must be its strict ancestor (prefix or `global`,
+  else 403), and only POST `initialize` / `notifications/initialized` /
+  `tools/list` / `tools/call` of `recall`·`retrieve`·`search_nodes` pass — any
+  write under the header → 403. The account check still applies per stage.
+  The ACL is asked ONCE per session
+  (TAC-299): the `initialize`'s yes is kept on the binding (bearer as
+  SHA-256, never in clear, + context + account + user) and reused only when
+  a request of that session carries the same bearer, context and account —
+  any difference is a full `authorize` again. Only a yes is kept (never a
+  401/403/503); it dies with the session (DELETE or eviction), no TTL. The yes
+  is kept with the context it was given on, so a read-only `recall-for` yes
+  never serves a request without that header.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

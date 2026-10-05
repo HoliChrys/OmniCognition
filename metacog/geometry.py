@@ -16,7 +16,10 @@ time.
 from __future__ import annotations
 
 import math
+import time
 from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
 
 Vector = Tuple[float, ...]
 
@@ -79,6 +82,7 @@ _SPREAD_THR_CACHE: dict = {}
 def clear_geo_cache() -> None:
     """Drop cached geometric statistics (sleep()/load() rebuild path)."""
     _SPREAD_THR_CACHE.clear()
+    _ROW_CACHE.clear()
 
 
 def effective_embedding(point: "Point", t_now: float) -> Vector:  # noqa: F821
@@ -120,6 +124,75 @@ def effective_keyword_embedding(point: "Point", t_now: float) -> Vector:  # noqa
         vec_add(tuple(point.keywords_embedding), active_now),
         point.delta_latent,
     )
+
+
+def _effective_matrix(
+    points: Sequence["Point"],  # noqa: F821
+    t_now: float,
+    *,
+    keyword: bool,
+) -> "np.ndarray":
+    """One row per point : `effective_keyword_embedding` (keyword=True) or
+    `effective_embedding` (keyword=False) at `t_now`, bit for bit — the same
+    element-wise (base + active·decay) + latent, in float64 (TAC-248)."""
+    base = _stack([p.embedding_orig for p in points], "orig")
+    if keyword:
+        has_kw = [i for i, p in enumerate(points) if p.keywords_embedding]
+        if has_kw:
+            base[has_kw] = _stack([points[i].keywords_embedding for i in has_kw], "kw")
+    active = _stack([p.delta_active for p in points], "active")
+    latent = _stack([p.delta_latent for p in points], "latent")
+    decay = np.asarray([decay_factor(t_now, p.t_last_obs) for p in points],
+                       dtype=np.float64)
+    return (base + active * decay[:, None]) + latent
+
+
+# float64 rows of point vectors, per slot, keyed on the identity of the
+# tuple each row was read from (TAC-248) : converting ~1 800 × 384 Python
+# floats per field and per recall cost more than the products themselves.
+# A point's vectors are immutable tuples that pulls REPLACE, never mutate,
+# so an identity hit is exact ; holding the tuple keeps its id from being
+# reused. Lists are converted every time. Each slot keeps only the rows of
+# its latest call, so it never outgrows one population.
+_ROW_CACHE: dict = {}
+
+
+def _stack(vectors: Sequence[Vector], slot: str) -> "np.ndarray":
+    """`np.asarray(vectors, dtype=float64)`, reusing cached rows. Fresh array."""
+    old = _ROW_CACHE.get(slot, {})
+    new: dict = {}
+    rows = []
+    for v in vectors:
+        if isinstance(v, tuple):
+            hit = new.get(id(v)) or old.get(id(v))
+            if hit is None or hit[0] is not v:
+                hit = (v, np.asarray(v, dtype=np.float64))
+            new[id(v)] = hit
+            rows.append(hit[1])
+        else:
+            rows.append(np.asarray(v, dtype=np.float64))
+    _ROW_CACHE[slot] = new
+    return np.stack(rows)
+
+
+def _cosines(q: Vector, M: "np.ndarray") -> "np.ndarray":
+    """`cosine(q, row)` for every row of M, with the same zero-norm guard."""
+    qv = np.asarray(q, dtype=np.float64)
+    nq = math.sqrt(float(qv @ qv))
+    out = np.zeros(M.shape[0], dtype=np.float64)
+    if nq < _EPS:
+        return out
+    nm = np.sqrt(np.einsum("ij,ij->i", M, M))
+    ok = nm >= _EPS
+    out[ok] = (M[ok] @ qv) / (nq * nm[ok])
+    return out
+
+
+def _top_pool(scores: "np.ndarray", points: Sequence["Point"], k: int):  # noqa: F821
+    """`sorted(zip(scores, points), key=score, reverse=True)[:k]` : descending,
+    ties kept in point order (stable), as the list sort did."""
+    order = np.argsort(-scores, kind="stable")[:k]
+    return [(float(scores[i]), points[i]) for i in order]
 
 
 def apply_pull(
@@ -330,6 +403,24 @@ def retrieve_with_lineage(
     return [(score, points_by_id[pid]) for pid, score in ranked]
 
 
+def _pairwise_spread_threshold(X: "np.ndarray") -> float:
+    """(median − σ) of all pairwise Euclidean distances between rows of X.
+
+    Same statistic as the scalar definition (upper-median of the sorted
+    distances, population σ), computed with the Gram identity
+    ‖a − b‖² = ‖a‖² + ‖b‖² − 2a·b over the strict upper triangle. Rounding
+    noise can push a near-zero d² slightly negative : clipped to 0.
+    """
+    sq = np.einsum("ij,ij->i", X, X)
+    iu, ju = np.triu_indices(X.shape[0], k=1)
+    d2 = sq[iu] + sq[ju] - 2.0 * (X @ X.T)[iu, ju]
+    dists = np.sqrt(np.clip(d2, 0.0, None))
+    mid = dists.size // 2
+    median = float(np.partition(dists, mid)[mid])
+    sigma = float(dists.std())
+    return max(0.0, median - sigma)
+
+
 def geometric_spread(
     seed_points: Sequence["Point"],  # noqa: F821
     all_points: Sequence["Point"],  # noqa: F821
@@ -361,39 +452,40 @@ def geometric_spread(
     # CACHED on (subset ids, GEO_EPOCH) — Phase 5 : reused only while no pull
     # touched the manifold and the subset is identical ; any structural change
     # falls back to this exact recompute.
-    embs = {p.id: effective_keyword_embedding(p, t_now) for p in all_points}
     pts = list(all_points)
+    # One row per point of `pts`, built as a matrix (TAC-248) ; a repeated
+    # id reuses the row of its LAST occurrence, as the former {id: emb}
+    # dict did. Vectorised with numpy (TAC-940) : the pure-Python O(n²)
+    # loop cost ~170 s per cache miss on a 1 830-point context.
+    X = _effective_matrix(pts, t_now, keyword=True)
+    last_row = {p.id: i for i, p in enumerate(pts)}
+    if len(last_row) != len(pts):
+        X = X[[last_row[p.id] for p in pts]]
     cache_key = (len(pts), hash(tuple(p.id for p in pts)))
     hit = _SPREAD_THR_CACHE.get(cache_key)
     if hit is not None and hit[0] == GEO_EPOCH:
         threshold = hit[1]
     else:
-        dists: List[float] = []
-        for i in range(len(pts)):
-            for j in range(i + 1, len(pts)):
-                dists.append(distance(embs[pts[i].id], embs[pts[j].id]))
-        if not dists:
-            return []
-        dists.sort()
-        median = dists[len(dists) // 2]
-        mean = sum(dists) / len(dists)
-        sigma = math.sqrt(sum((d - mean) ** 2 for d in dists) / len(dists))
-        threshold = max(0.0, median - sigma)
+        threshold = _pairwise_spread_threshold(X)
         _SPREAD_THR_CACHE[cache_key] = (GEO_EPOCH, threshold)
 
     seed_ids = {p.id for p in seed_points}
+    row_of = {p.id: i for i, p in enumerate(pts)}
+    candidate = np.array([p.id not in seed_ids for p in pts], dtype=bool)
     found: dict[str, float] = {}
     for seed in seed_points:
-        es = embs.get(seed.id)
-        if es is None:
+        r = row_of.get(seed.id)
+        if r is None:
             continue
-        for p in all_points:
-            if p.id in seed_ids:
-                continue
-            d = distance(es, embs[p.id])
-            if d < threshold:
-                if p.id not in found or d < found[p.id]:
-                    found[p.id] = d
+        # Direct ‖a − b‖ per row (not the Gram form) : the returned
+        # distances and the `< threshold` cut match the scalar loop.
+        d_row = np.sqrt(((X - X[r]) ** 2).sum(axis=1))
+        # Hits in point order, so `found` keeps the scalar insertion order.
+        for j in np.nonzero(candidate & (d_row < threshold))[0]:
+            pid = pts[j].id
+            d = float(d_row[j])
+            if pid not in found or d < found[pid]:
+                found[pid] = d
     by_id = {p.id: p for p in all_points}
     ranked = sorted(found.items(), key=lambda x: x[1])
     return [(d, by_id[pid]) for pid, d in ranked]
@@ -416,6 +508,7 @@ def retrieve_hybrid(
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
     restrict_kind: Optional["PointKind"] = None,  # noqa: F821
     text_index=None,
+    cost: Optional[dict] = None,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -462,14 +555,14 @@ def retrieve_hybrid(
     else:
         query_kw_emb = tuple(encoder.encode(query_text))
 
+    # Both cosine signals are one matrix-vector product over all points
+    # (TAC-248) instead of a Python loop ; same scores, same stable order.
     cosine_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
-    for p in points:
-        if not p.keywords_embedding:
-            continue
-        s = cosine(query_kw_emb, tuple(p.keywords_embedding))
-        cosine_pool.append((s, p))
-    cosine_pool.sort(key=lambda x: x[0], reverse=True)
-    cosine_pool = cosine_pool[:pool_per_signal]
+    kw_points = [p for p in points if p.keywords_embedding]
+    if kw_points:
+        K = _stack([p.keywords_embedding for p in kw_points], "kw")
+        cosine_pool = _top_pool(_cosines(query_kw_emb, K), kw_points,
+                                pool_per_signal)
 
     # Phase 1b — dense cosine on the FULL-CONTENT effective embedding.
     # Keyword cosine matches at the entity level but discards most of the
@@ -478,11 +571,10 @@ def retrieve_hybrid(
     # complementary and fused below. COMPUTATION on vectors — A(·) ⊥ P.
     query_content_emb = tuple(encoder.encode(query_text))
     content_pool: List[Tuple[float, "Point"]] = []  # noqa: F821
-    for p in points:
-        eff = effective_embedding(p, t_now)
-        content_pool.append((cosine(query_content_emb, eff), p))
-    content_pool.sort(key=lambda x: x[0], reverse=True)
-    content_pool = content_pool[:pool_per_signal]
+    if points:
+        E = _effective_matrix(points, t_now, keyword=False)
+        content_pool = _top_pool(_cosines(query_content_emb, E), points,
+                                 pool_per_signal)
 
     # Phase 2 — BM25 on raw content text (pure lexical channel).
     # bm25_score now always indexes content tokens — query_keywords are
@@ -535,7 +627,11 @@ def retrieve_hybrid(
     # neighbour membership uses the emergent (median − σ) threshold.
     if use_spreading:
         seeds = [points_by_id[pid] for pid in top_ids if pid in points_by_id]
+        t0 = time.perf_counter()
         spread = geometric_spread(seeds, points, t_now)
+        if cost is not None:                 # what the recall cost (TAC-265)
+            cost["spread_ms"] = (cost.get("spread_ms", 0.0)
+                                 + (time.perf_counter() - t0) * 1000.0)
         for srank, (_dist, p) in enumerate(spread):
             rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + srank)
         if spread:
