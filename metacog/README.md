@@ -309,9 +309,9 @@ when the stamp differs — a brain is never read in the wrong embedding space.
 rerank_pre=30)` runs mnema's pipeline — cosine pre-fetch → joint scoring →
 sigmoid → top-k — *before* the need-odds / spreading blends, and exposes the
 logit as `rerank_score`; failure-safe (cosine order kept). The oblique judge
-(`_proposition_scores`) uses the same object. The ONNX session runs on
-`METACOG_RERANK_THREADS` threads (default 4, measured TAC-265; `0` =
-onnxruntime's default). `retrieve(cost={})` fills what the recall cost —
+(`_proposition_scores`) uses the same object. `METACOG_RERANK_THREADS`
+pins the ONNX session's threads (unset = onnxruntime's default, measured best
+by TAC-265). `retrieve(cost={})` fills what the recall cost —
 `pool_size`, `spread_ms`, `rerank_n`, `rerank_ms`, a key only when its stage
 ran — and the MCP `retrieve` stamps them on every entry. Tests:
 `tests/test_reranker.py`.
