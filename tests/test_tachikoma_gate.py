@@ -148,7 +148,6 @@ def _live_note_points(m, needle):
     ("tachikoma.paralelle.GenAI", "paralelle/GenAI/notes"),   # measured: 16 docs
     ("tachikoma.paradigm", "paradigm/notes"),
     ("tachikoma", "notes"),                                    # the tree root
-    ("global", "notes"),                                       # the hierarchy root
     # Another tree lives in its own folder under the root, every segment
     # kept (TAC-934's layout): chosen by the NAME, whatever exists.
     ("demo.sandbox.alice", "demo/sandbox/alice/notes"),
@@ -156,9 +155,79 @@ def _live_note_points(m, needle):
 ])
 def test_the_dotted_name_maps_to_one_folder(ctx, expected):
     """THE MAPPING IS WRITTEN, not rediscovered: one folder per name, the
-    first segment IS the root folder, the roots read `<notes_root>/notes`."""
+    first segment IS the root folder, the tree root reads `<notes_root>/notes`."""
     root = "/opt/tachikoma-fs/global/tachikoma"
     assert gate.notes_folder(root, ctx) == os.path.join(root, *expected.split("/"))
+
+
+def test_global_reads_the_notes_of_the_parent_folder():
+    """TAC-329 option (a), TAC-330: `global` is the PARENT of the tree root in
+    the FUSE layout, its notes are `<parent>/notes` — never the tree root's,
+    which `tachikoma` reads. Deployed: `/opt/tachikoma-fs/global/notes`."""
+    root = "/opt/tachikoma-fs/global/tachikoma"
+    assert gate.notes_folder(root, "global") == "/opt/tachikoma-fs/global/notes"
+    assert gate.notes_folder(root, "global") != gate.notes_folder(root, "tachikoma")
+    assert gate.notes_folder(root + "/", "global") == "/opt/tachikoma-fs/global/notes"
+
+
+def _wiki_ids(m):
+    rows = m.journal.conn.execute("SELECT doc_id FROM wiki_docs").fetchall()
+    return sorted(r[0] for r in rows if str(r[0]).startswith("notes:"))
+
+
+def test_the_wiki_of_global_is_the_parent_notes_and_not_tachikomas(tmp_path):
+    """N notes in `<parent>/notes` are the N `notes:*` docs of `global` — and
+    none of them is listed by `tachikoma`, which lists its own folder only."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    names = [f"g{i}" for i in range(5)]
+    for name in names:
+        _write(_notes_of(root.parent) / f"{name}.md", f"# {name}\n\nGlobal note {name}.")
+    _write(_notes_of(root) / "t0.md", "# t0\n\nTree root note.")
+    mg = _test_instance(p, "global")
+    mt = _test_instance(p, "tachikoma")
+    report = p._refresh_notes("global", mg)
+    assert (report["state"], report["notes"]) == ("ok", len(names))
+    assert report["folder"] == str(root.parent / "notes")
+    p._refresh_notes("tachikoma", mt)
+    assert _wiki_ids(mg) == [f"notes:{n}" for n in names]
+    assert _wiki_ids(mt) == ["notes:t0"]
+
+
+def test_global_never_falls_back_on_the_tree_roots_notes(tmp_path):
+    """No existence cascade: `<parent>/notes` absent → `global` has NO notes,
+    even though `<notes_root>/notes` holds some."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    _write(_notes_of(root) / "t0.md", "# t0\n\nTree root note.")
+    mg = _test_instance(p, "global")
+    report = p._refresh_notes("global", mg)
+    assert (report["state"], report["notes"]) == ("no_notes", 0)
+    assert report["folder"] == str(root.parent / "notes")
+    assert _wiki_ids(mg) == [] and _live_note_points(mg, "Tree root note") == []
+
+
+def test_the_chain_of_tachikoma_sees_globals_notes_once_as_ancestor(tmp_path):
+    """The recall of `tachikoma` climbs `tachikoma` → `global` (tachikoma's
+    `recall_inherited`). Both read the same folder before TAC-330: every note
+    came back twice, once per stage. Now a `global` note lives in `global`'s
+    memory only — served once, by the ancestor stage."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    _write(_notes_of(root.parent) / "beacon.md",
+           "# Beacon\n\nThe global beacon colour is cobalt-9921.")
+    _write(_notes_of(root) / "port.md", "# Port\n\nThe tachikoma port is 8101.")
+    chain = ["tachikoma", "global"]
+    assert all(gate.is_strict_ancestor(s, "tachikoma") for s in chain[1:])
+    mems = {ctx: _test_instance(p, ctx) for ctx in chain}
+    for ctx in chain:
+        p._refresh_notes(ctx, mems[ctx])
+    per_stage = {ctx: len(_live_note_points(mems[ctx], "cobalt-9921")) for ctx in chain}
+    assert per_stage == {"tachikoma": 0, "global": 1}
+    served = [ctx for ctx in chain
+              for h in mems[ctx].retrieve("global beacon colour cobalt", k=7, rerank=False)
+              if "cobalt-9921" in (h.get("content") or "")]
+    assert served == ["global"]
 
 
 @pytest.mark.parametrize("ctx", ["", "a/../b", "../x", "a..b"])
@@ -305,10 +374,10 @@ def test_a_context_without_notes_says_so(tmp_path):
     report says NO NOTES, distinct from an engine that did not answer."""
     root, p, m = _wiki(tmp_path, ctx="global")
     assert p._refresh_notes("global", m)["state"] == "no_notes"   # folder absent
-    _notes_of(root)                                               # folder empty
+    _notes_of(root.parent)                                        # folder empty
     report = p._refresh_notes("global", m)
     assert (report["state"], report["notes"]) == ("no_notes", 0)
-    assert report["folder"] == str(root / "notes")
+    assert report["folder"] == str(root.parent / "notes")
 
 
 def _eagain_on(monkeypatch, fn_name, target):
