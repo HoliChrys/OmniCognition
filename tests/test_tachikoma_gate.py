@@ -774,3 +774,19 @@ def test_the_account_check_still_applies_under_recall_for(chain_gate):
     assert r.status_code == 403 and "someone-else" in r.json()["detail"]
     h = _open(client, {**h, ACCOUNT_HEADER: "child"})
     _ok(_call(client, h, "retrieve", {"query": "anything", "k": 3}))
+
+
+def test_a_recall_for_yes_never_serves_the_session_without_the_header(chain_gate):
+    """TAC-299 × TAC-272: the session keeps the yes WITH the context it was
+    given on. A session opened under `recall-for` (yes on the asked child,
+    read-only) that drops the header is asked again on the stage itself —
+    never served a write on the ancestor on the child's read."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    seen.clear()
+    bare = {k: v for k, v in h.items() if k != RECALL_FOR_HEADER}
+    r = _call(client, bare, "ingest", {"content": "smuggled past the cache", "kind": "FACT"})
+    assert r.status_code == 403
+    assert seen == [("child", "iso-alpha")]
+    ha = _open(client, _hdrs("admin", "iso-alpha"))
+    assert "smuggled" not in str(_ok(_call(client, ha, "stats", {})))
