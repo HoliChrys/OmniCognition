@@ -31,6 +31,10 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   MCP `forget` → a new instance does not serve the id; a pickle that lost a
   forget (pending or merged event) is replayed INVALID at `load`; a reverted
   or already-pickled forget is not replayed; a stale writer keeps the forget.
+- `test_llm_errors.py` (TAC-209) pins that `ClaudeLLM.generate` never fails
+  silently: a client failure (incl. a missing `anthropic` package) answers
+  `""`, increments `llm_errors` and warns once. `test_d3_wiki_bench.py`
+  pins the D3 harness guards: no write under a live root, LLM cap, build cap.
 - `test_canonical_tools.py` asserts the tool-tier manifest partitions the live
   `@app.tool()` set EXACTLY — a new tool must be classified or it fails. The
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,
@@ -52,6 +56,12 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   missing context header is a 400 that writes nothing. It is the `Done`
   condition of the roadmap's A/B/D tickets: never skip, xfail or weaken it.
   It runs in CI on every push and PR (`.github/workflows/context-isolation.yml`).
+
+- `test_d3_wiki_bench.py` (D3, Linear TAC-939) pins the D3 bench's scoring
+  and Proxy's decision rule at its boundaries (noise 5 %, p95 2 s, 10-point
+  gap), checks that the frozen `questions.yaml` is consistent with its pins,
+  and runs one offline end-to-end pass that must leave the source store
+  byte-identical.
 
 ## Work Guidance
 
