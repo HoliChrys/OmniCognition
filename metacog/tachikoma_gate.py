@@ -69,6 +69,11 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    `ingest` (and `remember`, which delegates to it). Other writes of a narrow
    account stay in its own memory — the safe direction (the manager sees
    less, nobody sees more).
+   A narrow account's RECALL also reads the context's NOTES — the shared
+   corpus, never another account's facts nor the manager's (TAC-345,
+   decision A of TAC-344). What is a note is the gate's to say: the points
+   `_refresh_notes` read in the folder (`_note_marks`), never a tag or an id
+   a writer chose. See `_member_retrieve`.
 
 5. THE MODELS ARE THE PROCESS'S, NOT THE CONTEXT'S (TAC-237) — every
    `Memory` of the gate shares ONE encoder and ONE reranker (`models()`). They
@@ -412,6 +417,14 @@ class ContextualMemory:
         #: backend is down: only the real path can CONFIRM an absence.
         #: In memory only — unknown after a restart (see `_scan_notes`).
         self._notes_real: dict[str, str] = {}
+        #: ctx → {doc_id: (point id, sha256 of the body READ FROM THE FILE)}
+        #: of the note content points this gate ingested or recognised
+        #: (TAC-345). THE NOTE MARK a lobby member is served by: only
+        #: `_refresh_notes` writes it, from the folder itself — a tag, an id
+        #: or a source `notes:…` is the caller's to choose, this is not.
+        #: In memory only: rebuilt by the first pass after a restart, which
+        #: reads every note (no fingerprints yet). Until then, no note.
+        self._note_marks: dict[str, dict[str, tuple[str, str]]] = {}
         #: contexts whose inherited note copies (pre-C3) were purged.
         self._inherited_purged: set[str] = set()
         #: ctx → the request number of its last notes check (once per request).
@@ -530,8 +543,10 @@ class ContextualMemory:
         """The memory the caller READS: its account's, under its context.
 
         The context's own account gets the context memory (deepwiki
-        included). A narrow account gets ONLY its own memory — no notes, no
-        other account's facts: it reads what its account wrote.
+        included). A narrow account gets its own memory — no other account's
+        facts, not the manager's: it reads what its account wrote. Its RECALL
+        (`retrieve`, `abstains`) also reads the context's notes, and only
+        them (TAC-345, see `_member_retrieve`).
         """
         name = self._ctx_name()
         account = self._account_name(name)
@@ -631,9 +646,13 @@ class ContextualMemory:
         own = _own_note_points(ctx, m)
         known_ids = {p.id for p in getattr(m, "points", [])}
         new_seen: dict[str, tuple[int, int]] = {}
+        marks = self._note_marks.get(ctx, {})
+        new_marks: dict[str, tuple[str, str]] = {}
         for doc_id, (path, fp) in on_disk.items():
             if seen is not None and seen.get(doc_id) == fp:
                 new_seen[doc_id] = fp
+                if doc_id in marks:
+                    new_marks[doc_id] = marks[doc_id]
                 report["unchanged"] += 1
                 continue
             try:
@@ -665,6 +684,7 @@ class ContextualMemory:
                     m.forget_node(p.id, f"note {doc_id} superseded by {keep.id}",
                                   superseded_by=keep.id)
             new_seen[doc_id] = fp
+            new_marks[doc_id] = (keep.id, _digest(body))
 
         # Deleted notes: what this gate ingested for ctx and the folder no
         # longer holds. Only OWN deepwiki traces are touched — never an
@@ -683,6 +703,7 @@ class ContextualMemory:
             report["removed"].append(doc_id)
 
         self._notes_seen[ctx] = new_seen
+        self._note_marks[ctx] = new_marks
         changed = report["added"] or report["updated"] or report["removed"]
         if changed and getattr(m, "storage_path", None):
             m.save()
@@ -752,6 +773,89 @@ class ContextualMemory:
             return out
         return save
 
+    # ── a member's recall: its account + the context's notes (TAC-345) ──
+    #
+    # Decision A of TAC-344: a lobby member reads, on EVERY stage of its
+    # recall chain (each stage is one call of tachikoma's `recall_inherited`,
+    # served here under that stage's context), its own account PLUS the notes
+    # of the stage's context — never another account's facts (the
+    # `account:<x>` mirrors live in the same store), never the manager's.
+    # The notes are the context's shared corpus, which the member may already
+    # read (`authorize(token, ctx)`); they are asked in the store at call time,
+    # never copied into the account (C3.3). `origin_ctx` is the stage's,
+    # stamped by the caller as for any other hit.
+
+    def _readable_notes(self) -> tuple[Any, dict[str, str]]:
+        """(context memory, {point id: content}) of the notes a member reads.
+
+        A point is a note only if `_refresh_notes` marked it — read from the
+        folder, never from what a writer chose — AND its content is still the
+        body read (same SHA-256). A `remember` tagged `deepwiki` /
+        `note:notes:…`, a source `notes:…`, an explicit id `notes:x#…`: none
+        of them is in the marks, so none passes.
+        """
+        from metacog.epistemic import EpistemicState
+
+        ctx_mem = self._context_memory()        # the notes, refreshed once per request
+        marks = {pid: digest for pid, digest
+                 in self._note_marks.get(self._ctx_name(), {}).values()}
+        notes: dict[str, str] = {}
+        for p in getattr(ctx_mem, "points", []):
+            if (p.id in marks and p.state not in (EpistemicState.INVALID,
+                                                  EpistemicState.DEPRECATED)
+                    and _digest(p.content) == marks[p.id]):
+                notes[p.id] = p.content
+        return ctx_mem, notes
+
+    def _member_retrieve(self, own: Any):
+        """`retrieve` for a narrow account: its memory, then the notes.
+
+        Two pools, one answer: the account's own retrieve, and the context
+        memory's restricted to the marked notes (`only_ids`). A hit of the
+        second pool is kept only if its id AND content are a marked note's —
+        a point that borrowed a note's id is dropped. Merged by score, cut to
+        `k`. `cost` adds both pools: the notes are part of what the stage cost
+        (E1's budget measures the stage as a whole).
+        """
+        def retrieve(query: str, **kwargs: Any) -> list:
+            k = kwargs.get("k", 7)
+            cost = kwargs.pop("cost", None)
+            abstain = kwargs.pop("abstain", False)
+            threshold = kwargs.pop("abstain_threshold", None)
+            ctx_mem, notes = self._readable_notes()
+            if abstain and own.abstains(query, threshold,
+                                        points=self._member_cloud(own, ctx_mem, notes)):
+                return []
+            spent_own: dict = {}
+            hits = list(own.retrieve(query, cost=spent_own, **kwargs))
+            spent_notes: dict = {}
+            if notes:
+                found = ctx_mem.retrieve(query, cost=spent_notes,
+                                         only_ids=list(notes), **kwargs)
+                hits += [h for h in found if notes.get(h.get("id")) == h.get("content")]
+                hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
+            if cost is not None:
+                for key in set(spent_own) | set(spent_notes):
+                    cost[key] = spent_own.get(key, 0) + spent_notes.get(key, 0)
+            return hits[:k]
+        return retrieve
+
+    @staticmethod
+    def _member_cloud(own: Any, ctx_mem: Any, notes: dict[str, str]) -> list:
+        """The points a member's recall reads: its own, and the marked notes."""
+        return [*own.points, *(p for p in ctx_mem.points
+                               if notes.get(p.id) == p.content)]
+
+    def _member_abstains(self, own: Any):
+        """`abstains` for a narrow account, over what it reads: a note that
+        stands out is an answer, not a gap — tachikoma reads a gap notice as
+        an empty stage, and would drop the note with it."""
+        def abstains(query: str, threshold: Optional[float] = None) -> bool:
+            ctx_mem, notes = self._readable_notes()
+            return own.abstains(query, threshold,
+                                points=self._member_cloud(own, ctx_mem, notes))
+        return abstains
+
     # ── delegation ────────────────────────────────────────────────────
     def __getattr__(self, name: str) -> Any:
         m = self._resolve()
@@ -760,6 +864,10 @@ class ContextualMemory:
             return self._mirrored_ingest(m, account)
         if account and name == "save":
             return self._mirrored_save(m)
+        if account and name == "retrieve":
+            return self._member_retrieve(m)
+        if account and name == "abstains":
+            return self._member_abstains(m)
         return getattr(m, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -861,6 +969,11 @@ def _own_note_points(ctx: str, m: Any) -> dict[str, list[Any]]:
         if key:
             out.setdefault(key, []).append(p)
     return out
+
+
+def _digest(text: str) -> str:
+    """The note mark's hash: SHA-256 of the text, as the gate read it."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 def _wiki_doc_exists(m: Any, doc_id: str) -> bool:

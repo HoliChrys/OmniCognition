@@ -183,10 +183,20 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   ALWAYS served its own account, header or not; any other token with no
   `x-tachikoma-account` (or the context's name) = the context memory +
   deepwiki. A header naming another account than the token's is a 403 both
-  ways. A narrow account reads ONLY `<root>/<ctx>/accounts/<account>/memory.pkl`,
+  ways. A narrow account reads `<root>/<ctx>/accounts/<account>/memory.pkl`,
   and its `ingest` is mirrored into the context memory tagged
   `account:<account>` in the id's EXACT case (tag matching is
-  case-insensitive, so older lowercased tags still match). ONE encoder + ONE reranker per gate
+  case-insensitive, so older lowercased tags still match). Its RECALL
+  (`retrieve`, `abstains`) also reads the served context's NOTES, and only
+  them (TAC-345, decision A of TAC-344): never another account's mirror nor
+  the manager's facts. A note is a point of the gate's note marks
+  (`_note_marks`: point id + SHA-256 of the body, written ONLY by
+  `_refresh_notes` from the folder) whose content still has that hash — never
+  a tag, id or `src:notes:…` a writer chose. The context store is searched at
+  call time with `Memory.retrieve(only_ids=…)`, merged with the account's
+  hits by score, costs added; the gap verdict is `abstains(points=…)` over
+  account + notes. Each stage of tachikoma's `recall_inherited` is one such
+  call, so a member reads every ancestor's notes under its `origin_ctx`. ONE encoder + ONE reranker per gate
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
