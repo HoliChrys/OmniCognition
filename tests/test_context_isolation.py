@@ -57,11 +57,14 @@ import pytest
 
 from metacog.defaults import SimpleEncoder
 
-C = "iso-alpha"                 # the witness that knows the fact
-C2 = "iso-beta"                 # its sibling — must never see it
-CHILD = "iso-alpha.child"       # c's descendant — inherits nothing by copy
+# Under the tree root `tachikoma`: the deployed gate maps ONLY the tree's
+# descendants to a notes folder (`notes_folder`, D2 / TAC-938) — any other
+# name is "outside" and would leave the wiki lane measuring nothing.
+C = "tachikoma.iso-alpha"       # the witness that knows the fact
+C2 = "tachikoma.iso-beta"       # its sibling — must never see it
+CHILD = "tachikoma.iso-alpha.child"  # c's descendant — inherits nothing by copy
 CONTEXTS = ["global", "tachikoma", "tachikoma.paralelle",
-            "tachikoma.paralelle.GenAI", C, CHILD, C2, "iso-beta.child"]
+            "tachikoma.paralelle.GenAI", C, CHILD, C2, "tachikoma.iso-beta.child"]
 
 #: Tokens that exist nowhere else: a byte search for them is unambiguous.
 FACT = "The iso-alpha vault code is vermillon-7731."
@@ -199,13 +202,13 @@ def gate(tmp_path, monkeypatch):
     monkeypatch.setattr(defaults, "make_encoder", lambda: SimpleEncoder())
     monkeypatch.setattr(defaults, "make_reranker", lambda: None)
 
-    notes = tmp_path / "notes"
+    notes = tmp_path / "tachikoma"
     # Each witness and c's child carry ONE note whose token exists nowhere
     # else. The mapping is the gate's: `iso-alpha` → <notes>/iso-alpha/notes,
     # `iso-alpha.child` → <notes>/iso-alpha/child/notes.
-    _notes(notes, C, "alpha-runbook",
+    _notes(notes, "iso-alpha", "alpha-runbook",
            "# Alpha runbook\n\nThe alpha relay frequency is saffron-5519.")
-    _notes(notes, C2, "beta-runbook",
+    _notes(notes, "iso-beta", "beta-runbook",
            "# Beta runbook\n\nThe beta relay frequency is cobalt-2290.")
     _notes(notes, "iso-alpha/child", "child-runbook",
            "# Child runbook\n\nThe child relay frequency is jade-8846.")
@@ -338,7 +341,7 @@ def test_a_contexts_notes_are_listed_by_that_context_only(gate):
             if "notes:alpha-runbook" in ids] == [C]
     assert gate.tag_rows("note:notes:alpha-runbook") == \
         {ctx: int(ctx == C) for ctx in CONTEXTS}
-    assert gate.tag_rows("ctx:iso-alpha") == \
+    assert gate.tag_rows(f"ctx:{C}") == \
         {ctx: int(ctx == C) for ctx in CONTEXTS}
     # The note's CONTENT point is served from c only (it is a RAG point, not
     # yet pickled: the gate ingests notes in memory, the next write saves).
@@ -476,3 +479,26 @@ def test_the_yes_dies_with_the_session(gate):
     r = gate.raw_call(session, "retrieve", {"query": QUERY, "k": 5})
     # Closed: the gate no longer knows the session, and asked the ACL anew.
     assert r.status_code == 404 and gate.acl_calls == [("test-token", C)]
+
+
+# ── the deepwiki of a LONG session follows its notes (TAC-938) ─────────
+
+def _session_wiki(gate, headers) -> list[str]:
+    r = gate.raw_call(headers, "wiki_list", {"prefix": "notes:"})
+    assert r.status_code == 200, r.text
+    frames = [ln[5:].strip() for ln in r.text.splitlines() if ln.startswith("data:")]
+    result = json.loads(frames[0] if frames else r.text)["result"]
+    sc = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    return [d["doc_id"] for d in sc.get("result", sc)["docs"]]
+
+
+def test_a_note_added_mid_session_is_listed_in_that_session(gate, tmp_path):
+    """A tool call runs in the session's task, whose contextvars were copied
+    at `initialize` (TAC-934): a per-request stamp held in a contextvar would
+    freeze the wiki for the whole session. The note added between two calls
+    of ONE session must be listed by the second."""
+    headers = gate.open(C)
+    assert _session_wiki(gate, headers) == ["notes:alpha-runbook"]
+    _notes(tmp_path / "tachikoma", "iso-alpha", "alpha-late",
+           "# Late note\n\nAdded while the session was open.")
+    assert _session_wiki(gate, headers) == ["notes:alpha-late", "notes:alpha-runbook"]

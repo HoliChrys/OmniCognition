@@ -26,9 +26,14 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    a token with rights on GenAI only wrote into `demo.sandbox.alice`, HTTP 200.
 
 3. The PER-CONTEXT DEEPWIKI — the `notes/` folder of the tachikoma context IS
-   its wiki: every `.md` is ingested (`import_okf`) the first time the memory
-   of that context is touched, its refs linked into the RAG. The wiki lives
-   where the notes already live — not in a parallel store that would drift.
+   its wiki: every `.md` is ingested (`import_okf` for the doc, `ingest` for
+   its content point), its refs linked into the RAG. The wiki lives where the
+   notes already live — not in a parallel store that would drift. It is
+   REFRESHED, not photographed (TAC-938): once per request the folder is
+   compared with what was ingested (mtime + size per note), so a note added,
+   corrected or deleted is reflected WITHOUT a restart. `ingest_notes()` is
+   the explicit form, and its report says what the folder holds — including
+   "this context has no notes", never an empty list read as an outage.
    ONLY THE CONTEXT'S OWN NOTES (TAC-936, rule C3): inheritance is served AT
    QUERY TIME by the caller, which asks each ancestor's memory in turn
    (`memory_engines.recall_inherited` in tachikoma) — never copied here.
@@ -96,6 +101,7 @@ import hashlib
 import hmac
 import os
 import re
+import stat
 import threading
 from contextvars import ContextVar
 from typing import Any, NamedTuple, Optional
@@ -105,6 +111,19 @@ _current_ctx: ContextVar[str] = ContextVar("tachikoma_context", default="")
 
 #: The contextvar of the caller's NARROW account ("" = the context's own).
 _current_account: ContextVar[str] = ContextVar("tachikoma_account", default="")
+
+#: The number of HTTP requests the middleware let through (TAC-938): the
+#: notes folder is re-read once per request, not once per attribute access of
+#: the proxy. NOT a contextvar: a tool call runs in its MCP session's task,
+#: whose contextvars were copied at `initialize` (TAC-934) — a per-request
+#: contextvar would freeze the wiki for the whole session (measured by
+#: `test_a_note_added_mid_session_is_listed_in_that_session`). 0 = no request
+#: yet (library use): every access re-reads.
+_requests_seen = 0
+
+#: The root of the tachikoma context hierarchy — every ancestor chain ends
+#: there. Its notes folder IS the notes_root's own `notes/` (see `notes_folder`).
+ROOT_CONTEXT = "global"
 
 #: The header tachikoma sends — same value as mnema's `CTX_HEADER`, taken
 #: verbatim so a proxy never speaks a dialect the server does not listen to.
@@ -143,6 +162,41 @@ def valid_account_name(name: str) -> bool:
     """True when `name` is an account id safe to use as ONE path component."""
     return (bool(name) and _ACCOUNT_NAME.fullmatch(name) is not None
             and ".." not in name)
+
+
+def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
+    """THE MAPPING dotted context name → its `notes/` folder (TAC-938).
+
+    ONE rule, no existence cascade — the folder need not exist (an absent
+    folder is a context WITHOUT notes, said as such, never another folder
+    tried in its place):
+
+    - `notes_root` is the folder of the TREE ROOT context, named by its last
+      path component. Deployed: `/opt/tachikoma-fs/global/tachikoma` → the
+      tree root is `tachikoma`.
+    - the tree root (`tachikoma`) and the hierarchy root (`global`, above
+      it) → `<notes_root>/notes`. Both read the same folder: `global` has no
+      folder of its own under this root (measured layout, 2026-10-04).
+    - a descendant `tachikoma.paralelle.GenAI` →
+      `<notes_root>/paralelle/GenAI/notes` — the dots are the slashes, and
+      the first segment IS the root folder, never repeated in the path.
+    - a context of ANOTHER tree (`iso-alpha.child`, `demo.sandbox.alice`)
+      lives in its own folder UNDER the notes root, every segment kept:
+      `<notes_root>/iso-alpha/child/notes` (TAC-934's layout, C3's second
+      candidate). The rule is chosen by the NAME, never by which folder
+      happens to exist.
+    - an invalid name → None: no path is ever built from it.
+    """
+    if not notes_root or not valid_context_name(ctx):
+        return None
+    root = os.path.normpath(os.path.expanduser(notes_root))
+    tree = os.path.basename(root)
+    if ctx in (tree, ROOT_CONTEXT):
+        return os.path.join(root, "notes")
+    head, _, rest = ctx.partition(".")
+    if head == tree:
+        return os.path.join(root, *rest.split("."), "notes")
+    return os.path.join(root, *ctx.split("."), "notes")
 
 # ── THE ACL — who may read which memory (mnema's `acl.py`, ported) ──────────
 #
@@ -297,7 +351,20 @@ class ContextualMemory:
         #: The root of tachikoma contexts — where each `notes/` folder lives.
         self._notes_root = os.path.expanduser(notes_root) if notes_root else None
         self._memories: dict[str, Any] = {}
-        self._ingested: set[str] = set()
+        #: ctx → {doc_id: (mtime_ns, size)} of the notes as last ingested.
+        #: In memory only: after a restart the first read compares with the
+        #: STORE (content-addressed point ids), so nothing is re-ingested twice.
+        self._notes_seen: dict[str, dict[str, tuple[int, int]]] = {}
+        #: ctx → the REAL path of its notes folder, as resolved by the last
+        #: pass that read it (TAC-255). Deployed, `notes/` is a FUSE link to
+        #: the local disk, and the FUSE answers ENOENT for it while its
+        #: backend is down: only the real path can CONFIRM an absence.
+        #: In memory only — unknown after a restart (see `_scan_notes`).
+        self._notes_real: dict[str, str] = {}
+        #: contexts whose inherited note copies (pre-C3) were purged.
+        self._inherited_purged: set[str] = set()
+        #: ctx → the request number of its last notes check (once per request).
+        self._notes_checked: dict[str, int] = {}
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
         self._models: Optional[tuple[Any, Any]] = None
         self._models_lock = threading.Lock()
@@ -365,13 +432,27 @@ class ContextualMemory:
         """The memory of the context ITSELF — its account's, the manager's."""
         name = self._ctx_name()
         m = self._memory_at(name)
-        # THE DEEPWIKI IS INGESTED ON EVERY FIRST ACCESS OF THE PROCESS, not
-        # only at creation: a memory loaded from the pickle (server restart)
-        # must find ITS notes too — otherwise the wiki only lives in the
-        # process that created the memory, and every restart loses it.
-        # `_ingested` bounds it to once per (process, context).
-        self._ingest_notes(name, m)
+        # THE DEEPWIKI IS CHECKED ONCE PER REQUEST (TAC-938), not once per
+        # process: a note added or corrected after the first access used to
+        # stay out — or stale — until the `[omni]` process restarted. The
+        # check is a stat of the folder; only a changed note costs an ingest.
+        seq = _requests_seen
+        if not seq or self._notes_checked.get(name) != seq:
+            self._notes_checked[name] = seq
+            self._refresh_notes(name, m)
         return m
+
+    def ingest_notes(self) -> dict:
+        """The CONTRACT operation `ingest_notes(ctx)` — the served context's
+        notes re-read NOW, and the report of what the folder holds.
+
+        A REAL method (not delegated): the MCP tool `ingest_notes` finds it on
+        the proxy's class; a bare `Memory` has none and says "unsupported".
+        """
+        name = self._ctx_name()
+        m = self._memory_at(name)
+        self._notes_checked[name] = _requests_seen
+        return self._refresh_notes(name, m)
 
     def _resolve(self) -> Any:
         """The memory the caller READS: its account's, under its context.
@@ -386,83 +467,162 @@ class ContextualMemory:
             return self._context_memory()
         return self._memory_at(os.path.join(name, "accounts", account))
 
-    def _ingest_notes(self, ctx: str, m: Any) -> None:
-        """The context's deepwiki: its OWN `notes/` folder, ingested once.
+    # ── the deepwiki: the context's OWN notes, kept in step with the folder ──
+    #
+    # TWO INGESTIONS PER NOTE, TWO ROLES — both kept, deliberately (TAC-938
+    # names them so no engine silently does only one):
+    #   1. the DOC — `import_okf(doc_id, body)`: frontmatter, refs, the
+    #      `wiki_list` / `wiki_doc` / `wiki_where` surface. Lives in the journal.
+    #   2. the CONTENT — `ingest(body)` as a RAG point. Measured gap: retrieve /
+    #      walk never saw the notes (docs live in the journal, the RAG indexes
+    #      points) — without it a question whose answer is IN a note returns
+    #      empty. Its id CITES the note: `<doc_id>#<sha256[:12] of the body>`,
+    #      so a recall hit names the `notes:*` doc it came from, and the id
+    #      itself tells whether the store holds the CURRENT version.
+    #
+    # ONLY THE CONTEXT'S OWN NOTES: inheritance is served at query time by the
+    # caller (TAC-936 / C3), never copied here.
 
-        Every `.md` becomes an OKF doc (`import_okf` — frontmatter + refs
-        linked into the RAG), recursively. ONCE per (ctx, process).
+    def _refresh_notes(self, ctx: str, m: Any) -> dict:
+        """Bring the context's deepwiki in step with its `notes/` folder.
 
-        NO ANCESTOR SEEDING (TAC-936, rule C3). This used to COPY every
-        ancestor's notes into the child's memory (`notes:<ancestor>/…`): a
-        note corrected in the ancestor stayed stale in every child that had
-        ingested it, since `_ingested` bounds ingestion to once per process.
-        Inheritance is now served AT QUERY TIME, by the caller asking each
-        ancestor's memory in turn; the inherited mark is the `origin_ctx` of
-        the contract, not a doc-id prefix. The copies an older gate left
-        behind are soft-forgotten here (`_forget_inherited_copies`).
+        - a note ADDED is ingested (doc + content point);
+        - a note CORRECTED is re-ingested and every older content point of it
+          is soft-forgotten (`forget_node`, superseded by the new one) — the
+          old version is no longer retrievable;
+        - a note DELETED leaves the wiki (doc removed) and its points are
+          soft-forgotten.
 
-        THE MAPPING IS THE CONTEXT PATH, NOT ITS DOTTED NAME: the context
-        `tachikoma.paralelle.GenAI` lives at
-        `<notes_root>/tachikoma/paralelle/GenAI` — the dots of the name are
-        the slashes of the folder (measured: the root is `tachikoma`, its
-        notes at `<root>/notes`, GenAI's at
-        `<root>/tachikoma/paralelle/GenAI/notes`). The FIRST segment often
-        repeats the root name, so the without-first-segment form is tried
-        first; the ROOT context's folder IS the notes_root itself.
+        Cheap when nothing moved: one stat per note, compared with the
+        fingerprints (mtime_ns, size) of the last pass. After a restart there
+        are no fingerprints: the store is the reference (content-addressed
+        ids), so an unchanged note is recognised, not re-ingested.
+
+        Returns the REPORT — `state` says what the folder is:
+        `ok` (notes indexed), `no_notes` (the folder is absent or holds no
+        `.md`: this context HAS no notes), `outside` (no folder can be built
+        from the name — an invalid name, which the gate refuses before any
+        tool runs), `disabled` (no notes_root at all),
+        `error` (the folder could not be READ — nothing was removed, nothing
+        saved, the next pass retries). A note that cannot be read is listed
+        in `errors`, never skipped silently, and is retried on the next pass.
         """
-        if ctx in self._ingested or not self._notes_root:
-            return
-        self._ingested.add(ctx)
-        self._forget_inherited_copies(ctx, m)
-        n_docs = n_points = 0
-        folder = self._note_folder(ctx)
-        if folder:
-            for root, _dirs, files in sorted(os.walk(folder)):
-                for filename in sorted(files):
-                    if not filename.endswith(".md"):
-                        continue
-                    path = os.path.join(root, filename)
-                    # The doc id keeps the RELATIVE path (collision-proof).
-                    rel = os.path.relpath(path, folder)[:-3]
-                    try:
-                        with open(path, encoding="utf-8", errors="replace") as fh:
-                            body = fh.read()
-                        doc_id = f"notes:{rel}"
-                        # TWO INGESTIONS, TWO ROLES — both asked for:
-                        # 1. import_okf: the DOC (frontmatter, refs, wiki_where/
-                        #    wiki_doc queryable) — the deepwiki structure.
-                        m.import_okf(doc_id, body)
-                        n_docs += 1
-                        # 2. ingest: the CONTENT as a RAG point — measured gap:
-                        #    retrieve/walk never saw the notes (docs live in the
-                        #    journal, the RAG indexes points). Without this, a
-                        #    question whose answer is IN a note returns empty.
-                        #    The point is tagged with its doc id + its ctx so
-                        #    the hit can be traced back to the note it came from.
-                        try:
-                            # The engine's ingest() takes NO tags (measured:
-                            # TypeError) — the MCP tool adds them to the point
-                            # AFTER creation (add_tag + journal tag index).
-                            # We mirror the tool exactly.
-                            p = m.ingest(body, kind="FACT")
-                            p.add_tag(f"note:{doc_id}", f"ctx:{ctx}",
-                                      "deepwiki")
-                            try:
-                                if m.journal is not None:
-                                    m.journal.log_tags(p.id, p.tags)
-                            except Exception:  # noqa: BLE001 — doc index only
-                                pass
-                            n_points += 1
-                        except Exception:  # noqa: BLE001 — doc stays even if the point fails
-                            print(f"[gate] content point failed: {doc_id}",
-                                  flush=True)
-                    except Exception:  # noqa: BLE001 — one unreadable note never stops the wiki
-                        print(f"[gate] unreadable note skipped: "
-                              f"{ctx}/notes/{rel}.md", flush=True)
-        if n_docs or n_points:
-            print(f"[gate] deepwiki of {ctx!r}: {n_docs} doc(s) + "
-                  f"{n_points} content point(s) ingested (own notes only)",
-                  flush=True)
+        folder = notes_folder(self._notes_root, ctx) if self._notes_root else None
+        report: dict = {"ctx": ctx, "folder": folder, "state": "ok", "notes": 0,
+                        "added": [], "updated": [], "removed": [],
+                        "unchanged": 0, "errors": []}
+        if not self._notes_root:
+            report["state"] = "disabled"
+            return report
+        if folder is None:
+            report["state"] = "outside"
+            return report
+
+        try:
+            on_disk = _scan_notes(folder, self._notes_real.get(ctx))
+        except OSError as exc:
+            # An unconfirmed absence of a context whose notes are UNKNOWN
+            # removes nothing either way: it is a context without notes.
+            if not (isinstance(exc, _UnconfirmedAbsence)
+                    and not self._notes_seen.get(ctx)
+                    and not _own_note_points(ctx, m)):
+                # A READ ERROR IS NEVER AN ABSENCE (TAC-243, TAC-255).
+                # Measured: the FUSE answered EAGAIN under load (TAC-243),
+                # then ENOENT during a `tachikoma-api` restart (TAC-255) —
+                # each time the pass removed all the docs of GenAI. Nothing
+                # is touched; the fingerprints stay those of the last good
+                # pass, so the next one retries.
+                report["state"] = "error"
+                report["errors"].append({"doc_id": None,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                print(f"[gate] deepwiki of {ctx!r}: folder unreadable, nothing "
+                      f"changed: {report['errors'][0]['error']}", flush=True)
+                return report
+            on_disk = {}
+        else:
+            try:   # strict: a component that does not answer keeps the old one
+                self._notes_real[ctx] = os.path.realpath(folder, strict=True)
+            except OSError:
+                pass
+        report["notes"] = len(on_disk)
+        fingerprints = {doc: fp for doc, (_path, fp) in on_disk.items()}
+        seen = self._notes_seen.get(ctx)
+        if seen is not None and seen == fingerprints:
+            report["unchanged"] = len(on_disk)
+            report["state"] = "ok" if on_disk else "no_notes"
+            return report
+
+        if ctx not in self._inherited_purged:
+            # Rule C3 (TAC-936): ancestor notes an older gate COPIED here.
+            self._forget_inherited_copies(ctx, m)
+            self._inherited_purged.add(ctx)
+        own = _own_note_points(ctx, m)
+        known_ids = {p.id for p in getattr(m, "points", [])}
+        new_seen: dict[str, tuple[int, int]] = {}
+        for doc_id, (path, fp) in on_disk.items():
+            if seen is not None and seen.get(doc_id) == fp:
+                new_seen[doc_id] = fp
+                report["unchanged"] += 1
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except OSError as exc:
+                report["errors"].append({"doc_id": doc_id,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            olds = own.get(doc_id.lower(), [])
+            pid = f"{doc_id}#{hashlib.sha256(body.encode('utf-8')).hexdigest()[:12]}"
+            current = [p for p in olds if p.id == pid]
+            had_doc = _wiki_doc_exists(m, doc_id)
+            if current and (had_doc or m.journal is None):
+                keep = current[0]
+                report["unchanged"] += 1
+            else:
+                try:
+                    keep = _ingest_note(m, ctx, doc_id, body, pid, known_ids)
+                except Exception as exc:  # noqa: BLE001 — said in the report, retried next pass
+                    report["errors"].append({"doc_id": doc_id,
+                                             "error": f"{type(exc).__name__}: {exc}"})
+                    continue
+                report["updated" if (olds or had_doc) else "added"].append(doc_id)
+            # Every OTHER point of this note is an older version or a duplicate
+            # left by a once-per-process gate: out of retrieval.
+            for p in olds:
+                if p.id != keep.id:
+                    m.forget_node(p.id, f"note {doc_id} superseded by {keep.id}",
+                                  superseded_by=keep.id)
+            new_seen[doc_id] = fp
+
+        # Deleted notes: what this gate ingested for ctx and the folder no
+        # longer holds. Only OWN deepwiki traces are touched — never an
+        # ancestor copy (C3's), never a doc another tool wrote.
+        present = {d.lower() for d in on_disk}
+        gone = {d for d in (seen or {}) if d.lower() not in present}
+        for key, points in own.items():
+            if key in present:
+                continue
+            for p in points:
+                m.forget_node(p.id, f"note {key} removed from notes/")
+            gone |= {d for d in _note_doc_ids(m) if d.lower() == key}
+        for doc_id in sorted(gone):
+            if m.journal is not None and _wiki_doc_exists(m, doc_id):
+                m.journal.delete_wiki_doc(doc_id)
+            report["removed"].append(doc_id)
+
+        self._notes_seen[ctx] = new_seen
+        changed = report["added"] or report["updated"] or report["removed"]
+        if changed and getattr(m, "storage_path", None):
+            m.save()
+        if changed:
+            print(f"[gate] deepwiki of {ctx!r}: +{len(report['added'])} "
+                  f"~{len(report['updated'])} -{len(report['removed'])} "
+                  f"({len(on_disk)} note(s) in {folder})", flush=True)
+        if report["errors"]:
+            print(f"[gate] deepwiki of {ctx!r}: {len(report['errors'])} "
+                  f"note(s) not ingested: {report['errors']}", flush=True)
+        report["state"] = "ok" if on_disk else "no_notes"
+        return report
 
     @staticmethod
     def _forget_inherited_copies(ctx: str, m: Any) -> None:
@@ -487,23 +647,6 @@ class ContextualMemory:
         if stale:
             print(f"[gate] {ctx!r}: {len(stale)} inherited note copie(s) "
                   f"soft-forgotten (rule C3)", flush=True)
-
-    def _note_folder(self, ctx: str) -> str:
-        """The `notes/` folder of `ctx` itself — never an ancestor's — or "".
-
-        The dotted name maps to the folder path; the FIRST segment often
-        repeats the root name, so the without-first-segment form is tried
-        first. A single-segment name is the root: its own folder if it
-        exists, else the notes_root itself stands in.
-        """
-        sub = ctx.split(".")
-        if len(sub) > 1:
-            candidates = [os.path.join(self._notes_root, *sub[1:], "notes"),
-                          os.path.join(self._notes_root, *sub, "notes")]
-        else:
-            candidates = [os.path.join(self._notes_root, *sub, "notes"),
-                          os.path.join(self._notes_root, "notes")]
-        return next((d for d in candidates if os.path.isdir(d)), "")
 
     # ── the context tag of a narrow account's writes ──────────────────
     def _mirrored_ingest(self, own: Any, account: str):
@@ -552,6 +695,130 @@ class ContextualMemory:
             super().__setattr__(name, value)
             return
         setattr(self._resolve(), name, value)
+
+
+class _UnconfirmedAbsence(OSError):
+    """The notes folder answered ENOENT / ENOTDIR and nothing confirms it."""
+
+
+def _scan_notes(folder: str, real: Optional[str] = None,
+                ) -> dict[str, tuple[str, tuple[int, int]]]:
+    """{doc_id: (path, (mtime_ns, size))} for every `.md` under `folder`,
+    recursively (measured: GenAI's `notes/trace/` held 14 notes a flat read
+    missed). The doc id keeps the RELATIVE path — collision-proof. An absent
+    folder is an empty dict: a context without notes.
+
+    ONLY an absent folder is absent (TAC-243): `ENOENT` / `ENOTDIR`, or a
+    path that is not a directory. Any other `OSError` — on the folder or on
+    any sub-folder (`EAGAIN` of the FUSE, `EIO`, `ENOTCONN`) — RAISES: an
+    unreadable folder read as empty would remove every note it holds.
+    `os.path.isdir` and a bare `os.walk` both swallow those errors.
+
+    And ENOENT itself is only an absence once CONFIRMED (TAC-255): the FUSE
+    ResourceFS answers ENOENT for a folder that exists whenever its backend
+    cannot resolve it (measured: `tachikoma-api` restarting, 17 docs of
+    GenAI removed then re-added). `real` is the folder's real path at the
+    last pass that read it — deployed, the local disk the FUSE link points
+    at. The disk confirms: absent there too → absent; present there → the
+    FUSE lied, RAISES. A folder that is its own real path (no link) is
+    answered by the filesystem that holds it → absent. No `real` (nothing
+    read since the start) → `_UnconfirmedAbsence`: the caller removes
+    nothing if the context has known notes. A notes folder deleted while
+    the gate was down is therefore confirmed by no pass — its docs stay
+    until the folder is read again, e.g. recreated EMPTY."""
+    out: dict[str, tuple[str, tuple[int, int]]] = {}
+    try:
+        st = os.stat(folder)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if real is None:
+            raise _UnconfirmedAbsence(
+                exc.errno, f"{exc.strerror}, unconfirmed: its real path is "
+                "unknown (not read since the start)", folder) from exc
+        if real != folder:
+            try:
+                st = os.stat(real)
+            except (FileNotFoundError, NotADirectoryError):
+                return out          # the disk itself says absent
+            if stat.S_ISDIR(st.st_mode):
+                raise OSError(exc.errno, f"{exc.strerror} through the FUSE, "
+                              f"yet present on disk at {real}", folder) from exc
+        return out
+    if not stat.S_ISDIR(st.st_mode):
+        return out
+
+    def _fail(exc: OSError) -> None:
+        raise exc
+
+    for root, _dirs, files in sorted(os.walk(folder, onerror=_fail)):
+        for filename in sorted(files):
+            if not filename.endswith(".md"):
+                continue
+            path = os.path.join(root, filename)
+            rel = os.path.relpath(path, folder)[:-3].replace(os.sep, "/")
+            try:
+                st = os.stat(path)
+                fp = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                # Listed but not stat-able: kept, so the read fails LOUDLY
+                # in the report instead of the note vanishing from the wiki.
+                fp = (-1, -1)
+            out[f"notes:{rel}"] = (path, fp)
+    return out
+
+
+def _own_note_points(ctx: str, m: Any) -> dict[str, list[Any]]:
+    """The context's OWN live deepwiki content points, keyed by lowercased
+    doc id. Own = tagged `ctx:<ctx>` (an ancestor copy carries its source's).
+    `add_tag` lowercases, hence the key; the content-addressed id
+    `<doc_id>#<hash>` keeps the case."""
+    from metacog.epistemic import EpistemicState
+
+    own_tag = f"ctx:{ctx}".lower()
+    out: dict[str, list[Any]] = {}
+    for p in getattr(m, "points", []):
+        tags = p.tags or []
+        if "deepwiki" not in tags or own_tag not in tags:
+            continue
+        if p.state in (EpistemicState.INVALID, EpistemicState.DEPRECATED):
+            continue
+        if "#" in p.id and p.id.startswith("notes:"):
+            key = p.id.rsplit("#", 1)[0].lower()
+        else:   # a point written before TAC-938: auto id, the doc in its tag
+            key = next((t[len("note:"):] for t in tags
+                        if t.startswith("note:notes:")), "")
+        if key:
+            out.setdefault(key, []).append(p)
+    return out
+
+
+def _wiki_doc_exists(m: Any, doc_id: str) -> bool:
+    return m.journal is not None and m.journal.get_wiki_doc(doc_id) is not None
+
+
+def _note_doc_ids(m: Any) -> list[str]:
+    """The `notes:*` doc ids of the memory's journal ([] without one)."""
+    if m.journal is None:
+        return []
+    return [d for d in m.journal.all_wiki_doc_ids() if d.startswith("notes:")]
+
+
+def _ingest_note(m: Any, ctx: str, doc_id: str, body: str, pid: str,
+                 known_ids: set) -> Any:
+    """The two ingestions of one note — the DOC, then the CONTENT point."""
+    m.import_okf(doc_id, body)
+    # A body that comes BACK (A → B → A) finds its old id taken by the
+    # forgotten point: a suffix, never a reuse of a forgotten node.
+    free, n = pid, 1
+    while free in known_ids:
+        n += 1
+        free = f"{pid}.{n}"
+    # The engine's ingest() takes NO tags (measured: TypeError) — the MCP tool
+    # adds them to the point AFTER creation (add_tag + journal tag index).
+    p = m.ingest(body, kind="FACT", id=free)
+    known_ids.add(p.id)
+    p.add_tag(f"note:{doc_id}", f"ctx:{ctx}", "deepwiki")
+    _log_tags(m, p)
+    return p
 
 
 def _log_tags(m: Any, p: Any) -> None:
@@ -749,6 +1016,9 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                 await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
+            # A new request: the notes are re-read once (TAC-938).
+            global _requests_seen
+            _requests_seen += 1
             response = await call_next(request)
             opened = (response.headers.get(SESSION_HEADER) or "").strip()
             if opened and not session:
