@@ -58,6 +58,11 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   missing context header is a 400 that writes nothing. It is the `Done`
   condition of the roadmap's A/B/D tickets: never skip, xfail or weaken it.
   It runs in CI on every push and PR (`.github/workflows/context-isolation.yml`).
+- `test_member_reads_notes.py` (TAC-345) pins decision A of TAC-344: a lobby
+  member's recall reads its account + the notes of every stage of its chain
+  (ctx → ancestors → `global`, over HTTP as `recall_inherited` asks it),
+  never another account's mirror nor the manager's facts, and a write dressed
+  as a note (tags, `src:notes:…`, a note-shaped or borrowed id) never passes.
 
 - `test_d3_wiki_bench.py` (D3, Linear TAC-939) pins the D3 bench's scoring
   and Proxy's decision rule at its boundaries (noise 5 %, p95 2 s, 10-point
