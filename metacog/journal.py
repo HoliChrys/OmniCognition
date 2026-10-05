@@ -946,16 +946,20 @@ class Journal:
     def nodes_with_tag(self, tag: str, hierarchical: bool = True) -> List[str]:
         """Node ids carrying `tag`. With `hierarchical` (default) the tag matches
         as an ANCESTOR too — querying 'health' returns nodes tagged
-        'health:condition:x' (SQL : tag = ? OR tag LIKE ?||':%'). Sorted."""
+        'health:condition:x' (SQL : tag = ? OR tag LIKE ?||':%'). Sorted.
+        Case-insensitive, like `metacog.tags.match_tag`: `account:<id>` keeps
+        the id's case (TAC-274) and older lowercased tags still match."""
         tag = str(tag)
         if hierarchical:
             rows = self.conn.execute(
-                "SELECT DISTINCT node_id FROM tags WHERE tag = ? OR tag LIKE ? "
+                "SELECT DISTINCT node_id FROM tags WHERE tag = ? COLLATE NOCASE "
+                "OR tag LIKE ? "
                 "ORDER BY node_id ASC", (tag, tag + ":%"),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT DISTINCT node_id FROM tags WHERE tag = ? ORDER BY node_id",
+                "SELECT DISTINCT node_id FROM tags WHERE tag = ? COLLATE NOCASE "
+                "ORDER BY node_id",
                 (tag,),
             ).fetchall()
         return [r["node_id"] for r in rows]

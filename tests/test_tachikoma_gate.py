@@ -914,6 +914,122 @@ def test_a_caller_never_borrows_another_account():
     assert r.status_code == 403 and "agent-b" in r.json()["detail"]
 
 
+# ── TAC-274: a lobby member's account is its TOKEN's, not its header's ──
+
+_CTX = "tachikoma.paralelle.GenAI"
+_MANAGER = "manager-GenAI-1545c4"
+_MEMBER = "tachikoma-GenAI-archiviste"
+
+
+def _token(user, scopes):
+    """A token in tachikoma's wire format (`serialize_token`: base64 JSON)."""
+    import base64
+    import json
+    return base64.b64encode(json.dumps(
+        {"user_id": user, "scopes": scopes, "signature": "sig"}).encode()).decode()
+
+
+def _member_token(user=_MEMBER):
+    """What `mint-lobby-member-token` hands a member (TAC-241)."""
+    return _token(user, [f"ctx:{_CTX}", "agent", "lobby"])
+
+
+def _call_as(user, token, account=None):
+    client, _ = _account_client(user=user)
+    headers = {CTX_HEADER: _CTX, "Authorization": f"Bearer {token}"}
+    if account is not None:
+        headers[ACCOUNT_HEADER] = account
+    return client.post("/mcp", headers=headers)
+
+
+def test_a_member_without_header_is_served_its_own_account():
+    """Measured before (TAC-262): served the context memory, it read the
+    manager's `fact_79014e81`. The token decides, not the header."""
+    r = _call_as(_MEMBER, _member_token())
+    assert r.status_code == 200 and r.text == f"{_CTX}|{_MEMBER}"
+
+
+def test_a_member_naming_its_own_account_is_served_it():
+    r = _call_as(_MEMBER, _member_token(), account=_MEMBER)
+    assert r.status_code == 200 and r.text == f"{_CTX}|{_MEMBER}"
+
+
+@pytest.mark.parametrize("target", [_CTX, _MANAGER, "tachikoma-GenAI-autre"])
+def test_a_member_never_reaches_the_managers_memory(target):
+    """The context's own name used to mean « the context's account » for
+    anyone; for a member it is another account than its token's: 403."""
+    r = _call_as(_MEMBER, _member_token(), account=target)
+    assert r.status_code == 403 and target in r.json()["detail"]
+
+
+def test_the_manager_never_reaches_a_members_memory():
+    manager_token = _token(_MANAGER, [f"ctx:{_CTX}", "agent"])
+    r = _call_as(_MANAGER, manager_token, account=_MEMBER)
+    assert r.status_code == 403 and _MEMBER in r.json()["detail"]
+
+
+def test_the_managers_token_stays_on_the_context_memory():
+    """No `lobby` scope: the context's account, header absent or its own."""
+    manager_token = _token(_MANAGER, [f"ctx:{_CTX}", "agent"])
+    assert _call_as(_MANAGER, manager_token).text == f"{_CTX}|"
+    # The context's name as account: the proxy reads it as the context's own.
+    assert _call_as(_MANAGER, manager_token, account=_CTX).text == f"{_CTX}|{_CTX}"
+
+
+def test_a_member_whose_id_cannot_name_a_folder_is_refused():
+    r = _call_as("../x", _member_token("../x"))
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("token", ["", "t", "not base64 !", "bnVsbA==",
+                                   "eyJ1c2VyX2lkIjogIngifQ=="])
+def test_a_token_that_carries_no_scope_reads_as_none(token):
+    """Undecodable, `null`, no `scopes` key: no scope, never an exception."""
+    assert gate.token_scopes(token) == []
+
+
+def test_the_account_tag_keeps_the_case_of_the_id(tmp_path):
+    """Measured before (TAC-262): `account:tachikoma-genai-archiviste` in the
+    tags, `accounts/tachikoma-GenAI-archiviste` on disk. Same name now."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    own_mem = _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "the archivist filed the minutes",
+                               tags=["module:gate"])
+    tag = f"account:{_MEMBER}"
+    own = [x for x in own_mem.points if x.id == pt.id][0]
+    mirror = [x for x in ctx_mem.points
+              if x.content == "the archivist filed the minutes"][0]
+    assert tag in own.tags and tag in mirror.tags
+    assert tag.lower() not in mirror.tags
+    # …the folder's very name
+    assert own_mem.storage_path == os.path.join(
+        p._root, _CTX, "accounts", _MEMBER, "memory.pkl")
+
+
+def test_reads_find_the_exact_case_tag_and_the_older_lowercased_one(tmp_path):
+    """No migration: a tag an older gate lowercased is still found, by the
+    exact id and by its lowercased form, on both read paths (the in-memory
+    `filter_list` and the journal's SQL `tag_scoped`)."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    _ingest_like_the_tool(p, "written by the new gate")
+    mirror_new = [x for x in ctx_mem.points
+                  if x.content == "written by the new gate"][0]
+    _as(_CTX, "")
+    old = _ingest_like_the_tool(p, "written by an older gate")
+    old.add_tag(f"account:{_MEMBER}")            # lowercased, as before
+    assert f"account:{_MEMBER}".lower() in old.tags
+    ctx_mem.reindex_tags()
+    want = {mirror_new.id, old.id}
+    for needle in (f"account:{_MEMBER}", f"account:{_MEMBER}".lower()):
+        assert {x.id for x in ctx_mem.filter_list(tags=[needle])} == want
+        assert {x.id for x in ctx_mem.tag_scoped(needle)} == want
+
+
 # ── TAC-237: ONE encoder + ONE reranker per gate, loaded off the loop ───
 
 def _counting_models(monkeypatch):
