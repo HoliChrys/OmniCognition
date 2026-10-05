@@ -982,3 +982,175 @@ def test_the_gate_loads_the_models_off_the_event_loop():
     r = client.post("/mcp", headers={CTX_HEADER: "ctx-a"})
     assert r.status_code == 200
     assert len(warmed) == 1 and warmed[0] != int(r.text)
+
+
+# ── TAC-272: a recall climbs its chain READ-ONLY under `recall-for` ────
+#
+# The real gated app over MCP streamable HTTP. The ACL is faked by TOKEN:
+# `admin` reads everything, `child` reads ONLY `iso-alpha.child` — like
+# `manager-GenAI-1545c4`, which has `read` on GenAI and none on its parents.
+
+from metacog.tachikoma_gate import RECALL_FOR_HEADER  # noqa: E402
+
+ASKED = "iso-alpha.child"
+ANCESTOR_FACT = "The iso-alpha ancestor beacon is ochre-4471."
+
+
+@pytest.fixture
+def chain_gate(tmp_path, monkeypatch):
+    import metacog.defaults as defaults
+    monkeypatch.setattr(defaults, "make_encoder", lambda: SimpleEncoder())
+    monkeypatch.setattr(defaults, "make_reranker", lambda: None)
+
+    seen = []
+
+    def fake_authorize(token, ctx):
+        seen.append((token, ctx))
+        if token == "admin" or (token == "child" and ctx == ASKED):
+            return token
+        raise gate.Denied(f"{token!r} n'a pas 'read' sur le contexte {ctx!r}")
+
+    from starlette.testclient import TestClient
+    outer, _mcp, _inner = gate.build_gated_app(
+        str(tmp_path / "store"), "", authorize_fn=fake_authorize)
+    with TestClient(outer, base_url="http://127.0.0.1:8788") as client:
+        yield client, seen
+
+
+def _hdrs(token, ctx, recall_for=None):
+    h = {"Accept": "application/json, text/event-stream",
+         "Content-Type": "application/json",
+         "Authorization": f"Bearer {token}", CTX_HEADER: ctx}
+    if recall_for:
+        h[RECALL_FOR_HEADER] = recall_for
+    return h
+
+
+def _open(client, h):
+    r = client.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "tac-272", "version": "0"}}})
+    if r.status_code != 200:
+        return r
+    h = {**h, "mcp-session-id": r.headers["mcp-session-id"]}
+    r2 = client.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert r2.status_code in (200, 202), r2.text
+    return h
+
+
+def _call(client, h, tool, args):
+    return client.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": args}})
+
+
+def _ok(r):
+    import json
+    assert r.status_code == 200, r.text
+    frames = [ln[5:].strip() for ln in r.text.splitlines() if ln.startswith("data:")]
+    payload = json.loads(frames[0] if frames else r.text)
+    assert "error" not in payload and not payload["result"].get("isError"), payload
+    return payload["result"]
+
+
+def _plant(client, ctx, content):
+    h = _open(client, _hdrs("admin", ctx))
+    return _ok(_call(client, h, "ingest", {"content": content, "kind": "FACT"}))
+
+
+@pytest.mark.parametrize("ancestor", ["iso-alpha", "global"])
+def test_a_child_reader_recalls_its_ancestors_under_recall_for(chain_gate, ancestor):
+    client, seen = chain_gate
+    _plant(client, ancestor, ANCESTOR_FACT)
+    # WITHOUT the header: the per-stage check of before — refused (the bug).
+    r = _open(client, _hdrs("child", ancestor))
+    assert r.status_code == 403 and ancestor in r.json()["detail"]
+    # WITH it: authorized on the ASKED context, the ancestor's fact served.
+    seen.clear()
+    h = _open(client, _hdrs("child", ancestor, recall_for=ASKED))
+    for tool in ("retrieve", "recall"):
+        result = _ok(_call(client, h, tool, {"query": "ancestor beacon ochre", "k": 5}))
+        assert "ochre-4471" in str(result["content"])
+    assert all(ctx == ASKED for _tok, ctx in seen) and seen
+
+
+@pytest.mark.parametrize("stage", [
+    "iso-alpha.child",          # the asked context itself: no header needed
+    "iso-alpha.child.grand",    # a child of the asked context
+    "iso-alpha.sibling",        # a sibling
+    "iso-beta",                 # off the chain
+    "iso-alph",                 # a string prefix that is not a segment prefix
+])
+def test_recall_for_serves_only_strict_ancestors(chain_gate, stage):
+    client, seen = chain_gate
+    r = client.post("/mcp", headers=_hdrs("child", stage, recall_for=ASKED),
+                    json={"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+    assert r.status_code == 403 and "ancêtre" in r.json()["detail"]
+    assert seen == []            # refused before any ACL call
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("ingest", {"content": "smuggled into the ancestor", "kind": "FACT"}),
+    ("remember", {"content": "smuggled into the ancestor"}),
+    ("forget", {"node_id": "x", "reason": "r"}),
+    ("wiki_list", {}),           # a read, but not a recall/search tool
+])
+def test_nothing_but_recall_passes_under_recall_for(chain_gate, tool, args):
+    client, _ = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    r = _call(client, h, tool, args)
+    assert r.status_code == 403 and "lecture seule" in r.json()["detail"]
+    assert repr(tool) in r.json()["detail"]
+    # The admin's view of the ancestor: nothing was written there.
+    ha = _open(client, _hdrs("admin", "iso-alpha"))
+    stats = _ok(_call(client, ha, "stats", {}))
+    assert "smuggled" not in str(stats)
+
+
+def test_a_batch_smuggling_a_write_is_refused(chain_gate):
+    client, _ = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    r = client.post("/mcp", headers=h, json=[
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "retrieve", "arguments": {"query": "q"}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "ingest", "arguments": {"content": "x"}}}])
+    assert r.status_code == 403 and "'ingest'" in r.json()["detail"]
+
+
+def test_recall_for_is_post_only_and_named(chain_gate):
+    client, _ = chain_gate
+    r = client.get("/mcp", headers=_hdrs("child", "iso-alpha", recall_for=ASKED))
+    assert r.status_code == 403 and "GET" in r.json()["detail"]
+    r = client.post("/mcp", headers=_hdrs("child", "iso-alpha", recall_for="../x"),
+                    json={"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+    assert r.status_code == 400
+
+
+def test_the_account_check_still_applies_under_recall_for(chain_gate):
+    """TAC-213 per stage: a recall stage narrows to the caller's own account,
+    never to another's."""
+    client, _ = chain_gate
+    h = _hdrs("child", "iso-alpha", recall_for=ASKED)
+    r = _open(client, {**h, ACCOUNT_HEADER: "someone-else"})
+    assert r.status_code == 403 and "someone-else" in r.json()["detail"]
+    h = _open(client, {**h, ACCOUNT_HEADER: "child"})
+    _ok(_call(client, h, "retrieve", {"query": "anything", "k": 3}))
+
+
+def test_a_recall_for_yes_never_serves_the_session_without_the_header(chain_gate):
+    """TAC-299 × TAC-272: the session keeps the yes WITH the context it was
+    given on. A session opened under `recall-for` (yes on the asked child,
+    read-only) that drops the header is asked again on the stage itself —
+    never served a write on the ancestor on the child's read."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    seen.clear()
+    bare = {k: v for k, v in h.items() if k != RECALL_FOR_HEADER}
+    r = _call(client, bare, "ingest", {"content": "smuggled past the cache", "kind": "FACT"})
+    assert r.status_code == 403
+    assert seen == [("child", "iso-alpha")]
+    ha = _open(client, _hdrs("admin", "iso-alpha"))
+    assert "smuggled" not in str(_ok(_call(client, ha, "stats", {})))

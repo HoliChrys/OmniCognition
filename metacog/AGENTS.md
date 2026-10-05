@@ -179,7 +179,20 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   context it was opened under (its server task copies the `initialize`
   request's contextvars): the middleware binds each `mcp-session-id` to its
   (context, account) and refuses a call naming another pair (409) or an
-  unbound session (404) (TAC-934).
+  unbound session (404) (TAC-934). An ancestor stage of a recall carries
+  `x-tachikoma-recall-for: <asked ctx>` (TAC-272): the ACL is asked about the
+  ASKED context, the stage must be its strict ancestor (prefix or `global`,
+  else 403), and only POST `initialize` / `notifications/initialized` /
+  `tools/list` / `tools/call` of `recall`·`retrieve`·`search_nodes` pass — any
+  write under the header → 403. The account check still applies per stage.
+  The ACL is asked ONCE per session
+  (TAC-299): the `initialize`'s yes is kept on the binding (bearer as
+  SHA-256, never in clear, + context + account + user) and reused only when
+  a request of that session carries the same bearer, context and account —
+  any difference is a full `authorize` again. Only a yes is kept (never a
+  401/403/503); it dies with the session (DELETE or eviction), no TTL. The yes
+  is kept with the context it was given on, so a read-only `recall-for` yes
+  never serves a request without that header.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +

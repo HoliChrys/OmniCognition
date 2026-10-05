@@ -19,7 +19,7 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
 2. The Starlette middleware — reads `x-tachikoma-context` from EVERY HTTP
    request and sets the contextvar. No header: 400, like mnema ("en HTTP le
    contexte est obligatoire") — fail-closed, never a default memory that would
-   mix contexts. Then THE ACL, on every request (`authorize`, mnema's
+   mix contexts. Then THE ACL, once per MCP session (8.) (`authorize`, mnema's
    `acl.authorize_read` ported): WHO (`/api/auth/me`), the context EXISTS
    (`/api/hierarchy/<ctx>` — else `_resolve` would `makedirs` a memory under
    any name), and MAY READ it (`/api/acl/check`). Measured before (TAC-214):
@@ -69,6 +69,26 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    isolation lanes (recall, capture, wiki, index) are pinned end to end in
    `tests/test_context_isolation.py`.
 
+7. A RECALL CLIMBS ITS CHAIN READ-ONLY (TAC-272) — tachikoma asks each
+   ancestor stage with `x-tachikoma-recall-for: <asked ctx>`. The ACL is then
+   asked about the ASKED context (its rights only descend, so `read` on a child
+   never reached its parents), the stage must be a strict ancestor of it, and
+   only the handshake, `tools/list` and the recall/search tools pass — any
+   write under the header is a 403. The account check stays per stage.
+
+8. ONE AUTHORIZATION PER SESSION (TAC-299) — the ACL is asked at the
+   `initialize`, and its yes is kept on the session binding: a later request
+   of the SAME session, with the SAME bearer (compared by SHA-256, never
+   stored in clear), context and account, is served on it. Any difference is
+   a full check again. Measured before: a `remote_mcp` call cost three ACL
+   rounds (initialize, notification, tools/call), each up to
+   `OMNI_ACL_TIMEOUT` (30 s), inside the 60 s the lobby grants the whole.
+   Only a yes is kept — a 401/403/503 never is — and it dies with the
+   session (DELETE, or eviction past `_SessionBindings.BOUND`): no TTL.
+   The yes is kept with the context it was GIVEN on (the asked one under
+   `x-tachikoma-recall-for`, 7.): a read-only yes never serves a request
+   without the header, nor one asked for another context.
+
 Storage: `<storage_root>/<ctx>/memory.pkl` — one memory per context, isolated,
 persistent. `global` and `tachikoma.paralelle.GenAI` share NOTHING by accident.
 Context and account names are VALIDATED before any path is built or any ACL
@@ -78,12 +98,13 @@ folders anywhere (measured: `contexts/tachikoma/paralelle/GenAI/`, nested).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import stat
 import threading
 from contextvars import ContextVar
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 #: The contextvar of the served context. Set by the middleware, read by the proxy.
 _current_ctx: ContextVar[str] = ContextVar("tachikoma_context", default="")
@@ -110,6 +131,18 @@ CTX_HEADER = "x-tachikoma-context"
 
 #: The account the caller operates under (TAC-213). Absent = the context's.
 ACCOUNT_HEADER = "x-tachikoma-account"
+
+#: The context a recall was ASKED for, sent on each ANCESTOR stage of its
+#: inheritance chain (TAC-272, rule C3). Under it, `read` on the asked context
+#: is enough to READ an ancestor's memory — the ACL's SUB_RESOURCE rights only
+#: descend, so a per-stage check stopped a non-admin's chain at `global`. The
+#: stage must be a strict ancestor of the asked context, and only the methods
+#: below pass: never a write.
+RECALL_FOR_HEADER = "x-tachikoma-recall-for"
+
+#: What a recall stage needs: the handshake, the listing, the recall/search tools.
+_RECALL_FOR_METHODS = frozenset({"initialize", "notifications/initialized", "tools/list"})
+_RECALL_FOR_TOOLS = frozenset({"recall", "retrieve", "search_nodes"})
 
 #: A tachikoma context name: dotted segments, no `/`, no empty segment — so no
 #: `..` and no absolute path can ever reach `os.path.join`.
@@ -256,9 +289,47 @@ def authorize(token: str, ctx: str) -> str:
     raise Denied(f"{user!r} n'a pas 'read' sur le contexte {ctx!r}")
 
 
+def is_strict_ancestor(stage: str, ctx: str) -> bool:
+    """`stage` is above `ctx` in its chain: a dotted prefix of it, or `global`.
+
+    The chain of tachikoma's `credential_inheritance.ancestor_chain`
+    (`a.b.c` → `a.b`, `a`, `global`) — never a sibling, a child, or `ctx`.
+    """
+    return stage != ctx and (stage == "global" or ctx.startswith(stage + "."))
+
+
+def recall_for_refusal(body: bytes) -> str:
+    """"" when every JSON-RPC message of `body` only READS, else what is refused."""
+    import json
+    try:
+        payload = json.loads(body or b"null")
+    except ValueError:
+        return "un corps illisible"
+    messages = payload if isinstance(payload, list) else [payload]
+    if not messages:
+        return "un lot vide"
+    for m in messages:
+        method = m.get("method") if isinstance(m, dict) else None
+        if method in _RECALL_FOR_METHODS:
+            continue
+        if method == "tools/call":
+            params = m.get("params")
+            name = params.get("name") if isinstance(params, dict) else None
+            if name in _RECALL_FOR_TOOLS:
+                continue
+            return f"l'outil {name!r}"
+        return f"la méthode {method!r}"
+    return ""
+
+
 def _bearer(headers: Any) -> str:
     auth = headers.get("authorization") or ""
     return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+
+
+def _token_digest(token: str) -> bytes:
+    """What the gate keeps of a bearer: its SHA-256, never the token itself."""
+    return hashlib.sha256(token.encode()).digest()
 
 
 class ContextualMemory:
@@ -781,8 +852,17 @@ class _MirroredPoint:
 SESSION_HEADER = "mcp-session-id"
 
 
+class _Binding(NamedTuple):
+    """What a session was opened under, and the yes the ACL gave it."""
+
+    pair: tuple[str, str]   # (context, account)
+    digest: bytes           # SHA-256 of the `initialize`'s bearer
+    auth_ctx: str           # the context the ACL said yes ON (TAC-272: the asked one)
+    user: str               # the user the ACL returned for it
+
+
 class _SessionBindings:
-    """session id → the (context, account) it was opened under.
+    """session id → the (context, account) it was opened under, and its yes.
 
     Bounded like the SDK's own session table (`max_sessions`, 10 000 by
     default): past the bound the OLDEST binding is dropped, and a call on
@@ -795,22 +875,26 @@ class _SessionBindings:
 
     def __init__(self) -> None:
         from collections import OrderedDict
-        self._map: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+        self._map: "OrderedDict[str, _Binding]" = OrderedDict()
         self._lock = threading.Lock()
 
-    def bind(self, session: str, pair: tuple[str, str]) -> None:
+    def bind(self, session: str, binding: _Binding) -> None:
         with self._lock:
-            self._map[session] = pair
+            self._map[session] = binding
             while len(self._map) > self.BOUND:
                 self._map.popitem(last=False)
 
-    def get(self, session: str) -> Optional[tuple[str, str]]:
+    def get(self, session: str) -> Optional[_Binding]:
         with self._lock:
             return self._map.get(session)
 
+    def drop(self, session: str) -> None:
+        with self._lock:
+            self._map.pop(session, None)
+
 
 def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
-    """The middleware class: context header, then the ACL, on EVERY request.
+    """The middleware class: context header, then the ACL, once per session.
 
     `authorize_fn(token, ctx) -> user` defaults to `authorize` (resolved at call
     time); tests inject a fake. The check is blocking urllib — run in a thread
@@ -820,6 +904,10 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
     yes: the first authorized request loads the ONNX models there — 4-10 s
     measured on the event loop before (TAC-237), omni deaf to everyone. Once
     loaded it returns at once. Only an authorized caller can trigger the load.
+
+    `authorize_fn` runs ONCE per MCP session (TAC-299): a request of a bound
+    session whose bearer, context and account are those of its `initialize`
+    reuses that yes; anything else is checked again from scratch.
     """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
@@ -845,12 +933,55 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                 return JSONResponse(
                     {"detail": f"nom de compte invalide dans {ACCOUNT_HEADER} : "
                                f"{account!r}"}, status_code=400)
+            # AN ANCESTOR STAGE OF A RECALL (TAC-272): authorized on the
+            # context the recall was asked for, READ-ONLY, and only on its
+            # chain. Checked before the ACL: a structural refusal costs no call.
+            auth_ctx = ctx
+            recall_for = (request.headers.get(RECALL_FOR_HEADER) or "").strip()
+            if recall_for:
+                if not valid_context_name(recall_for):
+                    return JSONResponse(
+                        {"detail": f"nom de contexte invalide dans "
+                                   f"{RECALL_FOR_HEADER} : {recall_for!r}"},
+                        status_code=400)
+                if not is_strict_ancestor(ctx, recall_for):
+                    return JSONResponse(
+                        {"detail": f"{ctx!r} n'est pas un ancêtre de "
+                                   f"{recall_for!r} : {RECALL_FOR_HEADER} ne "
+                                   "sert que la chaîne d'héritage"}, status_code=403)
+                refused = ("la méthode HTTP " + request.method
+                           if request.method != "POST"
+                           else recall_for_refusal(await request.body()))
+                if refused:
+                    return JSONResponse(
+                        {"detail": f"sous {RECALL_FOR_HEADER} la mémoire de "
+                                   f"{ctx!r} est en lecture seule : {refused} "
+                                   "est refusé"}, status_code=403)
+                auth_ctx = recall_for
             import anyio
-            try:
-                user = await anyio.to_thread.run_sync(
-                    authorize_fn or authorize, _bearer(request.headers), ctx)
-            except Denied as e:
-                return JSONResponse({"detail": str(e)}, status_code=e.status)
+            # The context's own account is "" whether the header is absent
+            # or names the context — the proxy reads both as the same memory.
+            pair = (ctx, "" if account == ctx else account)
+            session = (request.headers.get(SESSION_HEADER) or "").strip()
+            bound = sessions.get(session) if session else None
+            token = _bearer(request.headers)
+            digest = _token_digest(token)
+            # ONE AUTHORIZATION PER SESSION (TAC-299): the yes of the
+            # `initialize` serves the rest of ITS session, and only when
+            # bearer, context, account and the context the yes was given on
+            # (`auth_ctx`, TAC-272) are all the same. Anything else —
+            # another bearer, another context, another account, an unbound
+            # session — goes through the full check below.
+            if (bound is not None and bound.pair == pair
+                    and bound.auth_ctx == auth_ctx
+                    and hmac.compare_digest(bound.digest, digest)):
+                user = bound.user
+            else:
+                try:
+                    user = await anyio.to_thread.run_sync(
+                        authorize_fn or authorize, token, auth_ctx)
+                except Denied as e:
+                    return JSONResponse({"detail": str(e)}, status_code=e.status)
             # THE ACCOUNT IS VERIFIED, never trusted: a caller narrows to ITS
             # OWN account (the user the ACL just authenticated), or stays on
             # the context's. Naming another account would read its memory.
@@ -868,21 +999,17 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
             # beta), was served alpha's fact. So a session is bound to its
             # (context, account) and a request that names another pair is
             # refused — never served a memory its header did not ask for.
-            # The context's own account is "" whether the header is absent
-            # or names the context — the proxy reads both as the same memory.
-            pair = (ctx, "" if account == ctx else account)
-            session = (request.headers.get(SESSION_HEADER) or "").strip()
             if session:
-                bound = sessions.get(session)
                 if bound is None:
                     return JSONResponse(
                         {"detail": f"session MCP inconnue du gate : {session!r} "
                                    "— rouvrir une session (initialize)"},
                         status_code=404)
-                if bound != pair:
+                if bound.pair != pair:
                     return JSONResponse(
                         {"detail": f"la session {session!r} a été ouverte sous le "
-                                   f"contexte {bound[0]!r} (compte {bound[1]!r}) : "
+                                   f"contexte {bound.pair[0]!r} "
+                                   f"(compte {bound.pair[1]!r}) : "
                                    f"elle ne sert pas {ctx!r} (compte {pair[1]!r}) "
                                    "— une session par contexte"}, status_code=409)
             if warm is not None:
@@ -895,7 +1022,12 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
             response = await call_next(request)
             opened = (response.headers.get(SESSION_HEADER) or "").strip()
             if opened and not session:
-                sessions.bind(opened, pair)
+                # Reached only past a yes of the ACL: a refusal is never kept.
+                sessions.bind(opened, _Binding(pair, digest, auth_ctx, user))
+            elif (session and request.method == "DELETE"
+                  and response.status_code < 300):
+                # The session is closed: its yes dies with it.
+                sessions.drop(session)
             return response
 
     return _ContextGate
