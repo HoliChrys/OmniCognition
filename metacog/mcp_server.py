@@ -594,6 +594,22 @@ def build_app(
         return {"docs": [{"doc_id": i} for i in ids], "count": len(ids)}
 
     @app.tool()
+    def ingest_notes() -> dict:
+        """Re-read the served context's `notes/` folder into its deepwiki NOW
+        (added / corrected / deleted notes) and report what the folder holds:
+        `state` ok | no_notes (this context HAS no notes) | outside | disabled
+        | error (the folder could not be read: nothing changed, retried next
+        pass), with the doc ids added / updated / removed. The memory contract's
+        `ingest_notes(ctx)` (TAC-938). Only the tachikoma gate serves notes:
+        a bare memory answers `state: unsupported` — said, never an empty list."""
+        fn = getattr(type(memory), "ingest_notes", None)
+        if fn is None:
+            return {"state": "unsupported",
+                    "reason": "this memory serves no notes folder "
+                              "(notes are served by metacog.tachikoma_gate)"}
+        return memory.ingest_notes()
+
+    @app.tool()
     def wiki_ops(doc_id: str, revert_op_id: Optional[int] = None) -> dict:
         """The reversible history of object edits (vars / portions) on a doc ;
         pass revert_op_id to undo one (a removed object comes back, a created

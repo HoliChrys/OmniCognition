@@ -41,7 +41,8 @@ TWO TRAPS THAT ALREADY LIED, PINNED HERE:
 Plus the hole this test found (TAC-934): an MCP session served the context
 of its `initialize`, whatever header a later call carried — a session opened
 under c, called with c''s header, was served c's fact. The gate now binds a
-session to its context and refuses the mismatch (409).
+session to its context and refuses the mismatch (409). And the ACL is asked
+once per session (TAC-299), again on any other bearer, context or account.
 
 The encoder is SimpleEncoder (hash), the reranker none: deterministic, no
 model download, no network — runnable in CI.
@@ -56,11 +57,14 @@ import pytest
 
 from metacog.defaults import SimpleEncoder
 
-C = "iso-alpha"                 # the witness that knows the fact
-C2 = "iso-beta"                 # its sibling — must never see it
-CHILD = "iso-alpha.child"       # c's descendant — inherits nothing by copy
+# Under the tree root `tachikoma`: the deployed gate maps ONLY the tree's
+# descendants to a notes folder (`notes_folder`, D2 / TAC-938) — any other
+# name is "outside" and would leave the wiki lane measuring nothing.
+C = "tachikoma.iso-alpha"       # the witness that knows the fact
+C2 = "tachikoma.iso-beta"       # its sibling — must never see it
+CHILD = "tachikoma.iso-alpha.child"  # c's descendant — inherits nothing by copy
 CONTEXTS = ["global", "tachikoma", "tachikoma.paralelle",
-            "tachikoma.paralelle.GenAI", C, CHILD, C2, "iso-beta.child"]
+            "tachikoma.paralelle.GenAI", C, CHILD, C2, "tachikoma.iso-beta.child"]
 
 #: Tokens that exist nowhere else: a byte search for them is unambiguous.
 FACT = "The iso-alpha vault code is vermillon-7731."
@@ -73,9 +77,13 @@ QUERY = "what is the vault code vermillon"
 class Gate:
     """The real gated app over HTTP, one MCP session per call (McpTransport)."""
 
-    def __init__(self, client, root: str):
+    def __init__(self, client, root: str, acl_calls: list, refuse: set):
         self.client = client
         self.root = root
+        #: Every question asked to the (fake) ACL: (token, ctx), in order.
+        self.acl_calls = acl_calls
+        #: (token, ctx) pairs the fake ACL refuses (403).
+        self.refuse = refuse
 
     def headers(self, ctx: str | None) -> dict:
         h = {"Accept": "application/json, text/event-stream",
@@ -194,13 +202,13 @@ def gate(tmp_path, monkeypatch):
     monkeypatch.setattr(defaults, "make_encoder", lambda: SimpleEncoder())
     monkeypatch.setattr(defaults, "make_reranker", lambda: None)
 
-    notes = tmp_path / "notes"
+    notes = tmp_path / "tachikoma"
     # Each witness and c's child carry ONE note whose token exists nowhere
     # else. The mapping is the gate's: `iso-alpha` → <notes>/iso-alpha/notes,
     # `iso-alpha.child` → <notes>/iso-alpha/child/notes.
-    _notes(notes, C, "alpha-runbook",
+    _notes(notes, "iso-alpha", "alpha-runbook",
            "# Alpha runbook\n\nThe alpha relay frequency is saffron-5519.")
-    _notes(notes, C2, "beta-runbook",
+    _notes(notes, "iso-beta", "beta-runbook",
            "# Beta runbook\n\nThe beta relay frequency is cobalt-2290.")
     _notes(notes, "iso-alpha/child", "child-runbook",
            "# Child runbook\n\nThe child relay frequency is jade-8846.")
@@ -208,12 +216,22 @@ def gate(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from metacog.tachikoma_gate import build_gated_app
+    from metacog.tachikoma_gate import Denied
+    acl_calls: list = []
+    refuse: set = set()
+
+    def fake_authorize(tok: str, ctx: str) -> str:
+        acl_calls.append((tok, ctx))
+        if (tok, ctx) in refuse:
+            raise Denied(f"refus de test pour {ctx!r}")
+        return "tester"
+
     root = str(tmp_path / "store")
     outer, _mcp, _inner = build_gated_app(root, str(notes),
-                                          authorize_fn=lambda tok, ctx: "tester")
+                                          authorize_fn=fake_authorize)
     # The SDK's DNS-rebinding guard wants a loopback Host, as served live.
     with TestClient(outer, base_url="http://127.0.0.1:8788") as client:
-        yield Gate(client, root)
+        yield Gate(client, root, acl_calls, refuse)
 
 
 # ── the default context: there is none ─────────────────────────────────
@@ -323,7 +341,7 @@ def test_a_contexts_notes_are_listed_by_that_context_only(gate):
             if "notes:alpha-runbook" in ids] == [C]
     assert gate.tag_rows("note:notes:alpha-runbook") == \
         {ctx: int(ctx == C) for ctx in CONTEXTS}
-    assert gate.tag_rows("ctx:iso-alpha") == \
+    assert gate.tag_rows(f"ctx:{C}") == \
         {ctx: int(ctx == C) for ctx in CONTEXTS}
     # The note's CONTENT point is served from c only (it is a RAG point, not
     # yet pickled: the gate ingests notes in memory, the next write saves).
@@ -381,3 +399,106 @@ def test_a_session_never_serves_another_context_than_its_own(gate):
     r = gate.raw_call({**gate.headers(C), "mcp-session-id": "forged"},
                       "retrieve", {"query": QUERY, "k": 5})
     assert r.status_code == 404
+
+
+# ── one authorization per session (TAC-299) ────────────────────────────
+#
+# `authorize` asks tachikoma three questions per call, each up to
+# OMNI_ACL_TIMEOUT (30 s). A remote_mcp call is three HTTP requests
+# (initialize, notification, tools/call) inside the lobby's 60 s: the gate
+# now asks once per session, and again on ANY difference.
+
+def test_a_full_handshake_asks_tachikoma_once(gate):
+    """initialize + notifications/initialized + tools/call: ONE ACL round
+    (it was three). The call is really served — not a cheap refusal."""
+    fact = gate.remember(C, FACT, ["tac-299:witness"])
+    gate.acl_calls.clear()
+    session = gate.open(C)
+    r = gate.raw_call(session, "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 200 and fact["id"] in r.text
+    assert gate.acl_calls == [("test-token", C)]
+
+
+def test_another_bearer_on_the_same_session_is_checked_again(gate):
+    session = gate.open(C)
+    gate.acl_calls.clear()
+    other = {**session, "Authorization": "Bearer other-token"}
+    r = gate.raw_call(other, "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 200
+    assert gate.acl_calls == [("other-token", C)]
+    # …and its refusal is served, never the session's earlier yes.
+    gate.refuse.add(("other-token", C))
+    r = gate.raw_call(other, "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 403
+    # The refusal is not kept either: the session's own bearer still passes
+    # on its yes, without a new question.
+    gate.acl_calls.clear()
+    r = gate.raw_call(session, "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 200 and gate.acl_calls == []
+
+
+def test_another_context_on_the_same_session_is_checked_again(gate):
+    """TAC-934 still holds: the other context goes through tachikoma, then
+    the session refuses it (409) — the cache never shortcuts isolation."""
+    fact = gate.remember(C, FACT, ["tac-299:crossed"])
+    session = gate.open(C)
+    gate.acl_calls.clear()
+    crossed = {**session, "x-tachikoma-context": C2}
+    r = gate.raw_call(crossed, "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 409
+    assert FACT_TOKEN not in r.text and fact["id"] not in r.text
+    assert gate.acl_calls == [("test-token", C2)]
+    # Refused by the ACL for that context: its 403, before any session talk.
+    gate.refuse.add(("test-token", C2))
+    r = gate.raw_call(crossed, "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 403
+    # Another account of the same context: checked again too.
+    gate.acl_calls.clear()
+    r = gate.raw_call({**session, "x-tachikoma-account": "tester"},
+                      "retrieve", {"query": QUERY, "k": 5})
+    assert r.status_code == 409 and gate.acl_calls == [("test-token", C)]
+
+
+def test_a_refused_initialize_is_never_kept(gate):
+    """A 403 at initialize binds no session; asking again asks the ACL again."""
+    gate.refuse.add(("test-token", C))
+    for _ in range(2):
+        r = gate.client.post("/mcp", headers=gate.headers(C), json={
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "tac-299", "version": "0"}}})
+        assert r.status_code == 403 and "mcp-session-id" not in r.headers
+    assert gate.acl_calls == [("test-token", C)] * 2
+
+
+def test_the_yes_dies_with_the_session(gate):
+    session = gate.open(C)
+    r = gate.client.delete("/mcp", headers=session)
+    assert r.status_code < 300, r.text
+    gate.acl_calls.clear()
+    r = gate.raw_call(session, "retrieve", {"query": QUERY, "k": 5})
+    # Closed: the gate no longer knows the session, and asked the ACL anew.
+    assert r.status_code == 404 and gate.acl_calls == [("test-token", C)]
+
+
+# ── the deepwiki of a LONG session follows its notes (TAC-938) ─────────
+
+def _session_wiki(gate, headers) -> list[str]:
+    r = gate.raw_call(headers, "wiki_list", {"prefix": "notes:"})
+    assert r.status_code == 200, r.text
+    frames = [ln[5:].strip() for ln in r.text.splitlines() if ln.startswith("data:")]
+    result = json.loads(frames[0] if frames else r.text)["result"]
+    sc = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    return [d["doc_id"] for d in sc.get("result", sc)["docs"]]
+
+
+def test_a_note_added_mid_session_is_listed_in_that_session(gate, tmp_path):
+    """A tool call runs in the session's task, whose contextvars were copied
+    at `initialize` (TAC-934): a per-request stamp held in a contextvar would
+    freeze the wiki for the whole session. The note added between two calls
+    of ONE session must be listed by the second."""
+    headers = gate.open(C)
+    assert _session_wiki(gate, headers) == ["notes:alpha-runbook"]
+    _notes(tmp_path / "tachikoma", "iso-alpha", "alpha-late",
+           "# Late note\n\nAdded while the session was open.")
+    assert _session_wiki(gate, headers) == ["notes:alpha-late", "notes:alpha-runbook"]

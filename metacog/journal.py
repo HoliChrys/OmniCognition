@@ -432,6 +432,15 @@ class Journal:
         )
         self.conn.commit()
 
+    def delete_wiki_doc(self, doc_id: str) -> None:
+        """Remove a doc, its links and its field index — for a doc whose
+        SOURCE is gone (a note deleted from a context's `notes/`). Its op
+        history / seeds / annotations stay: they are history, not the doc."""
+        for table in ("wiki_refs", "okf_fields", "wiki_docs"):
+            self.conn.execute(f"DELETE FROM {table} WHERE doc_id = ?",
+                              (str(doc_id),))
+        self.conn.commit()
+
     def get_wiki_doc(self, doc_id: str) -> Optional[dict]:
         row = self.conn.execute(
             "SELECT doc_id, type, title, tags, body, ts, body_mode FROM wiki_docs "

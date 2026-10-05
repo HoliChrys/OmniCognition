@@ -141,6 +141,28 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   (unknown → 403, never `makedirs`; no `general` exception),
   `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
+  rule, chosen by the name only (no candidate cascade): `global` and the
+  tree root (basename of notes_root) read `<notes_root>/notes`, its
+  descendants drop the first segment, another tree keeps every segment
+  under the root. The context's OWN notes are kept
+  in step with the folder once per request (mtime+size fingerprints; after a
+  restart the store is the reference): added → doc (`import_okf`) + content
+  point whose id cites the note (`<doc_id>#<sha256[:12]>`); corrected → old
+  points `forget_node`d, superseded by the new; deleted → doc removed
+  (`Journal.delete_wiki_doc`) + points forgotten. `ingest_notes()` (MCP tool,
+  T1) is the explicit form; its report `state` is ok | no_notes | outside |
+  disabled | error — a bare `Memory` answers `unsupported`. A read error is
+  never an absence (TAC-243): only ENOENT/ENOTDIR on the folder is
+  `no_notes`; any other `OSError` (folder or sub-folder, e.g. the FUSE's
+  EAGAIN) is `error` with nothing removed, forgotten or saved. And ENOENT is
+  an absence only once CONFIRMED (TAC-255 — the FUSE answers ENOENT for a
+  folder that exists while its backend is down): by the folder's real path
+  recorded at the last good pass (the disk behind the FUSE link; absent
+  there too → absent, present → `error`), or by a folder that is its own
+  real path. Unconfirmed (nothing read since the start) is `error` when the
+  context has known notes; a folder deleted while the gate was down is
+  removed once it is read again (e.g. recreated empty).
   Context/account names are validated BEFORE the ACL call (400). The right to
   read is the ACCOUNT's, taken from the TOKEN: a lobby member's token (scope
   `lobby`, read from the token's payload after `/api/auth/me` accepted it) is
@@ -167,6 +189,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   else 403), and only POST `initialize` / `notifications/initialized` /
   `tools/list` / `tools/call` of `recall`·`retrieve`·`search_nodes` pass — any
   write under the header → 403. The account check still applies per stage.
+  The ACL is asked ONCE per session
+  (TAC-299): the `initialize`'s yes is kept on the binding (bearer as
+  SHA-256, never in clear, + context + account + user) and reused only when
+  a request of that session carries the same bearer, context and account —
+  any difference is a full `authorize` again. Only a yes is kept (never a
+  401/403/503); it dies with the session (DELETE or eviction), no TTL. The yes
+  is kept with the context it was given on, so a read-only `recall-for` yes
+  never serves a request without that header.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
