@@ -1275,6 +1275,7 @@ def test_20_concurrent_remember_at_first_access_write_20(tmp_path,
 # The real gated app over MCP streamable HTTP. The ACL is faked by TOKEN:
 # `admin` reads everything, `child` reads ONLY `iso-alpha.child` — like
 # `manager-GenAI-1545c4`, which has `read` on GenAI and none on its parents.
+# `top` reads ONLY `iso-alpha`: rights on a stage, none on its children.
 
 from metacog.tachikoma_gate import RECALL_FOR_HEADER  # noqa: E402
 
@@ -1292,7 +1293,8 @@ def chain_gate(tmp_path, monkeypatch):
 
     def fake_authorize(token, ctx):
         seen.append((token, ctx))
-        if token == "admin" or (token == "child" and ctx == ASKED):
+        if (token == "admin" or (token == "child" and ctx == ASKED)
+                or (token == "top" and ctx == "iso-alpha")):
             return token
         raise gate.Denied(f"{token!r} n'a pas 'read' sur le contexte {ctx!r}")
 
@@ -1440,3 +1442,32 @@ def test_a_recall_for_yes_never_serves_the_session_without_the_header(chain_gate
     assert seen == [("child", "iso-alpha")]
     ha = _open(client, _hdrs("admin", "iso-alpha"))
     assert "smuggled" not in str(_ok(_call(client, ha, "stats", {})))
+
+
+def test_a_recall_for_yes_never_serves_another_asked_context(chain_gate):
+    """TAC-299 × TAC-272: same session, same stage, same bearer — but
+    `recall-for` now names a context the bearer cannot read. Asked again on
+    THAT context, never vouched for by the yes given on ASKED."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    seen.clear()
+    other = {**h, RECALL_FOR_HEADER: "iso-alpha.other"}
+    r = _call(client, other, "retrieve", {"query": "ancestor beacon", "k": 3})
+    assert r.status_code == 403
+    assert seen == [("child", "iso-alpha.other")]
+
+
+def test_a_stage_yes_never_serves_a_recall_for_request(chain_gate):
+    """The other direction: a session opened on the stage itself (yes on
+    `iso-alpha`) that adds `recall-for` is asked about the ASKED context —
+    the ACL is never skipped for a context it was not asked about. The
+    refusal is not kept: the bare session still runs on its own yes."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("top", "iso-alpha"))
+    seen.clear()
+    r = _call(client, {**h, RECALL_FOR_HEADER: ASKED}, "retrieve",
+              {"query": "ancestor beacon", "k": 3})
+    assert r.status_code == 403
+    assert seen == [("top", ASKED)]
+    _ok(_call(client, h, "retrieve", {"query": "ancestor beacon", "k": 3}))
+    assert seen == [("top", ASKED)]

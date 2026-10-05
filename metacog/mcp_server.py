@@ -409,7 +409,10 @@ def build_app(
         names the successor node to merge into during the next latent sleep. The
         explicit on-demand correction — distinct from the autonomic
         decay-forgetting in sleep."""
-        return memory.forget_node(node_id, reason, superseded_by=superseded_by)
+        out = memory.forget_node(node_id, reason, superseded_by=superseded_by)
+        if out.get("forgotten") and memory.storage_path:
+            memory.save()           # a forget holds from the answer on (TAC-323)
+        return out
 
     @app.tool()
     def revert_merge(node_id: str) -> dict:

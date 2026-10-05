@@ -77,6 +77,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   clash keeps ours) → `<store>.tmp` + fsync + `os.replace`. `_read_store`
   turns any unreadable file into `CorruptStoreError`; `__post_init__`
   re-raises it (refuse to serve, file untouched).
+  **A forget is durable** (TAC-323): the MCP `forget` tool saves after
+  `forget_node`; `forget_node` stamps the log entry and the `forget_events`
+  row with ONE instant; `load` of the own store replays every journal forget
+  event (merged or not) whose (id, reason, t) is absent from the pickled
+  `_forget_log` and whose newest `forget` ledger row is not reverted
+  (`_replay_forgets` → INVALID, never deleted); `_merge_from_disk` applies a
+  forget another writer saved to our copy of the node.
 - `meta_walk.py` — `MetaWalker`: re-anchors on the nearest ACTION each stage and
   spreads from it; stops on `step().done` (σ/GUM), not a fixed cap. `_relevant_cum`
   is the committed evidence set (uncapped); `_composable_evidence` is the bounded
