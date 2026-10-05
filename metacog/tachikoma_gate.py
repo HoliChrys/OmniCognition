@@ -34,6 +34,9 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    corrected or deleted is reflected WITHOUT a restart. `ingest_notes()` is
    the explicit form, and its report says what the folder holds — including
    "this context has no notes", never an empty list read as an outage.
+   ONLY THE CONTEXT'S OWN NOTES (TAC-936, rule C3): inheritance is served AT
+   QUERY TIME by the caller, which asks each ancestor's memory in turn
+   (`memory_engines.recall_inherited` in tachikoma) — never copied here.
 
 4. THE ACCOUNT (TAC-213) — the right to read is the ACCOUNT's, not only the
    context's. Every caller operates under an account. By default (no
@@ -157,11 +160,12 @@ def notes_folder(notes_root: str, ctx: str) -> Optional[str]:
 
 _API = os.environ.get("TACHIKOMA_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-#: The COMMON NOTEBOOK — the ONLY name that escapes authorization (not
-#: authentication). `general` is no tachikoma context: no hierarchy, no ACL
-#: resource — there is nothing to ask. Anything written there is readable by
-#: ANY valid token, by construction (mnema's documented exception, kept as is).
-GENERAL = os.environ.get("MNEMA_GENERAL_CTX", "general")
+# NO COMMON NOTEBOOK (TAC-936, rule C3). mnema's `general` — readable by any
+# valid token, outside the hierarchy — was the one name that escaped
+# authorization (`MNEMA_GENERAL_CTX`). It is gone: a recall climbs ctx → its
+# ancestors → `global`, nothing beside the chain. What everyone must read is
+# written in `global`. `general` is now an ordinary name: no hierarchy entry,
+# so the existence check refuses it like any unknown context.
 
 #: 30 s, mnema's measured ceiling: warm the check costs ~13 ms, but the first
 #: rights resolution of a fresh API was measured at 17.8 s. A timeout yields a
@@ -212,10 +216,6 @@ def authorize(token: str, ctx: str) -> str:
     if code != 200 or not isinstance(body, dict) or not body.get("user_id"):
         raise Denied(f"jeton rejeté par l'ACL (HTTP {code})", 401)
     user = str(body["user_id"])
-
-    # Authentication required, authorization does not apply — `general` only.
-    if ctx == GENERAL:
-        return user
 
     # 2. WHERE — existence FIRST, it is a guard: `_resolve` does `os.makedirs`,
     # so an authorized unknown name would GIVE BIRTH to a memory (measured:
@@ -277,6 +277,8 @@ class ContextualMemory:
         self._notes_real: dict[str, str] = {}
         #: ctx → the request stamp of its last notes check (once per request).
         self._notes_checked: dict[str, Optional[object]] = {}
+        #: Contexts whose ancestor copies were swept (C3), once per process.
+        self._c3_swept: set[str] = set()
         #: THE encoder and THE reranker of the gate (TAC-237), loaded once.
         self._models: Optional[tuple[Any, Any]] = None
         self._models_lock = threading.Lock()
@@ -365,6 +367,9 @@ class ContextualMemory:
         """The memory of the context ITSELF — its account's, the manager's."""
         name = self._ctx_name()
         m = self._memory_at(name)
+        if name not in self._c3_swept:
+            self._c3_swept.add(name)
+            self._forget_inherited_copies(name, m)
         # THE DEEPWIKI IS CHECKED ONCE PER REQUEST (TAC-938), not once per
         # process: a note added or corrected after the first access used to
         # stay out — or stale — until the `[omni]` process restarted. The
@@ -425,6 +430,11 @@ class ContextualMemory:
           old version is no longer retrievable;
         - a note DELETED leaves the wiki (doc removed) and its points are
           soft-forgotten.
+
+        NO ANCESTOR SEEDING (TAC-936, rule C3): only `ctx`'s own folder is
+        read. The ancestor copies an older gate left behind are swept by
+        `_forget_inherited_copies`, once per (ctx, process), in
+        `_context_memory`.
 
         Cheap when nothing moved: one stat per note, compared with the
         fingerprints (mtime_ns, size) of the last pass. After a restart there
@@ -551,6 +561,32 @@ class ContextualMemory:
                   f"note(s) not ingested: {report['errors']}", flush=True)
         report["state"] = "ok" if on_disk else "no_notes"
         return report
+
+    @staticmethod
+    def _forget_inherited_copies(ctx: str, m: Any) -> None:
+        """Soft-forget the ancestor notes an older gate COPIED into `ctx`.
+
+        Those content points carry `deepwiki` and the `ctx:<ancestor>` tag of
+        their source. Left in place, a recall from the child would serve them
+        as LOCAL memories — stale, and mislabeled. `forget_node` is reversible
+        (state INVALID + ledger row), never a deletion; idempotent, since an
+        invalidated point already carries `invalidated`.
+        """
+        # `add_tag` lowercases: `ctx:tachikoma.paralelle.GenAI` is stored as
+        # `ctx:tachikoma.paralelle.genai` — compare in that form, or the
+        # context's OWN notes would read as foreign and be forgotten.
+        own = f"ctx:{ctx}".lower()
+        stale = [p.id for p in getattr(m, "points", [])
+                 if "deepwiki" in p.tags and "invalidated" not in p.tags
+                 and any(t.startswith("ctx:") and t != own for t in p.tags)]
+        for node_id in stale:
+            m.forget_node(node_id, "TAC-936: ancestor note copied at ingestion; "
+                                   "inheritance is served at query time")
+        if stale and getattr(m, "storage_path", None):
+            m.save()
+        if stale:
+            print(f"[gate] {ctx!r}: {len(stale)} inherited note copie(s) "
+                  f"soft-forgotten (rule C3)", flush=True)
 
     # ── the context tag of a narrow account's writes ──────────────────
     def _mirrored_ingest(self, own: Any, account: str):
