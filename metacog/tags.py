@@ -2,7 +2,9 @@
 Tag namespace tooling — parent-prefix glossary and tri-modal matching.
 
 Tags are an open-vocabulary list normalised lowercase on every Point
-(see `epistemic.Point.__post_init__`). Several conventions in the
+(see `epistemic.Point.__post_init__`) — except `account:<id>`, which the
+tachikoma gate writes in the id's exact case (TAC-274); matching is
+therefore case-insensitive on both sides. Several conventions in the
 codebase are *hierarchical* with `:` as the separator:
 
     ref:date:2022      ref:skill:plot:path:src/plot.py
@@ -186,10 +188,12 @@ def match_tag(
     needle = pattern.strip().lower()
     if not needle:
         return False
+    # The stored side is lowered too: `account:<id>` keeps the id's exact case
+    # (TAC-274) while older gates wrote it lowercased — both must match.
     if mode == "exact":
-        return any(_ancestor_of(needle, t) for t in point_tags)
+        return any(_ancestor_of(needle, t.lower()) for t in point_tags)
     # fuzzy
-    return any(_fuzzy_ancestor(needle, t) for t in point_tags)
+    return any(_fuzzy_ancestor(needle, t.lower()) for t in point_tags)
 
 
 def match_tags_all(
