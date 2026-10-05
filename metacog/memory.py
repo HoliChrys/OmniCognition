@@ -3602,6 +3602,7 @@ class Memory:
         abstain_threshold: Optional[float] = None,
         rerank: Optional[bool] = None,
         rerank_pre: int = 30,
+        cost: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -3629,6 +3630,12 @@ class Memory:
         Runs BEFORE the ACT-R blends (need-odds / spreading act on the reranked
         relevance, as in mnema's `blend_scores`). Failure-safe : a reranker
         error leaves the cosine order.
+
+        `cost` (optional out-param, TAC-265) : a dict filled with what this
+        recall cost — `pool_size` (points searched), `spread_ms` (geometric
+        spreading, hybrid mode only), `rerank_n` / `rerank_ms` (docs scored by
+        the cross-encoder and its wall time). A key is set only when the stage
+        ran : absent means "did not run", never 0.
         """
         t_now = self._now(t)
         if abstain and self.abstains(query, abstain_threshold):
@@ -3660,6 +3667,8 @@ class Memory:
         # cosine retrieve and would only displace evidence (and aren't answers).
         search_pts = [p for p in search_pts
                       if "event:action" not in (p.tags or ())]
+        if cost is not None:
+            cost["pool_size"] = len(search_pts)
         # Over-fetch more when atomic facts are present : many atoms resolve
         # to the same source turn, so we need headroom to dedup to k turns.
         k_fetch = k
@@ -3690,6 +3699,7 @@ class Memory:
                 lineage_depth=lineage_depth,
                 prefer_kind=kind_filter,
                 text_index=self._text_index,
+                cost=cost,
             )
             if atomics:
                 # Second pass over RAW turns only — atoms flood the joint
@@ -3768,7 +3778,11 @@ class Memory:
         if do_rerank and results:
             try:
                 docs = [(p.content or "")[:512] for _, p in results]
+                t_rr = time.perf_counter()
                 logits = [float(x) for x in rr.rerank(query, docs)]
+                if cost is not None:
+                    cost["rerank_n"] = len(docs)
+                    cost["rerank_ms"] = (time.perf_counter() - t_rr) * 1000.0
                 if len(logits) == len(results):
                     import math as _m
                     scored = []
