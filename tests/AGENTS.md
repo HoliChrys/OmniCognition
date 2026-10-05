@@ -24,7 +24,9 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   20 concurrent processes/threads lose no fact, a SIGKILL mid-dump leaves a
   loadable store, a corrupt store raises `CorruptStoreError` and is untouched.
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
-  access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20).
+  access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),
+  and (TAC-353) that a member's write → forget → recall under the context's
+  account no longer serves the mirror, on disk too.
   `test_forget_durable.py` (TAC-323) guards that a forget survives a restart:
   MCP `forget` → a new instance does not serve the id; a pickle that lost a
   forget (pending or merged event) is replayed INVALID at `load`; a reverted

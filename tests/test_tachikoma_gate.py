@@ -1099,6 +1099,82 @@ def test_reads_find_the_exact_case_tag_and_the_older_lowercased_one(tmp_path):
         assert {x.id for x in ctx_mem.tag_scoped(needle)} == want
 
 
+# ── TAC-353: a member's forget also forgets its mirror ─────────────────
+
+def _forget_like_the_tool(p, node_id, reason="member retracted it",
+                          superseded_by=None):
+    """What the `forget` MCP tool does with `memory` (the proxy)."""
+    out = p.forget_node(node_id, reason, superseded_by=superseded_by)
+    if out.get("forgotten") and p.storage_path:
+        p.save()
+    return out
+
+
+def _context_recalls(ctx_mem, query):
+    return [h["id"] for h in ctx_mem.retrieve(query, k=7, rerank=False)]
+
+
+def test_a_member_forget_also_forgets_the_mirror(tmp_path):
+    """Measured on GenAI: `forget` under charts answered `forgotten`, and
+    the manager still recalled the context copy (score 0.968). Write,
+    forget, recall under the context's account: the copy is gone, on disk
+    too."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    own_mem = _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "the charts palette is cobalt and amber")
+    mirror = [x for x in ctx_mem.points
+              if x.content == "the charts palette is cobalt and amber"][0]
+    _as(_CTX, "")
+    assert mirror.id in _context_recalls(ctx_mem, "charts palette cobalt amber")
+
+    _as(_CTX, _MEMBER)
+    out = _forget_like_the_tool(p, pt.id)
+    assert out["forgotten"] == pt.id
+    assert out["mirrors_forgotten"] == [mirror.id]
+
+    _as(_CTX, "")
+    assert mirror.id not in _context_recalls(ctx_mem, "charts palette cobalt amber")
+    assert pt.id not in [h["id"] for h in own_mem.retrieve(
+        "charts palette cobalt amber", k=7, rerank=False)]
+    # saved: a fresh read of the context store holds the forget
+    again = Memory(storage_path=ctx_mem.storage_path, encoder=SimpleEncoder())
+    assert "invalidated" in next(x for x in again.points if x.id == mirror.id).tags
+
+
+def test_a_member_forget_finds_a_mirror_written_before_the_tag(tmp_path):
+    """A mirror written before TAC-353 has no `mirror_of:` tag: it is found
+    by account and content — one per forget, never another account's."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "an older member fact")
+    mirror = [x for x in ctx_mem.points if x.content == "an older member fact"][0]
+    mirror.tags.remove(f"mirror_of:{pt.id}")      # as the older gate wrote it
+    _as(_CTX, "")
+    other = _ingest_like_the_tool(p, "an older member fact")
+    other.tags.append("account:someone-else")
+
+    _as(_CTX, _MEMBER)
+    assert _forget_like_the_tool(p, pt.id)["mirrors_forgotten"] == [mirror.id]
+    assert "invalidated" in mirror.tags
+    assert "invalidated" not in other.tags
+
+
+def test_a_member_forget_of_an_unknown_id_touches_no_mirror(tmp_path):
+    """A refused forget (unknown id) says so and forgets nothing anywhere."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    _ingest_like_the_tool(p, "kept fact")
+    out = _forget_like_the_tool(p, "fact_nope")
+    assert out["forgotten"] is None and "mirrors_forgotten" not in out
+    assert not any("invalidated" in x.tags for x in ctx_mem.points)
+
+
 # ── TAC-237: ONE encoder + ONE reranker per gate, loaded off the loop ───
 
 def _counting_models(monkeypatch):
