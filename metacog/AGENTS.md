@@ -186,6 +186,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   (`ContextualMemory.models()`), shared by every context and account memory
   — never a pair per key (~2 GB each); the middleware loads them in a worker
   thread after the ACL (`context_gate(warm=…)`), never on the event loop.
+  ONE `Memory` per key (context or account store), even at a concurrent first
+  access: `_memory_at` is double-checked under a lock PER KEY (TAC-228) — an
+  orphan instance would still write the same store, and the merge-on-save
+  would keep its facts twice.
   A store holds ONLY its own context (TAC-936, rule C3): the deepwiki ingests
   the context's own `notes/`, never an ancestor's — inheritance is served at query time by
   tachikoma's `recall_inherited`, marked by `origin_ctx`; copies left by the
