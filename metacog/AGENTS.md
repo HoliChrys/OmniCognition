@@ -132,6 +132,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   and `assemble_set` (the whole orchestrated loop in one call). Surface gated by
   `build_app(surface=…)` / `METACOG_SURFACE` via `_install_surface_gate` (wraps
   `app.tool` once; unexposed names not registered, still callable internally).
+  `retrieve(exclude_tags=…)` (TAC-930) leaves every point carrying one of
+  the tags (case-insensitive) out of the SEARCH POOL — before top-k, rerank
+  and spreading, so the slots it would take go to the rest; tachikoma's
+  pre-turn recall passes `session:<id>` to skip the session's own captures.
   `retrieve` applies the reranker's relevance floor `RERANK_FLOOR` (a raw
   logit): hits under it are dropped and an all-under-floor recall answers the
   gap verdict alone (TAC-941). The value is CALIBRATED, not a constant: the

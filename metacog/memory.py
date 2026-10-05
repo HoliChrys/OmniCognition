@@ -3669,6 +3669,7 @@ class Memory:
         rerank: Optional[bool] = None,
         rerank_pre: int = 30,
         cost: Optional[Dict[str, Any]] = None,
+        exclude_tags: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -3702,8 +3703,19 @@ class Memory:
         spreading, hybrid mode only), `rerank_n` / `rerank_ms` (docs scored by
         the cross-encoder and its wall time). A key is set only when the stage
         ran : absent means "did not run", never 0.
+
+        `exclude_tags` (TAC-930) : a point carrying ANY of these tags (case-
+        insensitive, as `add_tag` stores them) is out of the SEARCH POOL — it
+        never takes a top-k slot, so what it would have displaced comes back.
+        Used by tachikoma's pre-turn recall to leave out the turns its own
+        session captured (`session:<id>`) : they are already in the session's
+        history, and recalling them echoed a wrong answer over the corpus.
         """
         t_now = self._now(t)
+        excluded = {str(x).strip().lower() for x in (exclude_tags or ()) if str(x).strip()}
+
+        def _kept(p: Any) -> bool:
+            return not excluded or excluded.isdisjoint(p.tags or ())
         if abstain and self.abstains(query, abstain_threshold):
             return []                            # retrieval failure (ACT-R)
         rr = getattr(self, "reranker", None)
@@ -3732,7 +3744,7 @@ class Memory:
         # their pull already shifted the real facts ; they are dead weight in a
         # cosine retrieve and would only displace evidence (and aren't answers).
         search_pts = [p for p in search_pts
-                      if "event:action" not in (p.tags or ())]
+                      if "event:action" not in (p.tags or ()) and _kept(p)]
         if cost is not None:
             cost["pool_size"] = len(search_pts)
         # Over-fetch more when atomic facts are present : many atoms resolve
@@ -3772,7 +3784,7 @@ class Memory:
                 # pool and bury strong raw evidence below the over-fetch
                 # cutoff, so we need the TRUE raw ranking to interleave with.
                 raw_pts = [p for p in self.points
-                           if not p.id.startswith(("atom_", "entity_"))]
+                           if not p.id.startswith(("atom_", "entity_")) and _kept(p)]
                 self._raw_results = retrieve_hybrid(
                     query, raw_pts, k, t_now,
                     encoder=self.encoder, extractor=self.extractor,
@@ -3836,7 +3848,7 @@ class Memory:
         # exclusion the walk applies, so a forgotten node stops surfacing.
         from metacog.epistemic import EpistemicState as _ES
         results = [(s, p) for s, p in results
-                   if p.state not in (_ES.INVALID, _ES.DEPRECATED)]
+                   if p.state not in (_ES.INVALID, _ES.DEPRECATED) and _kept(p)]
         # CROSS-ENCODER RERANK (mnema's second stage) : the pre-fetched
         # candidates are scored jointly with the query ; sigmoid(logit) becomes
         # the relevance the ACT-R blends below act on. Top-k after rerank.
@@ -3885,7 +3897,7 @@ class Memory:
                     spread = self.spreading_weight * (cooc / mx)
                     if nid in cur:
                         cur[nid][0] += spread
-                    elif nid in pt_by_id:
+                    elif nid in pt_by_id and _kept(pt_by_id[nid]):
                         cur[nid] = [spread, pt_by_id[nid]]   # missed neighbour
                 results = sorted(((s, p) for s, p in cur.values()),
                                  key=lambda sp: sp[0], reverse=True)[:k]
