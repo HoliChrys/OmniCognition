@@ -148,20 +148,102 @@ def _live_note_points(m, needle):
     ("tachikoma.paralelle.GenAI", "paralelle/GenAI/notes"),   # measured: 16 docs
     ("tachikoma.paradigm", "paradigm/notes"),
     ("tachikoma", "notes"),                                    # the tree root
-    ("global", "notes"),                                       # the hierarchy root
+    # Another tree lives in its own folder under the root, every segment
+    # kept (TAC-934's layout): chosen by the NAME, whatever exists.
+    ("demo.sandbox.alice", "demo/sandbox/alice/notes"),
+    ("other", "other/notes"),
 ])
 def test_the_dotted_name_maps_to_one_folder(ctx, expected):
     """THE MAPPING IS WRITTEN, not rediscovered: one folder per name, the
-    first segment IS the root folder, the roots read `<notes_root>/notes`."""
+    first segment IS the root folder, the tree root reads `<notes_root>/notes`."""
     root = "/opt/tachikoma-fs/global/tachikoma"
     assert gate.notes_folder(root, ctx) == os.path.join(root, *expected.split("/"))
 
 
-@pytest.mark.parametrize("ctx", ["demo.sandbox.alice", "other", "", "a/../b"])
-def test_a_name_outside_the_tree_has_no_folder_here(ctx):
-    """No cascade of candidates: a context of another tree is not given the
-    root's notes (the old fallback did, for any single-segment name)."""
+def test_global_reads_the_notes_of_the_parent_folder():
+    """TAC-329 option (a), TAC-330: `global` is the PARENT of the tree root in
+    the FUSE layout, its notes are `<parent>/notes` — never the tree root's,
+    which `tachikoma` reads. Deployed: `/opt/tachikoma-fs/global/notes`."""
+    root = "/opt/tachikoma-fs/global/tachikoma"
+    assert gate.notes_folder(root, "global") == "/opt/tachikoma-fs/global/notes"
+    assert gate.notes_folder(root, "global") != gate.notes_folder(root, "tachikoma")
+    assert gate.notes_folder(root + "/", "global") == "/opt/tachikoma-fs/global/notes"
+
+
+def _wiki_ids(m):
+    rows = m.journal.conn.execute("SELECT doc_id FROM wiki_docs").fetchall()
+    return sorted(r[0] for r in rows if str(r[0]).startswith("notes:"))
+
+
+def test_the_wiki_of_global_is_the_parent_notes_and_not_tachikomas(tmp_path):
+    """N notes in `<parent>/notes` are the N `notes:*` docs of `global` — and
+    none of them is listed by `tachikoma`, which lists its own folder only."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    names = [f"g{i}" for i in range(5)]
+    for name in names:
+        _write(_notes_of(root.parent) / f"{name}.md", f"# {name}\n\nGlobal note {name}.")
+    _write(_notes_of(root) / "t0.md", "# t0\n\nTree root note.")
+    mg = _test_instance(p, "global")
+    mt = _test_instance(p, "tachikoma")
+    report = p._refresh_notes("global", mg)
+    assert (report["state"], report["notes"]) == ("ok", len(names))
+    assert report["folder"] == str(root.parent / "notes")
+    p._refresh_notes("tachikoma", mt)
+    assert _wiki_ids(mg) == [f"notes:{n}" for n in names]
+    assert _wiki_ids(mt) == ["notes:t0"]
+
+
+def test_global_never_falls_back_on_the_tree_roots_notes(tmp_path):
+    """No existence cascade: `<parent>/notes` absent → `global` has NO notes,
+    even though `<notes_root>/notes` holds some."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    _write(_notes_of(root) / "t0.md", "# t0\n\nTree root note.")
+    mg = _test_instance(p, "global")
+    report = p._refresh_notes("global", mg)
+    assert (report["state"], report["notes"]) == ("no_notes", 0)
+    assert report["folder"] == str(root.parent / "notes")
+    assert _wiki_ids(mg) == [] and _live_note_points(mg, "Tree root note") == []
+
+
+def test_the_chain_of_tachikoma_sees_globals_notes_once_as_ancestor(tmp_path):
+    """The recall of `tachikoma` climbs `tachikoma` → `global` (tachikoma's
+    `recall_inherited`). Both read the same folder before TAC-330: every note
+    came back twice, once per stage. Now a `global` note lives in `global`'s
+    memory only — served once, by the ancestor stage."""
+    root = _tree(tmp_path)
+    p = ContextualMemory(str(tmp_path / "store"), str(root))
+    _write(_notes_of(root.parent) / "beacon.md",
+           "# Beacon\n\nThe global beacon colour is cobalt-9921.")
+    _write(_notes_of(root) / "port.md", "# Port\n\nThe tachikoma port is 8101.")
+    chain = ["tachikoma", "global"]
+    assert all(gate.is_strict_ancestor(s, "tachikoma") for s in chain[1:])
+    mems = {ctx: _test_instance(p, ctx) for ctx in chain}
+    for ctx in chain:
+        p._refresh_notes(ctx, mems[ctx])
+    per_stage = {ctx: len(_live_note_points(mems[ctx], "cobalt-9921")) for ctx in chain}
+    assert per_stage == {"tachikoma": 0, "global": 1}
+    served = [ctx for ctx in chain
+              for h in mems[ctx].retrieve("global beacon colour cobalt", k=7, rerank=False)
+              if "cobalt-9921" in (h.get("content") or "")]
+    assert served == ["global"]
+
+
+@pytest.mark.parametrize("ctx", ["", "a/../b", "../x", "a..b"])
+def test_an_invalid_name_has_no_folder(ctx):
+    """No path is ever built from a name that is not a context name."""
     assert gate.notes_folder("/opt/tachikoma-fs/global/tachikoma", ctx) is None
+
+
+def test_the_rule_never_depends_on_which_folder_exists(tmp_path):
+    """The old cascade tried `<root>/sandbox/notes` then `<root>/demo/sandbox/
+    notes` and took the first that EXISTED: one stray folder moved a context's
+    wiki. The rule reads the name only."""
+    root = _tree(tmp_path)
+    (root / "sandbox" / "notes").mkdir(parents=True)          # a decoy
+    assert gate.notes_folder(str(root), "demo.sandbox") == \
+        str(root / "demo" / "sandbox" / "notes")
 
 
 def test_the_contexts_notes_are_ingested_twice_doc_and_content(tmp_path):
@@ -204,15 +286,17 @@ def test_one_unreadable_note_never_stops_the_wiki_and_is_said(tmp_path):
     assert p._refresh_notes("tachikoma.a", m)["added"] == ["notes:bad"]
 
 
-def test_a_note_added_later_enters_without_restart(tmp_path):
+def test_a_note_added_later_enters_without_restart(tmp_path, monkeypatch):
     """THE BUG: `_ingested` was a set — a note added after the first access
     never entered until the [omni] process restarted."""
     root, p, m = _wiki(tmp_path)
     folder = _notes_of(root, "a")
     _write(folder / "first.md", "# First")
+    monkeypatch.setattr(gate, "_requests_seen", 1)          # a request
     assert p._context_memory() is m
     _write(folder / "later.md", "# Later note body")
-    p._context_memory()                      # same process, next access
+    monkeypatch.setattr(gate, "_requests_seen", 2)          # the next one
+    p._context_memory()                      # same process, next request
     assert m.journal.get_wiki_doc("notes:later") is not None
     assert len(_live_note_points(m, "Later note body")) == 1
 
@@ -290,46 +374,207 @@ def test_a_context_without_notes_says_so(tmp_path):
     report says NO NOTES, distinct from an engine that did not answer."""
     root, p, m = _wiki(tmp_path, ctx="global")
     assert p._refresh_notes("global", m)["state"] == "no_notes"   # folder absent
-    _notes_of(root)                                               # folder empty
+    _notes_of(root.parent)                                        # folder empty
     report = p._refresh_notes("global", m)
     assert (report["state"], report["notes"]) == ("no_notes", 0)
-    assert report["folder"] == str(root / "notes")
+    assert report["folder"] == str(root.parent / "notes")
 
 
-def test_outside_the_tree_and_disabled_are_said(tmp_path):
+def _eagain_on(monkeypatch, fn_name, target):
+    """`os.<fn_name>(target)` raises EAGAIN — the FUSE timing out under load
+    (measured on holistix-baremetal, TAC-243); every other path is real."""
+    import errno
+    real = getattr(os, fn_name)
+
+    def flaky(path, *args, **kwargs):
+        if os.fspath(path) == str(target):
+            raise OSError(errno.EAGAIN, "resource-fuse op timed out", str(target))
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(os, fn_name, flaky)
+
+
+@pytest.mark.parametrize("fn_name, where", [
+    ("stat", ""),          # the notes/ folder itself does not answer
+    ("scandir", ""),       # it answers stat, not its listing
+    ("scandir", "trace"),  # a sub-folder does not answer: 14 notes measured there
+])
+def test_an_unreadable_folder_is_never_an_absence(tmp_path, monkeypatch,
+                                                  fn_name, where):
+    """MEASURED (TAC-243): the FUSE rendered EAGAIN, `os.path.isdir` read it
+    as "absent" and the pass removed all 16 docs of GenAI, then saved. A read
+    error says `error`: nothing removed, nothing forgotten, nothing saved —
+    and the next pass, the folder readable again, finds everything in place."""
+    root, p, m = _wiki(tmp_path)
+    folder = _notes_of(root, "a")
+    (folder / "trace").mkdir()
+    _write(folder / "top.md", "# Top\n\nTop note body.")
+    _write(folder / "trace" / "wot.md", "# WOT\n\nTrace note body.")
+    assert len(p._refresh_notes("tachikoma.a", m)["added"]) == 2
+    saved = os.stat(m.storage_path).st_mtime_ns
+    saves = []
+    monkeypatch.setattr(m, "save", lambda *a, **k: saves.append(1))
+    with monkeypatch.context() as mp:
+        _eagain_on(mp, fn_name, folder / where if where else folder)
+        report = p._refresh_notes("tachikoma.a", m)
+    assert report["state"] == "error"
+    assert "timed out" in report["errors"][0]["error"]
+    assert (report["removed"], report["added"], report["updated"]) == ([], [], [])
+    assert saves == [] and os.stat(m.storage_path).st_mtime_ns == saved
+    assert {"notes:top", "notes:trace/wot"} <= set(m.journal.all_wiki_doc_ids())
+    assert len(_live_note_points(m, "Top note body")) == 1
+    assert len(_live_note_points(m, "Trace note body")) == 1
+    again = p._refresh_notes("tachikoma.a", m)        # the FUSE answers again
+    assert (again["state"], again["removed"], again["unchanged"]) == ("ok", [], 2)
+
+
+def _linked_wiki(tmp_path, ctx="tachikoma.a"):
+    """The DEPLOYED layout: `<notes_root>/<a>/notes` is a LINK (the FUSE's)
+    to the real folder on the local disk."""
+    root, p, m = _wiki(tmp_path, ctx)
+    disk = tmp_path / "disk" / "notes"
+    disk.mkdir(parents=True)
+    (root / "a").mkdir()
+    (root / "a" / "notes").symlink_to(disk, target_is_directory=True)
+    _write(disk / "one.md", "# One\n\nFirst note body.")
+    _write(disk / "two.md", "# Two\n\nSecond note body.")
+    assert len(p._refresh_notes(ctx, m)["added"]) == 2
+    return root, p, m, disk
+
+
+def _fuse_enoent_on(monkeypatch, target):
+    """`os.stat(target)` raises ENOENT — the FUSE whose backend cannot
+    resolve the folder (measured on holistix-baremetal, TAC-255)."""
+    import errno
+    real = os.stat
+
+    def lying(path, *args, **kwargs):
+        if os.fspath(path) == str(target):
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory",
+                                    str(target))
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(os, "stat", lying)
+
+
+def _assert_wiki_intact(m, report):
+    assert report["state"] == "error"
+    assert (report["removed"], report["added"], report["updated"]) == ([], [], [])
+    assert {"notes:one", "notes:two"} <= set(m.journal.all_wiki_doc_ids())
+    assert len(_live_note_points(m, "First note body")) == 1
+    assert len(_live_note_points(m, "Second note body")) == 1
+
+
+def test_a_fuse_enoent_on_a_folder_present_on_disk_is_never_an_absence(
+        tmp_path, monkeypatch):
+    """MEASURED (TAC-255): `tachikoma-api` restarting, the FUSE answered
+    ENOENT for GenAI's notes/ — which existed — and the pass removed its 17
+    docs (`-17`), re-added a minute later (`+17`). The disk says the folder
+    is there: nothing removed, nothing saved, the next pass finds all."""
+    root, p, m, _disk = _linked_wiki(tmp_path)
+    saves = []
+    monkeypatch.setattr(m, "save", lambda *a, **k: saves.append(1))
+    with monkeypatch.context() as mp:
+        _fuse_enoent_on(mp, root / "a" / "notes")
+        report = p._refresh_notes("tachikoma.a", m)
+    _assert_wiki_intact(m, report)
+    assert "present on disk" in report["errors"][0]["error"] and saves == []
+    again = p._refresh_notes("tachikoma.a", m)
+    assert (again["state"], again["removed"], again["unchanged"]) == ("ok", [], 2)
+
+
+def test_after_a_restart_an_enoent_is_unconfirmed_and_removes_nothing(
+        tmp_path, monkeypatch):
+    """A gate that just started has read no folder: the FUSE's ENOENT has
+    nothing to be checked against. The context HAS notes in its store —
+    they stay. Recreating the folder EMPTY is the positive observation that
+    removes them."""
+    root, _p, m, disk = _linked_wiki(tmp_path)
+    restarted = ContextualMemory(str(tmp_path / "store"), str(root))
+    with monkeypatch.context() as mp:
+        _fuse_enoent_on(mp, root / "a" / "notes")
+        report = restarted._refresh_notes("tachikoma.a", m)
+    _assert_wiki_intact(m, report)
+    assert "unconfirmed" in report["errors"][0]["error"]
+    for note in disk.iterdir():          # really deleted, gate restarted
+        note.unlink()
+    disk.rmdir()
+    _assert_wiki_intact(m, restarted._refresh_notes("tachikoma.a", m))
+    disk.mkdir()                         # recreated empty: read, confirmed
+    report = restarted._refresh_notes("tachikoma.a", m)
+    assert (report["state"], sorted(report["removed"])) == (
+        "no_notes", ["notes:one", "notes:two"])
+    assert _live_note_points(m, "First note body") == []
+
+
+@pytest.mark.parametrize("linked", [True, False])
+def test_a_folder_really_deleted_leaves_the_wiki(tmp_path, linked):
+    """The absence CONFIRMED — by the disk behind the link, or by a plain
+    folder that is its own real path — still removes the notes."""
+    if linked:
+        _root, p, m, folder = _linked_wiki(tmp_path)
+    else:
+        root, p, m = _wiki(tmp_path)
+        folder = _notes_of(root, "a")
+        _write(folder / "one.md", "# One\n\nFirst note body.")
+        _write(folder / "two.md", "# Two\n\nSecond note body.")
+        assert len(p._refresh_notes("tachikoma.a", m)["added"]) == 2
+    for note in folder.iterdir():
+        note.unlink()
+    folder.rmdir()
+    report = p._refresh_notes("tachikoma.a", m)
+    assert (report["state"], sorted(report["removed"])) == (
+        "no_notes", ["notes:one", "notes:two"])
+    assert _live_note_points(m, "Second note body") == []
+
+
+def test_a_note_that_comes_back_is_live_again_and_saved(tmp_path):
+    """The -16 then +16 cycle measured on GenAI (TAC-243 §3): a note removed
+    then back with the SAME body gets a fresh live point (suffixed id — never
+    the forgotten node reused), and that point reaches the store on disk."""
+    root, p, m = _wiki(tmp_path)
+    note = _notes_of(root, "a") / "port.md"
+    body = "# Port\n\nThe probe port is 48217."
+    _write(note, body)
+    p._refresh_notes("tachikoma.a", m)
+    (first,) = _live_note_points(m, "48217")
+    note.unlink()
+    assert p._refresh_notes("tachikoma.a", m)["removed"] == ["notes:port"]
+    assert _live_note_points(m, "48217") == []
+    _write(note, body)
+    assert p._refresh_notes("tachikoma.a", m)["added"] == ["notes:port"]
+    (back,) = _live_note_points(m, "48217")
+    assert back.id == f"{first.id}.2"
+    reloaded = Memory(storage_path=m.storage_path, encoder=SimpleEncoder())
+    assert [q.id for q in _live_note_points(reloaded, "48217")] == [back.id]
+
+
+def test_another_tree_and_disabled_are_said(tmp_path):
     root, p, m = _wiki(tmp_path, ctx="demo.sandbox")
-    assert p._refresh_notes("demo.sandbox", m)["state"] == "outside"
+    report = p._refresh_notes("demo.sandbox", m)
+    assert report["state"] == "no_notes"
+    assert report["folder"] == str(root / "demo" / "sandbox" / "notes")
+    _write(_notes_of(root, "demo", "sandbox") / "d.md", "# Demo note")
+    assert p._refresh_notes("demo.sandbox", m)["added"] == ["notes:d"]
     bare = ContextualMemory(str(tmp_path / "store2"))
     assert bare._refresh_notes("demo.sandbox", m)["state"] == "disabled"
 
 
-def test_ancestor_notes_are_not_copied_into_the_child(tmp_path):
-    """Inheritance is served AT QUERY TIME (C3): the child's wiki holds its
-    OWN notes only — a copy would go stale when the ancestor's note moves."""
-    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
-    _write(_notes_of(root) / "root.md", "# Root note")
-    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
-    p._refresh_notes("tachikoma.sub.Child", m)
-    assert m.journal.get_wiki_doc("notes:own") is not None
-    assert [d for d in m.journal.all_wiki_doc_ids()] == ["notes:own"]
-
-
 def test_the_folder_is_read_once_per_request(tmp_path):
     """Every tool call touches `memory.<attr>` many times: the folder is
-    stat'ed once per REQUEST (the stamp the middleware sets), not per access."""
-    root, p, m = _wiki(tmp_path)
+    stat'ed once per REQUEST (the count the middleware bumps), not per access."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.a")
     folder = _notes_of(root, "a")
-    token = gate._request_stamp.set(object())
+    before = gate._requests_seen
+    gate._requests_seen = before + 1              # a request
     try:
         p._context_memory()
         _write(folder / "mid.md", "# Mid-request note")
         p._context_memory()                       # same request: not re-read
         assert m.journal.get_wiki_doc("notes:mid") is None
-        gate._request_stamp.set(object())         # the next request
+        gate._requests_seen += 1                  # the next request
         p._context_memory()
         assert m.journal.get_wiki_doc("notes:mid") is not None
     finally:
-        gate._request_stamp.reset(token)
+        gate._requests_seen = before
 
 
 def test_ingest_notes_is_a_tool_and_a_bare_memory_says_unsupported(tmp_path):
@@ -356,6 +601,41 @@ def test_ingest_notes_is_a_tool_and_a_bare_memory_says_unsupported(tmp_path):
     report = asyncio.run(call(p))
     assert (report["state"], report["notes"]) == ("ok", 1)
     assert m.journal.get_wiki_doc("notes:x") is not None
+
+
+def test_ancestor_notes_are_never_copied_into_the_child(tmp_path):
+    """Rule C3 (TAC-936): inheritance is served AT QUERY TIME, never copied at
+    ingestion — a copy goes stale the day the ancestor's note is corrected.
+    The child's memory holds its OWN notes, and nothing of its ancestors'."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
+    _write(_notes_of(root) / "root.md", "# Root note")
+    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
+    p._refresh_notes("tachikoma.sub.Child", m)
+    assert m.journal.get_wiki_doc("notes:own") is not None
+    assert m.journal.all_wiki_doc_ids() == ["notes:own"]
+    assert [p_.content for p_ in m.points] == ["# Own note"]
+    assert "ctx:tachikoma.sub.child" in m.points[0].tags   # add_tag lowercases
+    # …and the ancestor's note lives in the ANCESTOR's memory, where a
+    # query-time recall reads it.
+    ancestor = _test_instance(p, "tachikoma")
+    p._refresh_notes("tachikoma", ancestor)
+    assert [p_.content for p_ in ancestor.points] == ["# Root note"]
+
+
+def test_copies_left_by_an_older_gate_are_soft_forgotten(tmp_path):
+    """The older gate copied ancestor notes into the child (`ctx:<ancestor>`
+    tag). A recall would serve them as LOCAL memories, stale and mislabeled:
+    the first access soft-forgets them (reversible, never deleted)."""
+    root, p, m = _wiki(tmp_path, ctx="tachikoma.sub.Child")
+    _write(_notes_of(root, "sub", "Child") / "own.md", "# Own note")
+    copy = m.ingest("# Root note, copied", kind="FACT")
+    copy.add_tag("note:notes:tachikoma/root", "ctx:tachikoma", "deepwiki")
+    fact = m.ingest("a fact written by an agent", kind="FACT")
+    p._refresh_notes("tachikoma.sub.Child", m)
+    (own,) = _live_note_points(m, "# Own note")
+    assert "invalidated" in copy.tags
+    assert "invalidated" not in own.tags
+    assert "invalidated" not in fact.tags
 
 
 # ── the ACL: who may read which memory (TAC-214) ──────────────────────
@@ -395,10 +675,16 @@ def test_a_rejected_token_is_refused_401(monkeypatch):
     assert e.value.status == 401
 
 
-def test_general_needs_a_valid_token_but_no_right(monkeypatch):
-    calls = _fake_api(monkeypatch, ME)
-    assert gate.authorize("t", gate.GENERAL) == "manager-GenAI-1545c4"
-    assert [c[0] for c in calls] == ["/api/auth/me"]
+def test_general_is_no_longer_a_common_notebook(monkeypatch):
+    """Rule C3 (TAC-936): `general` was the one name readable by any valid
+    token, outside the chain. It is an ordinary name now — no hierarchy
+    entry, refused like any unknown context; what all must read goes in
+    `global`."""
+    assert not hasattr(gate, "GENERAL")
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    with pytest.raises(gate.Denied, match="n'existe pas"):
+        gate.authorize("t", "general")
+    assert [c[0] for c in calls] == ["/api/auth/me", "/api/hierarchy/general"]
 
 
 def test_an_unknown_context_is_never_born(monkeypatch, tmp_path):
@@ -697,6 +983,122 @@ def test_a_caller_never_borrows_another_account():
     assert r.status_code == 403 and "agent-b" in r.json()["detail"]
 
 
+# ── TAC-274: a lobby member's account is its TOKEN's, not its header's ──
+
+_CTX = "tachikoma.paralelle.GenAI"
+_MANAGER = "manager-GenAI-1545c4"
+_MEMBER = "tachikoma-GenAI-archiviste"
+
+
+def _token(user, scopes):
+    """A token in tachikoma's wire format (`serialize_token`: base64 JSON)."""
+    import base64
+    import json
+    return base64.b64encode(json.dumps(
+        {"user_id": user, "scopes": scopes, "signature": "sig"}).encode()).decode()
+
+
+def _member_token(user=_MEMBER):
+    """What `mint-lobby-member-token` hands a member (TAC-241)."""
+    return _token(user, [f"ctx:{_CTX}", "agent", "lobby"])
+
+
+def _call_as(user, token, account=None):
+    client, _ = _account_client(user=user)
+    headers = {CTX_HEADER: _CTX, "Authorization": f"Bearer {token}"}
+    if account is not None:
+        headers[ACCOUNT_HEADER] = account
+    return client.post("/mcp", headers=headers)
+
+
+def test_a_member_without_header_is_served_its_own_account():
+    """Measured before (TAC-262): served the context memory, it read the
+    manager's `fact_79014e81`. The token decides, not the header."""
+    r = _call_as(_MEMBER, _member_token())
+    assert r.status_code == 200 and r.text == f"{_CTX}|{_MEMBER}"
+
+
+def test_a_member_naming_its_own_account_is_served_it():
+    r = _call_as(_MEMBER, _member_token(), account=_MEMBER)
+    assert r.status_code == 200 and r.text == f"{_CTX}|{_MEMBER}"
+
+
+@pytest.mark.parametrize("target", [_CTX, _MANAGER, "tachikoma-GenAI-autre"])
+def test_a_member_never_reaches_the_managers_memory(target):
+    """The context's own name used to mean « the context's account » for
+    anyone; for a member it is another account than its token's: 403."""
+    r = _call_as(_MEMBER, _member_token(), account=target)
+    assert r.status_code == 403 and target in r.json()["detail"]
+
+
+def test_the_manager_never_reaches_a_members_memory():
+    manager_token = _token(_MANAGER, [f"ctx:{_CTX}", "agent"])
+    r = _call_as(_MANAGER, manager_token, account=_MEMBER)
+    assert r.status_code == 403 and _MEMBER in r.json()["detail"]
+
+
+def test_the_managers_token_stays_on_the_context_memory():
+    """No `lobby` scope: the context's account, header absent or its own."""
+    manager_token = _token(_MANAGER, [f"ctx:{_CTX}", "agent"])
+    assert _call_as(_MANAGER, manager_token).text == f"{_CTX}|"
+    # The context's name as account: the proxy reads it as the context's own.
+    assert _call_as(_MANAGER, manager_token, account=_CTX).text == f"{_CTX}|{_CTX}"
+
+
+def test_a_member_whose_id_cannot_name_a_folder_is_refused():
+    r = _call_as("../x", _member_token("../x"))
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("token", ["", "t", "not base64 !", "bnVsbA==",
+                                   "eyJ1c2VyX2lkIjogIngifQ=="])
+def test_a_token_that_carries_no_scope_reads_as_none(token):
+    """Undecodable, `null`, no `scopes` key: no scope, never an exception."""
+    assert gate.token_scopes(token) == []
+
+
+def test_the_account_tag_keeps_the_case_of_the_id(tmp_path):
+    """Measured before (TAC-262): `account:tachikoma-genai-archiviste` in the
+    tags, `accounts/tachikoma-GenAI-archiviste` on disk. Same name now."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    own_mem = _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    pt = _ingest_like_the_tool(p, "the archivist filed the minutes",
+                               tags=["module:gate"])
+    tag = f"account:{_MEMBER}"
+    own = [x for x in own_mem.points if x.id == pt.id][0]
+    mirror = [x for x in ctx_mem.points
+              if x.content == "the archivist filed the minutes"][0]
+    assert tag in own.tags and tag in mirror.tags
+    assert tag.lower() not in mirror.tags
+    # …the folder's very name
+    assert own_mem.storage_path == os.path.join(
+        p._root, _CTX, "accounts", _MEMBER, "memory.pkl")
+
+
+def test_reads_find_the_exact_case_tag_and_the_older_lowercased_one(tmp_path):
+    """No migration: a tag an older gate lowercased is still found, by the
+    exact id and by its lowercased form, on both read paths (the in-memory
+    `filter_list` and the journal's SQL `tag_scoped`)."""
+    p = _make_proxy(tmp_path)
+    ctx_mem = _test_instance(p, _CTX)
+    _test_store(p, os.path.join(_CTX, "accounts", _MEMBER))
+    _as(_CTX, _MEMBER)
+    _ingest_like_the_tool(p, "written by the new gate")
+    mirror_new = [x for x in ctx_mem.points
+                  if x.content == "written by the new gate"][0]
+    _as(_CTX, "")
+    old = _ingest_like_the_tool(p, "written by an older gate")
+    old.add_tag(f"account:{_MEMBER}")            # lowercased, as before
+    assert f"account:{_MEMBER}".lower() in old.tags
+    ctx_mem.reindex_tags()
+    want = {mirror_new.id, old.id}
+    for needle in (f"account:{_MEMBER}", f"account:{_MEMBER}".lower()):
+        assert {x.id for x in ctx_mem.filter_list(tags=[needle])} == want
+        assert {x.id for x in ctx_mem.tag_scoped(needle)} == want
+
+
 # ── TAC-237: ONE encoder + ONE reranker per gate, loaded off the loop ───
 
 def _counting_models(monkeypatch):
@@ -866,3 +1268,206 @@ def test_20_concurrent_remember_at_first_access_write_20(tmp_path,
     for i in range(20):
         assert contents.count(f"fait concurrent numéro {i}") == 1
     assert set(ids) <= {pt.id for pt in on_disk.points}
+
+
+# ── TAC-272: a recall climbs its chain READ-ONLY under `recall-for` ────
+#
+# The real gated app over MCP streamable HTTP. The ACL is faked by TOKEN:
+# `admin` reads everything, `child` reads ONLY `iso-alpha.child` — like
+# `manager-GenAI-1545c4`, which has `read` on GenAI and none on its parents.
+# `top` reads ONLY `iso-alpha`: rights on a stage, none on its children.
+
+from metacog.tachikoma_gate import RECALL_FOR_HEADER  # noqa: E402
+
+ASKED = "iso-alpha.child"
+ANCESTOR_FACT = "The iso-alpha ancestor beacon is ochre-4471."
+
+
+@pytest.fixture
+def chain_gate(tmp_path, monkeypatch):
+    import metacog.defaults as defaults
+    monkeypatch.setattr(defaults, "make_encoder", lambda: SimpleEncoder())
+    monkeypatch.setattr(defaults, "make_reranker", lambda: None)
+
+    seen = []
+
+    def fake_authorize(token, ctx):
+        seen.append((token, ctx))
+        if (token == "admin" or (token == "child" and ctx == ASKED)
+                or (token == "top" and ctx == "iso-alpha")):
+            return token
+        raise gate.Denied(f"{token!r} n'a pas 'read' sur le contexte {ctx!r}")
+
+    from starlette.testclient import TestClient
+    outer, _mcp, _inner = gate.build_gated_app(
+        str(tmp_path / "store"), "", authorize_fn=fake_authorize)
+    with TestClient(outer, base_url="http://127.0.0.1:8788") as client:
+        yield client, seen
+
+
+def _hdrs(token, ctx, recall_for=None):
+    h = {"Accept": "application/json, text/event-stream",
+         "Content-Type": "application/json",
+         "Authorization": f"Bearer {token}", CTX_HEADER: ctx}
+    if recall_for:
+        h[RECALL_FOR_HEADER] = recall_for
+    return h
+
+
+def _open(client, h):
+    r = client.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "tac-272", "version": "0"}}})
+    if r.status_code != 200:
+        return r
+    h = {**h, "mcp-session-id": r.headers["mcp-session-id"]}
+    r2 = client.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert r2.status_code in (200, 202), r2.text
+    return h
+
+
+def _call(client, h, tool, args):
+    return client.post("/mcp", headers=h, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": args}})
+
+
+def _ok(r):
+    import json
+    assert r.status_code == 200, r.text
+    frames = [ln[5:].strip() for ln in r.text.splitlines() if ln.startswith("data:")]
+    payload = json.loads(frames[0] if frames else r.text)
+    assert "error" not in payload and not payload["result"].get("isError"), payload
+    return payload["result"]
+
+
+def _plant(client, ctx, content):
+    h = _open(client, _hdrs("admin", ctx))
+    return _ok(_call(client, h, "ingest", {"content": content, "kind": "FACT"}))
+
+
+@pytest.mark.parametrize("ancestor", ["iso-alpha", "global"])
+def test_a_child_reader_recalls_its_ancestors_under_recall_for(chain_gate, ancestor):
+    client, seen = chain_gate
+    _plant(client, ancestor, ANCESTOR_FACT)
+    # WITHOUT the header: the per-stage check of before — refused (the bug).
+    r = _open(client, _hdrs("child", ancestor))
+    assert r.status_code == 403 and ancestor in r.json()["detail"]
+    # WITH it: authorized on the ASKED context, the ancestor's fact served.
+    seen.clear()
+    h = _open(client, _hdrs("child", ancestor, recall_for=ASKED))
+    for tool in ("retrieve", "recall"):
+        result = _ok(_call(client, h, tool, {"query": "ancestor beacon ochre", "k": 5}))
+        assert "ochre-4471" in str(result["content"])
+    assert all(ctx == ASKED for _tok, ctx in seen) and seen
+
+
+@pytest.mark.parametrize("stage", [
+    "iso-alpha.child",          # the asked context itself: no header needed
+    "iso-alpha.child.grand",    # a child of the asked context
+    "iso-alpha.sibling",        # a sibling
+    "iso-beta",                 # off the chain
+    "iso-alph",                 # a string prefix that is not a segment prefix
+])
+def test_recall_for_serves_only_strict_ancestors(chain_gate, stage):
+    client, seen = chain_gate
+    r = client.post("/mcp", headers=_hdrs("child", stage, recall_for=ASKED),
+                    json={"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+    assert r.status_code == 403 and "ancêtre" in r.json()["detail"]
+    assert seen == []            # refused before any ACL call
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("ingest", {"content": "smuggled into the ancestor", "kind": "FACT"}),
+    ("remember", {"content": "smuggled into the ancestor"}),
+    ("forget", {"node_id": "x", "reason": "r"}),
+    ("wiki_list", {}),           # a read, but not a recall/search tool
+])
+def test_nothing_but_recall_passes_under_recall_for(chain_gate, tool, args):
+    client, _ = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    r = _call(client, h, tool, args)
+    assert r.status_code == 403 and "lecture seule" in r.json()["detail"]
+    assert repr(tool) in r.json()["detail"]
+    # The admin's view of the ancestor: nothing was written there.
+    ha = _open(client, _hdrs("admin", "iso-alpha"))
+    stats = _ok(_call(client, ha, "stats", {}))
+    assert "smuggled" not in str(stats)
+
+
+def test_a_batch_smuggling_a_write_is_refused(chain_gate):
+    client, _ = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    r = client.post("/mcp", headers=h, json=[
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "retrieve", "arguments": {"query": "q"}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "ingest", "arguments": {"content": "x"}}}])
+    assert r.status_code == 403 and "'ingest'" in r.json()["detail"]
+
+
+def test_recall_for_is_post_only_and_named(chain_gate):
+    client, _ = chain_gate
+    r = client.get("/mcp", headers=_hdrs("child", "iso-alpha", recall_for=ASKED))
+    assert r.status_code == 403 and "GET" in r.json()["detail"]
+    r = client.post("/mcp", headers=_hdrs("child", "iso-alpha", recall_for="../x"),
+                    json={"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+    assert r.status_code == 400
+
+
+def test_the_account_check_still_applies_under_recall_for(chain_gate):
+    """TAC-213 per stage: a recall stage narrows to the caller's own account,
+    never to another's."""
+    client, _ = chain_gate
+    h = _hdrs("child", "iso-alpha", recall_for=ASKED)
+    r = _open(client, {**h, ACCOUNT_HEADER: "someone-else"})
+    assert r.status_code == 403 and "someone-else" in r.json()["detail"]
+    h = _open(client, {**h, ACCOUNT_HEADER: "child"})
+    _ok(_call(client, h, "retrieve", {"query": "anything", "k": 3}))
+
+
+def test_a_recall_for_yes_never_serves_the_session_without_the_header(chain_gate):
+    """TAC-299 × TAC-272: the session keeps the yes WITH the context it was
+    given on. A session opened under `recall-for` (yes on the asked child,
+    read-only) that drops the header is asked again on the stage itself —
+    never served a write on the ancestor on the child's read."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    seen.clear()
+    bare = {k: v for k, v in h.items() if k != RECALL_FOR_HEADER}
+    r = _call(client, bare, "ingest", {"content": "smuggled past the cache", "kind": "FACT"})
+    assert r.status_code == 403
+    assert seen == [("child", "iso-alpha")]
+    ha = _open(client, _hdrs("admin", "iso-alpha"))
+    assert "smuggled" not in str(_ok(_call(client, ha, "stats", {})))
+
+
+def test_a_recall_for_yes_never_serves_another_asked_context(chain_gate):
+    """TAC-299 × TAC-272: same session, same stage, same bearer — but
+    `recall-for` now names a context the bearer cannot read. Asked again on
+    THAT context, never vouched for by the yes given on ASKED."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("child", "iso-alpha", recall_for=ASKED))
+    seen.clear()
+    other = {**h, RECALL_FOR_HEADER: "iso-alpha.other"}
+    r = _call(client, other, "retrieve", {"query": "ancestor beacon", "k": 3})
+    assert r.status_code == 403
+    assert seen == [("child", "iso-alpha.other")]
+
+
+def test_a_stage_yes_never_serves_a_recall_for_request(chain_gate):
+    """The other direction: a session opened on the stage itself (yes on
+    `iso-alpha`) that adds `recall-for` is asked about the ASKED context —
+    the ACL is never skipped for a context it was not asked about. The
+    refusal is not kept: the bare session still runs on its own yes."""
+    client, seen = chain_gate
+    h = _open(client, _hdrs("top", "iso-alpha"))
+    seen.clear()
+    r = _call(client, {**h, RECALL_FOR_HEADER: ASKED}, "retrieve",
+              {"query": "ancestor beacon", "k": 3})
+    assert r.status_code == 403
+    assert seen == [("top", ASKED)]
+    _ok(_call(client, h, "retrieve", {"query": "ancestor beacon", "k": 3}))
+    assert seen == [("top", ASKED)]

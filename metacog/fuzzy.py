@@ -50,6 +50,21 @@ def levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
+def _within_edits(a: str, b: str, budget: int) -> bool:
+    """`levenshtein(a, b) <= budget`, with the same DP but stopping as soon
+    as a whole row exceeds `budget` : a row's minimum never decreases on the
+    next row, so the final distance is then already > budget. Exact."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > budget:
+            return False
+        prev = cur
+    return prev[-1] <= budget
+
+
 def _edit_budget(token: str) -> int:
     """Length-relative tolerance : ~1 edit per 4 chars. Parameter-free."""
     return len(token) // 4
@@ -69,7 +84,7 @@ def fuzzy_match(qtok: str, dtok: str) -> bool:
     # Quick length filter : can't be within budget if lengths differ more.
     if abs(len(qtok) - len(dtok)) > budget:
         return False
-    return levenshtein(qtok, dtok) <= budget
+    return _within_edits(qtok, dtok, budget)
 
 
 def fuzzy_score(
@@ -85,14 +100,23 @@ def fuzzy_score(
     if not q_tokens:
         return []
     scored: List[Tuple[float, "Point"]] = []
+    # Query tokens each document token fuzzy-matches, computed once per
+    # DISTINCT document token (TAC-248) : the same token recurs across
+    # points, and re-running Levenshtein on it was most of the recall cost.
+    # A point's score — distinct query tokens matched by any of its
+    # tokens — is the size of the union, i.e. the same count as before.
+    hits: dict = {}
     for p in points:
         d_tokens = {t for t in _tokens(p.content) if len(t) >= _MIN_TOKEN_LEN}
         if not d_tokens:
             continue
-        matched = 0
-        for qt in q_tokens:
-            if any(fuzzy_match(qt, dt) for dt in d_tokens):
-                matched += 1
+        matched_q: set = set()
+        for dt in d_tokens:
+            h = hits.get(dt)
+            if h is None:
+                h = hits[dt] = frozenset(qt for qt in q_tokens if fuzzy_match(qt, dt))
+            matched_q |= h
+        matched = len(matched_q)
         if matched:
             # Normalize by query size so longer queries don't dominate.
             scored.append((matched / len(q_tokens), p))

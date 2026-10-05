@@ -118,3 +118,55 @@ def test_audit_clean_on_fresh_memory():
             assert au["violations"] == []
 
     _run(go())
+
+
+class _TopicReranker:
+    """Deterministic cross-encoder stand-in returning RAW logits, as
+    `CrossEncoderReranker.rerank` does. The values are the top-1 logits
+    measured on the real GenAI corpus (TAC-217) : a doc sharing a word with the
+    query scores like the in-domain "push" query (−1.585), any other like the
+    off-topic kouign-amann recipe (−1.866) — just under the floor."""
+
+    def rerank(self, query, docs):
+        q = set(query.lower().split())
+        return [-1.585 if q & set(d.lower().split()) else -1.866 for d in docs]
+
+
+def _blocks(r):
+    return [json.loads(c.text) for c in r.content]
+
+
+def test_retrieve_relevance_floor_answers_gap_not_least_bad():
+    """TAC-941 : an off-topic recall (a kouign-amann recipe against an ACL
+    corpus) used to return its least-bad candidate first, rerank −1.16. Every
+    candidate under RERANK_FLOOR → the gap verdict, alone ; a candidate at the
+    measured in-domain logit stays."""
+    from metacog.mcp_server import GAP_SENTINEL, RERANK_FLOOR
+
+    assert -1.866 < RERANK_FLOOR <= -1.585   # the calibration this test encodes
+
+    async def go():
+        mem = Memory(encoder=SimpleEncoder(), reranker=_TopicReranker())
+        async with await _session(mem) as s:
+            await s.initialize()
+            for i, txt in enumerate([
+                    "the acl grants read access per context",
+                    "the acl gate refuses a request without context header",
+                    "the memory plugin is named omni"]):
+                await _call(s, "ingest", content=txt, kind="FACT", id=f"A{i}")
+
+            off = _blocks(await s.call_tool(
+                "retrieve", {"query": "kouign-amann recipe butter sugar", "k": 3}))
+            assert len(off) == 1 and off[0]["abstained"] is True
+            assert off[0]["gap"] is True and GAP_SENTINEL in off[0]["note"]
+
+            on = _blocks(await s.call_tool("retrieve", {"query": "acl", "k": 3}))
+            hits = [b for b in on if "id" in b]
+            assert {h["id"] for h in hits} == {"A0", "A1"}   # A2 is under the floor
+            assert all(h["rerank_score"] >= RERANK_FLOOR for h in hits)
+            # TAC-265 : every entry, the gap verdict included, says the cost
+            for b in on + off:
+                assert b["pool_size"] == 3 and b["rerank_n"] == 3
+                assert b["rerank_ms"] >= 0.0 and b["spread_ms"] >= 0.0
+
+    _run(go())

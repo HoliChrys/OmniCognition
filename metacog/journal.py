@@ -400,6 +400,16 @@ class Journal:
                  "superseded_by": r["superseded_by"], "ts": r["ts"]}
                 for r in rows]
 
+    def forget_history(self) -> List[dict]:
+        """Every forget event, merged or not, oldest first — what `load`
+        replays onto a pickle that lost them (TAC-323)."""
+        rows = self.conn.execute(
+            "SELECT id, node_id, reason, superseded_by, ts, merged "
+            "FROM forget_events ORDER BY id ASC").fetchall()
+        return [{"id": r["id"], "node_id": r["node_id"], "reason": r["reason"],
+                 "superseded_by": r["superseded_by"], "ts": r["ts"],
+                 "merged": bool(r["merged"])} for r in rows]
+
     def mark_forget_merged(self, event_id: int) -> None:
         """Mark a forget event as processed by the latent merge (idempotent)."""
         self.conn.execute(
@@ -946,16 +956,20 @@ class Journal:
     def nodes_with_tag(self, tag: str, hierarchical: bool = True) -> List[str]:
         """Node ids carrying `tag`. With `hierarchical` (default) the tag matches
         as an ANCESTOR too — querying 'health' returns nodes tagged
-        'health:condition:x' (SQL : tag = ? OR tag LIKE ?||':%'). Sorted."""
+        'health:condition:x' (SQL : tag = ? OR tag LIKE ?||':%'). Sorted.
+        Case-insensitive, like `metacog.tags.match_tag`: `account:<id>` keeps
+        the id's case (TAC-274) and older lowercased tags still match."""
         tag = str(tag)
         if hierarchical:
             rows = self.conn.execute(
-                "SELECT DISTINCT node_id FROM tags WHERE tag = ? OR tag LIKE ? "
+                "SELECT DISTINCT node_id FROM tags WHERE tag = ? COLLATE NOCASE "
+                "OR tag LIKE ? "
                 "ORDER BY node_id ASC", (tag, tag + ":%"),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT DISTINCT node_id FROM tags WHERE tag = ? ORDER BY node_id",
+                "SELECT DISTINCT node_id FROM tags WHERE tag = ? COLLATE NOCASE "
+                "ORDER BY node_id",
                 (tag,),
             ).fetchall()
         return [r["node_id"] for r in rows]

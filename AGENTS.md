@@ -80,7 +80,9 @@ bind every subtree; child docs add local detail but may not weaken them.
   edges. No `edges` field — co-location *is* the edge.
 - **Hyperparameter-free.** Every threshold is a mathematical constant or emerges
   from the data (e.g. the walk's σ-cap from GUM uncertainty propagation). Do not
-  introduce tunable magic numbers.
+  introduce tunable magic numbers. One documented exception, decided outside
+  the code (TAC-219): `mcp_server.RERANK_FLOOR`, the reranker relevance floor,
+  calibrated on measured logits — see `metacog/AGENTS.md`.
 - **Anti-laundering (Cor. 5).** Provenance is typed. `SourceClass.GENERATOR`
   content can become *content* but never *evidence*. Generated nodes
   (THOUGHT / ACTION / event hubs / beacons) must be created with `apply_pull`

@@ -84,6 +84,42 @@ def test_rerank_pre_bounds_the_prefetch_and_failure_keeps_cosine_order():
     assert hits[0]["id"] == "A" and len(hits) == 2       # cosine order survived
 
 
+def test_make_reranker_passes_onnx_threads(monkeypatch):
+    """TAC-265 : the cross-encoder session runs on METACOG_RERANK_THREADS
+    threads (default DEFAULT_RERANK_THREADS) ; 0 = onnxruntime's default."""
+    seen = []
+
+    class Rec:
+        def __init__(self, model, threads=None):
+            seen.append(threads)
+    monkeypatch.setattr(D, "CrossEncoderReranker", Rec)
+    monkeypatch.delenv("METACOG_RERANK_THREADS", raising=False)
+    make_reranker("auto")
+    monkeypatch.setenv("METACOG_RERANK_THREADS", "4")
+    make_reranker("auto")
+    monkeypatch.setenv("METACOG_RERANK_THREADS", "0")
+    make_reranker("auto")
+    assert seen == [D.DEFAULT_RERANK_THREADS, 4, None]
+
+
+def test_retrieve_reports_its_cost_only_for_stages_that_ran():
+    """TAC-265 : `cost` says what the recall cost — pool searched, docs sent to
+    the cross-encoder and its time, the spreading's time. A stage that did not
+    run leaves its key absent (never 0) ; results are unchanged."""
+    stub = _Stub({"alpha beta delta": 4.0})
+    m = _corpus(reranker=stub)
+    cost: dict = {}
+    hits = m.retrieve("alpha beta gamma", k=2, use_hybrid=True,
+                      use_spreading=True, cost=cost)
+    assert [h["id"] for h in hits] == [h["id"] for h in m.retrieve(
+        "alpha beta gamma", k=2, use_hybrid=True, use_spreading=True)]
+    assert cost["pool_size"] == 10 and cost["rerank_n"] == stub.calls[0]
+    assert cost["rerank_ms"] >= 0.0 and cost["spread_ms"] >= 0.0
+    plain: dict = {}
+    m.retrieve("alpha beta gamma", k=2, rerank=False, cost=plain)
+    assert plain == {"pool_size": 10}                    # no rerank, no spread
+
+
 def test_rerank_runs_before_the_actr_blends():
     from metacog.journal import Journal
     stub = _Stub({"alpha beta delta": 4.0, "alpha beta gamma": -1.0})
