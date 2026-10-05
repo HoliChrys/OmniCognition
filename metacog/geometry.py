@@ -16,6 +16,7 @@ time.
 from __future__ import annotations
 
 import math
+import time
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -507,6 +508,7 @@ def retrieve_hybrid(
     prefer_kind: Optional["PointKind"] = None,  # noqa: F821
     restrict_kind: Optional["PointKind"] = None,  # noqa: F821
     text_index=None,
+    cost: Optional[dict] = None,
 ) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Hybrid retrieval :
       - cosine on KEYWORD embeddings       (entity-level match)
@@ -625,7 +627,11 @@ def retrieve_hybrid(
     # neighbour membership uses the emergent (median − σ) threshold.
     if use_spreading:
         seeds = [points_by_id[pid] for pid in top_ids if pid in points_by_id]
+        t0 = time.perf_counter()
         spread = geometric_spread(seeds, points, t_now)
+        if cost is not None:                 # what the recall cost (TAC-265)
+            cost["spread_ms"] = (cost.get("spread_ms", 0.0)
+                                 + (time.perf_counter() - t0) * 1000.0)
         for srank, (_dist, p) in enumerate(spread):
             rrf_scores[p.id] = rrf_scores.get(p.id, 0.0) + 1.0 / (rrf_k + srank)
         if spread:
