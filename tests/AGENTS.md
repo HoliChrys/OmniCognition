@@ -45,6 +45,12 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   condition of the roadmap's A/B/D tickets: never skip, xfail or weaken it.
   It runs in CI on every push and PR (`.github/workflows/context-isolation.yml`).
 
+- `test_d3_wiki_bench.py` (D3, Linear TAC-939) pins the D3 bench's scoring
+  and Proxy's decision rule at its boundaries (noise 5 %, p95 2 s, 10-point
+  gap), checks that the frozen `questions.yaml` is consistent with its pins,
+  and runs one offline end-to-end pass that must leave the source store
+  byte-identical.
+
 ## Work Guidance
 
 - A behavior change in `metacog` requires updating or adding a test here in the

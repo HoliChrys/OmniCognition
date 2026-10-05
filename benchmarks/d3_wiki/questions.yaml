@@ -1,0 +1,237 @@
+# D3 question set (Linear TAC-939) — frozen BEFORE any measurement.
+# Edited after a run = invalid run. A new set is a new file.
+#
+# Written on 2026-10-05 from the notes inventoried read-only in Paperclip
+# TAC-327, pinned below by sha256. The harness refuses a corpus whose notes
+# differ from these pins (fail-closed): the questions only make sense on the
+# notes they were written on.
+#
+# Doc ids follow the gate's rule (`_scan_notes`): `notes:<relative path
+# without .md>`. A returned item cites note d when its id is `notes:d#…` or
+# it carries the tag `note:notes:d`.
+#
+#   expected : the note(s) holding the answer — coverage counts a hit on one
+#   relevant : expected + notes that legitimately bear on the question —
+#              a cited note outside this list is noise
+#
+# Off-topic questions are asked on EVERY context; the right answer is
+# nothing. `absent_marker` is a regex: if a point of the copied store
+# already matches it, the question is reported `invalid_offtopic` (the store
+# DOES hold the topic) instead of being scored — decided here, before any run.
+
+version: 1
+written: "2026-10-05"
+source_inventory: "Paperclip TAC-327"
+
+contexts:
+  global:
+    # Folder read for `global` by omni 1d8d537 (`<root>/notes`, a link to
+    # contexts/tachikoma/notes) is EMPTY (TAC-327). The bench corpus is
+    # contexts/global/notes (80 .md), copied into the scratch notes root at
+    # the folder `notes_folder()` maps `global` to. See PROTOCOL.md.
+    notes_source: /home/ubuntu/data_tachikoma/contexts/global/notes
+    store_source: /home/ubuntu/data_tachikoma/omni/contexts/global
+    corpus:
+      notes:handoff-linear-2026-08-02: a1c11b71ece64063759582905375b9926a62bd1018666974b2f76675abe3cc08
+      notes:memory-multi-contexte: 2793ea2063588347cf31b2ed27db8730490c36f4bd911875f274dc3c7840cf9e
+      notes:mise/admin: e4d2f161d7440dd636aa896fdc70e4ca5d6f4acac085e1346958720d57c79b08
+      notes:mise/agent: 5106c57b80452b816c927d8f5d316283566307e1e9964fb881722d1f5a894dee
+      notes:mise/agents: 9c37ab5789134e1c4083c6686dc4561b19f380f8aa1d3d5659803a1878e9e70c
+      notes:mise/annex: f059bcabe105fe6f351aca030e9fb708abe1dee85778cae28caab7be61992eb8
+      notes:mise/app: 9ec5663abeb8ec0ebc47b8e73afb6024215dd230b0e450d097c8e818cebe4986
+      notes:mise/backup: f8900fb1ac0c463cac3f02ecdec5df3b7d1a83e86319b8a72604e6a35987f0e3
+      notes:mise/borrow: 4d0a731b76f9adc7a037d98a1f79fd0b75d9dd5ea8838983189c5df2f2b6535d
+      notes:mise/build: 68dffe5e33e42f3476810688eb2b6487fb260709a949ad6247cc748a8d32fdd3
+      notes:mise/channel: 0d7dd1840dd5178ba975be7b9317c79a8950c7dc496e408baf02955de8eb52dc
+      notes:mise/clawdbot: 054a2d771f4054172e7504832b79ae0a5a21a2c88e0587d8c210026d199bbc78
+      notes:mise/cli: f7f02e0be5b459ac9c3ead42b2a7ce219ad830713e382a1240b25ff04f8afa7a
+      notes:mise/component: 522e15f4cd5731ad0634e7a391935fd7877cbccd1749c26f894142b954f24a7b
+      notes:mise/computer: 4f93f4f40288a34b41ea40565e630fa9dfede4b88a56ae0aa16e5ff4abe7196d
+      notes:mise/config: 23c8d41fb0525276ae9d414db9465583049d0e62081f357fb3bb694ddbc105cb
+      notes:mise/context: dd92298593bb250c036b5dab869955e1274f06639ed80dd75fc8adedab32294b
+      notes:mise/cred: 1c3842d7dc3a4a69aad9ce0c3c874cb512efcf52abf174fc96bdd93866015d23
+      notes:mise/crm: 1132c864c79d6834cbf0d3e347cdb9a3b286f0531ea76267eebf9d36be483948
+      notes:mise/ctx: 522d244292dd7543679aca4f71e796fc76e21607f9d4435bf7ecec5d7ba70667
+      notes:mise/dashboard: 29e545efb709363bd0ed75e151008aad2ed8f397d8a9f4b1c33de761a838a649
+      notes:mise/deploy: a4a7b0620f117b0bcedc912cefa7d3c8ed946deccf20fbe3d0c1e8ab8d75f5c7
+      notes:mise/entities: 0ea6613ae3963746228a84966467d3d565eae759321b8493102b51a7c65a6e6d
+      notes:mise/entity: ce039525144c5835bff1cb00a40e7b9a4b1c89f31d254dda06db6eb032cf0b3b
+      notes:mise/events: 57228d4a5182411b51bf8e96047b91d0860ee1de3066188bce9ca76d8739732d
+      notes:mise/expose: ccc77ee9204e4215636b8b7787dd924cfc96a8e59ca791f4c603bf491b5b5556
+      notes:mise/folder: 751a2d265d64e14cd33e7582d8a448c827ed2e1cb7fc9fa9667091e7fc386ca1
+      notes:mise/fuse: 2213c07ad8450b7483d32899f3ea91f78dd17af44eece44a4efa2eddda95af05
+      notes:mise/gastown: d47253cc623b92432e738c50d5be3e2c403ac117a0333681968c02637ca158f2
+      notes:mise/_generateurs/README: b185f23730af00b627d38377cd31c9814efad2fc8a9c491e760db5e18a59a389
+      notes:mise/ghost: 29d3332ec3c39a51fca485c86d34ba5f81f8949847a25f57be20a42838d795ce
+      notes:mise/goal: c702a3eca8c00e4efc99463af22f967934063c95dd48c6ea892ce1b34a2af66c
+      notes:mise/groups: 4726a0474f84b23f54161ef25a8c389ff7e33b706e43b3f78935aa0b296bb5f8
+      notes:mise/help: 05248f132400bfd42e0bff481aa34058ce39143205bb299234dbe97ad96ea1ec
+      notes:mise/hermes: aa9b02530400ff5381baef305bfd9e106880b6e4c2d22edd5c8cf75249b4a093
+      notes:mise/infisical: b4abd8a28102dae769a45ae2ef5ccccfeb5f8d66ceacab56ce7ab24f47f6453b
+      notes:mise/install: 2bac3aba3ee0039dda89f3df9ecb66c98bc366576e27887f7201122314895268
+      notes:mise/job: cfd7ee3a80b48b00452b7d6ab99c29ac153553f5b27156e73ba198abb2c6e915
+      notes:mise/lint: 929c620573f905429e4f94cc2a7660ce945e3a1be4878bc2640d41d448dbe98b
+      notes:mise/litellm: 0386e875a2f4edefdf1d8201e18dbb175d1e57b970949339c874df4a040ebb64
+      notes:mise/lobby: 2d2a30bde59af843401849d68844dacf517d4b6384b1c123af467d17ddfe44bb
+      notes:mise/logs: cdeb4da7ff224512c30f38d3440003d3451ca541eac3dcd5df213ceb18833401
+      notes:mise/loop: 09efa215859bbf2520c026e11173ed33dd61e9386aa053e00d2d9fe7fa763a5c
+      notes:mise/ls: 6094f34100e1724969ba9f1e301cdf02a98baa739e36c91471b3c1f9c509811f
+      notes:mise/manifest: b7f78c9f5b61596a4ef216f44cfadc2812e66b7aa8ed8b560fcffc71db949b9d
+      notes:mise/mcp: 806ffd63da9d40b4f83ca3b896085874e02909a3b5f518996eb386d5d6b1258e
+      notes:mise/migrate: 6eb7dc66f1fa9089d602275ae14299e86e968697bfdcad3321a7282e3629370d
+      notes:mise/network: ad19811604a24f5fd8e9d2250c14753aca30eb6e7125bd2376cfc3e31c8b95cc
+      notes:mise/process: 963067a1343e3c99a3fa2f65cc32e5a5a7a741b6871f2ce8d3cf13b8b0e4c65c
+      notes:mise/_racine: ee9053050c3b9b19f8d2464afb605856d54c47a3ec3ac5c9e3d5d8acb09bc151
+      notes:mise/ray: 2ca9ed937382768c7d18ccca829840bb7433417a51780ae2ce85af70e9cacd44
+      notes:mise/README: ed76c808f590251beae68f8241922e7dbf46effba000de5ff66f34159e06c8f9
+      notes:mise/repo: a2fef7f373b4174d5a04aff68733d918796948fc31566c80ce2e1423af34678a
+      notes:mise/resource-fuse: e4621fd9cb23460ff5415d1ffbb6268f28c09df97e3cc1482a8fd779e6f39641
+      notes:mise/restart: 324b2c7249e2316104c5eecee9aec65f09d73fbf5b84fdf1e16a90c26de7afa7
+      notes:mise/run: 49549fffd686ac5032e48263a1ee8875145ce4b21cb4e1afd25cf0ca3921b451
+      notes:mise/runner: 6c8ec3ac13d5b354ebea93961c3eaf2ff0d83c5f370173763a0ecb4a721678c0
+      notes:mise/sandbox: 505dd423733abb1d8de634449a08d88796b7942c48b122d26ea61986b25aa45b
+      notes:mise/script: 1603741469f4ef315eb22b7595c7df80b825cfe06bb521f5b38c2e8e8c234935
+      notes:mise/scripts: 242ac621ddab51240ba85c048d3b9c37fab4dfcd050ce8558701c706cf3b03d6
+      notes:mise/security: a55262042a2b04adfd5496632c2e0ba2395235b41c50c3ecfa9bc3ef39a5f638
+      notes:mise/service: 61f2f469bfcdb94b210744282cbf3518a885a76ba6804fdbab76ca2b070b416a
+      notes:mise/session: af37e6098f1d0b867e645e7287bdca2cb4f45d013ea5c035fa836240e2e15c91
+      notes:mise/skill: 307707f0ac181b14b78982aa17a9da15a877fc180eb76349e40fd66f5b8c751f
+      notes:mise/ssh: b2cef8acbe5279a8394df3c2cdac75c76f7fd3fcd8a318021040ca96403ea66e
+      notes:mise/storage: f12fc15b1532dbd84472008dc1fdb5cf2815c7adfe2efdb75d80ec5df01717e8
+      notes:mise/swarm: 74fcdb8ef06c261965833575f98c58761badd2af83945c1c267782f6cef51a64
+      notes:mise/symlink: d63b39dae3d0bfb838f8af35e4c4a2254ca3850525dddee85c91ababd528f793
+      notes:mise/sync: b909c1357be0ac4f9eb10f70b7da5d3b7076daf8244aacbe3a612127b330e78d
+      notes:mise/test: da13c70fb12b1ae6508fbadc7772ed91e17eeec9369dddf804d1ef3fede2d810
+      notes:mise/theme: 9ff4ac93fe2dfeadff420a9003133467267526100426394097cad8cd60b5d30d
+      notes:mise/tsp: 473ded7b5600a8587b36f6d7aabc75686ef75279d4ea221a1bba01e2ed068b0f
+      notes:mise/undo: 85be1837a7d6e8910320799bb033026ac64b0b94cd4472b97ba641b37f5c1fa6
+      notes:mise/unexpose: b816c0c1440d1a336c950cb90ead1ac4ab5d2bb1bb52ea6bd0f2e76bb35f8853
+      notes:mise/users: cb4259407a2f28d4b36277db3d3806de0cdf40331e410966353da57462a18df6
+      notes:mise/venv: b3dd94a2c2669d8ff65cca14d6a0a59aae50b9c10045dc45596b7253b2006960
+      notes:mise/worker: 32024740ba6282306ef8fc83b46007d15d65f5cf9cd2db3200216f5ade6441a6
+      notes:mise/zellij: f0cf690e2ec42e22222af522ee601e9dd3b0e47c29d85c0029de57d82ee80127
+      notes:self-designing-self-healing-wot: 71f01e761eba44fcb45c14a12bd5cb1aa6af9effccd900565208380af7346f7a
+      notes:serverless-wot-verification: 607d03ac6d1c8df430708fdb388c21e17dd68961b7ceecd79060731241604607
+    questions:
+      - id: g01
+        q: "Pourquoi servir toutes les mémoires depuis un seul processus partagé plutôt qu'un serveur stdio par contexte ?"
+        expected: [notes:memory-multi-contexte]
+        relevant: [notes:memory-multi-contexte]
+      - id: g02
+        q: "Quelle commande annule la dernière action faite dans data_tachikoma ?"
+        expected: [notes:mise/undo]
+        relevant: [notes:mise/undo, notes:mise/README, notes:mise/backup]
+      - id: g03
+        q: "Comment faire tourner sur GLM l'agent qui pilote la ville isolée d'un contexte ?"
+        expected: [notes:mise/gastown]
+        relevant: [notes:mise/gastown, notes:mise/README]
+      - id: g04
+        q: "Comment remplacer la valeur d'un secret utilisé par les modèles de langage et la propager au proxy LLM ?"
+        expected: [notes:mise/infisical]
+        relevant: [notes:mise/infisical, notes:mise/litellm, notes:mise/README]
+      - id: g05
+        q: "Quelle tâche remet les espaces de travail sur leurs chemins physiques sans passer par le montage ?"
+        expected: [notes:mise/fuse]
+        relevant: [notes:mise/fuse, notes:mise/resource-fuse, notes:mise/README]
+      - id: g06
+        q: "Que fait le superviseur d'une boucle quand l'échec d'une étape exige de changer la topologie ?"
+        expected: [notes:self-designing-self-healing-wot]
+        relevant: [notes:self-designing-self-healing-wot, notes:serverless-wot-verification]
+      - id: g07
+        q: "Pourquoi un worker Ray éphémère ne voit-il pas les variables d'environnement du driver ?"
+        expected: [notes:serverless-wot-verification]
+        relevant: [notes:serverless-wot-verification, notes:self-designing-self-healing-wot]
+      - id: g08
+        q: "Quel est le prochain geste prioritaire dans le prompt de reprise de début août ?"
+        expected: [notes:handoff-linear-2026-08-02]
+        relevant: [notes:handoff-linear-2026-08-02]
+      - id: g09
+        q: "Quelle tâche restreint par compte l'accès aux adresses loopback propres à chaque contexte ?"
+        expected: [notes:mise/network]
+        relevant: [notes:mise/network, notes:mise/README]
+      - id: g10
+        q: "Comment s'assurer qu'un contexte a son équipe dans le proxy LLM ?"
+        expected: [notes:mise/litellm]
+        relevant: [notes:mise/litellm, notes:mise/infisical, notes:mise/README]
+      - id: g11
+        q: "Comment restaurer une sauvegarde de la hiérarchie, des entités et de la clé age ?"
+        expected: [notes:mise/backup]
+        relevant: [notes:mise/backup, notes:mise/undo, notes:mise/README]
+      - id: g12
+        q: "Combien de tâches mise existent, réparties en combien de domaines ?"
+        expected: [notes:mise/README]
+        relevant: [notes:mise/README, notes:mise/_racine, notes:mise/_generateurs/README]
+
+  tachikoma.paralelle.GenAI:
+    notes_source: /home/ubuntu/data_tachikoma/contexts/tachikoma.paralelle.GenAI/notes
+    store_source: /home/ubuntu/data_tachikoma/omni/contexts/tachikoma.paralelle.GenAI
+    corpus:
+      notes:proj03-to-iris-port: 87152f126b5392fea0320f914975713b961798c49e723c250a87e204fd36a6cc
+      notes:showcase-strategy-underwriting: 56cc93d4e791ce1ac350d7ae8b5e5a28caace241c3f0d425571b29d990c725cd
+      notes:trace/charts: 0f78f429a74670350af2d7258b1386c86d8d5b4ae4102de9fb23154cccfa845c
+      notes:trace/compliance: 12922e18d622dd15bbab85be38846ca76f7438c9fe18c0e943454aced8ad1ae0
+      notes:trace/create_card: a8163be3d2e7fc872adfe059aa439205dd6ff749568683d7a724182da761e5a4
+      notes:trace/fetch: 0379c196e94108b233ccee361faa99a3ce1da45d044cd51b27aaa7eeacf1d823
+      notes:trace/generate: 14e522553461168c68e1b127c7ab80f89ac063064a3dffc2e9433bc9a0e68a3a
+      notes:trace/interpret: bae3243d28de2a8d9e71a2f4020f6b0069a5979b38d058bea37059d61f5b7f46
+      notes:trace/interpret_vers_fetch: 84d79f152c91f6b46f0fb045e079959888761b7b9567dafe2a99fefc1c9f16ad
+      notes:trace/premiere_frame_interpret: a6f85cc90bff52d0fc9a7a865e08a1c5573dc8ab7b6080d27fa3c7c24219b39d
+      notes:trace/README: 2abc0ca8f6aeb309cb9ae43e645a2fce2cf3f21db7fb298a542ff0524ac74fde
+      notes:trace/report_architect: 0cbbcbb650fa00b88a0c66ec25179d554bc959a436744c942174e41d49b558cf
+      notes:trace/todo_2: a9bce2ce95e88cbcd7f17efbc761def473f91dff3fb625150fd8d02139175991
+      notes:trace/todo: 171687139aca7dfff254602db2fc6813c6ad56ebeda3394cc79756d2cb70d69b
+      notes:trace/_to_loader_event: c0806fac1313be75808043cd3ff307377d60c1e928845aee3fd54eaeb13ea04a
+      notes:trace/wot: b87c303889d59cae8ca55c1ab59584ac57196cda2fb0cb6a0c3dedff0edd9d5a
+    questions:
+      - id: a01
+        q: "Quel contrôle de proj-03 apporterait le plus à IRIS, et pourquoi ?"
+        expected: [notes:proj03-to-iris-port]
+        relevant: [notes:proj03-to-iris-port, notes:showcase-strategy-underwriting]
+      - id: a02
+        q: "Parmi les six dossiers de prêt de la démonstration, lesquels sont refusés ?"
+        expected: [notes:showcase-strategy-underwriting]
+        relevant: [notes:showcase-strategy-underwriting, notes:proj03-to-iris-port]
+      - id: a03
+        q: "Comment éviter qu'un chiffre inventé apparaisse à l'écran pendant la démo ?"
+        expected: [notes:showcase-strategy-underwriting]
+        relevant: [notes:showcase-strategy-underwriting, notes:proj03-to-iris-port]
+      - id: a04
+        q: "Quel agent du run tracé a mis le plus de temps ?"
+        expected: [notes:trace/README]
+        relevant: &trace [notes:trace/README, notes:trace/charts, notes:trace/compliance,
+                          notes:trace/create_card, notes:trace/fetch, notes:trace/generate,
+                          notes:trace/interpret, notes:trace/interpret_vers_fetch,
+                          notes:trace/premiere_frame_interpret, notes:trace/report_architect,
+                          notes:trace/todo, notes:trace/todo_2, notes:trace/_to_loader_event,
+                          notes:trace/wot]
+      - id: a05
+        q: "À combien de caractères le traceur tronque-t-il l'entrée envoyée au modèle ?"
+        expected: [notes:trace/README]
+        relevant: *trace
+      - id: a06
+        q: "Quel modèle et quel fournisseur le relecteur de conformité a-t-il appelés ?"
+        expected: [notes:trace/compliance]
+        relevant: *trace
+      - id: a07
+        q: "Qu'est-ce qu'IRIS ne reprend pas de proj-03 parce qu'il est déjà en avance ?"
+        expected: [notes:proj03-to-iris-port]
+        relevant: [notes:proj03-to-iris-port, notes:showcase-strategy-underwriting]
+      - id: a08
+        q: "Quels pièges plantés le rapprochement des documents doit-il faire apparaître en direct ?"
+        expected: [notes:showcase-strategy-underwriting]
+        relevant: [notes:showcase-strategy-underwriting, notes:proj03-to-iris-port]
+      - id: a09
+        q: "Combien de temps a duré l'exécution du WoT de vérification banking_bi ?"
+        expected: [notes:trace/wot]
+        relevant: *trace
+
+offtopic:
+  - id: o01
+    q: "Quelle est la recette du kouign-amann ?"
+    absent_marker: "(?i)kouign"
+  - id: o02
+    q: "À quelle période faut-il tailler les rosiers grimpants ?"
+    absent_marker: "(?i)rosier"
+  - id: o03
+    q: "Who scored in the 1998 FIFA World Cup final?"
+    absent_marker: "(?i)world cup|coupe du monde"

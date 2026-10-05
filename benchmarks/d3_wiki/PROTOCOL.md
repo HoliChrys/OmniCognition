@@ -1,65 +1,67 @@
 # D3 — deep-wiki strategies, compared per context (Linear TAC-939)
 
 Two ways to grow a context's deep wiki coexist and were never measured against
-each other. This protocol is frozen **before** any measurement: the question
-set and this file are versioned, and a run names the commit it ran on.
+each other. This protocol, the question set (`questions.yaml`) and the harness
+(`run_d3.py`) are frozen **before** any measurement. A run names the commit it
+ran on and the sha256 of the question set. Editing either after a run voids
+that run.
 
-## The two strategies — where they live
+## The two strategies, and where they live
 
 The deep-wiki cycle the ticket attributes to mnema (`feed_wiki`, `wiki_doc`,
-sleep → seeds → rerun → absorb) is the "mnema layer" of this repository
-(`metacog/memory.py`). The mnema *package* exposes no wiki tool over MCP:
-TAC-218 found no `wiki_*` tool, and tachikoma's `memory_engines.py` marks
-`MnemaEngine.list_docs/read_doc` unsupported. If the deployed package turns out
-to carry a sleep cycle of its own, it is measured as a third column, under
-TAC-321's bench-window rules.
+sleep → seeds → rerun → absorb) exists **only** in this repository, as the
+"mnema layer" of `metacog/memory.py`. TAC-327 checked the deployed mnema
+package (editable install, source `3593a93`) and found no `sleep`, wiki or
+seed function; its only consolidation is `reflect.py` (`run_reflection`). Both
+strategies therefore run in one omni process.
 
-| strategy | build (offline) | answer (query time) |
+| column | build | answer (MCP tool, surface `external` as deployed) |
 |---|---|---|
-| `sleep` (mnema layer) | notes → `import_okf` + content point; `add_seed`; `Memory.sleep()` → `reconcile_wiki` → `rerun_seeds` (re-run, diff, absorb into generated docs / pending on authored) | `retrieve(q, k=5)`, cited through the wiki docs of the hits |
-| `walk` (omni) | notes → `import_okf` + content point (D2 `_ingest_note`) | the uncertainty-stopped walk (`meta_walk`), cited through its committed evidence set (never hard-capped) |
+| `walk` | notes ingested by the gate's own pass (`ContextualMemory._refresh_notes`: doc via `import_okf` + content point `notes:<d>#<sha12>`) | `walk_start(query)`; items = `relevant_collected` (never hard-capped) |
+| `sleep` | same ingest, then one seed per note (`add_seed(doc, <first heading>, target="*")`), then `Memory.sleep()` (`reconcile_wiki` → `rerun_seeds` → absorb / pending) | `recall(query, k=5)` (retrieve + relevance floor + gap sentinel) |
+| `deployed` (reference, **not** a candidate) | same ingest as `walk` | `recall(query, k=5)`: what tachikoma's `OmniEngine.recall` calls today |
 
-**Shared corpus by construction.** Both strategies run in one process, on
-the same scratch copy of one context's notes and store. Each note is read from
-`notes_folder(OMNI_NOTES_ROOT, ctx)` and pinned by its sha256 in the run's
-manifest. A run never opens the live `memory.pkl` or `*.journal.db` of
-`global` or `tachikoma.paralelle.GenAI` for writing. It works on a copy under
-a scratch root.
+## Corpus: common by construction
 
-## Contexts
+- Each strategy runs on **its own scratch copy** of the context's live store
+  (`memory.pkl` + `memory.pkl.journal.db`), because `sleep()` mutates the
+  store. Into that copy go the **same** notes, copied into the scratch notes
+  root at the folder `notes_folder()` maps the context to.
+- The notes are pinned by sha256 in `questions.yaml`. The harness refuses a
+  corpus that differs (fail-closed).
+- The live store is only read. Its sha256 is taken before and after the run,
+  and any change fails the run.
+- `global`: the folder omni reads for it (`<root>/notes` → `contexts/tachikoma/notes`)
+  is **empty** (TAC-327). The bench corpus is `contexts/global/notes` (80 `.md`).
+  omni does not read that folder in production. This is a bench choice, not a
+  production change. The mapping gap is reported separately.
+- `tachikoma.paralelle.GenAI`: `contexts/tachikoma.paralelle.GenAI/notes` (16 `.md`),
+  the folder omni reads.
 
-- `global`: the heavy context. Its notes folder is `<notes_root>/notes`.
-- `tachikoma.paralelle.GenAI`: the light context. Its notes folder is
-  `<notes_root>/paralelle/GenAI/notes`.
-
-## Question set — `questions.yaml`
-
-- **In-topic:** each question has a known answer located in one note. It
-  carries `expected` (the note doc ids that answer it) and `relevant` (expected
-  plus any note that legitimately bears on it). Questions are written as
-  paraphrases, never as the note's title or a copied sentence.
-- **Off-topic:** at least one per context. The right answer is "I have
-  nothing". It is answered against every context.
-- Once a measurement has run, the file is not edited. A new question set is a
-  new file and a new run.
-
-## Measures (per strategy × context)
+## Measures (per column × context)
 
 A returned item **cites** note `d` when its id is `notes:<d>#…` or it carries
-the tag `note:<d>`. An item that resolves to no note cites nothing.
+the tag `note:notes:<d>`. An item that resolves to no note is **uncited**: a
+fact of the live store or a generated node.
 
-- **Coverage** = in-topic questions with at least one returned item citing an
+- **Coverage** = in-topic questions with at least one item citing an
   `expected` note ÷ in-topic questions.
-- **Noise** = in-topic answers holding at least one item that cites nothing, or
-  cites a note outside `relevant` ÷ in-topic answers. Reported with the
-  item-level precision and `n`.
-- **Off-topic recall** = items returned (gap notices excluded) summed over the
-  off-topic questions. It must be 0.
-- **Build cost** = wall time and LLM calls (counted on the `Memory.llm` client)
-  from an empty scratch store to a built wiki.
-- **Query cost** = wall time of the answer call, p50 / p95 / max over all
-  questions, after one uncounted warm-up query. Measured on the same host,
-  in the same window, for both strategies.
+- **Noise** = in-topic answers holding at least one item that cites a note
+  **outside** `relevant` ÷ in-topic answers. Uncited items are not judged:
+  the store's facts have no gold. They are reported (`items_uncited`), along
+  with the precision over cited items and `n`.
+- **Off-topic** = items returned (gap notices excluded) summed over the
+  off-topic questions, asked on every context. It must be 0. If a point of the
+  copied store already matches the question's `absent_marker`, the question is
+  reported `invalid_offtopic` and not scored: the store does hold the topic.
+- **Build cost** = wall time and LLM calls, counted on `Memory.llm`, failures
+  included:
+  - `build_empty`: from an empty store with the notes only;
+  - `build_live`: on the copy of the live store. This includes the load time.
+- **Query cost** = wall time of each answer call, p50 / p95 / max (nearest
+  rank) over all questions, in-topic and off-topic. One uncounted warm-up runs
+  first. The LLM calls and errors are counted per answer. An LLM error is a
+  degraded answer and is reported, never hidden.
 
 ## Decision rule (Proxy, 2026-10-04 — TAC-190 decisions doc, applied as is)
 
@@ -76,5 +78,7 @@ both conditions:
   context. If it wins nowhere, it is retired, and Linear TAC-34 / TAC-38 are
   closed with the reason.
 
-The kept strategy is written as a **per-context configuration entry** that
-the API can read. It is never a global variable.
+`decide()` in `run_d3.py` is this rule. It is unit-tested at its boundaries in
+`tests/test_d3_wiki_bench.py`. The kept strategy is written as a
+**per-context configuration entry** that the API can read. It is never a
+global variable.

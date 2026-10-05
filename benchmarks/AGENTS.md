@@ -49,4 +49,9 @@ by running one small query end-to-end and confirming the table renders.
 - `locomo/AGENTS.md` — LoCoMo long-conversation QA harness and answerers
 - `obliq_bench/AGENTS.md` — OBLIQ-Bench oblique-query harness and debuggers
 - `d3_wiki/PROTOCOL.md` — D3 (Linear TAC-939): `sleep` vs `walk` deep-wiki
-  strategies per context; protocol and question set frozen before any run
+  strategies per context. `PROTOCOL.md`, `questions.yaml` (notes pinned by
+  sha256) and `run_d3.py` are frozen before any run; never edit them after a
+  measurement. The harness only reads live stores (it works on scratch
+  copies), refuses a SimpleEncoder fallback, and checks the live sha256 before
+  and after. Its scoring and `decide()` are tested in
+  `tests/test_d3_wiki_bench.py` (offline).
