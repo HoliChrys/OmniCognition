@@ -738,9 +738,40 @@ class ContextualMemory:
             # could collide with another account's — the engine names it.
             q = ctx_mem.ingest(content, kind=kwargs.get("kind", "FACT"))
             _tag_account(q, account)
+            q.tags.append(_mirror_tag(p.id))   # exact case: ids may carry capitals
             _log_tags(ctx_mem, q)
             return _MirroredPoint(p, q, ctx_mem)
         return ingest
+
+    def _mirrored_forget(self, own: Any, account: str):
+        """`forget_node` for a narrow account: its point AND its mirror (TAC-353).
+
+        Measured on GenAI: a member's `forget` answered `forgotten` while the
+        copy `_mirrored_ingest` left in the context memory stayed live — the
+        manager kept recalling the fact. The mirror is found by its
+        `mirror_of:<id>` tag, or, for a mirror written before that tag, by
+        the account tag and the same content (one per forget). The answer
+        names the mirrors forgotten: `[]` says none was found.
+        """
+        def forget_node(node_id: str, reason: str,
+                        superseded_by: Optional[str] = None) -> dict:
+            p = next((x for x in own.points if x.id == node_id), None)
+            out = own.forget_node(node_id, reason, superseded_by=superseded_by)
+            if not out.get("forgotten") or p is None:
+                return out
+            ctx_mem = self._context_memory()
+            successor = None
+            if superseded_by:
+                q = _mirror_of(ctx_mem, superseded_by, None, account)
+                successor = q.id if q is not None else None
+            done = []
+            q = _mirror_of(ctx_mem, node_id, p.content, account)
+            if q is not None and ctx_mem.forget_node(
+                    q.id, reason, superseded_by=successor).get("forgotten"):
+                done.append(q.id)
+            out["mirrors_forgotten"] = done
+            return out
+        return forget_node
 
     def _mirrored_save(self, own: Any):
         """`save` for a narrow account: both stores the write touched."""
@@ -758,6 +789,8 @@ class ContextualMemory:
         account = self._account_name(self._ctx_name())
         if account and name == "ingest":
             return self._mirrored_ingest(m, account)
+        if account and name == "forget_node":
+            return self._mirrored_forget(m, account)
         if account and name == "save":
             return self._mirrored_save(m)
         return getattr(m, name)
@@ -903,6 +936,35 @@ def _tag_account(p: Any, account: str) -> None:
     tag = f"account:{account}"
     if tag not in p.tags:
         p.tags.append(tag)
+
+
+def _mirror_tag(own_id: str) -> str:
+    """The tag naming the account point a context-memory mirror copies."""
+    return f"mirror_of:{own_id}"
+
+
+def _mirror_of(ctx_mem: Any, own_id: str, content: Optional[str],
+               account: str) -> Any:
+    """The live mirror of the account point `own_id` in the context memory.
+
+    By its `mirror_of:` tag; failing that, when `content` is given, a mirror
+    written before the tag (TAC-213 → TAC-353): the same account (any case,
+    `match_tag`'s rule), the same content, and no `mirror_of:` of its own.
+    """
+    tag, acct = _mirror_tag(own_id), f"account:{account}".lower()
+    live = [q for q in getattr(ctx_mem, "points", [])
+            if "invalidated" not in q.tags]
+    for q in live:
+        if tag in q.tags:
+            return q
+    if content is None:
+        return None
+    for q in live:
+        if (q.content == content
+                and any(t.lower() == acct for t in q.tags)
+                and not any(t.startswith("mirror_of:") for t in q.tags)):
+            return q
+    return None
 
 
 def _log_tags(m: Any, p: Any) -> None:
