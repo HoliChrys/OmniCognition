@@ -29,6 +29,9 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    its wiki: every `.md` is ingested (`import_okf`) the first time the memory
    of that context is touched, its refs linked into the RAG. The wiki lives
    where the notes already live — not in a parallel store that would drift.
+   ONLY THE CONTEXT'S OWN NOTES (TAC-936, rule C3): inheritance is served AT
+   QUERY TIME by the caller, which asks each ancestor's memory in turn
+   (`memory_engines.recall_inherited` in tachikoma) — never copied here.
 
 4. THE ACCOUNT (TAC-213) — the right to read is the ACCOUNT's, not only the
    context's. Every caller operates under an account. By default (no
@@ -109,11 +112,12 @@ def valid_account_name(name: str) -> bool:
 
 _API = os.environ.get("TACHIKOMA_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-#: The COMMON NOTEBOOK — the ONLY name that escapes authorization (not
-#: authentication). `general` is no tachikoma context: no hierarchy, no ACL
-#: resource — there is nothing to ask. Anything written there is readable by
-#: ANY valid token, by construction (mnema's documented exception, kept as is).
-GENERAL = os.environ.get("MNEMA_GENERAL_CTX", "general")
+# NO COMMON NOTEBOOK (TAC-936, rule C3). mnema's `general` — readable by any
+# valid token, outside the hierarchy — was the one name that escaped
+# authorization (`MNEMA_GENERAL_CTX`). It is gone: a recall climbs ctx → its
+# ancestors → `global`, nothing beside the chain. What everyone must read is
+# written in `global`. `general` is now an ordinary name: no hierarchy entry,
+# so the existence check refuses it like any unknown context.
 
 #: 30 s, mnema's measured ceiling: warm the check costs ~13 ms, but the first
 #: rights resolution of a fresh API was measured at 17.8 s. A timeout yields a
@@ -164,10 +168,6 @@ def authorize(token: str, ctx: str) -> str:
     if code != 200 or not isinstance(body, dict) or not body.get("user_id"):
         raise Denied(f"jeton rejeté par l'ACL (HTTP {code})", 401)
     user = str(body["user_id"])
-
-    # Authentication required, authorization does not apply — `general` only.
-    if ctx == GENERAL:
-        return user
 
     # 2. WHERE — existence FIRST, it is a guard: `_resolve` does `os.makedirs`,
     # so an authorized unknown name would GIVE BIRTH to a memory (measured:
@@ -307,19 +307,19 @@ class ContextualMemory:
         return self._memory_at(os.path.join(name, "accounts", account))
 
     def _ingest_notes(self, ctx: str, m: Any) -> None:
-        """The context's deepwiki: its `notes/` folder, ingested once.
+        """The context's deepwiki: its OWN `notes/` folder, ingested once.
 
         Every `.md` becomes an OKF doc (`import_okf` — frontmatter + refs
         linked into the RAG), recursively. ONCE per (ctx, process).
 
-        ANCESTOR SEEDING — the inheritance mnema serves on query, the wiki
-        serves at ingestion: alongside the context's OWN notes, every
-        ANCESTOR's notes are ingested too (a child context's wiki sees its
-        parents' notes — `tachikoma.paralelle.GenAI` also gets `tachikoma`'s
-        and the root's). The ancestor docs are marked by their doc id
-        (`notes:<ancestor>/…` namespace below), so a caller can tell an
-        inherited note from a local one. Measured on mnema: its recall marks
-        inherited hits `← hérité`; the wiki answers the same question.
+        NO ANCESTOR SEEDING (TAC-936, rule C3). This used to COPY every
+        ancestor's notes into the child's memory (`notes:<ancestor>/…`): a
+        note corrected in the ancestor stayed stale in every child that had
+        ingested it, since `_ingested` bounds ingestion to once per process.
+        Inheritance is now served AT QUERY TIME, by the caller asking each
+        ancestor's memory in turn; the inherited mark is the `origin_ctx` of
+        the contract, not a doc-id prefix. The copies an older gate left
+        behind are soft-forgotten here (`_forget_inherited_copies`).
 
         THE MAPPING IS THE CONTEXT PATH, NOT ITS DOTTED NAME: the context
         `tachikoma.paralelle.GenAI` lives at
@@ -333,22 +333,21 @@ class ContextualMemory:
         if ctx in self._ingested or not self._notes_root:
             return
         self._ingested.add(ctx)
+        self._forget_inherited_copies(ctx, m)
         n_docs = n_points = 0
-        # OWN notes first, then every ancestor's (nearest first).
-        for source_ctx, folder in self._note_folders(ctx):
-            prefix = "" if source_ctx == ctx else f"{source_ctx}/"
+        folder = self._note_folder(ctx)
+        if folder:
             for root, _dirs, files in sorted(os.walk(folder)):
                 for filename in sorted(files):
                     if not filename.endswith(".md"):
                         continue
                     path = os.path.join(root, filename)
-                    # The doc id keeps the RELATIVE path (collision-proof) and,
-                    # for ancestors, the source context (inheritance visible).
+                    # The doc id keeps the RELATIVE path (collision-proof).
                     rel = os.path.relpath(path, folder)[:-3]
                     try:
                         with open(path, encoding="utf-8", errors="replace") as fh:
                             body = fh.read()
-                        doc_id = f"notes:{prefix}{rel}"
+                        doc_id = f"notes:{rel}"
                         # TWO INGESTIONS, TWO ROLES — both asked for:
                         # 1. import_okf: the DOC (frontmatter, refs, wiki_where/
                         #    wiki_doc queryable) — the deepwiki structure.
@@ -358,7 +357,7 @@ class ContextualMemory:
                         #    retrieve/walk never saw the notes (docs live in the
                         #    journal, the RAG indexes points). Without this, a
                         #    question whose answer is IN a note returns empty.
-                        #    The point is tagged with its doc id + source ctx so
+                        #    The point is tagged with its doc id + its ctx so
                         #    the hit can be traced back to the note it came from.
                         try:
                             # The engine's ingest() takes NO tags (measured:
@@ -366,7 +365,7 @@ class ContextualMemory:
                             # AFTER creation (add_tag + journal tag index).
                             # We mirror the tool exactly.
                             p = m.ingest(body, kind="FACT")
-                            p.add_tag(f"note:{doc_id}", f"ctx:{source_ctx}",
+                            p.add_tag(f"note:{doc_id}", f"ctx:{ctx}",
                                       "deepwiki")
                             try:
                                 if m.journal is not None:
@@ -379,42 +378,52 @@ class ContextualMemory:
                                   flush=True)
                     except Exception:  # noqa: BLE001 — one unreadable note never stops the wiki
                         print(f"[gate] unreadable note skipped: "
-                              f"{source_ctx}/notes/{rel}.md", flush=True)
+                              f"{ctx}/notes/{rel}.md", flush=True)
         if n_docs or n_points:
             print(f"[gate] deepwiki of {ctx!r}: {n_docs} doc(s) + "
-                  f"{n_points} content point(s) ingested (own + ancestors)",
+                  f"{n_points} content point(s) ingested (own notes only)",
                   flush=True)
 
-    def _note_folders(self, ctx: str) -> list[tuple[str, str]]:
-        """(source_context, notes_folder) for ctx and its ancestors, own first.
+    @staticmethod
+    def _forget_inherited_copies(ctx: str, m: Any) -> None:
+        """Soft-forget the ancestor notes an older gate COPIED into `ctx`.
 
-        The ancestor chain of `a.b.c` is `[a.b.c, a.b, a]` — each prefix of
-        the dotted name, nearest parent first, the root last. The same
-        candidate mapping as a single context applies per ancestor.
+        Those content points carry `deepwiki` and the `ctx:<ancestor>` tag of
+        their source. Left in place, a recall from the child would serve them
+        as LOCAL memories — stale, and mislabeled. `forget_node` is reversible
+        (state INVALID + ledger row), never a deletion; idempotent, since an
+        invalidated point already carries `invalidated`.
         """
-        segments = ctx.split(".")
-        out: list[tuple[str, str]] = []
-        seen: set[str] = set()
-        # own context first, then progressively shorter prefixes (ancestors)
-        for i in range(len(segments), 0, -1):
-            src = ".".join(segments[:i])
-            if not src or src in seen:
-                continue
-            seen.add(src)
-            sub = segments[:i]
-            candidates = []
-            if len(sub) > 1:
-                candidates.append(os.path.join(self._notes_root, *sub[1:], "notes"))
-                candidates.append(os.path.join(self._notes_root, *sub, "notes"))
-            else:
-                # SINGLE-SEGMENT = the galaxy/root: its own folder if it
-                # exists, else the notes_root itself stands in.
-                candidates.append(os.path.join(self._notes_root, *sub, "notes"))
-                candidates.append(os.path.join(self._notes_root, "notes"))
-            folder = next((d for d in candidates if os.path.isdir(d)), "")
-            if folder and all(folder != f for _s, f in out):
-                out.append((src, folder))
-        return out
+        # `add_tag` lowercases: `ctx:tachikoma.paralelle.GenAI` is stored as
+        # `ctx:tachikoma.paralelle.genai` — compare in that form, or the
+        # context's OWN notes would read as foreign and be forgotten.
+        own = f"ctx:{ctx}".lower()
+        stale = [p.id for p in getattr(m, "points", [])
+                 if "deepwiki" in p.tags and "invalidated" not in p.tags
+                 and any(t.startswith("ctx:") and t != own for t in p.tags)]
+        for node_id in stale:
+            m.forget_node(node_id, "TAC-936: ancestor note copied at ingestion; "
+                                   "inheritance is served at query time")
+        if stale:
+            print(f"[gate] {ctx!r}: {len(stale)} inherited note copie(s) "
+                  f"soft-forgotten (rule C3)", flush=True)
+
+    def _note_folder(self, ctx: str) -> str:
+        """The `notes/` folder of `ctx` itself — never an ancestor's — or "".
+
+        The dotted name maps to the folder path; the FIRST segment often
+        repeats the root name, so the without-first-segment form is tried
+        first. A single-segment name is the root: its own folder if it
+        exists, else the notes_root itself stands in.
+        """
+        sub = ctx.split(".")
+        if len(sub) > 1:
+            candidates = [os.path.join(self._notes_root, *sub[1:], "notes"),
+                          os.path.join(self._notes_root, *sub, "notes")]
+        else:
+            candidates = [os.path.join(self._notes_root, *sub, "notes"),
+                          os.path.join(self._notes_root, "notes")]
+        return next((d for d in candidates if os.path.isdir(d)), "")
 
     # ── the context tag of a narrow account's writes ──────────────────
     def _mirrored_ingest(self, own: Any, account: str):
