@@ -1,0 +1,29 @@
+# C1 (TAC-934): per-context isolation, on the four lanes, at every step.
+#
+# The isolation test is the Done condition of the roadmap's A/B/D tickets: it
+# runs on EVERY push and EVERY pull request, not once at the end. Deterministic
+# and offline (SimpleEncoder, no reranker, no network): the models fastembed
+# would download are never built.
+name: context-isolation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e . pytest
+      - name: Context isolation (recall, capture, wiki, index) + the gate
+        run: python -m pytest -q tests/test_context_isolation.py tests/test_tachikoma_gate.py
