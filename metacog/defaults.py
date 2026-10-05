@@ -25,6 +25,15 @@ DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-
 #: mnema's production reranker : a multilingual cross-encoder (FR rerank 9/10
 #: vs bge-base 7/10 in their measurement), ONNX on CPU, ~1.1 GB.
 DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
+#: ONNX threads (intra- AND inter-op) of the cross-encoder session. A compute
+#: knob, not a retrieval parameter : ids and logits are bit-identical whatever
+#: the value (TAC-265, 12/12). Measured on holistix-baremetal (4 cores / 8 HT,
+#: load 33-46), a copy of `global`, 12 new questions each right after a
+#: capture, rerank_pre=30 : 1 thread p50 31.5 s, 2 -> 29.2 s, 4 -> 19.3 s,
+#: onnxruntime's default -> 19.2 s. Fewer threads only lose the CPU share under
+#: load ; 4 is kept. `METACOG_RERANK_THREADS` overrides it ; `0` = onnxruntime's
+#: default (one thread per physical core).
+DEFAULT_RERANK_THREADS = 4
 
 
 class SimpleEncoder:
@@ -182,10 +191,15 @@ class CrossEncoderReranker:
     top-k), the same pipeline as mnema's `search_memory`."""
 
     def __init__(self, model_name: str = DEFAULT_RERANK_MODEL,
-                 cache_dir: Optional[str] = None, max_cache: int = 20_000) -> None:
+                 cache_dir: Optional[str] = None, max_cache: int = 20_000,
+                 threads: Optional[int] = None) -> None:
         from fastembed.rerank.cross_encoder import TextCrossEncoder
         self.model_name = model_name
-        self._model = TextCrossEncoder(model_name=model_name, cache_dir=cache_dir)
+        # fastembed sets intra_op_num_threads AND inter_op_num_threads from
+        # `threads` ; None leaves onnxruntime's default (one per core).
+        self.threads = threads
+        self._model = TextCrossEncoder(model_name=model_name, cache_dir=cache_dir,
+                                       threads=threads)
         self._cache: dict = {}
         self._max_cache = max_cache
 
@@ -219,7 +233,9 @@ def make_reranker(spec: Optional[str] = None, *, warn: bool = True):
       none | off          no reranker
 
     Called by the MCP server ; the hooks deliberately skip it (1 GB model per
-    hook process is not worth it for a k=5 recall)."""
+    hook process is not worth it for a k=5 recall). The ONNX session runs on
+    `METACOG_RERANK_THREADS` threads (default `DEFAULT_RERANK_THREADS`, `0` =
+    onnxruntime's default)."""
     spec = (spec if spec is not None
             else os.environ.get("METACOG_RERANKER", "auto")).strip()
     if spec.lower() in ("none", "off", "0", "false"):
@@ -231,7 +247,9 @@ def make_reranker(spec: Optional[str] = None, *, warn: bool = True):
         elif "/" in spec:
             model = spec
         try:
-            return CrossEncoderReranker(model)
+            n = int(os.environ.get("METACOG_RERANK_THREADS",
+                                   DEFAULT_RERANK_THREADS))
+            return CrossEncoderReranker(model, threads=n if n > 0 else None)
         except Exception as exc:
             if spec not in ("", "auto"):
                 raise

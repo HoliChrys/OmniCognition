@@ -115,7 +115,9 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `{{name}}` placeholder per list, unplaced lists appended). `strategy="auto"`/
   `placement="auto"` let the agent decide.
 - `mcp_server.py` — the MCP tool surface (`build_app`). `event:action` beacons are
-  excluded from `retrieve`'s search pool. Bag-domain tools: `collect(ids, bag,
+  excluded from `retrieve`'s search pool. Every `retrieve` entry carries the
+  recall's cost (`pool_size`, `spread_ms`, `rerank_n`, `rerank_ms` from
+  `Memory.retrieve(cost=…)`; a key only when its stage ran, never a fake 0). Bag-domain tools: `collect(ids, bag,
   description)`, `bag(name)`, `bags()` (overview with description/schema for
   decisions), `bag_render(name, strategy, placement)`. Retrieval tools include
   `scoped_answer`, `scoped_list` (non-kNN filtered listing), `search_nodes`
