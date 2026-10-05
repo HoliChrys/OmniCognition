@@ -238,16 +238,82 @@ class _BrokenClientLLM:
         return ""
 
 
-def test_counting_llm_counts_absorbed_errors_and_enforces_the_cap():
+class _FlakyLLM:
+    """Absorbs `fail` client errors into "" (like ClaudeLLM on a 429), then
+    answers. `raises=True`: the failures are exceptions instead."""
+
+    def __init__(self, fail, raises=False):
+        self.llm_errors, self.fail, self.raises, self.made = 0, fail, raises, 0
+
+    def generate(self, prompt, max_tokens=None):
+        self.made += 1
+        if self.fail:
+            self.fail -= 1
+            if self.raises:
+                raise RuntimeError("429 cooling down")
+            self.llm_errors += 1
+            return ""
+        return "answer"
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    """The backoff waits, recorded instead of slept."""
+    got = []
+    monkeypatch.setattr(d3, "_sleep", got.append)
+    return got
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_failed_calls_back_off_and_do_not_spend_the_cap(waits, raises):
     budget = d3.new_budget(2)
-    llm = d3.CountingLLM(_BrokenClientLLM(), budget)
-    assert llm.generate("a") == "" and llm.generate("b") == ""
-    assert (llm.calls, llm.errors) == (2, 2)
+    llm = d3.CountingLLM(_FlakyLLM(fail=3, raises=raises), budget)
+    assert llm.generate("a") == "answer"          # 3 failed tries, then success
+    assert waits == [30.0, 60.0, 120.0]
+    assert (llm.calls, llm.errors) == (1, 3)
+    assert budget["used"] == 1 and budget["errors"] == 3
+    assert budget["retries"] == 3 and budget["backoff_s"] == 210.0
+    assert llm.generate("b") == "answer"          # the cap counts successes only
     with pytest.raises(d3.LLMCapReached):
-        llm.generate("c")                     # NOT made: inner not called
-    assert budget == {"cap": 2, "used": 2, "errors": 2, "refused": 1,
-                      "reached": True}
-    assert llm._inner.llm_errors == 2
+        llm.generate("c")                         # NOT made: inner not called
+    assert llm._inner.made == 5 and budget["reached"] and budget["refused"] == 1
+
+
+def test_six_failed_tries_make_the_llm_unavailable(waits):
+    budget = d3.new_budget(1000)
+    llm = d3.CountingLLM(_BrokenClientLLM(), budget)
+    with pytest.raises(d3.LLMUnavailable, match="6 tries"):
+        llm.generate("a")
+    assert waits == [30.0, 60.0, 120.0, 240.0, 300.0]      # each wait <= 5 min
+    assert budget["used"] == 0 and budget["errors"] == 6 and budget["retries"] == 5
+    with pytest.raises(d3.LLMUnavailable):
+        llm.generate("b")                         # refused, NOT made
+    assert llm._inner.llm_errors == 6 and budget["refused"] == 1
+
+
+def test_sixty_minutes_of_backoff_make_the_llm_unavailable(waits):
+    budget = d3.new_budget(1000)
+    llm = d3.CountingLLM(_FlakyLLM(fail=10 ** 6), budget)
+    with pytest.raises(d3.LLMUnavailable, match="backoff"):
+        while True:
+            try:
+                llm.generate("a")
+            except d3.LLMUnavailable as exc:
+                if "6 tries" in str(exc):         # this call gave up: next one
+                    budget["unavailable"] = None
+                    continue
+                raise
+    # 4 calls x 750 s, then 30+60+120+240 s: the next 300 s would pass 3600 s
+    assert budget["backoff_s"] == 3450.0 and budget["used"] == 0
+
+
+def test_a_stop_is_not_swallowed_by_failure_safe_code():
+    llm = d3.CountingLLM(_FlakyLLM(fail=0), d3.new_budget(0))
+    with pytest.raises(d3.LLMCapReached):
+        try:                                      # the library's failure-safe path
+            llm.generate("a")
+        except Exception:
+            pass
 
 
 def test_llm_cap_stops_the_context_and_says_so(tmp_path):
@@ -261,6 +327,92 @@ def test_llm_cap_stops_the_context_and_says_so(tmp_path):
     assert set(res["ineligible"]) == {"walk", "sleep"}
     v = d3.decide({}, {"tachikoma.c": res["ineligible"]})["tachikoma.c"]
     assert v["strategy"] == "walk" and not v["eligible"]
+
+
+class _DownLLM:
+    """Every call fails (429 absorbed into ""), except the control call."""
+
+    def __init__(self):
+        self.llm_errors, self.model, self.last_error = 0, "m", None
+
+    def generate(self, prompt, max_tokens=None):
+        if prompt == d3.CONTROL_PROMPT:
+            return "OK"
+        self.llm_errors += 1
+        self.last_error = "RateLimitError: 429 cooling down"
+        return ""
+
+
+def test_an_unavailable_llm_stops_the_context_cleanly(tmp_path, waits):
+    from metacog.defaults import SimpleEncoder
+
+    spec, off, scratch = _tiny(tmp_path)
+    res = d3.run_context("tachikoma.c", spec, off, scratch,
+                         (SimpleEncoder(), None), _DownLLM)
+    assert res["stopped"] == "llm_unavailable"
+    assert "6 tries" in res["llm"]["unavailable"] and "429" in res["llm"]["unavailable"]
+    assert res["llm"]["calls"] == 0 and res["llm"]["errors"] == 6
+    assert res["llm"]["retries"] == 5 and res["llm"]["backoff_s"] == 750.0
+    assert not res["llm"]["cap_reached"]
+    # walk answers call the LLM: walk is in progress, sleep never answered
+    assert set(res["ineligible"]) == {"walk", "sleep"}
+    assert res["bench_writes_under_live_root"] == []
+
+
+def test_main_writes_the_summary_on_a_stop_and_exits_0(tmp_path, monkeypatch, waits):
+    import json
+
+    import metacog.defaults as defaults
+    import metacog.llm as llm_mod
+    from metacog.defaults import SimpleEncoder
+
+    spec, off, scratch = _tiny(tmp_path)
+    qfile = tmp_path / "questions.yaml"
+    qfile.write_text(yaml.safe_dump({"contexts": {"tachikoma.c": spec},
+                                     "offtopic": off}))
+    real_run_context = d3.run_context
+
+    def run_offline(ctx, spec, offtopic, scratch, _models, factory, **kw):
+        return real_run_context(ctx, spec, offtopic, scratch,
+                                (SimpleEncoder(), None), factory, **kw)
+    monkeypatch.setattr(d3, "run_context", run_offline)
+    monkeypatch.setattr(llm_mod, "ClaudeLLM", _DownLLM)
+    monkeypatch.setattr(defaults, "make_encoder", lambda: object())
+    monkeypatch.setattr(defaults, "make_reranker", lambda: object())
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["run_d3", "--questions", str(qfile),
+                                      "--scratch", str(tmp_path / "s2"),
+                                      "--out", str(out)])
+    d3.main()                                     # returns: RC 0
+    summary = json.loads((out / "d3_summary.json").read_text())
+    c = summary["contexts"]["tachikoma.c"]
+    assert c["stopped"] == "llm_unavailable"
+    assert c["llm"]["cap_reached"] is False and c["llm"]["backoff_s"] == 750.0
+    assert set(c["ineligible"]) == {"walk", "sleep"}
+    assert summary["decision"]["tachikoma.c"]["strategy"] == "walk"
+    assert (out / "d3_records.jsonl").exists()
+
+
+def test_cap_reached_inside_a_build_still_writes_the_result(tmp_path, monkeypatch):
+    from metacog.defaults import SimpleEncoder
+    from metacog.memory import Memory
+
+    def chatty_sleep(self, t=None):               # an LLM-heavy, failure-safe build
+        for _ in range(10):
+            try:
+                self.llm.generate("extract_common")
+            except Exception:
+                pass
+        return {}
+    monkeypatch.setattr(Memory, "sleep", chatty_sleep)
+    spec, off, scratch = _tiny(tmp_path)
+    res = d3.run_context("tachikoma.c", spec, off, scratch,
+                         (SimpleEncoder(), None), _ScriptedLLM, llm_cap=4)
+    assert res["llm"]["cap_reached"] and res["llm"]["calls"] == 4
+    assert res["llm"]["refused_over_cap"] == 1    # the stop was NOT swallowed
+    assert res["stopped"].startswith("LLM cap reached")
+    assert set(res["ineligible"]) == {"walk", "sleep"}
+    assert "walk" in res["build_empty"] and "sleep" not in res["build_empty"]
 
 
 def test_sleep_over_its_build_cap_is_ineligible_and_walk_still_measured(tmp_path, monkeypatch):

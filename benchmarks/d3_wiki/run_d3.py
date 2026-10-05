@@ -15,10 +15,12 @@ information only: the served gate legitimately writes them meanwhile
 (`live_store_changed_by_other_process`). Decision Proxy, TAC-209, 2026-10-05.
 
 The LLM is real or the bench does not start: one control call first, every
-client failure counted (`ClaudeLLM.llm_errors`), at most `--llm-cap` calls
-per context (beyond, the context stops and says so), and `build(sleep)`
-capped at `--sleep-build-cap-s` (beyond, sleep is ineligible on that context
-for build cost — a result, not a failure).
+client failure counted (`ClaudeLLM.llm_errors`), at most `--llm-cap`
+SUCCESSFUL calls per context (beyond, the context stops and says so), and
+`build(sleep)` capped at `--sleep-build-cap-s` (beyond, sleep is ineligible on
+that context for build cost — a result, not a failure). A failed call does not
+spend the cap: it is retried with backoff; an LLM that stays down stops the
+context as `llm_unavailable` (Proxy, TAC-401). Every stop writes the summary.
 
 Pure parts (`cited_note`, `score`, `decide`) and the guards are unit-tested
 in tests/test_d3_wiki_bench.py.
@@ -53,6 +55,14 @@ QUERY_P95_MAX_S = 2.0       # E1 budget: p95 <= 2 s
 COVERAGE_TIE_POINTS = 10.0  # gap under 10 points -> walk (omni, active)
 STORE_FILES = ("memory.pkl", "memory.pkl.journal.db")
 LLM_CAP = 1000              # Proxy, TAC-209: LLM calls per context
+# Proxy, TAC-401: a failed call is retried after 30 s, 60 s, ... (each wait
+# capped at 5 min), at most 6 tries per call; past 60 min of backoff on one
+# context, or 6 failed tries of one call, the context stops (llm_unavailable).
+LLM_TRIES = 6
+BACKOFF_FIRST_S = 30.0
+BACKOFF_MAX_S = 300.0
+BACKOFF_CONTEXT_MAX_S = 3600.0
+_sleep = time.sleep                 # the backoff wait (patched by the tests)
 SLEEP_BUILD_CAP_S = 5400    # Proxy, TAC-209: 90 min for build(sleep)
 CONTROL_PROMPT = "Reply with the single word OK."
 
@@ -141,8 +151,15 @@ def live_write_guard(roots: List[str]) -> Iterator[List[dict]]:
         _GUARD["roots"], _GUARD["violations"] = (), None
 
 
-class LLMCapReached(RuntimeError):
-    """The per-context LLM call budget is spent: the call is NOT made."""
+class LLMCapReached(BaseException):
+    """The per-context LLM call budget is spent: the call is NOT made.
+    BaseException so that no failure-safe `except Exception` of the library
+    swallows the stop (TAC-401)."""
+
+
+class LLMUnavailable(BaseException):
+    """The LLM kept failing past the backoff budget (TAC-401): the context
+    stops as `llm_unavailable`. BaseException, like LLMCapReached."""
 
 
 class BenchStopped(Exception):
@@ -155,7 +172,10 @@ class _BuildCapExceeded(BaseException):
 
 
 def new_budget(cap: Optional[int]) -> Dict[str, Any]:
-    return {"cap": cap, "used": 0, "errors": 0, "refused": 0, "reached": False}
+    """`used` = successful calls (what the cap spends); `errors` = failed
+    tries; `retries`/`backoff_s` = the waits they caused."""
+    return {"cap": cap, "used": 0, "errors": 0, "refused": 0, "reached": False,
+            "retries": 0, "backoff_s": 0.0, "unavailable": None}
 
 
 def control_call(llm: Any) -> dict:
@@ -331,7 +351,13 @@ def check_corpus(folder: str, pinned: Dict[str, str]) -> None:
 class CountingLLM:
     """Counts every LLM call and its failures for the build/query cost, and
     spends the context's shared `budget`. A failure is an exception OR a
-    client error the inner LLM absorbed into "" (`llm_errors` grew)."""
+    client error the inner LLM absorbed into "" (`llm_errors` grew).
+
+    Only a SUCCESSFUL call spends the cap (TAC-401). A failed try is counted
+    in `errors`, then retried after an exponential backoff; 6 failed tries of
+    one call, or a context past 60 min of backoff, raise LLMUnavailable — and
+    once the budget is spent or the LLM unavailable, every later call is
+    refused without being made."""
 
     def __init__(self, inner: Any, budget: Optional[Dict[str, Any]] = None):
         self._inner, self.calls, self.errors = inner, 0, 0
@@ -344,22 +370,39 @@ class CountingLLM:
 
         def counted(*a, **kw):
             b = self._budget
+            if b["unavailable"]:
+                b["refused"] += 1
+                raise LLMUnavailable(b["unavailable"])
             if b["cap"] is not None and b["used"] >= b["cap"]:
                 b["reached"], b["refused"] = True, b["refused"] + 1
                 raise LLMCapReached(f"{b['cap']} LLM calls spent on this context")
-            b["used"] += 1
-            self.calls += 1
-            before = getattr(self._inner, "llm_errors", 0)
-            failed = 0
-            try:
-                return attr(*a, **kw)
-            except Exception:
-                failed = 1
-                raise
-            finally:
-                failed += max(0, getattr(self._inner, "llm_errors", 0) - before)
-                self.errors += failed
-                b["errors"] += failed
+            for attempt in range(LLM_TRIES):
+                before = getattr(self._inner, "llm_errors", 0)
+                try:
+                    out = attr(*a, **kw)
+                    err = None
+                    if getattr(self._inner, "llm_errors", 0) > before and not out:
+                        err = getattr(self._inner, "last_error", None) or "absorbed error"
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                if err is None:
+                    b["used"] += 1
+                    self.calls += 1
+                    return out
+                self.errors += 1
+                b["errors"] += 1
+                wait = min(BACKOFF_FIRST_S * 2 ** attempt, BACKOFF_MAX_S)
+                if attempt + 1 >= LLM_TRIES:
+                    why = f"{LLM_TRIES} tries failed for one call"
+                elif b["backoff_s"] + wait > BACKOFF_CONTEXT_MAX_S:
+                    why = f"over {BACKOFF_CONTEXT_MAX_S:.0f} s of backoff on this context"
+                else:
+                    b["retries"] += 1
+                    b["backoff_s"] += wait
+                    _sleep(wait)
+                    continue
+                b["unavailable"] = f"LLM unavailable: {why} (last: {err})"
+                raise LLMUnavailable(b["unavailable"])
         return counted
 
 
@@ -489,7 +532,11 @@ async def answer_all(strategy: str, m: Any, asks: List[tuple]) -> List[dict]:
             t0 = time.perf_counter()
             r = await s.call_tool(tool, arg(q))
             secs = time.perf_counter() - t0
-            if m._d3_llm._budget["reached"]:
+            b = m._d3_llm._budget
+            if b["unavailable"]:                 # the stop was swallowed
+                stop = LLMUnavailable(b["unavailable"])
+                break
+            if b["reached"]:
                 stop = BenchStopped(f"LLM cap reached while answering "
                                     f"{strategy} {qid}")
                 break
@@ -516,6 +563,18 @@ def live_roots(spec: dict) -> List[str]:
     the context's store, i.e. every context) and the source notes."""
     return [os.path.dirname(os.path.realpath(spec["store_source"])),
             os.path.realpath(spec["notes_source"])]
+
+
+def _stop_of(exc: BaseException) -> Optional[BaseException]:
+    """The bench stop carried by `exc`, also when anyio wrapped it in an
+    exception group (a stop raised inside an MCP tool during answering)."""
+    if isinstance(exc, (BenchStopped, LLMCapReached, LLMUnavailable)):
+        return exc
+    for sub in getattr(exc, "exceptions", ()) or ():
+        found = _stop_of(sub)
+        if found is not None:
+            return found
+    return None
 
 
 def run_context(ctx: str, spec: dict, offtopic: List[dict], scratch: str,
@@ -571,18 +630,28 @@ def run_context(ctx: str, spec: dict, offtopic: List[dict], scratch: str,
                     for r in asyncio.run(answer_all(s, m, asks)):
                         result["records"].append({"ctx": ctx, **r})
                 del m
-        except BenchStopped as stop:
-            # Proxy, TAC-209: beyond the cap the bench stops and says so. A
-            # strategy whose answers did not all come back is not scored.
-            result["stopped"] = str(stop)
+        except BaseException as exc:
+            # Proxy, TAC-209/TAC-401: on the cap or an unavailable LLM —
+            # raised wherever, build or answer — the context stops and says
+            # so. A strategy whose answers did not all come back is not scored.
+            stop = _stop_of(exc)
+            if stop is None:
+                raise
+            if budget["unavailable"]:
+                result["stopped"], why = "llm_unavailable", budget["unavailable"]
+            else:
+                result["stopped"] = why = (str(stop) if isinstance(stop, BenchStopped)
+                                           else f"LLM cap reached: {stop}")
             done = {r["strategy"] for r in result["records"]}
             for s in STRATEGIES:
                 if s not in done:
-                    result["ineligible"].setdefault(s, f"not measured: {stop}")
+                    result["ineligible"].setdefault(s, f"not measured: {why}")
     after = {p: sha256_file(p) for p in live}
     result["llm"] = {"calls": budget["used"], "errors": budget["errors"],
                      "refused_over_cap": budget["refused"], "cap": budget["cap"],
-                     "cap_reached": budget["reached"]}
+                     "cap_reached": budget["reached"], "retries": budget["retries"],
+                     "backoff_s": budget["backoff_s"],
+                     "unavailable": budget["unavailable"]}
     result["live_store_sha256_before"] = before
     result["live_store_sha256_after"] = after
     result["live_store_changed_by_other_process"] = before != after

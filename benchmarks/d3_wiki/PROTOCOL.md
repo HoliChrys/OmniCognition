@@ -112,3 +112,24 @@ measures and the question set above are unchanged. The guard rails become:
   one attempt per context. Beyond, sleep is **ineligible on that context for
   build cost** — a result, not a failure — and the rule applies among the
   strategies that finished (`decide(scores, ineligible)`).
+
+## Amendment — Proxy, 2026-10-05 (TAC-401), before the final rerun
+
+GenAI run1 (`dc58341`) died with no summary: 2 331 HTTP 429 from the shared
+proxy burnt the 1 000-call cap inside `build_live(sleep)`, and `LLMCapReached`
+was caught nowhere. Rules, measures, question set and `decide()` are
+unchanged; so are `--llm-cap 1000` and `--sleep-build-cap-s 5400`.
+
+- **Only a successful call spends the cap.** A failed call (exception, or
+  `llm_errors` grew while the client answered `""`) is counted in
+  `llm.errors` (per context and per answer), then retried after 30 s, 60 s,
+  120 s… (each wait capped at 5 min), at most 6 tries per call;
+  `llm.retries` and `llm.backoff_s` go in the summary.
+- **LLM unavailable.** 6 failed tries of one call, or more than 60 min of
+  backoff on one context, stop the context with `stopped: "llm_unavailable"`;
+  a strategy whose answers did not all come back is ineligible, as for the cap.
+- **Every stop writes the summary.** The cap and the unavailable stop are
+  caught wherever they fall (build or answer) — they derive from
+  `BaseException`, so no failure-safe `except Exception` swallows them — and
+  `d3_summary.json` / `d3_records.jsonl` are written with `stopped`,
+  `llm.cap_reached` and `ineligible` set. A clean stop exits 0.

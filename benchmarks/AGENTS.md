@@ -35,7 +35,9 @@ cross-benchmark conventions.
   harness for `sleep` vs `walk` per context. It runs against COPIES of live
   stores and must never write under a live root (audit hook, run fails); it
   starts only after a successful LLM control call, counts every LLM error,
-  caps LLM calls per context and `build(sleep)` time. Rules in
+  caps SUCCESSFUL LLM calls per context (a failed call backs off and retries;
+  an LLM that stays down stops the context as `llm_unavailable`) and
+  `build(sleep)` time; every stop still writes the summary. Rules in
   `d3_wiki/PROTOCOL.md`; tests in `tests/test_d3_wiki_bench.py`.
 
 ## Work Guidance
