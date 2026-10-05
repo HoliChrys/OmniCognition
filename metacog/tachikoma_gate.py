@@ -61,6 +61,14 @@ THREE PIECES, NONE OF THEM TOUCHES THE TOOLS:
    — omni idled at 7.16 GB. The pair is loaded ONCE, in a worker thread by the
    middleware, so the event loop never freezes for the 4-10 s of the load.
 
+6. ONE SESSION, ONE CONTEXT (TAC-934) — an MCP session runs every call under
+   the context of the `initialize` that opened it (its server task copied
+   that request's contextvars). The gate binds each session id to its
+   (context, account) and refuses (409) a call whose headers name another
+   pair: the header and the memory served can never disagree. The four
+   isolation lanes (recall, capture, wiki, index) are pinned end to end in
+   `tests/test_context_isolation.py`.
+
 Storage: `<storage_root>/<ctx>/memory.pkl` — one memory per context, isolated,
 persistent. `global` and `tachikoma.paralelle.GenAI` share NOTHING by accident.
 Context and account names are VALIDATED before any path is built or any ACL
@@ -788,6 +796,38 @@ class _MirroredPoint:
         return getattr(self._own, name)
 
 
+#: The MCP session header (streamable HTTP transport).
+SESSION_HEADER = "mcp-session-id"
+
+
+class _SessionBindings:
+    """session id → the (context, account) it was opened under.
+
+    Bounded like the SDK's own session table (`max_sessions`, 10 000 by
+    default): past the bound the OLDEST binding is dropped, and a call on
+    that session gets a 404 from the gate — the client re-initializes, as
+    MCP prescribes for an unknown session. Fail-closed: a session the gate
+    does not know is never served.
+    """
+
+    BOUND = 10_000
+
+    def __init__(self) -> None:
+        from collections import OrderedDict
+        self._map: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def bind(self, session: str, pair: tuple[str, str]) -> None:
+        with self._lock:
+            self._map[session] = pair
+            while len(self._map) > self.BOUND:
+                self._map.popitem(last=False)
+
+    def get(self, session: str) -> Optional[tuple[str, str]]:
+        with self._lock:
+            return self._map.get(session)
+
+
 def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
     """The middleware class: context header, then the ACL, on EVERY request.
 
@@ -802,6 +842,8 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
     """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
+
+    sessions = _SessionBindings()
 
     class _ContextGate(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -836,15 +878,47 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                     {"detail": f"{user!r} ne peut pas opérer sous le compte "
                                f"{account!r} : seul son propre compte (ou celui "
                                "du contexte) est permis"}, status_code=403)
+            # A SESSION SERVES THE CONTEXT IT WAS OPENED UNDER (TAC-934). The
+            # MCP session's server task is started by the `initialize`
+            # request and copies ITS contextvars: every later call of that
+            # session runs under the context of the initialize, whatever
+            # header it carries. Measured: a session opened under `iso-alpha`,
+            # called with `x-tachikoma-context: iso-beta` (authorized for
+            # beta), was served alpha's fact. So a session is bound to its
+            # (context, account) and a request that names another pair is
+            # refused — never served a memory its header did not ask for.
+            # The context's own account is "" whether the header is absent
+            # or names the context — the proxy reads both as the same memory.
+            pair = (ctx, "" if account == ctx else account)
+            session = (request.headers.get(SESSION_HEADER) or "").strip()
+            if session:
+                bound = sessions.get(session)
+                if bound is None:
+                    return JSONResponse(
+                        {"detail": f"session MCP inconnue du gate : {session!r} "
+                                   "— rouvrir une session (initialize)"},
+                        status_code=404)
+                if bound != pair:
+                    return JSONResponse(
+                        {"detail": f"la session {session!r} a été ouverte sous le "
+                                   f"contexte {bound[0]!r} (compte {bound[1]!r}) : "
+                                   f"elle ne sert pas {ctx!r} (compte {pair[1]!r}) "
+                                   "— une session par contexte"}, status_code=409)
             if warm is not None:
                 await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
             # A fresh stamp: this request re-reads the notes once (TAC-938).
             _request_stamp.set(object())
-            return await call_next(request)
+            response = await call_next(request)
+            opened = (response.headers.get(SESSION_HEADER) or "").strip()
+            if opened and not session:
+                sessions.bind(opened, pair)
+            return response
 
     return _ContextGate
+
+
 
 
 def build_gated_app(storage_root: str, notes_root: str,

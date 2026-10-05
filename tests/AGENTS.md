@@ -34,6 +34,18 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   frontmatter+inline+DB, `reconcile_wiki` rewriting refs on merge, wiki->RAG
   ingest, and the EAV field index (query by any field, schema recovered, no
   migrations).
+- `test_recall_vectorised.py` keeps the pre-vectorisation recall code verbatim
+  as reference and asserts the numpy/memoised path returns the same pools. Its
+  real-store case runs only with `METACOG_STORE_COPY=<copy of a store>` (needs
+  fastembed) — point it at a COPY, never at a live store.
+- `test_context_isolation.py` (C1, TAC-934) proves per-context isolation on
+  the FOUR lanes — recall, capture, wiki, index — through the real gated app
+  over MCP streamable HTTP, measured in the journals and stores of ALL eight
+  contexts of the storage root. Every negative assertion is doubled by its
+  positive (the fact IS in c; the scan DID cover eight journals), and a
+  missing context header is a 400 that writes nothing. It is the `Done`
+  condition of the roadmap's A/B/D tickets: never skip, xfail or weaken it.
+  It runs in CI on every push and PR (`.github/workflows/context-isolation.yml`).
 
 ## Work Guidance
 
