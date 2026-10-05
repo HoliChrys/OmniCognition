@@ -48,3 +48,5 @@ by running one small query end-to-end and confirming the table renders.
 
 - `locomo/AGENTS.md` — LoCoMo long-conversation QA harness and answerers
 - `obliq_bench/AGENTS.md` — OBLIQ-Bench oblique-query harness and debuggers
+- `d3_wiki/PROTOCOL.md` — D3 (Linear TAC-939): `sleep` vs `walk` deep-wiki
+  strategies per context; protocol and question set frozen before any run
