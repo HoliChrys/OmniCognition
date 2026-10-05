@@ -27,7 +27,15 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   seeds × points scan are numpy-vectorised (`_pairwise_spread_threshold`, Gram
   form) and must stay equal to the scalar definition to 1e-9
   (`tests/test_spread_vectorised.py`); never reintroduce a pure-Python O(n²)
-  loop on the recall path.
+  loop on the recall path. The O(n) signals of `retrieve_hybrid` are numpy too:
+  `_effective_matrix` (rows bit-identical to `effective_(keyword_)embedding`;
+  float64 rows cached by `_stack` on the identity of each vector TUPLE, so
+  point vectors must be REPLACED, never mutated in place — lists are never
+  cached; `clear_geo_cache()` drops it),
+  `_cosines` + `_top_pool` (stable descending, same order as the former list
+  sort); `fuzzy.fuzzy_score` runs `fuzzy_match` once per DISTINCT document token
+  and `fuzzy_match` stops its Levenshtein DP once a row exceeds the budget —
+  all guarded against the former code by `tests/test_recall_vectorised.py`.
 - `memory.py` — `Memory`: ingest/retrieve; event subsystem (`ingest_event`,
   `consolidate_events` multi-signal merge, `detect_event_type` centroid routing,
   `event_centroid`/`context_centroid`, `event_cluster`/`context_members`,
