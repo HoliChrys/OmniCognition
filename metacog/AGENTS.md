@@ -219,6 +219,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   401/403/503); it dies with the session (DELETE or eviction), no TTL. The yes
   is kept with the context it was given on, so a read-only `recall-for` yes
   never serves a request without that header.
+- `llm.py` — `ClaudeLLM`, the only LLM. No prompt over the model's context
+  window (`CONTEXT_WINDOW`, a model property) is ever sent (TAC-405): the
+  bound is the prompt's UTF-8 byte count (byte-level BPE ⇒ tokens ≤ bytes);
+  `generate` refuses an over-budget prompt (`PromptTooLong`, counted in
+  `llm_errors`, answers ""); `extract_common` chunks its passages under the
+  budget and merges the partial commons (sharing is an intersection), cutting
+  a passage that alone exceeds it.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
