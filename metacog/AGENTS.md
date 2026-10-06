@@ -229,6 +229,13 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   401/403/503); it dies with the session (DELETE or eviction), no TTL. The yes
   is kept with the context it was given on, so a read-only `recall-for` yes
   never serves a request without that header.
+- `llm.py` — `ClaudeLLM`, the only LLM. No prompt over the model's context
+  window (`CONTEXT_WINDOW`, a model property) is ever sent (TAC-405): the
+  bound is the prompt's UTF-8 byte count (byte-level BPE ⇒ tokens ≤ bytes);
+  `generate` refuses an over-budget prompt (`PromptTooLong`, counted in
+  `llm_errors`, answers ""); `extract_common` chunks its passages under the
+  budget and merges the partial commons (sharing is an intersection), cutting
+  a passage that alone exceeds it.
 - `journal.py` — the mnema append-only usage journal (SQLite, opt-in, separate
   from the pickle; `Memory(journal_path="auto")`). Tables: `retrievals` /
   `access_events` (co-retrieval self-join, `mark_useful` labels), `hops` +
@@ -251,6 +258,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   tags), `wiki_where`/`okf_schema`/`okf_fields` (query the EAV index, recover
   the schema from data), `import_okf` (consume an external OKF bundle). All
   no-op without a journal ; refs are resolved through `_merge_aliases`.
+- `llm.py` — `ClaudeLLM`, the only LLM. `generate` answers `""` on a client
+  failure (callers keep their fallback) but NEVER silently: it increments
+  `llm_errors`, keeps `last_error`, and warns on the first failure only
+  (TAC-209). `MissingCredential` is the only exception it propagates.
 - `canonical_tools.py` — the tool-tier manifest (T1 CANONICAL / T2 TOOL_TIER /
   T3 INTERNAL / DEPRECATED) + surfaces (`EXTERNAL`, `EXTERNAL_LIGHT`,
   `canonical`, `all`). `surface_tools(name)`, `classify(name)`. Must partition

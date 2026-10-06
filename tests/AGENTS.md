@@ -31,6 +31,16 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   MCP `forget` → a new instance does not serve the id; a pickle that lost a
   forget (pending or merged event) is replayed INVALID at `load`; a reverted
   or already-pickled forget is not replayed; a stale writer keeps the forget.
+- `test_llm_errors.py` (TAC-209) pins that `ClaudeLLM.generate` never fails
+  silently: a client failure (incl. a missing `anthropic` package) answers
+  `""`, increments `llm_errors` and warns once. `test_llm_prompt_budget.py`
+  (TAC-405) pins that no prompt over the context window is sent: an
+  over-limit `extract_common` / `resolve_collision` input is chunked so every
+  recorded prompt stays under `prompt_budget`, and `generate` refuses (never
+  sends) an over-budget prompt. `test_d3_wiki_bench.py`
+  pins the D3 harness guards: no write under a live root, LLM cap (failed
+  calls back off and do not spend it), `llm_unavailable` stop, build cap, and
+  a summary written with RC 0 on every stop (TAC-401).
 - `test_canonical_tools.py` asserts the tool-tier manifest partitions the live
   `@app.tool()` set EXACTLY — a new tool must be classified or it fails. The
   mnema-layer tests (`test_feedback_loop`, `test_recency_ranking`,
@@ -57,6 +67,12 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   (ctx → ancestors → `global`, over HTTP as `recall_inherited` asks it),
   never another account's mirror nor the manager's facts, and a write dressed
   as a note (tags, `src:notes:…`, a note-shaped or borrowed id) never passes.
+
+- `test_d3_wiki_bench.py` (D3, Linear TAC-939) pins the D3 bench's scoring
+  and Proxy's decision rule at its boundaries (noise 5 %, p95 2 s, 10-point
+  gap), checks that the frozen `questions.yaml` is consistent with its pins,
+  and runs one offline end-to-end pass that must leave the source store
+  byte-identical.
 
 ## Work Guidance
 
