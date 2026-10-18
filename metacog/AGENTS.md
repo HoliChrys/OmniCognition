@@ -150,7 +150,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   `authorize(token, ctx)` (mnema's ACL, ported) against the tachikoma API —
   `/api/auth/me` (no/invalid bearer → 401), `/api/hierarchy/<ctx>` existence
   (unknown → 403, never `makedirs`; no `general` exception),
-  `/api/acl/check` `read` (refused → 403; outage → 503). Fail-closed; callers
+  `/api/acl/check` `read` (refused → 403; outage → 503). The hierarchy 404s
+  an unreachable context like an unknown one, so a 404 says « n'existe pas »
+  only when the ACL grants the caller `read` on the name; otherwise
+  « inexistant ou non accordé à '<user>' » (TAC-1048). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
   rule, chosen by the name only (no candidate cascade): the tree root
