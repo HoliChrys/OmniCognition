@@ -298,10 +298,24 @@ def authorize(token: str, ctx: str) -> str:
     # so an authorized unknown name would GIVE BIRTH to a memory (measured:
     # `contexts/contexte.inconnu.personne/`, 2026-09-18). `quote(safe="")`: the
     # name comes from the caller — `../x` must not leave the route.
+    #
+    # The hierarchy answers 404 both to an unknown name AND to a caller who
+    # cannot reach the context — deliberately, a 403 would confirm the name.
+    # With the caller's token we cannot tell them apart, so a 404 is only
+    # called absent when the ACL says the caller WOULD read it (an admin, or
+    # a grant on the name): then nothing is hidden from them. Otherwise the
+    # refusal names both cases — never "n'existe pas" without knowing it.
     import urllib.parse
     code, _ = _api(f"/api/hierarchy/{urllib.parse.quote(ctx, safe='')}", token)
     if code == 404:
-        raise Denied(f"le contexte {ctx!r} n'existe pas")
+        try:
+            code, body = _api("/api/acl/check", token,
+                              {"user": user, "action": "read", "resource": ctx})
+        except Denied:
+            code, body = None, None
+        if code == 200 and isinstance(body, dict) and body.get("allowed") is True:
+            raise Denied(f"le contexte {ctx!r} n'existe pas")
+        raise Denied(f"contexte {ctx!r} inexistant ou non accordé à {user!r}")
     if code != 200:
         # We could NOT ASK: refuse (fail-closed), but never call an outage a fact.
         raise Denied(f"impossible de vérifier le contexte {ctx!r} : l'API a rendu "
@@ -315,7 +329,7 @@ def authorize(token: str, ctx: str) -> str:
         raise Denied(f"contrôle d'accès indisponible pour {user!r} (HTTP {code})", 503)
     if body.get("allowed") is True:
         return user
-    raise Denied(f"{user!r} n'a pas 'read' sur le contexte {ctx!r}")
+    raise Denied(f"contexte {ctx!r} non accordé à {user!r} (pas de 'read')")
 
 
 def is_strict_ancestor(stage: str, ctx: str) -> bool:

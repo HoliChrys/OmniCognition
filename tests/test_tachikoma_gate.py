@@ -681,23 +681,68 @@ def test_general_is_no_longer_a_common_notebook(monkeypatch):
     entry, refused like any unknown context; what all must read goes in
     `global`."""
     assert not hasattr(gate, "GENERAL")
-    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
-    with pytest.raises(gate.Denied, match="n'existe pas"):
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None),
+                                    "/api/acl/check": (200, {"allowed": False})})
+    with pytest.raises(gate.Denied, match="inexistant ou non accordé") as e:
         gate.authorize("t", "general")
-    assert [c[0] for c in calls] == ["/api/auth/me", "/api/hierarchy/general"]
+    assert e.value.status == 403
+    assert [c[0] for c in calls] == ["/api/auth/me", "/api/hierarchy/general",
+                                     "/api/acl/check"]
 
 
 def test_an_unknown_context_is_never_born(monkeypatch, tmp_path):
     """The measured hole: an unknown name created `contexts/<name>/`. The
-    hierarchy 404 refuses BEFORE `_resolve` could `makedirs`."""
-    _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    hierarchy 404 refuses BEFORE `_resolve` could `makedirs` — even when
+    the ACL would grant the name (an admin): then, and only then, the gate
+    KNOWS it is absent and says so."""
+    _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None),
+                            "/api/acl/check": (200, {"allowed": True})})
     with pytest.raises(gate.Denied, match="n'existe pas") as e:
         gate.authorize("t", "contexte.inconnu.personne")
     assert e.value.status == 403
 
 
+@pytest.mark.parametrize("acl", [(503, None), (200, {}), (200, {"allowed": "yes"}),
+                                 "unreachable"])
+def test_a_404_with_no_acl_verdict_never_claims_absence(monkeypatch, acl):
+    """The ACL cannot answer after a 404: still a 403 (fail-closed, same code
+    as before), and still no claim that the context does not exist."""
+    _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None),
+                            "/api/acl/check": acl})
+    if acl == "unreachable":
+        fake = gate._api
+
+        def api(path, token, payload=None):
+            if path == "/api/acl/check":
+                raise gate.Denied("ACL injoignable", 503)
+            return fake(path, token, payload)
+        monkeypatch.setattr(gate, "_api", api)
+    with pytest.raises(gate.Denied, match="inexistant ou non accordé") as e:
+        gate.authorize("t", "demo.sandbox")
+    assert e.value.status == 403
+
+
+def test_an_existing_but_ungranted_context_is_never_called_absent(monkeypatch):
+    """The measured case (TAC-1040): under `tachikoma-GenAI-archiviste`,
+    `demo.sandbox` exists, but the hierarchy answers 404 to a caller who
+    cannot reach it — on purpose, a 403 there would confirm the name. The
+    gate cannot tell absent from ungranted with the caller's token, so it
+    must say both and never assert absence."""
+    _fake_api(monkeypatch, {
+        "/api/auth/me": (200, {"user_id": "tachikoma-GenAI-archiviste"}),
+        "/api/hierarchy/": (404, None),
+        "/api/acl/check": (200, {"allowed": False})})
+    with pytest.raises(gate.Denied) as e:
+        gate.authorize("t", "demo.sandbox")
+    assert e.value.status == 403
+    assert "n'existe pas" not in str(e.value)
+    assert str(e.value) == ("contexte 'demo.sandbox' inexistant ou non accordé "
+                            "à 'tachikoma-GenAI-archiviste'")
+
+
 def test_the_context_name_cannot_leave_the_route(monkeypatch):
-    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None)})
+    calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (404, None),
+                                    "/api/acl/check": (200, {"allowed": False})})
     with pytest.raises(gate.Denied):
         gate.authorize("t", "../users/ubuntu/accesses")
     assert calls[1][0] == "/api/hierarchy/..%2Fusers%2Fubuntu%2Faccesses"
@@ -714,8 +759,10 @@ def test_a_context_without_read_right_is_refused(monkeypatch):
     """The measured case: a GenAI-only token wrote into demo.sandbox.alice."""
     calls = _fake_api(monkeypatch, {**ME, "/api/hierarchy/": (200, {}),
                                     "/api/acl/check": (200, {"allowed": False})})
-    with pytest.raises(gate.Denied, match="n'a pas 'read'") as e:
+    with pytest.raises(gate.Denied) as e:
         gate.authorize("t", "demo.sandbox.alice")
+    assert str(e.value) == ("contexte 'demo.sandbox.alice' non accordé à "
+                            "'manager-GenAI-1545c4' (pas de 'read')")
     assert e.value.status == 403
     assert calls[-1][1] == {"user": "manager-GenAI-1545c4", "action": "read",
                             "resource": "demo.sandbox.alice"}
