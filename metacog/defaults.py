@@ -25,15 +25,6 @@ DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-
 #: mnema's production reranker : a multilingual cross-encoder (FR rerank 9/10
 #: vs bge-base 7/10 in their measurement), ONNX on CPU, ~1.1 GB.
 DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
-#: ONNX threads (intra- AND inter-op) of the cross-encoder session. A compute
-#: knob, not a retrieval parameter : ids and logits are bit-identical whatever
-#: the value (TAC-265, 12/12). Measured on holistix-baremetal (4 cores / 8 HT,
-#: load 33-46), a copy of `global`, 12 new questions each right after a
-#: capture, rerank_pre=30 : 1 thread p50 31.5 s, 2 -> 29.2 s, 4 -> 19.3 s,
-#: onnxruntime's default -> 19.2 s. Fewer threads only lose the CPU share under
-#: load ; 4 is kept. `METACOG_RERANK_THREADS` overrides it ; `0` = onnxruntime's
-#: default (one thread per physical core).
-DEFAULT_RERANK_THREADS = 4
 
 
 class SimpleEncoder:
@@ -233,9 +224,11 @@ def make_reranker(spec: Optional[str] = None, *, warn: bool = True):
       none | off          no reranker
 
     Called by the MCP server ; the hooks deliberately skip it (1 GB model per
-    hook process is not worth it for a k=5 recall). The ONNX session runs on
-    `METACOG_RERANK_THREADS` threads (default `DEFAULT_RERANK_THREADS`, `0` =
-    onnxruntime's default)."""
+    hook process is not worth it for a k=5 recall). `METACOG_RERANK_THREADS`
+    pins the ONNX session's intra/inter-op threads ; unset or `0` leaves
+    onnxruntime's default (one per physical core). Logits are bit-identical
+    whatever the value ; TAC-265 measured 1 / 2 / 4 threads slower than or equal
+    to the default under load, so no value is pinned."""
     spec = (spec if spec is not None
             else os.environ.get("METACOG_RERANKER", "auto")).strip()
     if spec.lower() in ("none", "off", "0", "false"):
@@ -247,8 +240,7 @@ def make_reranker(spec: Optional[str] = None, *, warn: bool = True):
         elif "/" in spec:
             model = spec
         try:
-            n = int(os.environ.get("METACOG_RERANK_THREADS",
-                                   DEFAULT_RERANK_THREADS))
+            n = int(os.environ.get("METACOG_RERANK_THREADS") or 0)
             return CrossEncoderReranker(model, threads=n if n > 0 else None)
         except Exception as exc:
             if spec not in ("", "auto"):

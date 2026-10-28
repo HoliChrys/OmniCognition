@@ -85,8 +85,8 @@ def test_rerank_pre_bounds_the_prefetch_and_failure_keeps_cosine_order():
 
 
 def test_make_reranker_passes_onnx_threads(monkeypatch):
-    """TAC-265 : the cross-encoder session runs on METACOG_RERANK_THREADS
-    threads (default DEFAULT_RERANK_THREADS) ; 0 = onnxruntime's default."""
+    """TAC-265 : METACOG_RERANK_THREADS pins the cross-encoder session's
+    threads ; unset or 0 = onnxruntime's default (None)."""
     seen = []
 
     class Rec:
@@ -99,7 +99,7 @@ def test_make_reranker_passes_onnx_threads(monkeypatch):
     make_reranker("auto")
     monkeypatch.setenv("METACOG_RERANK_THREADS", "0")
     make_reranker("auto")
-    assert seen == [D.DEFAULT_RERANK_THREADS, 4, None]
+    assert seen == [None, 4, None]
 
 
 def test_retrieve_reports_its_cost_only_for_stages_that_ran():
