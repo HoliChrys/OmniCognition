@@ -26,7 +26,7 @@ import time
 import uuid
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
 
 from metacog.audit import audit, assert_no_laundering, inputs_of_A
 from metacog.collision import merge_duplicates, sleep_cycle_collisions
@@ -3670,6 +3670,7 @@ class Memory:
         rerank_pre: int = 30,
         cost: Optional[Dict[str, Any]] = None,
         exclude_tags: Optional[Sequence[str]] = None,
+        only_ids: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve top-k points.
 
@@ -3710,11 +3711,19 @@ class Memory:
         Used by tachikoma's pre-turn recall to leave out the turns its own
         session captured (`session:<id>`) : they are already in the session's
         history, and recalling them echoed a wrong answer over the corpus.
+
+        `only_ids` (TAC-345) : when given, the SEARCH POOL is these points and
+        nothing else — the same pool restriction as `exclude_tags`, by id. Used
+        by the tachikoma gate to let a lobby member read the context's notes
+        (and only them) out of a store that also holds other accounts' facts.
         """
         t_now = self._now(t)
         excluded = {str(x).strip().lower() for x in (exclude_tags or ()) if str(x).strip()}
+        allowed = None if only_ids is None else set(only_ids)
 
         def _kept(p: Any) -> bool:
+            if allowed is not None and p.id not in allowed:
+                return False
             return not excluded or excluded.isdisjoint(p.tags or ())
         if abstain and self.abstains(query, abstain_threshold):
             return []                            # retrieval failure (ACT-R)
@@ -5085,7 +5094,8 @@ class Memory:
         return max(cosine(q, p.embedding_orig) for p in pts)
 
     def abstains(self, query: str,
-                 threshold: Optional[float] = None) -> bool:
+                 threshold: Optional[float] = None,
+                 points: Optional[Sequence[Point]] = None) -> bool:
         """ACT-R retrieval-threshold test : True when retrieval should FAIL — no
         chunk is sufficiently activated, so the honest answer is 'I don't know'
         rather than the least-bad match.
@@ -5094,10 +5104,15 @@ class Memory:
         the best activation < tau. `None` (default) uses an EMERGENT floor — the
         best match must STAND OUT from the background : abstain unless it clears
         (mean + 2·std) of the query's similarity to the rest of the cloud. Never
-        abstains on a corpus too small (< 4) to have a background."""
+        abstains on a corpus too small (< 4) to have a background.
+
+        `points` (TAC-345) : the cloud to test against, when it is not this
+        memory's own — a lobby member reads its account AND the context's
+        notes, so its gap verdict is taken over both."""
         from metacog.geometry import cosine
         import statistics
-        pts = [p for p in self.points if p.embedding_orig]
+        pts = [p for p in (self.points if points is None else points)
+               if p.embedding_orig]
         if len(pts) < 4:
             return False
         q = tuple(self.encoder.encode(query))
