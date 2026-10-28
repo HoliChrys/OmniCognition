@@ -1,0 +1,13 @@
+name: metacog
+version: "0.1.0"
+description: >-
+  Persistent metacognitive memory for Hermes — a manifold + usage journal + OKF
+  wiki as a memory provider: prefetch recalls before the turn, sync_turn indexes
+  both sides, session end consolidates offline. Local embedding and rerank, no API.
+homepage: https://github.com/HoliChrys/OmniCognition
+license: MIT
+kind: memory_provider
+provider: metacog
+entrypoint: MetacogMemory
+requires:
+  python: ">=3.10"

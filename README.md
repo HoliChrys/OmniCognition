@@ -1839,6 +1839,50 @@ spreading blends (mnema's `blend_scores` order), and returns the raw logit as
 the oblique judge (§3.4) uses as its zero-token pre-filter. Hooks deliberately
 run without it (a 1 GB model per hook process is not worth a k=5 recall).
 
+### 7.5 Other hosts — Hermes and OpenClaw
+
+The memory is host-agnostic; only *where it hooks into the turn loop* differs.
+Each host gets a thin adapter over one shared core
+([`integrations/`](integrations/README.md)), and all of them write into the
+**same brain** (a `.metacog-brain` marker > `METACOG_STORAGE` >
+`~/.metacog/memory.pkl`).
+
+```bash
+python -m metacog.install status                 # what is installed where
+python -m metacog.install install hermes         # claude | hermes | openclaw | all
+python -m metacog.install install all --dry-run  # print the plan, write nothing
+python -m metacog.install uninstall openclaw
+```
+
+Both directions are idempotent, and an uninstall removes only what an install
+wrote — entries are identified by an absolute path into this repo, so a
+neighbour's hook or MCP server is never touched.
+
+**Hermes Agent** gets a **memory provider** (`agent.memory_provider.MemoryProvider`,
+Python, no subprocess): `prefetch` is the cheap `retrieve` fenced into
+`<memory-context>` — returning the grounding directive rather than noise on a
+gap — `sync_turn` indexes both sides of the turn, `on_pre_compress` stores what
+is about to leave the context window, `on_session_end` runs one `sleep()`. It
+also exposes `metacog_recall` / `walk` / `remember` / `forget` / `mark_useful` /
+`wiki` as tools. Hermes allows one external provider at a time; the built-in
+`MEMORY.md` stays active alongside.
+
+**OpenClaw** gets an **internal hook pack plus the MCP server**, split along
+what its hooks can actually do: they are *observers* (a return value cannot
+modify the operation, and only `/new`, `/reset` and compaction deliver a
+message), so **reading** the memory is the MCP server's job and **writing** it
+is the hook's — `message:received` / `message:sent` index each turn,
+`command:new` / `command:reset` / `session:compact:before` consolidate and reply
+with a one-line notice, `gateway:shutdown` saves. Its `handler.js` shells out to
+`hooks/host_bridge.py`, the host-agnostic CLI (`status` · `recall` · `feed` ·
+`consolidate`) that keeps brain resolution, encoder and dedup identical across
+hosts. Note that OpenClaw rejects interpreter-startup env keys (`PYTHONPATH`)
+for stdio MCP servers — the launcher sets it internally instead of via config.
+
+The adapters are written against the documented APIs of both hosts and are
+covered by `tests/test_integrations.py`, but have not been run inside a live
+install of either.
+
 ## References
 
 1. Romanchuk & Bondar. *Semantic Laundering in AI Agent Architectures.*
