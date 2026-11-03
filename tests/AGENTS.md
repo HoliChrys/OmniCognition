@@ -3,7 +3,8 @@
 ## Purpose
 
 The full pytest suite (967 tests collected at `381e460`, counted on
-2026-11-03 for TAC2-1179) guarding `metacog`'s invariants and behavior.
+2026-11-03 for TAC2-1179; 975 with `test_store_backend.py`, OO·V2·M1)
+guarding `metacog`'s invariants and behavior.
 Deterministic and offline. Beyond `pip install -e .`, counting the suite
 needs `pip install -e '.[bench]' networkx`: `test_answer_cluster.py` uses
 `sentence-transformers` (+ `torch`, and the `all-MiniLM-L6-v2` model in the
@@ -29,6 +30,13 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   `test_store_concurrency.py` guards the store write path: stale instances and
   20 concurrent processes/threads lose no fact, a SIGKILL mid-dump leaves a
   loadable store, a corrupt store raises `CorruptStoreError` and is untouched.
+  `test_store_backend.py` (OO·V2·M1, TAC2-1153) pins the store interface:
+  `save()` reaches the backend as point writes — an ingest upserts its new
+  points, a point moved by `apply_pull` is upserted too, a forget is a
+  `forget` write, a dropped point a `discard`, a save with no change only a
+  `commit`, merged points are never written back — and the pickle written is
+  `pickle.dumps(snapshot)`; an unknown `METACOG_STORE` refuses to construct.
+  The persistence tests above run UNMODIFIED against `PickleBackend`.
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
   access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),
   and (TAC-353) that a member's write → forget → recall under the context's
