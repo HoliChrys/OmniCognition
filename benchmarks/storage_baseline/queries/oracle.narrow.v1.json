@@ -1,0 +1,258 @@
+{
+ "version": 1,
+ "ctx": "oracle.narrow",
+ "seed": 1146,
+ "corpus_commit": "381e46079fa5b113bf3c599b5251489b5303f8ef",
+ "queries": [
+  {
+   "qid": "oracle.narrow#00",
+   "kind": "window",
+   "text": "Cor. 5 — a manual GENERATOR `Observation` must"
+  },
+  {
+   "qid": "oracle.narrow#01",
+   "kind": "window",
+   "text": "→ absent, present → `error`), or by a folder that"
+  },
+  {
+   "qid": "oracle.narrow#02",
+   "kind": "window",
+   "text": "refs rewritten `[[old]]→[[new]]` everywhere and an `INVALID`"
+  },
+  {
+   "qid": "oracle.narrow#03",
+   "kind": "window",
+   "text": "each bag carries description+schema via `bag_meta`/`bag_overview`, and the description"
+  },
+  {
+   "qid": "oracle.narrow#04",
+   "kind": "window",
+   "text": "is `enough_tools_for_workflow` (LLM, per depth, fail-closed)"
+  },
+  {
+   "qid": "oracle.narrow#05",
+   "kind": "window",
+   "text": "**Determinism.** No randomness without a fixed"
+  },
+  {
+   "qid": "oracle.narrow#06",
+   "kind": "window",
+   "text": "queryable (`wiki_where(\"tags\", …)`, `wiki_where(\"refs\", node_id)`), **recovers the schema from"
+  },
+  {
+   "qid": "oracle.narrow#07",
+   "kind": "window",
+   "text": "absent from the pickled `_forget_log` and whose newest `forget` ledger"
+  },
+  {
+   "qid": "oracle.narrow#08",
+   "kind": "window",
+   "text": "than the token's is a 403 both ways."
+  },
+  {
+   "qid": "oracle.narrow#09",
+   "kind": "window",
+   "text": "the body as `[[node_id]]` wikilinks, and the DB link"
+  },
+  {
+   "qid": "oracle.narrow#10",
+   "kind": "window",
+   "text": "names not registered, still callable internally). `retrieve(exclude_tags=…)` (TAC-930) leaves every"
+  },
+  {
+   "qid": "oracle.narrow#11",
+   "kind": "window",
+   "text": "(pending or merged event) is replayed"
+  },
+  {
+   "qid": "oracle.narrow#12",
+   "kind": "window",
+   "text": "be green before any commit. Targeted runs"
+  },
+  {
+   "qid": "oracle.narrow#13",
+   "kind": "window",
+   "text": "**exactly** the wiki refs the redirect rewrote (`wiki_ref_remaps` traces"
+  },
+  {
+   "qid": "oracle.narrow#14",
+   "kind": "window",
+   "text": "**zero deletion**: invalid points are exiled"
+  },
+  {
+   "qid": "oracle.narrow#15",
+   "kind": "window",
+   "text": "(wiki<->node links + stale flag), `okf_fields` (EAV"
+  },
+  {
+   "qid": "oracle.narrow#16",
+   "kind": "window",
+   "text": "node now (`fingerprint_drift` → `content_changed` / `tags_changed`). A"
+  },
+  {
+   "qid": "oracle.narrow#17",
+   "kind": "window",
+   "text": "positive (the fact IS in c;"
+  },
+  {
+   "qid": "oracle.narrow#18",
+   "kind": "window",
+   "text": "New extractors get a `Fake<Thing>Extractor` (source=GENERATOR) mirroring the existing ones."
+  },
+  {
+   "qid": "oracle.narrow#19",
+   "kind": "window",
+   "text": "the clear matches before the batch —"
+  },
+  {
+   "qid": "oracle.narrow#20",
+   "kind": "window",
+   "text": "**T3** stays callable internally (surface `all`) but off the"
+  },
+  {
+   "qid": "oracle.narrow#21",
+   "kind": "window",
+   "text": "`tags` list (`tool`, `tool_workflow`, `entity`, `atomic`, `lateral_absorbed`, `generated`, …)"
+  },
+  {
+   "qid": "oracle.narrow#22",
+   "kind": "window",
+   "text": "edge-free geometric relations, an uncertainty-governed retrieval walk, the event"
+  },
+  {
+   "qid": "oracle.narrow#23",
+   "kind": "window",
+   "text": "point of any kind — `FACT`, `THOUGHT`,"
+  },
+  {
+   "qid": "oracle.narrow#24",
+   "kind": "window",
+   "text": "behavior change in `metacog` requires updating or adding a test"
+  },
+  {
+   "qid": "oracle.narrow#25",
+   "kind": "section",
+   "text": "local contracts"
+  },
+  {
+   "qid": "oracle.narrow#26",
+   "kind": "section",
+   "text": "mcp tools mcp server py"
+  },
+  {
+   "qid": "oracle.narrow#27",
+   "kind": "section",
+   "text": "safety rails on identity ops redirects reversibility reasons"
+  },
+  {
+   "qid": "oracle.narrow#28",
+   "kind": "section",
+   "text": "metacog the metacog mem core"
+  },
+  {
+   "qid": "oracle.narrow#29",
+   "kind": "section",
+   "text": "ownership"
+  },
+  {
+   "qid": "oracle.narrow#30",
+   "kind": "section",
+   "text": "claude code plugin claude plugin hooks bin"
+  },
+  {
+   "qid": "oracle.narrow#31",
+   "kind": "section",
+   "text": "child dox index"
+  },
+  {
+   "qid": "oracle.narrow#32",
+   "kind": "section",
+   "text": "purpose"
+  },
+  {
+   "qid": "oracle.narrow#33",
+   "kind": "section",
+   "text": "the one schema"
+  },
+  {
+   "qid": "oracle.narrow#34",
+   "kind": "section",
+   "text": "touching this package"
+  },
+  {
+   "qid": "oracle.narrow#35",
+   "kind": "held_out",
+   "text": "une question d'event, détecter `event + type` →"
+  },
+  {
+   "qid": "oracle.narrow#36",
+   "kind": "held_out",
+   "text": "sur lequel les faits participants s'attachent, scorés par similarité,"
+  },
+  {
+   "qid": "oracle.narrow#37",
+   "kind": "held_out",
+   "text": "un *template* de rôles attendus) ; **RAMS** (139 types /"
+  },
+  {
+   "qid": "oracle.narrow#38",
+   "kind": "held_out",
+   "text": "non résolu ; (b) **interférence multi-events**"
+  },
+  {
+   "qid": "oracle.narrow#39",
+   "kind": "held_out",
+   "text": "est l'art antérieur direct. Son architecture ="
+  },
+  {
+   "qid": "oracle.narrow#40",
+   "kind": "hand",
+   "text": "what does test_context_isolation prove"
+  },
+  {
+   "qid": "oracle.narrow#41",
+   "kind": "hand",
+   "text": "comment l'écriture du store reste-t-elle atomique"
+  },
+  {
+   "qid": "oracle.narrow#42",
+   "kind": "hand",
+   "text": "what is the reranker relevance floor"
+  },
+  {
+   "qid": "oracle.narrow#43",
+   "kind": "hand",
+   "text": "why must a test never need an API key"
+  },
+  {
+   "qid": "oracle.narrow#44",
+   "kind": "hand",
+   "text": "quelle est la règle de l'index de champs OKF"
+  },
+  {
+   "qid": "oracle.narrow#45",
+   "kind": "hand",
+   "text": "the D3 deep wiki bench protocol"
+  },
+  {
+   "qid": "oracle.narrow#46",
+   "kind": "hand",
+   "text": "how is the event channel additive"
+  },
+  {
+   "qid": "oracle.narrow#47",
+   "kind": "hand",
+   "text": "store corrupt raises CorruptStoreError"
+  },
+  {
+   "qid": "oracle.narrow#48",
+   "kind": "hand",
+   "text": "recette du kouign-amann"
+  },
+  {
+   "qid": "oracle.narrow#49",
+   "kind": "hand",
+   "text": "résultats du match de football hier soir"
+  }
+ ]
+}
