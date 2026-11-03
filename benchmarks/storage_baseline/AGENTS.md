@@ -52,7 +52,9 @@ and the committed `baselines/`.
 
 - **`baselines/v1/`**: `build_manifest.json` (fingerprints of the four
   stores) and `oracle_run.json` (the reference run: 200 (view, query) pairs
-  × 3 probes = 600 comparisons), both from the orchestration container of
+  × 3 probes = 600 comparisons) and `latency.json` (`latency.py`: p50/p95 of
+  `recall`, `retrieve` without reranker, `remember` incl. its `save()`, and
+  `save()` alone), all from the orchestration container of
   2026-11-03 (4 CPU, onnxruntime 1.31.1, fastembed 0.9.1). A new baseline
   is a new `v<N>/`, never a rewrite.
 

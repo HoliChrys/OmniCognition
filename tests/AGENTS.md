@@ -2,8 +2,14 @@
 
 ## Purpose
 
-The full pytest suite (~470+ tests) guarding `metacog`'s invariants and
-behavior. Deterministic and offline.
+The full pytest suite (967 tests collected at `381e460`, counted on
+2026-11-03 for TAC2-1179) guarding `metacog`'s invariants and behavior.
+Deterministic and offline. Beyond `pip install -e .`, counting the suite
+needs `pip install -e '.[bench]' networkx`: `test_answer_cluster.py` uses
+`sentence-transformers` (+ `torch`, and the `all-MiniLM-L6-v2` model in the
+HF cache), `test_llm_keywords.py` patches `anthropic`, `test_communities.py`
+imports `networkx` (in no extra). Without them 18 of the 967 fail or error
+on a missing module.
 
 ## Ownership
 

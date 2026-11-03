@@ -1,0 +1,144 @@
+{
+ "code_commit": "7f224eb326186bf586e28e925fff87e5993905a7",
+ "cpus": 4,
+ "format": 1,
+ "host": "vm",
+ "loadavg_after": [
+  4.87744140625,
+  6.17919921875,
+  6.53759765625
+ ],
+ "memory_factory": "harness:default_memory_factory",
+ "rerank_threads": "4 (default)",
+ "taken_at": "2026-11-03T14:53:53+00:00",
+ "views": {
+  "oracle.medium": {
+   "pkl_bytes_after": 4364749,
+   "points_after": 305,
+   "recall": {
+    "first_ms": 4775.5,
+    "max_ms": 9877.1,
+    "n": 50,
+    "p50_ms": 5315.6,
+    "p95_ms": 7661.6
+   },
+   "remember": {
+    "first_ms": 251.4,
+    "max_ms": 275.1,
+    "n": 30,
+    "p50_ms": 128.0,
+    "p95_ms": 251.4
+   },
+   "retrieve": {
+    "first_ms": 27.3,
+    "max_ms": 64.4,
+    "n": 50,
+    "p50_ms": 35.1,
+    "p95_ms": 55.7
+   },
+   "save": {
+    "first_ms": 24.5,
+    "max_ms": 43.1,
+    "n": 20,
+    "p50_ms": 25.9,
+    "p95_ms": 37.1
+   }
+  },
+  "oracle.narrow": {
+   "pkl_bytes_after": 2044145,
+   "points_after": 142,
+   "recall": {
+    "first_ms": 6241.8,
+    "max_ms": 9624.1,
+    "n": 50,
+    "p50_ms": 3746.8,
+    "p95_ms": 7857.6
+   },
+   "remember": {
+    "first_ms": 128.4,
+    "max_ms": 137.5,
+    "n": 30,
+    "p50_ms": 80.2,
+    "p95_ms": 128.4
+   },
+   "retrieve": {
+    "first_ms": 21.7,
+    "max_ms": 62.5,
+    "n": 50,
+    "p50_ms": 24.1,
+    "p95_ms": 53.1
+   },
+   "save": {
+    "first_ms": 12.3,
+    "max_ms": 17.7,
+    "n": 20,
+    "p50_ms": 13.2,
+    "p95_ms": 16.0
+   }
+  },
+  "oracle.narrow/accounts/oracle-member": {
+   "pkl_bytes_after": 662232,
+   "points_after": 48,
+   "recall": {
+    "first_ms": 2679.2,
+    "max_ms": 3446.9,
+    "n": 50,
+    "p50_ms": 1731.4,
+    "p95_ms": 3077.1
+   },
+   "remember": {
+    "first_ms": 50.5,
+    "max_ms": 66.4,
+    "n": 30,
+    "p50_ms": 56.6,
+    "p95_ms": 65.9
+   },
+   "retrieve": {
+    "first_ms": 22.2,
+    "max_ms": 37.4,
+    "n": 50,
+    "p50_ms": 13.9,
+    "p95_ms": 35.5
+   },
+   "save": {
+    "first_ms": 6.0,
+    "max_ms": 16.0,
+    "n": 20,
+    "p50_ms": 5.4,
+    "p95_ms": 6.3
+   }
+  },
+  "oracle.small": {
+   "pkl_bytes_after": 950695,
+   "points_after": 67,
+   "recall": {
+    "first_ms": 4016.3,
+    "max_ms": 8302.4,
+    "n": 50,
+    "p50_ms": 4298.8,
+    "p95_ms": 7192.0
+   },
+   "remember": {
+    "first_ms": 103.1,
+    "max_ms": 192.4,
+    "n": 30,
+    "p50_ms": 60.7,
+    "p95_ms": 127.3
+   },
+   "retrieve": {
+    "first_ms": 8.7,
+    "max_ms": 19.5,
+    "n": 50,
+    "p50_ms": 6.9,
+    "p95_ms": 14.2
+   },
+   "save": {
+    "first_ms": 13.1,
+    "max_ms": 14.9,
+    "n": 20,
+    "p50_ms": 9.2,
+    "p95_ms": 14.1
+   }
+  }
+ }
+}
