@@ -28,4 +28,4 @@ bench = [
 metacog-mcp = "metacog.mcp_server:main"
 
 [tool.setuptools]
-packages = ["metacog", "benchmarks", "benchmarks.locomo"]
+packages = ["metacog", "metacog.store", "benchmarks", "benchmarks.locomo"]
