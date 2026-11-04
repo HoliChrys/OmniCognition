@@ -54,7 +54,8 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   second `--apply` plans and posts 0, the pickle and its journal keep their
   sha256/mtime and no `.lock` appears, a run cut after one chunk resumes with
   each point written once, a Neo4j clock ahead of the pickle is refused, one
-  tampered field makes `--verify` DIFFÉRENT, a narrow account's store needs that
+  tampered field makes `--verify` DIFFÉRENT, a point only in Neo4j is refused
+  (archived on `--discard-missing` only), a narrow account's store needs that
   account's token, a journal forget the pickle lost replays alike on both sides.
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
   access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),

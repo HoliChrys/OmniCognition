@@ -93,7 +93,8 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
   under the read revision; dry-run by default, `--apply`, `--verify` (reload
   by `Neo4jBackend.load`, fingerprints + digests + journal-forget replay on
   both sides). A store whose Neo4j `t_clock` is ahead of the pickle's is
-  refused. A codec change must keep its `--verify` IDENTIQUE
+  refused, and so is one holding points the pickle lacks unless
+  `--discard-missing` (archived, never deleted). A codec change must keep its `--verify` IDENTIQUE
   (`tests/test_migrate_pickle_to_neo4j.py`). The usage journal is NOT
   migrated: on `Neo4jBackend` the gate still opens `<storage_path>.journal.db`
   (the storage path keeps the gate's layout).

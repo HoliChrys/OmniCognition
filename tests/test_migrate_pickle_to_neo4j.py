@@ -19,7 +19,9 @@ exercised by the rehearsal (OO2-11, the oracle on Neo4j), not here.
   M6  --verify catches one changed field (DIFFÉRENT, rc 1) — the positive witness ;
   M7  a narrow account's store without that account's token is skipped, never written
       under another identity ;
-  M8  a forget in the journal that the pickle lost is replayed the same way on both sides.
+  M8  a forget in the journal that the pickle lost is replayed the same way on both sides ;
+  M9  a point Neo4j holds and the pickle does not is refused, archived only on
+      --discard-missing (never deleted).
 """
 from __future__ import annotations
 
@@ -312,3 +314,20 @@ def test_m8_journal_forgets_replay_alike(route, stores):
     assert v["forgets_replayed"]["pickle"] == ["f05"] == v["forgets_replayed"]["neo4j"]
     assert v["forgets_replayed"]["same_points_after_replay"] and v["verdict"] == "IDENTIQUE"
     assert v["journal"]["rows"]["forget_events"] == 2
+
+
+def test_m9_a_point_only_in_neo4j_is_never_archived_silently(route, stores):
+    _run(route, stores, "--apply")
+    st = route.store("alpha", "")
+    extra = json.loads(json.dumps(st["points"]["f01"]))
+    extra["fields"]["ordinal"] = 99
+    st["points"]["f99"] = extra                # written in Neo4j, absent from the pickle
+    n = len(route.posts)
+    rc, out = _run(route, stores, "--apply")
+    a = _alpha(out)
+    assert rc == mig.RC_REFUSED and a["status"] == "neo4j-only-points"
+    assert a["neo4j_only"] == ["f99"] and len(route.posts) == n
+    rc, out = _run(route, stores, "--apply", "--discard-missing", "--verify")
+    a = _alpha(out)
+    assert a["status"] == "ok" and a["verify"]["verdict"] == "IDENTIQUE" and rc == 0
+    assert st["points"]["f99"]["fields"]["discarded"] is True     # archived, not deleted

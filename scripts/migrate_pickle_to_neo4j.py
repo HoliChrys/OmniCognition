@@ -18,8 +18,11 @@ test namespace, for the oracle) : this one runs against SERVED stores, so it is
   after k chunks leaves k chunks written, and the next run's diff sends only the rest ;
 * GUARDED : a store whose logical clock (`t_clock`) in Neo4j is AHEAD of the pickle's was
   written after the bascule — overwriting it with the pickle would roll those writes back : it
-  is refused (`ahead`, rc 3), whatever the flags. Another writer committing during the run →
-  409 → refused (`conflict`, rc 3), nothing of that chunk written ;
+  is refused (`ahead`, rc 3), whatever the flags. Points that Neo4j holds and the pickle does
+  not are never archived silently : the store is refused (`neo4j-only-points`, rc 3) unless
+  `--discard-missing` says the pickle dropped them on purpose (then `discarded = True`, zero
+  deletion). Another writer committing during the run → 409 → refused (`conflict`, rc 3),
+  nothing of that chunk written ;
 * VERIFIABLE : `--verify` re-loads the store EXACTLY as the gate would (`Neo4jBackend.load`)
   and compares it with the pickle : points by kind and by state, the order, every point's
   full fingerprint, content and vector digests, the forgets (the `_forget_log`, the INVALID
@@ -368,6 +371,7 @@ def verify_store(pk: Dict[str, Any], nj: Dict[str, Any], journal: str) -> Dict[s
 
 def migrate_store(path: str, *, api: str, token: str, account_tokens: str, namespace: str,
                   apply: bool, verify: bool, chunk: int, timeout: float,
+                  discard_missing: bool = False,
                   log=print) -> Dict[str, Any]:
     ctx, account = scope_of(path)
     key = ctx + (f"/accounts/{account}" if account else "")
@@ -411,6 +415,14 @@ def migrate_store(path: str, *, api: str, token: str, account_tokens: str, names
         rep["detail"] = (f"Neo4j's clock {plan['held_t_clock']} is ahead of the pickle's "
                          f"{pk_clock} : the store was written after the bascule, the pickle "
                          "would roll it back — refused")
+        return rep
+    if plan["discard"] and not discard_missing:
+        ids = [d["point_id"] for d in plan["discard"]]
+        rep["status"] = "neo4j-only-points"
+        rep["neo4j_only"] = ids[:50]
+        rep["detail"] = (f"{len(ids)} point(s) live in Neo4j and not in the pickle : either the "
+                         "pickle dropped them since the last pass (then --discard-missing "
+                         "archives them), or something wrote the store since — refused")
         return rep
     todo = batches(plan, chunk)
     rep["plan"]["batches"] = len(todo)
@@ -474,6 +486,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="directory of <account> files, each that account's bearer")
     ap.add_argument("--namespace", default="", help="TESTS and rehearsal only")
     ap.add_argument("--apply", action="store_true", help="write (default : dry-run)")
+    ap.add_argument("--discard-missing", action="store_true",
+                    help="archive (discarded=True) the points Neo4j holds and the pickle "
+                         "no longer has — default : refuse the store")
     ap.add_argument("--verify", action="store_true",
                     help="reload from Neo4j and compare with the pickle")
     ap.add_argument("--chunk", type=int, default=200, help="points per batch")
@@ -494,6 +509,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             r = migrate_store(path, api=a.api.rstrip("/"), token=token,
                               account_tokens=a.account_tokens, namespace=a.namespace,
                               apply=a.apply, verify=a.verify, chunk=a.chunk,
+                              discard_missing=a.discard_missing,
                               timeout=a.timeout, log=log)
         except CorruptStoreError as e:
             ctx, account = scope_of(path)
