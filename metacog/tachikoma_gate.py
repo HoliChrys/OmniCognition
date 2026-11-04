@@ -1307,6 +1307,13 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                 await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
+            # A NARROW ACCOUNT'S STORE IS WRITTEN UNDER ITS OWN TOKEN (OO·V2·M3,
+            # TAC2-1157): on `Neo4jBackend` the records are owned by their
+            # writer, and the account's store is the account's — the bearer that
+            # the checks above just bound to it. The context's store keeps the
+            # gate's own token (`OMNI_STORE_TOKEN`); the pickle ignores both.
+            from metacog.store.neo4j_backend import store_token
+            store_token.set(token if account and account != ctx else "")
             # A new request: the notes are re-read once (TAC-938).
             global _requests_seen
             _requests_seen += 1

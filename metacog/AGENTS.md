@@ -164,6 +164,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   only when the ACL grants the caller `read` on the name; otherwise
   « inexistant ou non accordé à '<user>' » (TAC-1048). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  On `METACOG_STORE=neo4j` (OO·V2·M3) the context's store is written under
+  the gate's own token (`OMNI_STORE_TOKEN`) and a narrow account's store
+  under the request's bearer (the gate sets `store.neo4j_backend.store_token`
+  once the account is verified): the records belong to their writer.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
   rule, chosen by the name only (no candidate cascade): the tree root
   (basename of notes_root) reads `<notes_root>/notes`; `global` reads the

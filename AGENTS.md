@@ -93,7 +93,8 @@ bind every subtree; child docs add local detail but may not weaken them.
   conversation_log, clocks, `decay_exponent`, `_forget_log`); registries/bags/
   threads are rebuilt in `load()`. The store is reached ONLY through the
   `metacog.store.StoreBackend` interface (lock, load, point writes, commit;
-  `METACOG_STORE`, default `pickle` = `PickleBackend`) — see
+  `METACOG_STORE`, default `pickle` = `PickleBackend`; `neo4j` =
+  `Neo4jBackend`, the ontology's records through tachikoma's API) — see
   `metacog/store/AGENTS.md`. The SQL **usage journal is a SEPARATE SQLite
   file** (`<storage>.journal.db`), never pickled — it persists on its own and is
   re-attached on construction.
@@ -102,7 +103,9 @@ bind every subtree; child docs add local detail but may not weaken them.
   `<store>.lock`); if the store changed since this instance synced, it
   re-reads it and merges what the other writer ADDED before writing; the
   pickle is written `<store>.tmp` + fsync + `os.replace`. Never write the
-  store in place. A store that cannot be read raises `CorruptStoreError`
+  store in place. On `Neo4jBackend` the lock between processes is the store's
+  revision: a commit another writer overtook is refused (409) and `save()`
+  re-reads, merges and writes again. A store that cannot be read raises `CorruptStoreError`
   (fail-closed: the context is refused, the file left untouched) — never an
   empty memory passed off as a loaded one.
 - **mnema usage journal (opt-in, failure-safe).** `metacog/journal.py` is an

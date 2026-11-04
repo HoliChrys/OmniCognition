@@ -5660,17 +5660,29 @@ class Memory:
         own_store = not path or (self.storage_path is not None and (
             os.path.abspath(path) == os.path.abspath(self.storage_path)))
         backend = self._own_backend() if own_store else PickleBackend(target)
+        from metacog.store import StoreConflictError
         with backend.lock():
             idx_lock = getattr(self, "_index_lock", None)
             if idx_lock is not None:
                 idx_lock.acquire()        # no merge/pickle while the indexer mutates
             try:
-                if own_store:
-                    self._merge_from_disk(backend, target or backend.location)
-                snapshot = self._persist_snapshot()
-                fps = (self._stage_point_writes(backend, snapshot)
-                       if own_store else None)
-                backend.commit(snapshot)
+                # A backend whose lock does not span processes (Neo4jBackend) refuses a
+                # commit that another writer overtook (StoreConflictError) : the unit of
+                # work is redone — re-read and merge, then the point writes again. Each
+                # conflict means another writer committed, so the loop always progresses.
+                while True:
+                    if own_store:
+                        self._merge_from_disk(backend, target or backend.location)
+                    snapshot = self._persist_snapshot()
+                    fps = (self._stage_point_writes(backend, snapshot)
+                           if own_store else None)
+                    try:
+                        backend.commit(snapshot)
+                    except StoreConflictError:
+                        if not own_store:
+                            raise
+                        continue
+                    break
                 if own_store:
                     self._mark_synced(snapshot, fps)
             finally:
@@ -5684,8 +5696,12 @@ class Memory:
         if self.store_backend is not None:
             return self.store_backend
         st = getattr(self, "_store", None)
-        if st is None or st.location != self.storage_path:
+        # Keyed by the PATH it was opened for, not by `location` : a backend that is not
+        # a file names its store otherwise (Neo4jBackend : `neo4j:<api>/<ctx>`), and
+        # reopening it at each call would forget what it read.
+        if st is None or getattr(self, "_store_path", None) != self.storage_path:
             st = self._store = open_backend(self.storage_path)
+            self._store_path = self.storage_path
         return st
 
     def _stage_point_writes(self, backend: Any,

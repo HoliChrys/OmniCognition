@@ -3,15 +3,18 @@
 ## Purpose
 
 Where a `Memory`'s state is kept. `Memory` never opens its store itself: it
-talks to ONE `StoreBackend`. Today one backend, `PickleBackend` (the former
-`save()`/`load()` code, moved unchanged); the Neo4j backend of OO·V2·M3 plugs
-in here.
+talks to ONE `StoreBackend`. Two backends: `PickleBackend` (the former
+`save()`/`load()` code, moved unchanged — tests and the local plugin, D9) and
+`Neo4jBackend` (OO·V2·M3, Linear TAC2-1157: the store as governed `memory_*`
+records of the ontology, written and read through tachikoma's batch route).
 
 ## Ownership
 
 Owns `base.py` (the `StoreBackend` protocol, `CorruptStoreError`,
 `StoreNotFound`, `point_fingerprint` / `diff_points`), `pickle_backend.py`
-(`PickleBackend`, the per-store lock `_store_lock`, `_read_store`) and
+(`PickleBackend`, the per-store lock `_store_lock`, `_read_store`),
+`neo4j_backend.py` (`Neo4jBackend`, `StoreConflictError`, the point codec
+`encode_point`/`decode_point`, `scope_of`, the `store_token` contextvar) and
 `__init__.py` (`open_backend`, `BACKENDS`, `METACOG_STORE`). `Memory.save()`
 / `load()` / `_merge_from_disk` / `_stage_point_writes` (in `memory.py`) own
 the merge semantics and the unit of work; this package owns where the bytes
@@ -47,17 +50,41 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
   an unknown name raises `ValueError` (never a silent fallback). An explicit
   `save(path)` / `load(path)` on another path is always a pickle
   export/import.
-- **For the next backend** (OO·V2·M3): `discard` must archive, never delete
-  (zero deletion); `commit` that cannot reach the store raises
-  `CorruptStoreError`; `read_if_changed` is the optimistic-version check
-  (a conflict re-reads and merges, as the pickle does); `load` is per
-  context (`location`). With per-point writes, another writer's change to an
-  EXISTING point survives — the pickle's "ours wins" on a clash does not
-  carry over, and `test_store_concurrency` is rewritten case for case. The
-  call sites save only `if memory.storage_path:` — a backend injected
-  without a `storage_path` is never committed by them.
-- **Decisions not taken here**: D9 (the pickle kept for tests and the local
-  plugin) is a working hypothesis, reversible.
+- **`Neo4jBackend`** (`METACOG_STORE=neo4j`): NO direct Neo4j writer — every
+  read and write goes through tachikoma's API (D6, working hypothesis):
+  `GET /api/memory/points` (load: every point of the store, an exact scan, no
+  `k` — D3), `GET /api/memory/points:revision` (the `read_if_changed` fast
+  path), `POST /api/memory/points:batch` (one batch per `commit`: the staged
+  points, the discards, the context state and every observator). The store is
+  derived from the gate's path layout (`scope_of`: `<root>/<ctx>/memory.pkl`,
+  `<root>/<ctx>/accounts/<acc>/memory.pkl`); `METACOG_NEO4J_NAMESPACE` prefixes
+  the context — tests and the oracle only. The bearer is the store's OWNER:
+  `OMNI_STORE_TOKEN`/`OMNI_STORE_TOKEN_FILE` for a context store, the
+  account's own token (`store_token` contextvar or the backend's `_token`) for
+  a narrow account's store; none → `CorruptStoreError`.
+- **Neo4j invariants**: zero deletion — `discard` archives the record
+  (`discarded = True`, no longer served by a load, never deleted), a forget is
+  the point's own `INVALID` + `invalidated` plus the `_forget_log` entry on the
+  `memory_store` record; fail-closed — API or base unreachable, an unreadable
+  answer, a row that does not decode, points without a `memory_store` →
+  `CorruptStoreError`, never an empty memory; the codec is EXACT (floats
+  round-trip through JSON, tuples/None restored field by field, the point
+  order kept by `ordinal`), proven by the oracle (`neo4j.py` in
+  `benchmarks/storage_baseline`). Identity (P31): the node id is qualified by
+  the store on tachikoma's side (`mem:<ctx>:<id>`); omni's id is `point_id`.
+- **The lock between processes is the store's revision**: `commit` sends the
+  revision it read; another writer committed since → HTTP 409 →
+  `StoreConflictError`, nothing written; `Memory.save()` redoes the unit of
+  work (re-read, merge, write) until it commits — each conflict means another
+  writer progressed. `lock()` is per process. With per-point writes, another
+  writer's change to an EXISTING point that we did not change survives — the
+  pickle's whole-file "ours wins" does not carry over (`test_store_concurrency`
+  has each case C1–C8 twice: pickle, and `neo4j`). The call sites save only
+  `if memory.storage_path:` — a backend injected without a `storage_path` is
+  never committed by them.
+- **Decisions not taken here**: D3 (exact scan), D6 (writes through the API)
+  and D9 (the pickle kept for tests and the local plugin) are working
+  hypotheses, reversible.
 
 ## Work Guidance
 
@@ -70,7 +97,11 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
 
 `python -m pytest tests/test_store_backend.py tests/test_store_concurrency.py
 -q`; the oracle: `benchmarks/storage_baseline` (`build` → `run` on the base →
-`run` on the candidate → `compare` rc 0).
+`run` on the candidate → `compare` rc 0). Neo4j: the same files with `-m neo4j`
+and `OMNI_TEST_API_URL` / `OMNI_TEST_TOKEN_FILE` / `OMNI_TEST_NEO4J_HTTP`
+(`tests/neo4j_live.py`), plus `test_context_isolation.py`; the oracle by
+`benchmarks/storage_baseline/neo4j.py migrate` then `run --memory-factory
+benchmarks.storage_baseline.neo4j:factory`.
 
 ## Child DOX Index
 
