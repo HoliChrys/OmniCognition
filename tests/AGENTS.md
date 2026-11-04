@@ -48,6 +48,14 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   reason (`-rs`), once it is set an unreachable API fails. Each test writes in
   its own namespace `oo2t.r<hex>` (contexts created through the API); no test
   deletes (zero deletion) — the cleanup is the operator's, by that prefix.
+  `test_migrate_pickle_to_neo4j.py` (OO·V2·M4, TAC2-1160) pins the operation
+  migration `scripts/migrate_pickle_to_neo4j.py` against a loopback FAKE of the
+  batch route (its `_same`, lock and archive rules): dry-run posts nothing, a
+  second `--apply` plans and posts 0, the pickle and its journal keep their
+  sha256/mtime and no `.lock` appears, a run cut after one chunk resumes with
+  each point written once, a Neo4j clock ahead of the pickle is refused, one
+  tampered field makes `--verify` DIFFÉRENT, a narrow account's store needs that
+  account's token, a journal forget the pickle lost replays alike on both sides.
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
   access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),
   and (TAC-353) that a member's write → forget → recall under the context's

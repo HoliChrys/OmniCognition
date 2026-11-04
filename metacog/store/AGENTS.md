@@ -82,6 +82,21 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
   has each case C1–C8 twice: pickle, and `neo4j`). The call sites save only
   `if memory.storage_path:` — a backend injected without a `storage_path` is
   never committed by them.
+- **Migrating served stores** (OO·V2·M4, Linear TAC2-1160):
+  `scripts/migrate_pickle_to_neo4j.py` is the ONLY tool that moves a served
+  `memory.pkl` into `Neo4jBackend` (the oracle's `benchmarks/storage_baseline/
+  neo4j.py migrate` is for fresh test namespaces). It reads the pickle with
+  `_read_store` (read-only fd, no `Memory`, no `.lock`, sha256 before/after),
+  encodes with THIS package's codec (`encode_point` with ordinal = pickle
+  position, `encode_observator`, `encode_store`), diffs against the load route
+  with the route's `_same` rule, and writes chunks through the batch route
+  under the read revision; dry-run by default, `--apply`, `--verify` (reload
+  by `Neo4jBackend.load`, fingerprints + digests + journal-forget replay on
+  both sides). A store whose Neo4j `t_clock` is ahead of the pickle's is
+  refused. A codec change must keep its `--verify` IDENTIQUE
+  (`tests/test_migrate_pickle_to_neo4j.py`). The usage journal is NOT
+  migrated: on `Neo4jBackend` the gate still opens `<storage_path>.journal.db`
+  (the storage path keeps the gate's layout).
 - **Decisions not taken here**: D3 (exact scan), D6 (writes through the API)
   and D9 (the pickle kept for tests and the local plugin) are working
   hypotheses, reversible.
@@ -101,7 +116,10 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
 and `OMNI_TEST_API_URL` / `OMNI_TEST_TOKEN_FILE` / `OMNI_TEST_NEO4J_HTTP`
 (`tests/neo4j_live.py`), plus `test_context_isolation.py`; the oracle by
 `benchmarks/storage_baseline/neo4j.py migrate` then `run --memory-factory
-benchmarks.storage_baseline.neo4j:factory`.
+benchmarks.storage_baseline.neo4j:factory`. The migration tool:
+`python -m pytest tests/test_migrate_pickle_to_neo4j.py -q` (offline), and on a
+live API `scripts/migrate_pickle_to_neo4j.py --root … --apply --verify` twice
+(the second plans 0).
 
 ## Child DOX Index
 
