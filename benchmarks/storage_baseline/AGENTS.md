@@ -11,8 +11,10 @@ stores (OO0-4) and the latency baseline of `recall` / `remember` / `save()`
 ## Ownership
 
 Owns `inventory.py`, `corpus.py` + `fixtures/corpus.json`, `queries.py` +
-`queries/`, `build.py`, `run.py`, `compare.py`, `latency.py`, `harness.py`
-and the committed `baselines/`.
+`queries/`, `build.py`, `run.py`, `compare.py`, `latency.py`, `harness.py`,
+`neo4j.py` (OO·V2·M3: `migrate` copies a build's pickle stores into a TEST
+namespace of a tachikoma API through `Neo4jBackend`; `factory` is the
+`--memory-factory` that serves them) and the committed `baselines/`.
 
 ## Local Contracts
 
@@ -41,6 +43,10 @@ and the committed `baselines/`.
   `(storage_root, notes_root) -> memory` serving the gate's contract
   (`ContextualMemory` by default). A new backend is compared by building or
   migrating the SAME data, running with its factory, and `compare.py`.
+- **Neo4j** (`neo4j.py`): the stores are migrated into a FRESH namespace for
+  each run (a run advances the clocks; a namespace is never reused); a narrow
+  account's store is written and read under that account's own token (dev
+  login of the test API, granted on its context). Never against a served API.
 - **What is compared.** Per (view, query): `retrieve_plain`
   (`retrieve(k=7, rerank=False)`), `retrieve` (hybrid + lineage + spreading,
   no reranker) and `recall` (the MCP tool, reranker + floor + gap). Ids,
