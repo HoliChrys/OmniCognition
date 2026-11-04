@@ -69,14 +69,24 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   clear matches before the batch — never overturned, skipped on sets < 4;
   `stance_of(fact_id)` reads the card's stance THOUGHT.
   The default bag mirrors into `_bag` for backwards compatibility.
-  **Persistence** (`save`/`load`, TAC-935): `_store_lock(path)` is the one
-  lock per store in a process (RLock + `flock` on `<store>.lock`, lock file
-  never deleted); `save` = lock → `_merge_from_disk` (3-way: keys on disk
-  absent from the `_synced` base were added by another writer and are merged —
-  points/observators/turns/forget-log; keys removed here stay removed; id
-  clash keeps ours) → `<store>.tmp` + fsync + `os.replace`. `_read_store`
-  turns any unreadable file into `CorruptStoreError`; `__post_init__`
-  re-raises it (refuse to serve, file untouched).
+  **Persistence** (`save`/`load`, TAC-935, OO·V2·M1): `Memory` reaches its
+  store ONLY through a `metacog.store.StoreBackend` (`store_backend`, or
+  `open_backend(storage_path)` by `METACOG_STORE`, default `pickle`; an
+  unknown name raises at construction; the pickle is never SERVED — the gate
+  refuses it at startup, see `tachikoma_gate.py` below). `save()` is the UNIT OF WORK:
+  `backend.lock()` → `_merge_from_disk` (`backend.read_if_changed()`, then
+  3-way: keys on disk absent from the `_synced` base were added by another
+  writer and are merged — points/observators/turns/forget-log; keys removed
+  here stay removed; id clash keeps ours) → `_stage_point_writes` (the diff
+  against `_held`, what the backend holds: `upsert` per new or changed point
+  by `point_fingerprint`, `forget` per new forget-log entry, `discard` per
+  point no longer held — exhaustive, a point moved by `apply_pull` included;
+  merged points are held, never written back) → `backend.commit(snapshot)`.
+  The 19 `save()` call sites (`mcp_server.py`, `tachikoma_gate.py`, hooks)
+  are therefore point writes at the interface; `PickleBackend` groups them
+  into one atomic file. `save(path)`/`load(path)` on another path = pickle
+  export/import (no merge, no sync). `CorruptStoreError` (re-exported here)
+  from `load`: `__post_init__` re-raises it (refuse to serve, file untouched).
   **A forget is durable** (TAC-323): the MCP `forget` tool saves after
   `forget_node`; `forget_node` stamps the log entry and the `forget_events`
   row with ONE instant; `load` of the own store replays every journal forget
@@ -155,6 +165,14 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   only when the ACL grants the caller `read` on the name; otherwise
   « inexistant ou non accordé à '<user>' » (TAC-1048). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  `main()` serves `METACOG_STORE=neo4j` ONLY: `require_served_store` exits
+  before uvicorn listens on `pickle`, on an unset variable (the pickle
+  default) and on an unknown name (`SERVED_STORES`, TAC2-1232, D9 provisional;
+  the library default stays `pickle` for the tests and the local plugin).
+  On `METACOG_STORE=neo4j` (OO·V2·M3) the context's store is written under
+  the gate's own token (`OMNI_STORE_TOKEN`) and a narrow account's store
+  under the request's bearer (the gate sets `store.neo4j_backend.store_token`
+  once the account is verified): the records belong to their writer.
   The deepwiki (TAC-938): `notes_folder(notes_root, ctx)` is THE name→folder
   rule, chosen by the name only (no candidate cascade): the tree root
   (basename of notes_root) reads `<notes_root>/notes`; `global` reads the
@@ -289,8 +307,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
 
 `python -m pytest tests/ -q` (the suite covers this package). Targeted:
 `tests/test_no_laundering.py`, `test_event_node.py`, `test_event_schema.py`,
-`test_kind.py`, `test_spreading.py`, `test_persistence.py`.
+`test_kind.py`, `test_spreading.py`, `test_persistence.py`,
+`test_store_concurrency.py`, `test_store_backend.py`.
 
 ## Child DOX Index
 
-No child docs — this is a flat module package.
+- `store/AGENTS.md` — the storage interface (`StoreBackend`), `PickleBackend`
+  and the backend selection (`METACOG_STORE`).

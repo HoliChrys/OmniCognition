@@ -129,107 +129,20 @@ def query_date_tags(question: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Store persistence primitives (TAC-935) : one writer per store, atomic files,
-# corruption named — never an empty memory passed off as a loaded one.
+# Store persistence (TAC-935, OO·V2·M1) : the store lives behind the
+# `metacog.store.StoreBackend` interface ; `PickleBackend` (one atomic file,
+# one writer per store, merge-on-stale, corruption named) is the default.
+# `CorruptStoreError` is re-exported here : `from metacog.memory import
+# CorruptStoreError` stays the public spelling.
 # ---------------------------------------------------------------------------
 
-
-class CorruptStoreError(RuntimeError):
-    """The store file exists but cannot be read back (truncated, not a pickle,
-    wrong shape). Raised instead of serving an empty memory ; the file is left
-    untouched for recovery."""
-
-
-def _read_store(path: str) -> Tuple[Dict[str, Any], os.stat_result]:
-    """Unpickle the store at `path` and return (snapshot, stat of the version
-    read). FileNotFoundError propagates ; every other failure is a
-    `CorruptStoreError` naming the file. The stat comes from the open fd, so it
-    describes exactly the bytes that were read (an atomic replace in between
-    cannot desynchronise them)."""
-    with open(path, "rb") as f:
-        st = os.fstat(f.fileno())
-        try:
-            snapshot = pickle.load(f)
-        except Exception as e:
-            raise CorruptStoreError(
-                f"unreadable memory store {path} ({st.st_size} bytes) : "
-                f"{type(e).__name__}: {e}") from e
-    if not isinstance(snapshot, dict):
-        raise CorruptStoreError(
-            f"unreadable memory store {path} : expected a dict snapshot, "
-            f"got {type(snapshot).__name__}")
-    return snapshot, st
-
-
-def _fsync_dir(path: str) -> None:
-    """fsync the directory holding `path`, so the os.replace itself is durable."""
-    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-class _StoreLock:
-    """Exclusive, re-entrant lock on ONE store file : a thread RLock (threads
-    of this process) + an `flock` on `<store>.lock` (other processes) taken at
-    the outermost level only. The lock file is never deleted (deleting it would
-    let two processes lock two different inodes)."""
-
-    def __init__(self, store_path: str) -> None:
-        self.lock_path = f"{store_path}.lock"
-        self.rlock = threading.RLock()
-        self.depth = 0
-        self.fd: Optional[int] = None
-
-    def __enter__(self) -> "_StoreLock":
-        self.rlock.acquire()
-        try:
-            if self.depth == 0 and _fcntl is not None:
-                fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-                try:
-                    _fcntl.flock(fd, _fcntl.LOCK_EX)
-                except BaseException:
-                    os.close(fd)
-                    raise
-                self.fd = fd
-        except BaseException:
-            self.rlock.release()
-            raise
-        self.depth += 1
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.depth -= 1
-        try:
-            if self.depth == 0 and self.fd is not None:
-                fd, self.fd = self.fd, None
-                try:
-                    _fcntl.flock(fd, _fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-        finally:
-            self.rlock.release()
-
-
-try:                                    # POSIX ; elsewhere the thread lock alone
-    import fcntl as _fcntl
-except ImportError:                     # pragma: no cover - non-POSIX
-    _fcntl = None
-
-_STORE_LOCKS: Dict[str, _StoreLock] = {}
-_STORE_LOCKS_GUARD = threading.Lock()
-
-
-def _store_lock(path: str) -> _StoreLock:
-    """The ONE lock of a store, shared by every Memory of this process that
-    points at it (keyed by real path)."""
-    key = os.path.realpath(path)
-    with _STORE_LOCKS_GUARD:
-        lk = _STORE_LOCKS.get(key)
-        if lk is None:
-            lk = _STORE_LOCKS[key] = _StoreLock(key)
-        return lk
+from metacog.store import (  # noqa: E402
+    CorruptStoreError,
+    PickleBackend,
+    diff_points,
+    open_backend,
+    point_fingerprint,
+)
 
 
 def _turn_key(t: Any) -> tuple:
@@ -280,6 +193,10 @@ class Memory:
     # and the turn gravitates onto it. None = current behavior unchanged.
     event_extractor: Any = None
     storage_path: Optional[str] = None
+    # The store behind `save()` / `load()` (a `metacog.store.StoreBackend`).
+    # None = `open_backend(storage_path)`, chosen by `METACOG_STORE` (default
+    # `pickle`) the first time the store is needed. Never pickled.
+    store_backend: Any = None
 
     points: List[Point] = field(default_factory=list)
     observators: Dict[str, Observator] = field(default_factory=dict)
@@ -407,8 +324,9 @@ class Memory:
     _session_msg_chain: Dict[tuple, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._store = None                  # the backend opened for storage_path
         self._open_persistent_journal()
-        if self.storage_path:
+        if self.storage_path or self.store_backend is not None:
             try:
                 self.load()
             except FileNotFoundError:
@@ -420,7 +338,8 @@ class Memory:
                 # file is left untouched ; the caller (one context of the gate)
                 # fails loudly, the other contexts keep serving.
                 import sys as _sys
-                print(f"[metacog] REFUSING TO SERVE {self.storage_path} : {e}",
+                where = self.storage_path or self.store_backend.location
+                print(f"[metacog] REFUSING TO SERVE {where} : {e}",
                       file=_sys.stderr)
                 raise
 
@@ -463,20 +382,26 @@ class Memory:
         the workers racing on one shared point cloud: give each its own
         `memory.snapshot()`.
 
-        `storage_path` is cleared on the clone so a `save()` on a snapshot
-        can never overwrite the original's on-disk store.
+        `storage_path` and the store backend are cleared on the clone so a
+        `save()` on a snapshot can never overwrite the original's store.
         """
         import copy
         # Seed the deepcopy memo with the shared resources keyed by id, so
         # deepcopy returns them as-is (shared) instead of cloning them.
         memo: Dict[int, Any] = {}
         for name in ("encoder", "reranker", "journal", "llm", "executor",
-                     "extractor", "entity_extractor", "atomic_extractor"):
+                     "extractor", "entity_extractor", "atomic_extractor",
+                     "store_backend", "_store"):
             obj = getattr(self, name, None)
             if obj is not None:
                 memo[id(obj)] = obj
+        held = getattr(self, "_held", None)
+        if held is not None:
+            memo[id(held)] = None           # what the store holds : not the clone's
         clone = copy.deepcopy(self, memo)
         clone.storage_path = None
+        clone.store_backend = None          # a snapshot has no store at all
+        clone._store = None
         return clone
 
     # ------------------------------------------------------------------
@@ -5703,7 +5628,17 @@ class Memory:
     # ------------------------------------------------------------------
 
     def save(self, path: Optional[str] = None) -> None:
-        """Persist the whitelisted state to `path` (default `storage_path`).
+        """Persist the whitelisted state to `path` (default: this memory's
+        store, `store_backend` or the one `METACOG_STORE` opens for
+        `storage_path`).
+
+        `save()` is the UNIT OF WORK of the store interface (OO·V2·M1,
+        `metacog/store/`) : the change since the last sync is expressed as
+        point writes — `upsert` per new or changed point, `forget` per new
+        forget-log entry, `discard` per point no longer held — then
+        `commit`ted with the context state. `PickleBackend` groups them into
+        one file. An explicit `path` other than the store's is an EXPORT : the
+        whole snapshot to that pickle file (no merge, no sync).
 
         CONCURRENCY-SAFE (TAC-935). Three guarantees :
         1. ATOMIC : the snapshot is written to `<target>.tmp`, fsynced, then
@@ -5720,30 +5655,74 @@ class Memory:
            first instead of overwriting it with a stale snapshot.
         """
         target = path or self.storage_path
-        if target is None:
+        if target is None and self.store_backend is None:
             raise ValueError("no storage_path configured and none provided")
-        own_store = self.storage_path is not None and (
-            os.path.abspath(target) == os.path.abspath(self.storage_path))
-        with _store_lock(target):
+        own_store = not path or (self.storage_path is not None and (
+            os.path.abspath(path) == os.path.abspath(self.storage_path)))
+        backend = self._own_backend() if own_store else PickleBackend(target)
+        from metacog.store import StoreConflictError
+        with backend.lock():
             idx_lock = getattr(self, "_index_lock", None)
             if idx_lock is not None:
                 idx_lock.acquire()        # no merge/pickle while the indexer mutates
             try:
+                # A backend whose lock does not span processes (Neo4jBackend) refuses a
+                # commit that another writer overtook (StoreConflictError) : the unit of
+                # work is redone — re-read and merge, then the point writes again. Each
+                # conflict means another writer committed, so the loop always progresses.
+                while True:
+                    if own_store:
+                        self._merge_from_disk(backend, target or backend.location)
+                    snapshot = self._persist_snapshot()
+                    fps = (self._stage_point_writes(backend, snapshot)
+                           if own_store else None)
+                    try:
+                        backend.commit(snapshot)
+                    except StoreConflictError:
+                        if not own_store:
+                            raise
+                        continue
+                    break
                 if own_store:
-                    self._merge_from_disk(target)
-                snapshot = self._persist_snapshot()
-                tmp = f"{target}.tmp"
-                with open(tmp, "wb") as f:
-                    pickle.dump(snapshot, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, target)
-                _fsync_dir(target)
-                if own_store:
-                    self._mark_synced(os.stat(target), snapshot)
+                    self._mark_synced(snapshot, fps)
             finally:
                 if idx_lock is not None:
                     idx_lock.release()
+
+    def _own_backend(self) -> Any:
+        """This memory's store : `store_backend` when injected, else the
+        backend `METACOG_STORE` names for `storage_path` (opened once, and
+        again only if `storage_path` is changed)."""
+        if self.store_backend is not None:
+            return self.store_backend
+        st = getattr(self, "_store", None)
+        # Keyed by the PATH it was opened for, not by `location` : a backend that is not
+        # a file names its store otherwise (Neo4jBackend : `neo4j:<api>/<ctx>`), and
+        # reopening it at each call would forget what it read.
+        if st is None or getattr(self, "_store_path", None) != self.storage_path:
+            st = self._store = open_backend(self.storage_path)
+            self._store_path = self.storage_path
+        return st
+
+    def _stage_point_writes(self, backend: Any,
+                            snapshot: Dict[str, Any]) -> Dict[str, tuple]:
+        """Under the store lock : hand `backend` the change since the last
+        sync, point by point — `upsert` for every point new or changed
+        (`point_fingerprint` differs from the one held), `discard` for every
+        point held and no longer in memory, `forget` for every forget-log
+        entry not held. Returns the fingerprints of the snapshot's points (the
+        next base). Exhaustive by construction : a point moved by
+        `apply_pull` as a side effect is caught like the one ingested."""
+        held = getattr(self, "_held", None) or {"fp": {}, "forget": set()}
+        changed, gone, fps = diff_points(snapshot.get("points", []), held["fp"])
+        for p in changed:
+            backend.upsert(p)
+        for pid in gone:
+            backend.discard(pid)
+        for e in snapshot.get("_forget_log", []):
+            if _forget_key(e) not in held["forget"]:
+                backend.forget(e.get("id") if isinstance(e, dict) else None, e)
+        return fps
 
     def _persist_snapshot(self) -> Dict[str, Any]:
         from metacog.defaults import encoder_id
@@ -5760,38 +5739,41 @@ class Memory:
             "encoder_id": encoder_id(self.encoder),
         }
 
-    def _mark_synced(self, st: os.stat_result, snapshot: Dict[str, Any]) -> None:
-        """Remember WHICH file version this instance mirrors (its signature)
-        and the keys it held then — the merge BASE. A key present on disk but
-        absent from the base was added by another writer ; a key in the base
-        but absent from memory was removed here on purpose (not resurrected)."""
+    def _mark_synced(self, snapshot: Dict[str, Any],
+                     fps: Optional[Dict[str, tuple]] = None) -> None:
+        """Remember the keys this instance held at its last sync — the merge
+        BASE (the stored VERSION itself is the backend's). A key present on
+        disk but absent from the base was added by another writer ; a key in
+        the base but absent from memory was removed here on purpose (not
+        resurrected). And what the backend now HOLDS (`_held`) : the
+        fingerprint of each point and the forget keys — the base of the next
+        point writes (`_stage_point_writes`)."""
+        forget = {_forget_key(e) for e in snapshot.get("_forget_log", [])}
         self._synced = {
-            "sig": (st.st_ino, st.st_size, st.st_mtime_ns),
             "points": {p.id for p in snapshot.get("points", [])},
             "observators": set(snapshot.get("observators", {})),
             "turns": {_turn_key(t) for t in
                       getattr(snapshot.get("conversation_log"), "turns", [])},
-            "forget": {_forget_key(e) for e in snapshot.get("_forget_log", [])},
+            "forget": forget,
+        }
+        self._held = {
+            "fp": (fps if fps is not None else
+                   {p.id: point_fingerprint(p)
+                    for p in snapshot.get("points", [])}),
+            "forget": set(forget),
         }
 
-    def _merge_from_disk(self, target: str) -> int:
-        """Under the store lock : if the file changed since this instance last
-        synced, re-read it and fold in what the other writer ADDED (points,
-        observators, conversation turns, forget-log entries — keyed, never
-        duplicated). Returns the number of points merged. Loud, never silent.
-        A corrupt file on disk raises `CorruptStoreError` : we refuse to write
-        over it (the evidence stays for recovery)."""
-        try:
-            st = os.stat(target)
-        except FileNotFoundError:
-            return 0
-        if st.st_size == 0:
-            return 0                            # an empty file holds nothing to lose
+    def _merge_from_disk(self, backend: Any, target: str) -> int:
+        """Under the store lock : if the store changed since this instance last
+        synced (`backend.read_if_changed()`), fold in what the other writer
+        ADDED (points, observators, conversation turns, forget-log entries —
+        keyed, never duplicated). Returns the number of points merged. Loud,
+        never silent. A corrupt file on disk raises `CorruptStoreError` : we
+        refuse to write over it (the evidence stays for recovery)."""
+        disk = backend.read_if_changed()
+        if disk is None:
+            return 0                            # absent, empty, or unchanged
         synced = getattr(self, "_synced", None)
-        sig = (st.st_ino, st.st_size, st.st_mtime_ns)
-        if synced is not None and synced["sig"] == sig:
-            return 0                            # nobody wrote since : fast path
-        disk, _st = _read_store(target)
         base = synced or {"points": set(), "observators": set(),
                           "turns": set(), "forget": set()}
         mine = {p.id for p in self.points}
@@ -5836,6 +5818,14 @@ class Memory:
             self._rebuild_event_registry()
             from metacog.geometry import clear_geo_cache
             clear_geo_cache()
+        # What the other writer wrote is HELD by the store already : not a
+        # point write of ours (the merge semantics above are unchanged).
+        held = getattr(self, "_held", None)
+        if held is None:
+            held = self._held = {"fp": {}, "forget": set()}
+        for p in added:
+            held["fp"][p.id] = point_fingerprint(p)
+        held["forget"].update(_forget_key(e) for e in new_forgets)
         import sys as _sys
         print(f"[metacog] {target} changed on disk since this process synced : "
               f"merged {len(added)} point(s), {len(new_turns)} turn(s) written "
@@ -5856,20 +5846,23 @@ class Memory:
                 self._event_registry[f"{et}::{nm.lower()}"] = p.id
 
     def load(self, path: Optional[str] = None) -> None:
-        """Restore the state from `path` (default `storage_path`).
+        """Restore the state from `path` (default: this memory's store).
 
         FileNotFoundError propagates (first run). Any OTHER failure to read
-        the file — truncated, not a pickle, wrong shape — raises
+        the store — truncated, not a pickle, wrong shape — raises
         `CorruptStoreError` naming the file : never an empty memory passed off
-        as a loaded one."""
+        as a loaded one. An explicit `path` other than the store's is an
+        IMPORT of that pickle file (no sync, no forget replay)."""
         source = path or self.storage_path
-        if source is None:
+        if source is None and self.store_backend is None:
             raise ValueError("no storage_path configured and none provided")
-        snapshot, st = _read_store(source)
         own_store = path is None or (self.storage_path is not None and
                                      os.path.abspath(path) == os.path.abspath(self.storage_path))
         if own_store:
-            self._mark_synced(st, snapshot)
+            snapshot = self._own_backend().load()
+            self._mark_synced(snapshot)
+        else:
+            snapshot = PickleBackend(source).load()
         self.points = snapshot.get("points", [])
         self._text_index = TextIndex()          # refills lazily (not pickled)
         from metacog.geometry import clear_geo_cache

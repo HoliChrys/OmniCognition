@@ -1,0 +1,258 @@
+{
+ "version": 1,
+ "ctx": "oracle.medium",
+ "seed": 1146,
+ "corpus_commit": "381e46079fa5b113bf3c599b5251489b5303f8ef",
+ "queries": [
+  {
+   "qid": "oracle.medium#00",
+   "kind": "window",
+   "text": "*modest* across runs). The composition step is"
+  },
+  {
+   "qid": "oracle.medium#01",
+   "kind": "window",
+   "text": "all (*\"...Art\"*), collapsing token-F1 precision. `metacog/answer_cluster.py` SEGMENTS the evidence"
+  },
+  {
+   "qid": "oracle.medium#02",
+   "kind": "window",
+   "text": "(the same `_merge_aliases` mechanism lateral collision"
+  },
+  {
+   "qid": "oracle.medium#03",
+   "kind": "window",
+   "text": "every candidate phrasing lands on John's caritative persona, `D5:5` never"
+  },
+  {
+   "qid": "oracle.medium#04",
+   "kind": "window",
+   "text": "not in settings, because Claude Code merges hooks"
+  },
+  {
+   "qid": "oracle.medium#05",
+   "kind": "window",
+   "text": "`THOUGHT` is streamed alongside it. The walk"
+  },
+  {
+   "qid": "oracle.medium#06",
+   "kind": "window",
+   "text": "FACTs, RRF-merged (rrf_k=60) with the THOUGHT-evolved query results."
+  },
+  {
+   "qid": "oracle.medium#07",
+   "kind": "window",
+   "text": "/ Recall@7** — gold `dia_id`s in the static top-k."
+  },
+  {
+   "qid": "oracle.medium#08",
+   "kind": "window",
+   "text": "(§7.2) the client renders a single message that rewrites"
+  },
+  {
+   "qid": "oracle.medium#09",
+   "kind": "window",
+   "text": "later runs load instantly, and the cheap"
+  },
+  {
+   "qid": "oracle.medium#10",
+   "kind": "window",
+   "text": "(OKF: one concept per markdown file,"
+  },
+  {
+   "qid": "oracle.medium#11",
+   "kind": "window",
+   "text": "<details> <summary><b>🔬 <code>debug_qa</code> — the step-by-step QA debugger</b> &nbsp;(click to"
+  },
+  {
+   "qid": "oracle.medium#12",
+   "kind": "window",
+   "text": "May, 2023\"` → `\"8 May 2023\"`); the"
+  },
+  {
+   "qid": "oracle.medium#13",
+   "kind": "window",
+   "text": "/ `block=True` force synchrony for tests and shutdown). The"
+  },
+  {
+   "qid": "oracle.medium#14",
+   "kind": "window",
+   "text": "overrides (`auto` | `fastembed[:model]` | `org/model` | `simple[:dim]`); `auto`"
+  },
+  {
+   "qid": "oracle.medium#15",
+   "kind": "window",
+   "text": "self-built capability set is also a browsable, queryable part of"
+  },
+  {
+   "qid": "oracle.medium#16",
+   "kind": "window",
+   "text": "`access_events` (nodes surfaced in the same retrieval); drives lateral"
+  },
+  {
+   "qid": "oracle.medium#17",
+   "kind": "window",
+   "text": "drift*): a noisy clue (\"books on gardening\")"
+  },
+  {
+   "qid": "oracle.medium#18",
+   "kind": "window",
+   "text": "specialized retrieval modes the walk orchestrates (`presearch`, `scoped_*`,"
+  },
+  {
+   "qid": "oracle.medium#19",
+   "kind": "window",
+   "text": "every stage and the walk crawled). The IDF"
+  },
+  {
+   "qid": "oracle.medium#20",
+   "kind": "window",
+   "text": "single termination predicate, the walk halts"
+  },
+  {
+   "qid": "oracle.medium#21",
+   "kind": "window",
+   "text": "Passage Search via Contextualized Late Interaction over"
+  },
+  {
+   "qid": "oracle.medium#22",
+   "kind": "window",
+   "text": "it is all frontmatter: `wiki_where(\"keep\")`, `wiki_where(\"bindings\", \"D1\")`, `wiki_where(\"annotations\","
+  },
+  {
+   "qid": "oracle.medium#23",
+   "kind": "window",
+   "text": "vocabulary** — earlier few-shot leaks of gold answers"
+  },
+  {
+   "qid": "oracle.medium#24",
+   "kind": "window",
+   "text": "extractor and BM25 match a typed"
+  },
+  {
+   "qid": "oracle.medium#25",
+   "kind": "section",
+   "text": "abstract"
+  },
+  {
+   "qid": "oracle.medium#26",
+   "kind": "section",
+   "text": "a hyperparameter free metacognitive memory manifold for llm "
+  },
+  {
+   "qid": "oracle.medium#27",
+   "kind": "section",
+   "text": "4 1 token discipline"
+  },
+  {
+   "qid": "oracle.medium#28",
+   "kind": "section",
+   "text": "v11 uncertainty governed depth breadth only agent current"
+  },
+  {
+   "qid": "oracle.medium#29",
+   "kind": "section",
+   "text": "5 3 the usage journal mnema aligned activation feedback forg"
+  },
+  {
+   "qid": "oracle.medium#30",
+   "kind": "section",
+   "text": "3 5 query alignment anchor drift resistance"
+  },
+  {
+   "qid": "oracle.medium#31",
+   "kind": "section",
+   "text": "5 6 the okf wiki a bidirectional continuously evolving rag e"
+  },
+  {
+   "qid": "oracle.medium#32",
+   "kind": "section",
+   "text": "3 3 pre search gate validate a query before spending a walk"
+  },
+  {
+   "qid": "oracle.medium#33",
+   "kind": "section",
+   "text": "4 2 deterministic temporal resolution"
+  },
+  {
+   "qid": "oracle.medium#34",
+   "kind": "section",
+   "text": "5 6 5 the rules in one table"
+  },
+  {
+   "qid": "oracle.medium#35",
+   "kind": "held_out",
+   "text": "vrai dans le réel) et *ingestion time T′* (quand"
+  },
+  {
+   "qid": "oracle.medium#36",
+   "kind": "held_out",
+   "text": "∨ précision temporelle ≥ mois). Graphe :"
+  },
+  {
+   "qid": "oracle.medium#37",
+   "kind": "held_out",
+   "text": "· [Survey TKG](https://arxiv.org/html/2403.04782v1) · [TEMT](https://arxiv.org/abs/2309.16357) ·"
+  },
+  {
+   "qid": "oracle.medium#38",
+   "kind": "held_out",
+   "text": "les sous-events liés à un event)"
+  },
+  {
+   "qid": "oracle.medium#39",
+   "kind": "held_out",
+   "text": "résumé-event** comme ancre enrichie (CoNLL F1 86.7"
+  },
+  {
+   "qid": "oracle.medium#40",
+   "kind": "hand",
+   "text": "how do I install the MCP server"
+  },
+  {
+   "qid": "oracle.medium#41",
+   "kind": "hand",
+   "text": "what is the anti-laundering corollary"
+  },
+  {
+   "qid": "oracle.medium#42",
+   "kind": "hand",
+   "text": "comment lancer l'évaluation LoCoMo"
+  },
+  {
+   "qid": "oracle.medium#43",
+   "kind": "hand",
+   "text": "recall at 7 compared with the walk"
+  },
+  {
+   "qid": "oracle.medium#44",
+   "kind": "hand",
+   "text": "why are there no stored edges between points"
+  },
+  {
+   "qid": "oracle.medium#45",
+   "kind": "hand",
+   "text": "qu'est-ce que le plafond sigma de la marche"
+  },
+  {
+   "qid": "oracle.medium#46",
+   "kind": "hand",
+   "text": "hybrid retrieval with BM25 and reciprocal rank fusion"
+  },
+  {
+   "qid": "oracle.medium#47",
+   "kind": "hand",
+   "text": "how are observators used to route a query"
+  },
+  {
+   "qid": "oracle.medium#48",
+   "kind": "hand",
+   "text": "recette du kouign-amann"
+  },
+  {
+   "qid": "oracle.medium#49",
+   "kind": "hand",
+   "text": "le cours de l'action Total aujourd'hui"
+  }
+ ]
+}

@@ -1,0 +1,51 @@
+{
+  "code_commit": "381e46079fa5b113bf3c599b5251489b5303f8ef",
+  "corpus_commit": "381e46079fa5b113bf3c599b5251489b5303f8ef",
+  "corpus_version": 1,
+  "encoder_id": "fastembed:sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "format": 1,
+  "llm_calls": 0,
+  "seed": 1146,
+  "stores": {
+    "oracle.medium": {
+      "by_kind": {
+        "ACTION": 5,
+        "EVENT": 3,
+        "FACT": 252,
+        "THOUGHT": 15
+      },
+      "content_sha256": "69dcc2d468537a2e25a05ef51194f4a8d41bd070cf0220c0ee423f536df71d2a",
+      "points": 275,
+      "t_clock": 17.0,
+      "vectors_sha256": "7b0b156f034f889d6db659ef2d51705ff2eeed7aeee0805e36a31e902c07a2bb"
+    },
+    "oracle.narrow": {
+      "by_kind": {
+        "FACT": 112
+      },
+      "content_sha256": "063aba08969c90a23a5664cd6368835ab49c2bb3f7d349de8f3a2f04f0131371",
+      "points": 112,
+      "t_clock": 6.0,
+      "vectors_sha256": "89d935e3e4fb1bd96bfd9361558e834744f41f640f3b76105d83cd843dafdadc"
+    },
+    "oracle.narrow/accounts/oracle-member": {
+      "by_kind": {
+        "FACT": 18
+      },
+      "content_sha256": "67de6f63e7507b0e30774a70869db2a3e079ad2eecfd4d099d4c51abd8125f7b",
+      "points": 18,
+      "t_clock": 1.0,
+      "vectors_sha256": "15eac5e2df027c1cb148e91b796e953763c7cffa21162e45e6a7a970c6c5d4ed"
+    },
+    "oracle.small": {
+      "by_kind": {
+        "FACT": 33,
+        "THOUGHT": 4
+      },
+      "content_sha256": "227fdc0f60f422820e3ae38f4dd56d4fa1a589393dca8e651f8a21c11f0f82ed",
+      "points": 37,
+      "t_clock": 9.0,
+      "vectors_sha256": "d7b1691cd9d18c40e6bf19dc972a1d325f84e0584b40fd4c25d2c2a71c8e638f"
+    }
+  }
+}

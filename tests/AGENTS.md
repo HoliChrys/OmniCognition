@@ -2,8 +2,15 @@
 
 ## Purpose
 
-The full pytest suite (~470+ tests) guarding `metacog`'s invariants and
-behavior. Deterministic and offline.
+The full pytest suite (967 tests collected at `381e460`, counted on
+2026-11-03 for TAC2-1179; 975 with `test_store_backend.py`, OO·V2·M1)
+guarding `metacog`'s invariants and behavior.
+Deterministic and offline. Beyond `pip install -e .`, counting the suite
+needs `pip install -e '.[bench]' networkx`: `test_answer_cluster.py` uses
+`sentence-transformers` (+ `torch`, and the `all-MiniLM-L6-v2` model in the
+HF cache), `test_llm_keywords.py` patches `anthropic`, `test_communities.py`
+imports `networkx` (in no extra). Without them 18 of the 967 fail or error
+on a missing module.
 
 ## Ownership
 
@@ -23,10 +30,40 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   `test_store_concurrency.py` guards the store write path: stale instances and
   20 concurrent processes/threads lose no fact, a SIGKILL mid-dump leaves a
   loadable store, a corrupt store raises `CorruptStoreError` and is untouched.
+  `test_store_backend.py` (OO·V2·M1, TAC2-1153) pins the store interface:
+  `save()` reaches the backend as point writes — an ingest upserts its new
+  points, a point moved by `apply_pull` is upserted too, a forget is a
+  `forget` write, a dropped point a `discard`, a save with no change only a
+  `commit`, merged points are never written back — and the pickle written is
+  `pickle.dumps(snapshot)`; an unknown `METACOG_STORE` refuses to construct.
+  The persistence tests above run UNMODIFIED against `PickleBackend`.
+  `Neo4jBackend` (OO·V2·M3, TAC2-1157): `test_store_concurrency.py` has the
+  twin of each case C1–C8 (`TestNeo4jStore`) and every test of
+  `test_context_isolation.py` runs on both backends (`gate` is parametrized),
+  plus two Neo4j-only cases: the same omni id in two contexts is two nodes
+  (P31), and a positive witness that a broken context mapping is SEEN. They
+  are marked `neo4j` and need a live TEST API + its Neo4j (`neo4j_live.py`:
+  `OMNI_TEST_API_URL`, `OMNI_TEST_TOKEN_FILE`, `OMNI_TEST_NEO4J_HTTP`,
+  `NEO4J_PASSWORD`); without `OMNI_TEST_API_URL` they are skipped with their
+  reason (`-rs`), once it is set an unreachable API fails. Each test writes in
+  its own namespace `oo2t.r<hex>` (contexts created through the API); no test
+  deletes (zero deletion) — the cleanup is the operator's, by that prefix.
+  `test_migrate_pickle_to_neo4j.py` (OO·V2·M4, TAC2-1160) pins the operation
+  migration `scripts/migrate_pickle_to_neo4j.py` against a loopback FAKE of the
+  batch route (its `_same`, lock and archive rules): dry-run posts nothing, a
+  second `--apply` plans and posts 0, the pickle and its journal keep their
+  sha256/mtime and no `.lock` appears, a run cut after one chunk resumes with
+  each point written once, a Neo4j clock ahead of the pickle is refused, one
+  tampered field makes `--verify` DIFFÉRENT, a point only in Neo4j is refused
+  (archived on `--discard-missing` only), a narrow account's store needs that
+  account's token, a journal forget the pickle lost replays alike on both sides.
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
   access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),
   and (TAC-353) that a member's write → forget → recall under the context's
-  account no longer serves the mirror, on disk too.
+  account no longer serves the mirror, on disk too; and (TAC2-1232) that its
+  `main()` refuses `METACOG_STORE=pickle`, an unset one and an unknown one
+  before uvicorn is reached, starts on `neo4j`, while `open_backend` keeps the
+  pickle as the library default.
   `test_forget_durable.py` (TAC-323) guards that a forget survives a restart:
   MCP `forget` → a new instance does not serve the id; a pickle that lost a
   forget (pending or merged event) is replayed INVALID at `load`; a reverted

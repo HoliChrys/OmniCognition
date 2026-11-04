@@ -14,6 +14,10 @@ dependencies = [
     "nltk>=3.9.4",
     "fastembed>=0.8.0",  # the production encoder (mnema's multilingual MiniLM, ONNX/CPU)
     "numpy",  # vectorised geometry (geometric_spread) ; already pulled by fastembed
+    # PINNED (OO·V1·M2, TAC2-1149) : onnxruntime picks CPU kernels at run time, and the
+    # bit-for-bit oracle (`benchmarks/storage_baseline`) and tachikoma's embedder (same
+    # model, same version) only agree on one set of wheels.
+    "onnxruntime==1.31.1",
 ]
 
 [project.optional-dependencies]
@@ -28,4 +32,4 @@ bench = [
 metacog-mcp = "metacog.mcp_server:main"
 
 [tool.setuptools]
-packages = ["metacog", "benchmarks", "benchmarks.locomo"]
+packages = ["metacog", "metacog.store", "benchmarks", "benchmarks.locomo"]

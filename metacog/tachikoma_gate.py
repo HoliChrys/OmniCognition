@@ -1307,6 +1307,13 @@ def context_gate(authorize_fn: Any = None, warm: Any = None) -> Any:
                 await anyio.to_thread.run_sync(warm)
             _current_ctx.set(ctx)
             _current_account.set(account)
+            # A NARROW ACCOUNT'S STORE IS WRITTEN UNDER ITS OWN TOKEN (OO·V2·M3,
+            # TAC2-1157): on `Neo4jBackend` the records are owned by their
+            # writer, and the account's store is the account's — the bearer that
+            # the checks above just bound to it. The context's store keeps the
+            # gate's own token (`OMNI_STORE_TOKEN`); the pickle ignores both.
+            from metacog.store.neo4j_backend import store_token
+            store_token.set(token if account and account != ctx else "")
             # A new request: the notes are re-read once (TAC-938).
             global _requests_seen
             _requests_seen += 1
@@ -1362,12 +1369,45 @@ def build_gated_app(storage_root: str, notes_root: str,
         routes=[Mount("/", app=inner)]), mcp_app, inner
 
 
+#: The store backends the SERVED gate may run on (TAC2-1232, OO3-7). The pickle
+#: (`PickleBackend`, the `METACOG_STORE` default) is kept for the tests and the
+#: local plugin (`bin/metacog-mcp.sh`, `~/.metacog`) and is never served —
+#: decision D9 of DESIGN_OMNI_ONTOLOGIE, a PROVISIONAL working hypothesis (not
+#: yet decided by Chrys, TAC2-1185): widening this set is the revert.
+SERVED_STORES = frozenset({"neo4j"})
+
+
+def require_served_store() -> str:
+    """The store backend the gate will serve — or a refusal BEFORE it listens.
+
+    Read with the same rule as `Memory` (`metacog.store.backend_name`), so an
+    unset `METACOG_STORE` is the pickle default and is refused like an explicit
+    `pickle`. Raised at startup, not on the first request: a gate serving a
+    pickle next to a Neo4j that holds the context would be two memories of one
+    context, and the first request would not say so.
+    """
+    from metacog.store import ENV, backend_name
+
+    name = backend_name()
+    if name not in SERVED_STORES:
+        given = os.environ.get(ENV)
+        raise SystemExit(
+            f"[gate] refused to start: {ENV}={given!r} selects the {name!r} store"
+            + (" (unset = the pickle default)" if not given else "")
+            + f"; the served gate runs on {', '.join(sorted(SERVED_STORES))} only "
+            "(TAC2-1232, D9: the pickle is for tests and the local plugin). "
+            f"Set {ENV}=neo4j and OMNI_STORE_TOKEN or OMNI_STORE_TOKEN_FILE.")
+    return name
+
+
 def main() -> None:
     """The gated server launcher — the same variables processes.toml sets.
 
     OMNI_HTTP_PORT (default 8788), OMNI_STORAGE_ROOT, OMNI_NOTES_ROOT,
-    METACOG_SURFACE (optional).
+    METACOG_SURFACE (optional), METACOG_STORE (`neo4j` — anything else is
+    refused before the gate listens, `require_served_store`).
     """
+    store = require_served_store()
     import uvicorn
 
     port = int(os.environ.get("OMNI_HTTP_PORT", "8788"))
@@ -1377,8 +1417,8 @@ def main() -> None:
     surface = os.environ.get("METACOG_SURFACE") or None
 
     outer, mcp_app, inner = build_gated_app(storage_root, notes_root, surface)
-    print(f"[gate] omni gated per context on :{port} — store {storage_root}, "
-          f"notes {notes_root or '(disabled)'}", flush=True)
+    print(f"[gate] omni gated per context on :{port} — store {store} "
+          f"(layout {storage_root}), notes {notes_root or '(disabled)'}", flush=True)
     # WE SERVE `outer` — the wrapper WITH the context middleware. Serving
     # `inner` (the bare MCP app) would serve without the gate: measured,
     # initialize without header returned 200. The lifespan is inner's,

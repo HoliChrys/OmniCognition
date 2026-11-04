@@ -14,7 +14,8 @@ cross-benchmark conventions.
 ## Local Contracts
 
 - Benchmarks require an LLM (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`); they
-  are slow and cost tokens. Run them in the background and monitor; never block.
+  are slow and cost tokens. Exception: `storage_baseline/` is LLM-free by
+  contract (it counts and fails on any LLM call). Run them in the background and monitor; never block.
 - Report the **two answer modes** (recall for exhaustive retrieval, precision/F1
   for focused answers) and always the set size `n`. Never hard-cap the walk's
   evidence set.
@@ -56,6 +57,13 @@ by running one small query end-to-end and confirming the table renders.
 
 - `locomo/AGENTS.md` — LoCoMo long-conversation QA harness and answerers
 - `obliq_bench/AGENTS.md` — OBLIQ-Bench oblique-query harness and debuggers
+- `storage_baseline/AGENTS.md` — the storage oracle (Linear TAC2-1146,
+  OO·V0·M2): read-only inventory of served stores, three reproducible test
+  contexts built offline from repo prose, 50 frozen queries each, `run.py`
+  (ids + scores of `retrieve` / `recall`, memory factory injectable for
+  another backend), `compare.py` (identical / different and where), and the
+  `recall` / `remember` / `save()` latency probe. No LLM, no network, never
+  writes a source store.
 - `d3_wiki/PROTOCOL.md` — D3 (Linear TAC-939): `sleep` vs `walk` deep-wiki
   strategies per context. `PROTOCOL.md`, `questions.yaml` (notes pinned by
   sha256) and `run_d3.py` are frozen before any run; never edit them after a

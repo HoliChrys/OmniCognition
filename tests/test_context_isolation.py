@@ -46,16 +46,26 @@ once per session (TAC-299), again on any other bearer, context or account.
 
 The encoder is SimpleEncoder (hash), the reranker none: deterministic, no
 model download, no network — runnable in CI.
+
+ON BOTH BACKENDS (OO·V2·M3, TAC2-1157 / OO2-9). Every test of this file runs on the
+pickle store AND on `Neo4jBackend` (`METACOG_STORE=neo4j`, the `gate` fixture is
+parametrized; the `neo4j` run needs a live test API + Neo4j, `tests/neo4j_live.py`, and
+is skipped without one). No case is removed or relaxed: what changes is WHERE the data is
+measured — the journals stay SQLite files on both; the store is the pickle file (a byte
+search) or the store's rows read back through the API's load route PLUS the memory nodes
+in Neo4j (one node per point, in the context of the write and no other).
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+import uuid
 
 import pytest
 
 from metacog.defaults import SimpleEncoder
+from tests.neo4j_live import Namespace, requires_live, shared_namespace
 
 # Under the tree root `tachikoma`: the deployed gate maps ONLY the tree's
 # descendants to a notes folder (`notes_folder`, D2 / TAC-938) — any other
@@ -77,9 +87,12 @@ QUERY = "what is the vault code vermillon"
 class Gate:
     """The real gated app over HTTP, one MCP session per call (McpTransport)."""
 
-    def __init__(self, client, root: str, acl_calls: list, refuse: set):
+    def __init__(self, client, root: str, acl_calls: list, refuse: set,
+                 ns: "Namespace | None" = None):
         self.client = client
         self.root = root
+        #: The live namespace when the stores are `Neo4jBackend`'s, else None (pickle).
+        self.ns = ns
         #: Every question asked to the (fake) ACL: (token, ctx), in order.
         self.acl_calls = acl_calls
         #: (token, ctx) pairs the fake ACL refuses (403).
@@ -170,7 +183,13 @@ class Gate:
 
     def stores_holding(self, token: str) -> list[str]:
         """The contexts whose `memory.pkl` holds `token` (pickle keeps str
-        as UTF-8: a byte search is the store itself, not an API's opinion)."""
+        as UTF-8: a byte search is the store itself, not an API's opinion).
+
+        On Neo4j: the contexts whose store ROWS hold `token` (the load route, every
+        point of the store), and each holding point's NODE checked to live in that
+        context and in no other of the namespace."""
+        if self.ns is not None:
+            return self._neo4j_holding(token)
         hits = []
         for ctx in CONTEXTS:
             path = os.path.join(self.root, ctx, "memory.pkl")
@@ -178,6 +197,18 @@ class Gate:
                 with open(path, "rb") as fh:
                     if token.encode() in fh.read():
                         hits.append(ctx)
+        return sorted(hits)
+
+    def _neo4j_holding(self, token: str) -> list[str]:
+        hits = []
+        for ctx in CONTEXTS:
+            body = self.ns.load(ctx)
+            held = [p["point_id"] for p in body["points"]
+                    if token in p["fields"].get("content", "")]
+            if held:
+                hits.append(ctx)
+            for pid in held:
+                assert self.ns.real(ctx) in self.ns.nodes_of(pid), (ctx, pid)
         return sorted(hits)
 
     def touch_all(self) -> None:
@@ -194,10 +225,25 @@ def _notes(root, rel: str, name: str, body: str) -> None:
     (folder / f"{name}.md").write_text(body, encoding="utf-8")
 
 
-@pytest.fixture
-def gate(tmp_path, monkeypatch):
+@pytest.fixture(params=["pickle", pytest.param("neo4j", marks=requires_live)])
+def gate(request, tmp_path, monkeypatch):
     """The gated app on a fresh storage root, ACL faked to 'yes', the test
-    encoder in place of the ONNX pair (TAC-237's `models()` asks these)."""
+    encoder in place of the ONNX pair (TAC-237's `models()` asks these).
+    `neo4j`: the same app, its stores on `Neo4jBackend` in a fresh namespace."""
+    ns = None
+    if request.param == "neo4j":
+        ns = shared_namespace("isolation")
+        for ctx in CONTEXTS:
+            if getattr(ns, "first_use", False):
+                ns.fresh(ctx)               # empty at the start of the run
+            else:
+                ns.ensure(ctx)
+        ns.first_use = False
+        from tests.neo4j_live import API, token
+        monkeypatch.setenv("METACOG_STORE", "neo4j")
+        monkeypatch.setenv("TACHIKOMA_API_URL", API)
+        monkeypatch.setenv("OMNI_STORE_TOKEN", token())
+        monkeypatch.setenv("METACOG_NEO4J_NAMESPACE", ns.prefix)
     import metacog.defaults as defaults
     monkeypatch.setattr(defaults, "make_encoder", lambda: SimpleEncoder())
     monkeypatch.setattr(defaults, "make_reranker", lambda: None)
@@ -231,7 +277,7 @@ def gate(tmp_path, monkeypatch):
                                           authorize_fn=fake_authorize)
     # The SDK's DNS-rebinding guard wants a loopback Host, as served live.
     with TestClient(outer, base_url="http://127.0.0.1:8788") as client:
-        yield Gate(client, root, acl_calls, refuse)
+        yield Gate(client, root, acl_calls, refuse, ns)
 
 
 # ── the default context: there is none ─────────────────────────────────
@@ -502,3 +548,46 @@ def test_a_note_added_mid_session_is_listed_in_that_session(gate, tmp_path):
     _notes(tmp_path / "tachikoma", "iso-alpha", "alpha-late",
            "# Late note\n\nAdded while the session was open.")
     assert _session_wiki(gate, headers) == ["notes:alpha-late", "notes:alpha-runbook"]
+
+
+# ── Neo4j only: the identity of a point is its store's (P31, TAC2-1157) ──
+
+@pytest.fixture
+def neo4j_gate(gate):
+    if gate.ns is None:
+        pytest.skip("Neo4j identity: the pickle has one file per store, no shared key")
+    return gate
+
+
+def test_the_same_omni_id_in_two_contexts_is_two_nodes(neo4j_gate):
+    """omni's ids are unique per store only (`<doc_id>#<sha12>` is deterministic,
+    `fact_<hex8>` is 32 bits). Kept as the node key, the second context's write would
+    REWRITE the first's node (`MERGE (n:Entity {id})`) and succeed. Same id, two
+    contexts: two nodes, each in its context, each store serving its own content."""
+    g = neo4j_gate
+    pid = f"fact_{uuid.uuid4().hex[:8]}"
+    a = g.call(C, "ingest", {"content": f"alpha owns ochre-{pid}", "id": pid,
+                             "kind": "FACT"})
+    b = g.call(C2, "ingest", {"content": f"beta owns teal-{pid}", "id": pid,
+                              "kind": "FACT"})
+    assert a["id"] == b["id"] == pid
+    assert g.ns.nodes_of(pid) == sorted([g.ns.real(C), g.ns.real(C2)])
+    assert g.stores_holding(f"ochre-{pid}") == [C]
+    assert g.stores_holding(f"teal-{pid}") == [C2]
+
+
+def test_witness_a_broken_mapping_is_seen(neo4j_gate, monkeypatch):
+    """POSITIVE WITNESS (rule 9): break the isolation on purpose — the backend files
+    c''s store under c — and the measures above must SEE it, by rows and by nodes."""
+    from metacog.store import neo4j_backend as nb
+    real = nb.scope_of
+
+    def leaky(path):
+        ctx, account = real(path)
+        return (C if ctx == C2 else ctx), account
+    monkeypatch.setattr(nb, "scope_of", leaky)
+    g = neo4j_gate
+    token = f"leak-{uuid.uuid4().hex[:8]}"
+    g.remember(C2, f"The iso-beta vault code is {token}.", ["c1:leak"])
+    # The leak is SEEN: c''s write is in c's store, and its node in c's context.
+    assert g.stores_holding(token) == [C]
