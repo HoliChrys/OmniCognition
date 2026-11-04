@@ -1594,3 +1594,57 @@ def test_a_stage_yes_never_serves_a_recall_for_request(chain_gate):
     assert seen == [("top", ASKED)]
     _ok(_call(client, h, "retrieve", {"query": "ancestor beacon", "k": 3}))
     assert seen == [("top", ASKED)]
+
+
+# ── the served store (TAC2-1232, OO3-7): never the pickle ─────────────────
+
+def _main_reaching_uvicorn(monkeypatch):
+    """`main()` with the app build and uvicorn replaced: records what it serves."""
+    import uvicorn
+
+    from metacog import tachikoma_gate as gate
+
+    served = []
+    monkeypatch.setattr(gate, "build_gated_app",
+                        lambda *a, **k: ("outer-app", None, None))
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: served.append((app, kw)))
+    monkeypatch.setenv("OMNI_HTTP_PORT", "8793")
+    return gate, served
+
+
+@pytest.mark.parametrize("value", ["pickle", "PICKLE", None, "nowhere"])
+def test_the_served_gate_refuses_any_store_but_neo4j_before_listening(
+        monkeypatch, value):
+    """D9 (provisional): the pickle is for tests and the local plugin, never
+    served. An unset METACOG_STORE IS the pickle default, so it is refused
+    too; an unknown name is not a silent fallback either. Nothing listens."""
+    gate, served = _main_reaching_uvicorn(monkeypatch)
+    if value is None:
+        monkeypatch.delenv("METACOG_STORE", raising=False)
+    else:
+        monkeypatch.setenv("METACOG_STORE", value)
+    with pytest.raises(SystemExit) as exc:
+        gate.main()
+    message = str(exc.value)
+    assert "refused to start" in message and "TAC2-1232" in message
+    assert "METACOG_STORE=neo4j" in message
+    if value is None:
+        assert "unset = the pickle default" in message
+    assert served == []
+
+
+def test_the_served_gate_starts_on_neo4j(monkeypatch, capsys):
+    gate, served = _main_reaching_uvicorn(monkeypatch)
+    monkeypatch.setenv("METACOG_STORE", "neo4j")
+    gate.main()
+    assert [(app, kw["port"]) for app, kw in served] == [("outer-app", 8793)]
+    assert "store neo4j" in capsys.readouterr().out
+
+
+def test_the_pickle_stays_the_library_default(monkeypatch, tmp_path):
+    """The refusal is the GATE's, not the store's: a `Memory` (tests, the
+    local plugin `bin/metacog-mcp.sh`) still opens a pickle by default."""
+    from metacog.store import PickleBackend, open_backend
+
+    monkeypatch.delenv("METACOG_STORE", raising=False)
+    assert isinstance(open_backend(str(tmp_path / "memory.pkl")), PickleBackend)

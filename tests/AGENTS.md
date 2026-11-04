@@ -60,7 +60,10 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
   access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),
   and (TAC-353) that a member's write → forget → recall under the context's
-  account no longer serves the mirror, on disk too.
+  account no longer serves the mirror, on disk too; and (TAC2-1232) that its
+  `main()` refuses `METACOG_STORE=pickle`, an unset one and an unknown one
+  before uvicorn is reached, starts on `neo4j`, while `open_backend` keeps the
+  pickle as the library default.
   `test_forget_durable.py` (TAC-323) guards that a forget survives a restart:
   MCP `forget` → a new instance does not serve the id; a pickle that lost a
   forget (pending or merged event) is replayed INVALID at `load`; a reverted

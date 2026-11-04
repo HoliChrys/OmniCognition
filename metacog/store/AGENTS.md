@@ -47,7 +47,10 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
   OO·V2·M1 loads, and the bytes written are `pickle.dumps(snapshot)`.
 - **Selection**: `METACOG_STORE` (default `pickle`) is read by
   `open_backend` when a `Memory` with a `storage_path` first needs its store;
-  an unknown name raises `ValueError` (never a silent fallback). An explicit
+  an unknown name raises `ValueError` (never a silent fallback). The default
+  stays `pickle` HERE (tests, the local plugin); the served gate refuses every
+  store but `neo4j` at startup (`tachikoma_gate.require_served_store`,
+  TAC2-1232). An explicit
   `save(path)` / `load(path)` on another path is always a pickle
   export/import.
 - **`Neo4jBackend`** (`METACOG_STORE=neo4j`): NO direct Neo4j writer — every
@@ -99,8 +102,8 @@ go. Inherits every root invariant (zero deletion, fail-closed, single writer).
   migrated: on `Neo4jBackend` the gate still opens `<storage_path>.journal.db`
   (the storage path keeps the gate's layout).
 - **Decisions not taken here**: D3 (exact scan), D6 (writes through the API)
-  and D9 (the pickle kept for tests and the local plugin) are working
-  hypotheses, reversible.
+  and D9 (the pickle kept for tests and the local plugin, never served — the
+  gate's refusal) are working hypotheses, reversible.
 
 ## Work Guidance
 

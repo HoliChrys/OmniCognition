@@ -72,7 +72,8 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   **Persistence** (`save`/`load`, TAC-935, OO·V2·M1): `Memory` reaches its
   store ONLY through a `metacog.store.StoreBackend` (`store_backend`, or
   `open_backend(storage_path)` by `METACOG_STORE`, default `pickle`; an
-  unknown name raises at construction). `save()` is the UNIT OF WORK:
+  unknown name raises at construction; the pickle is never SERVED — the gate
+  refuses it at startup, see `tachikoma_gate.py` below). `save()` is the UNIT OF WORK:
   `backend.lock()` → `_merge_from_disk` (`backend.read_if_changed()`, then
   3-way: keys on disk absent from the `_synced` base were added by another
   writer and are merged — points/observators/turns/forget-log; keys removed
@@ -164,6 +165,10 @@ hyperparameter-free, anti-laundering, never-cache-empty, save/load rebuild).
   only when the ACL grants the caller `read` on the name; otherwise
   « inexistant ou non accordé à '<user>' » (TAC-1048). Fail-closed; callers
   must forward the caller's bearer. `TACHIKOMA_API_URL`, `OMNI_ACL_TIMEOUT`.
+  `main()` serves `METACOG_STORE=neo4j` ONLY: `require_served_store` exits
+  before uvicorn listens on `pickle`, on an unset variable (the pickle
+  default) and on an unknown name (`SERVED_STORES`, TAC2-1232, D9 provisional;
+  the library default stays `pickle` for the tests and the local plugin).
   On `METACOG_STORE=neo4j` (OO·V2·M3) the context's store is written under
   the gate's own token (`OMNI_STORE_TOKEN`) and a narrow account's store
   under the request's bearer (the gate sets `store.neo4j_backend.store_token`

@@ -95,7 +95,11 @@ bind every subtree; child docs add local detail but may not weaken them.
   `metacog.store.StoreBackend` interface (lock, load, point writes, commit;
   `METACOG_STORE`, default `pickle` = `PickleBackend`; `neo4j` =
   `Neo4jBackend`, the ontology's records through tachikoma's API) — see
-  `metacog/store/AGENTS.md`. The SQL **usage journal is a SEPARATE SQLite
+  `metacog/store/AGENTS.md`. **The pickle is never served**: it is for the
+  tests and the local plugin (`bin/metacog-mcp.sh`, `~/.metacog`); the served
+  gate (`python -m metacog.tachikoma_gate`) refuses to start on any store but
+  `neo4j`, an unset `METACOG_STORE` included (`require_served_store`,
+  TAC2-1232 — decision D9, provisional until Chrys decides it). The SQL **usage journal is a SEPARATE SQLite
   file** (`<storage>.journal.db`), never pickled — it persists on its own and is
   re-attached on construction.
 - **Store writes are atomic, single-writer, merge-on-stale.** `save()` runs
