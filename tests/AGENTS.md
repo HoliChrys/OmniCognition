@@ -37,6 +37,17 @@ Owns all unit/integration tests and shared fixtures (`conftest.py`).
   `commit`, merged points are never written back — and the pickle written is
   `pickle.dumps(snapshot)`; an unknown `METACOG_STORE` refuses to construct.
   The persistence tests above run UNMODIFIED against `PickleBackend`.
+  `Neo4jBackend` (OO·V2·M3, TAC2-1157): `test_store_concurrency.py` has the
+  twin of each case C1–C8 (`TestNeo4jStore`) and every test of
+  `test_context_isolation.py` runs on both backends (`gate` is parametrized),
+  plus two Neo4j-only cases: the same omni id in two contexts is two nodes
+  (P31), and a positive witness that a broken context mapping is SEEN. They
+  are marked `neo4j` and need a live TEST API + its Neo4j (`neo4j_live.py`:
+  `OMNI_TEST_API_URL`, `OMNI_TEST_TOKEN_FILE`, `OMNI_TEST_NEO4J_HTTP`,
+  `NEO4J_PASSWORD`); without `OMNI_TEST_API_URL` they are skipped with their
+  reason (`-rs`), once it is set an unreachable API fails. Each test writes in
+  its own namespace `oo2t.r<hex>` (contexts created through the API); no test
+  deletes (zero deletion) — the cleanup is the operator's, by that prefix.
   `test_tachikoma_gate.py` pins ONE `Memory` per context at a concurrent first
   access (20 threads → 1 instance; 20 concurrent `remember` → exactly +20),
   and (TAC-353) that a member's write → forget → recall under the context's
