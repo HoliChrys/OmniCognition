@@ -208,10 +208,17 @@ def decode_point(entity_type: str, point_id: str, f: Dict[str, Any]) -> Any:
         observator_views=views,
     )
     # `Point.__post_init__` normalises tags (and appends the kind tag) : the stored list
-    # was written from an already normalised point, so it must come back unchanged.
-    if p.tags != list(f.get("memory_tags") or []):
-        raise ValueError(f"point {point_id!r}: tags changed on decode "
-                         f"({f.get('memory_tags')!r} -> {p.tags!r})")
+    # was written from an already normalised point, so it must come back unchanged —
+    # EXCEPT the case of `account:<id>`, which the gate writes in the id's exact case
+    # (`tachikoma_gate._tag_account`, TAC-274) and `__post_init__` lowers. The stored list
+    # is restored when it differs by case only (the pickle never re-ran `__post_init__`,
+    # so it kept that case); any other difference is still refused (TAC-2363).
+    stored = list(f.get("memory_tags") or [])
+    if p.tags != stored:
+        if [t.lower() for t in stored] != p.tags:
+            raise ValueError(f"point {point_id!r}: tags changed on decode "
+                             f"({stored!r} -> {p.tags!r})")
+        p.tags = stored
     return p
 
 
