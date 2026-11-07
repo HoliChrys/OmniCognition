@@ -117,10 +117,16 @@ class FastEmbedEncoder:
         return v
 
     def encode_batch(self, texts: List[str]) -> List[Tuple[float, ...]]:
-        """Batched path (bulk ingest / re-encode) — one ONNX call for many."""
+        """Batched path (bulk ingest / re-encode) — each vector exactly encode()'s.
+
+        One text per ONNX run (batch_size=1) : a batch pads every text to the
+        longest one and the padded texts move, by 2.4e-4 per coordinate measured
+        2026-11-07 (TAC-2377). A text's vector then depended on its batch, and
+        differed from the API's for the same text."""
         todo = [t for t in dict.fromkeys(texts) if (t or "") not in self._cache]
         if todo:
-            for t, arr in zip(todo, self._model.embed([t or " " for t in todo])):
+            vectors = self._model.embed([t or " " for t in todo], batch_size=1)
+            for t, arr in zip(todo, vectors):
                 self._cache[t or ""] = self._l2(arr)
         return [self._cache[t or ""] for t in texts]
 
