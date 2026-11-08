@@ -56,65 +56,67 @@ logger = logging.getLogger(__name__)
 DEFAULT_DATABASE = "omni_journal"
 
 # ClickHouse DDL of the usage journal. `{db}` is the database. Every table
-# carries `context_path` (the memory's context) first in its sort key : every
-# read is bounded to one context. No TTL : the memory forgets nothing (J3).
+# carries `context_path` (the memory's context) first in its sort key, then
+# `account` ('' = the context's own store, else a narrow account's store,
+# `<ctx>/accounts/<acc>` in the gate's layout) : every read is bounded to one
+# store. No TTL : the memory forgets nothing (J3).
 # `logged_at` is the wall clock of the write ; `ts` is the caller's clock, kept
 # as given (logical or wall, see JC2-6).
 _DDL = (
     "CREATE DATABASE IF NOT EXISTS {db}",
     """CREATE TABLE IF NOT EXISTS {db}.retrievals (
-        context_path String, id UInt64,
+        context_path String, account String DEFAULT '', id UInt64,
         query_text Nullable(String), returned_node_ids String,
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.access_events (
-        context_path String, id UInt64,
+        context_path String, account String DEFAULT '', id UInt64,
         node_id String, retrieval_id UInt64, rank UInt32,
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, retrieval_id, rank, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, retrieval_id, rank, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.hops (
-        context_path String, id UInt64, src_id String, dst_id String,
+        context_path String, account String DEFAULT '', id UInt64, src_id String, dst_id String,
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.path_traversals (
-        context_path String, id UInt64, signature String,
+        context_path String, account String DEFAULT '', id UInt64, signature String,
         start_id String, end_id String, intermediates String, length UInt32,
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.collision_events (
-        context_path String, id UInt64, kind String,
+        context_path String, account String DEFAULT '', id UInt64, kind String,
         child_id Nullable(String), parent_ids String, anchor_ids String,
         trigger_distance Nullable(Float64), threshold Nullable(Float64),
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.forget_events (
-        context_path String, id UInt64, node_id String, reason String,
+        context_path String, account String DEFAULT '', id UInt64, node_id String, reason String,
         superseded_by Nullable(String),
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.merge_ledger (
-        context_path String, id UInt64, absorbed_id String,
+        context_path String, account String DEFAULT '', id UInt64, absorbed_id String,
         keeper_id Nullable(String), kind String, reason String, snapshot String,
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.tool_events (
-        context_path String, id UInt64, tool_id String, event String,
+        context_path String, account String DEFAULT '', id UInt64, tool_id String, event String,
         reason Nullable(String),
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     """CREATE TABLE IF NOT EXISTS {db}.wiki_ops (
-        context_path String, id UInt64, doc_id String, target String, op String,
+        context_path String, account String DEFAULT '', id UInt64, doc_id String, target String, op String,
         before Nullable(String), after Nullable(String),
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, id)""",
     # J4 : a flag SQLite rewrites in place is a row here. `target_table`.`target_id` is the
     # flagged row ; the flag's value is the one of its highest `id`.
     """CREATE TABLE IF NOT EXISTS {db}.journal_flags (
-        context_path String, id UInt64,
+        context_path String, account String DEFAULT '', id UInt64,
         target_table LowCardinality(String), target_id UInt64,
         flag LowCardinality(String), value Int64,
         ts Float64, logged_at DateTime64(6) DEFAULT now64(6)
-    ) ENGINE = MergeTree ORDER BY (context_path, target_table, flag, target_id, id)""",
+    ) ENGINE = MergeTree ORDER BY (context_path, account, target_table, flag, target_id, id)""",
 )
 
 #: The journal methods that read or write mutable STATE, served by `state`.
@@ -235,6 +237,7 @@ class ClickHouseJournal:
     """`JournalProtocol` on ClickHouse, bounded to one context (`ctx`)."""
 
     def __init__(self, transport: ClickHouseTransport, ctx: str, *,
+                 account: str = "",
                  database: str = DEFAULT_DATABASE,
                  state: Optional[Journal] = None,
                  batch_size: int = 1, max_buffer: int = 50_000,
@@ -244,8 +247,9 @@ class ClickHouseJournal:
                              "ctx is required")
         self.transport = transport
         self.ctx = ctx
+        self.account = account
         self.db = database
-        self.path = f"clickhouse:{database}/{ctx}"
+        self.path = f"clickhouse:{database}/{ctx}" + (f"/accounts/{account}" if account else "")
         self.state = state if state is not None else Journal(":memory:")
         self.batch_size = max(1, int(batch_size))
         self.max_buffer = max(self.batch_size, int(max_buffer))
@@ -280,6 +284,7 @@ class ClickHouseJournal:
         """Buffer one row. `last=False` while a call still has rows to add : a
         flush never splits one call's rows (a retrieval and its accesses)."""
         row["context_path"] = self.ctx
+        row["account"] = self.account
         with self._lock:
             self._buffer.append((table, row))
             if last and len(self._buffer) >= self.batch_size:
@@ -321,7 +326,8 @@ class ClickHouseJournal:
             self._flush_locked()
         try:
             return self.transport.select(sql.replace("{db}", self.db),
-                                         {"ctx": self.ctx, **params})
+                                         {"ctx": self.ctx, "account": self.account,
+                                          **params})
         except Exception:
             logger.warning("omni journal: read failed for %s", self.ctx,
                            exc_info=True)
@@ -338,7 +344,7 @@ class ClickHouseJournal:
     # The set of row ids of `table` whose `flag` currently holds a non-zero
     # value (the latest flag row wins).
     _FLAGGED = ("(SELECT target_id FROM {{db}}.journal_flags "
-                "WHERE context_path = {{ctx:String}} AND target_table = '{table}' "
+                "WHERE context_path = {{ctx:String}} AND account = {{account:String}} AND target_table = '{table}' "
                 "AND flag = '{flag}' GROUP BY target_id "
                 "HAVING argMax(value, id) != 0)")
 
@@ -462,7 +468,7 @@ class ClickHouseJournal:
     def pending_forgets(self) -> List[dict]:
         rows = self._rows(
             "SELECT id, node_id, reason, superseded_by, ts FROM {db}.forget_events "
-            "WHERE context_path = {ctx:String} AND id NOT IN "
+            "WHERE context_path = {ctx:String} AND account = {account:String} AND id NOT IN "
             + self._flagged("forget_events", "merged") + " ORDER BY id ASC")
         return [{"id": int(r["id"]), "node_id": r["node_id"], "reason": r["reason"],
                  "superseded_by": r["superseded_by"], "ts": r["ts"]} for r in rows]
@@ -471,13 +477,13 @@ class ClickHouseJournal:
         rows = self._rows(
             "SELECT id, node_id, reason, superseded_by, ts, id IN "
             + self._flagged("forget_events", "merged") + " AS merged "
-            "FROM {db}.forget_events WHERE context_path = {ctx:String} "
+            "FROM {db}.forget_events WHERE context_path = {ctx:String} AND account = {account:String} "
             "ORDER BY id ASC")
         return [{"id": int(r["id"]), "node_id": r["node_id"], "reason": r["reason"],
                  "superseded_by": r["superseded_by"], "ts": r["ts"],
                  "merged": bool(r["merged"])} for r in rows]
 
-    _LIVE_LEDGER = ("context_path = {ctx:String} AND id NOT IN "
+    _LIVE_LEDGER = ("context_path = {ctx:String} AND account = {account:String} AND id NOT IN "
                     + _FLAGGED.format(table="merge_ledger", flag="reverted"))
 
     def redirect_of(self, node_id: str) -> Optional[str]:
@@ -503,7 +509,7 @@ class ClickHouseJournal:
 
     def merge_history(self, node_id: Optional[str] = None,
                       include_reverted: bool = True) -> List[dict]:
-        conds = ["context_path = {ctx:String}"]
+        conds = ["context_path = {ctx:String} AND account = {account:String}"]
         params: Dict[str, Any] = {}
         if node_id is not None:
             conds.append("absorbed_id = {nid:String}")
@@ -524,18 +530,18 @@ class ClickHouseJournal:
         if tool_id is None:
             rows = self._rows(
                 "SELECT tool_id, event, reason, ts FROM {db}.tool_events "
-                "WHERE context_path = {ctx:String} ORDER BY id ASC")
+                "WHERE context_path = {ctx:String} AND account = {account:String} ORDER BY id ASC")
         else:
             rows = self._rows(
                 "SELECT tool_id, event, reason, ts FROM {db}.tool_events "
-                "WHERE context_path = {ctx:String} AND tool_id = {tid:String} "
+                "WHERE context_path = {ctx:String} AND account = {account:String} AND tool_id = {tid:String} "
                 "ORDER BY id ASC", tid=str(tool_id))
         return [{"tool_id": r["tool_id"], "event": r["event"],
                  "reason": r["reason"], "ts": r["ts"]} for r in rows]
 
     _WIKI_OP_COLS = ("SELECT id, doc_id, target, op, before, after, ts, id IN "
                      + _FLAGGED.format(table="wiki_ops", flag="reverted")
-                     + " AS reverted FROM {db}.wiki_ops WHERE context_path = {ctx:String} ")
+                     + " AS reverted FROM {db}.wiki_ops WHERE context_path = {ctx:String} AND account = {account:String} ")
 
     @staticmethod
     def _wiki_op(r: Mapping[str, Any]) -> dict:
@@ -558,7 +564,7 @@ class ClickHouseJournal:
     def hop_target_counts(self) -> List[Tuple[str, int]]:
         rows = self._rows(
             "SELECT dst_id, count() AS c FROM {db}.hops "
-            "WHERE context_path = {ctx:String} GROUP BY dst_id "
+            "WHERE context_path = {ctx:String} AND account = {account:String} GROUP BY dst_id "
             "ORDER BY c DESC, dst_id ASC")
         return [(r["dst_id"], int(r["c"])) for r in rows]
 
@@ -567,9 +573,9 @@ class ClickHouseJournal:
         # same substring test on the stored JSON text, not an array lookup.
         nid = str(node_id)
         rows = self._select(
-            "SELECT count() AS c FROM {db}.hops WHERE context_path = {ctx:String} "
+            "SELECT count() AS c FROM {db}.hops WHERE context_path = {ctx:String} AND account = {account:String} "
             "AND dst_id = {nid:String} AND ts > ifNull((SELECT maxOrNull(ts) "
-            "  FROM {db}.collision_events WHERE context_path = {ctx:String} "
+            "  FROM {db}.collision_events WHERE context_path = {ctx:String} AND account = {account:String} "
             "  AND kind = 'chasles' AND (child_id = {nid:String} "
             "  OR position(parent_ids, {q:String}) > 0 "
             "  OR position(anchor_ids, {q:String}) > 0)), 0)",
@@ -593,7 +599,7 @@ class ClickHouseJournal:
                        since_ts: float = 0.0) -> List[dict]:
         rows = self._rows(
             self._PATH_COLS + "FROM {db}.path_traversals "
-            "WHERE context_path = {ctx:String} AND length >= {ml:Int64} "
+            "WHERE context_path = {ctx:String} AND account = {account:String} AND length >= {ml:Int64} "
             "AND ts > {since:Float64} GROUP BY signature HAVING freq >= {mf:Int64} "
             "ORDER BY freq DESC, signature ASC",
             ml=int(min_len), since=float(since_ts), mf=int(min_freq))
@@ -608,9 +614,9 @@ class ClickHouseJournal:
         rows = self._rows(
             "WITH (SELECT (groupArray(anchor_ids), groupArray(ts)) "
             "      FROM {db}.collision_events "
-            "      WHERE context_path = {ctx:String} AND kind = 'chasles') AS fires "
+            "      WHERE context_path = {ctx:String} AND account = {account:String} AND kind = 'chasles') AS fires "
             + self._PATH_COLS + "FROM {db}.path_traversals "
-            "WHERE context_path = {ctx:String} AND length >= {ml:Int64} "
+            "WHERE context_path = {ctx:String} AND account = {account:String} AND length >= {ml:Int64} "
             "AND ts > ifNull(arrayMax(arrayFilter((t, a) -> "
             "  position(a, concat('\"', start_id, '\"')) > 0 "
             "  AND position(a, concat('\"', end_id, '\"')) > 0, "
@@ -625,7 +631,7 @@ class ClickHouseJournal:
         sql = ("SELECT a.node_id AS x, b.node_id AS y, count() AS cooc "
                "FROM {db}.access_events AS a INNER JOIN {db}.access_events AS b "
                "ON a.retrieval_id = b.retrieval_id "
-               "WHERE a.context_path = {ctx:String} AND b.context_path = {ctx:String} "
+               "WHERE a.context_path = {ctx:String} AND account = {account:String} AND b.context_path = {ctx:String} AND account = {account:String} "
                "AND a.node_id < b.node_id ")
         params: Dict[str, Any] = {}
         if window is not None:
@@ -637,7 +643,7 @@ class ClickHouseJournal:
 
     def modal_next(self, src_id: str) -> Optional[str]:
         rows = self._rows(
-            "SELECT dst_id FROM {db}.hops WHERE context_path = {ctx:String} "
+            "SELECT dst_id FROM {db}.hops WHERE context_path = {ctx:String} AND account = {account:String} "
             "AND src_id = {sid:String} GROUP BY dst_id "
             "ORDER BY count() DESC, dst_id ASC LIMIT 1", sid=str(src_id))
         return rows[0]["dst_id"] if rows else None
@@ -645,7 +651,7 @@ class ClickHouseJournal:
     def collision_events(self, kind: Optional[str] = None) -> List[dict]:
         sql = ("SELECT id, kind, child_id, parent_ids, anchor_ids, trigger_distance, "
                "threshold, ts FROM {db}.collision_events "
-               "WHERE context_path = {ctx:String} ")
+               "WHERE context_path = {ctx:String} AND account = {account:String} ")
         params: Dict[str, Any] = {}
         if kind is not None:
             sql += "AND kind = {kind:String} "
@@ -668,7 +674,7 @@ class ClickHouseJournal:
             "SELECT b.node_id AS node_id, count() AS cooc "
             "FROM {db}.access_events AS a INNER JOIN {db}.access_events AS b "
             "ON a.retrieval_id = b.retrieval_id "
-            "WHERE a.context_path = {ctx:String} AND b.context_path = {ctx:String} "
+            "WHERE a.context_path = {ctx:String} AND account = {account:String} AND b.context_path = {ctx:String} AND account = {account:String} "
             "AND a.node_id IN {seeds:Array(String)} "
             "AND b.node_id NOT IN {seeds:Array(String)} "
             "GROUP BY b.node_id ORDER BY cooc DESC, node_id ASC LIMIT {k:Int64}",
@@ -677,7 +683,7 @@ class ClickHouseJournal:
 
     # `useful` per retrieval : the latest flag row, stored as score + 1.
     _USEFUL = ("(SELECT target_id, argMax(value, id) - 1 AS useful "
-               "FROM {db}.journal_flags WHERE context_path = {ctx:String} "
+               "FROM {db}.journal_flags WHERE context_path = {ctx:String} AND account = {account:String} "
                "AND target_table = 'retrievals' AND flag = 'useful' "
                "GROUP BY target_id)")
 
@@ -687,7 +693,7 @@ class ClickHouseJournal:
             "countDistinctIf(a.retrieval_id, u.useful = 0) AS neg "
             "FROM {db}.access_events AS a INNER JOIN " + self._USEFUL + " AS u "
             "ON a.retrieval_id = u.target_id "
-            "WHERE a.context_path = {ctx:String} AND a.node_id = {nid:String}",
+            "WHERE a.context_path = {ctx:String} AND account = {account:String} AND a.node_id = {nid:String}",
             nid=str(node_id))
         if not rows:
             return {"useful": 0, "useless": 0}
@@ -695,13 +701,13 @@ class ClickHouseJournal:
 
     def retrieval_returned_ids(self, retrieval_id: int) -> List[str]:
         rows = self._rows(
-            "SELECT node_id FROM {db}.access_events WHERE context_path = {ctx:String} "
+            "SELECT node_id FROM {db}.access_events WHERE context_path = {ctx:String} AND account = {account:String} "
             "AND retrieval_id = {rid:UInt64} ORDER BY rank ASC", rid=int(retrieval_id))
         return [r["node_id"] for r in rows]
 
     def access_timestamps(self, node_id: str) -> List[float]:
         rows = self._rows(
-            "SELECT ts FROM {db}.access_events WHERE context_path = {ctx:String} "
+            "SELECT ts FROM {db}.access_events WHERE context_path = {ctx:String} AND account = {account:String} "
             "AND node_id = {nid:String} ORDER BY ts ASC, id ASC", nid=str(node_id))
         return [float(r["ts"]) for r in rows]
 
@@ -717,7 +723,7 @@ class ClickHouseJournal:
             "SELECT r.id AS id, r.query_text AS query_text, "
             "r.returned_node_ids AS returned_node_ids "
             "FROM {db}.retrievals AS r INNER JOIN " + self._USEFUL + " AS u "
-            "ON r.id = u.target_id WHERE r.context_path = {ctx:String} AND "
+            "ON r.id = u.target_id WHERE r.context_path = {ctx:String} AND account = {account:String} AND "
             + clause + " ORDER BY id ASC", **params)
         return [(int(r["id"]), r["query_text"] or "",
                  json.loads(r["returned_node_ids"] or "[]")) for r in rows]
@@ -725,9 +731,9 @@ class ClickHouseJournal:
     def counts(self) -> Tuple[int, int]:
         rows = self._select(
             "SELECT (SELECT count() FROM {db}.retrievals "
-            "        WHERE context_path = {ctx:String}) AS r, "
+            "        WHERE context_path = {ctx:String} AND account = {account:String}) AS r, "
             "       (SELECT count() FROM {db}.access_events "
-            "        WHERE context_path = {ctx:String}) AS a")
+            "        WHERE context_path = {ctx:String} AND account = {account:String}) AS a")
         if not rows:
             return 0, 0
         return int(rows[0]["r"]), int(rows[0]["a"])

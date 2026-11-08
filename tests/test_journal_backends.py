@@ -298,3 +298,19 @@ def test_reopening_a_context_reads_what_was_written():
     j1.close()                                 # flushes
     j2 = ClickHouseJournal(t, ctx, database="omni_journal_test")
     assert j2.useful_retrievals() == [(rid, "q", ["A"])]
+
+
+@needs_clickhouse
+def test_a_narrow_account_does_not_see_its_context():
+    t = _transport()
+    ctx = f"test.acc.{uuid.uuid4().hex}"
+    own = ClickHouseJournal(t, ctx, database="omni_journal_test")
+    acc = ClickHouseJournal(t, ctx, account="acc-1", database="omni_journal_test")
+    rid = own.log_retrieval("q", ["A", "B"], ts=1.0)
+    own.mark_useful(rid, 2)
+    own.log_merge("A", "B", "merge", "dup", ts=2.0)
+    assert acc.counts() == (0, 0)
+    assert acc.active_redirects() == {}
+    assert acc.useful_retrievals() == []
+    acc.log_retrieval("q", ["C"], ts=3.0)
+    assert own.counts() == (1, 2) and acc.counts() == (1, 1)
