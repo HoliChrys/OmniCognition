@@ -304,16 +304,21 @@ def test_m7_narrow_account_needs_its_own_token(route, stores):
 
 
 def test_m8_journal_forgets_replay_alike(route, stores):
-    # a forget the pickle lost : in the journal only (the save never happened)
-    from metacog.journal import Journal
-    j = Journal(stores["alpha"] + ".journal.db")
+    # a forget the pickle lost : in the journal only (the save never happened).
+    # The migration reads the on-disk SQLite journal, whatever backend the suite
+    # runs on : the forget is written there, by the SQLite class itself.
+    from metacog.journal import SQLiteJournal
+    j = SQLiteJournal(stores["alpha"] + ".journal.db")
     j.log_forget("f05", "lost before save", None, 999.0)
     j.conn.close()
     rc, out = _run(route, stores, "--apply", "--verify")
     v = _alpha(out)["verify"]
     assert v["forgets_replayed"]["pickle"] == ["f05"] == v["forgets_replayed"]["neo4j"]
     assert v["forgets_replayed"]["same_points_after_replay"] and v["verdict"] == "IDENTIQUE"
-    assert v["journal"]["rows"]["forget_events"] == 2
+    # The fixture's own forget went through the suite's journal : into this
+    # SQLite file, or into ClickHouse when the suite runs on it (conftest).
+    on_clickhouse = os.environ.get("OMNI_TEST_JOURNAL") == "clickhouse"
+    assert v["journal"]["rows"]["forget_events"] == (1 if on_clickhouse else 2)
 
 
 def test_m9_a_point_only_in_neo4j_is_never_archived_silently(route, stores):

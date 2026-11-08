@@ -175,6 +175,17 @@ class Gate:
         with sqlite3.connect(self.journals()[ctx]) as conn:
             return conn.execute(query, params).fetchall()
 
+    def usage_sql(self, ctx: str, query: str, params: tuple,
+                  clickhouse_query: str) -> list:
+        """A read of the USAGE journal of `ctx` : the SQLite file, or ClickHouse
+        when the suite runs on it (OMNI_TEST_JOURNAL=clickhouse, conftest)."""
+        if os.environ.get("OMNI_TEST_JOURNAL") != "clickhouse":
+            return self.sql(ctx, query, params)
+        from tests.conftest import clickhouse_usage_rows
+        rows = clickhouse_usage_rows(self.journals()[ctx], clickhouse_query,
+                                     **{f"p{i}": v for i, v in enumerate(params)})
+        return [tuple(r.values()) for r in rows]
+
     def tag_rows(self, tag: str) -> dict[str, int]:
         """Rows of `tag` in the journal of EVERY context (add_tag lowercases)."""
         return {ctx: self.sql(ctx, "SELECT COUNT(*) FROM tags WHERE tag = ?",
@@ -326,12 +337,16 @@ def test_recall_never_serves_another_contexts_fact(gate, tool):
         # WHERE IT LANDS: the retrieval_id names a row of THIS context's
         # journal, listing what was served — and only this journal logged it.
         rid = hits[0]["retrieval_id"]
-        row = gate.sql(other, "SELECT returned_node_ids FROM retrievals "
-                              "WHERE id = ?", (rid,))
+        row = gate.usage_sql(
+            other, "SELECT returned_node_ids FROM retrievals WHERE id = ?", (rid,),
+            "SELECT returned_node_ids FROM {db}.retrievals "
+            "WHERE context_path = {ctx:String} AND id = {p0:UInt64}")
         assert row and own["id"] in json.loads(row[0][0])
         assert fact["id"] not in json.loads(row[0][0])
-        logged = {ctx: gate.sql(ctx, "SELECT COUNT(*) FROM retrievals WHERE "
-                                     "query_text = ?", (query,))[0][0]
+        logged = {ctx: gate.usage_sql(
+            ctx, "SELECT COUNT(*) FROM retrievals WHERE query_text = ?", (query,),
+            "SELECT count() FROM {db}.retrievals "
+            "WHERE context_path = {ctx:String} AND query_text = {p0:String}")[0][0]
                   for ctx in gate.journals()}
         assert logged == {ctx: int(ctx == other) for ctx in CONTEXTS}
 
