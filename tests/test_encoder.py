@@ -116,3 +116,15 @@ def test_real_fastembed_encoder_is_semantic_and_multilingual():
     assert cosine(para, need) > 0.3 and cosine(para, need) > cosine(para, far)  # paraphrase
     # batched == single, and memoised
     assert enc.encode_batch(["a b", "c d"])[0] == enc.encode("a b")
+
+
+@pytest.mark.skipif(not _model_cached(), reason="fastembed model not cached ; "
+                    "set METACOG_REAL_EMBED=1 to download it")
+def test_batched_vector_does_not_depend_on_its_batch():
+    """A batch pads to its longest text ; the padded ones moved by 2.4e-4 per
+    coordinate (TAC-2377). Two encoders, so no memo makes the check tautological."""
+    short, long_ = "bonjour le monde", "salut la terre et tous les autres mondes de la galaxie"
+    batched = make_encoder("fastembed").encode_batch([short, long_])
+    single = make_encoder("fastembed")
+    assert batched[0] == single.encode(short)
+    assert batched[1] == single.encode(long_)
