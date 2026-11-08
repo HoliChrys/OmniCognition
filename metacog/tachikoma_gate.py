@@ -1386,9 +1386,10 @@ SERVED_STORES = frozenset({"neo4j"})
 #: before. `proxy` : written by the context's infra-proxy, read once by the API,
 #: then in memory (`metacog.journal_proxy`) — for the stores listed in
 #: `OMNI_JOURNAL_CONTEXTS` (comma separated store keys : `ctx` or
-#: `ctx/accounts/acc` ; unset = every store). A store left out keeps the SQLite
-#: journal : a context without a deployed `infra-proxy:<ctx>` has nowhere to
-#: write. Where the mutable state (tags, wiki, OKF) lives is `OMNI_STATE`'s.
+#: `ctx/accounts/acc` ; unset = every store ; a listed `ctx` covers its narrow
+#: accounts, whose rows go to the same `infra-proxy:<ctx>`). A store left out keeps
+#: the SQLite journal : a context without a deployed `infra-proxy:<ctx>` has nowhere
+#: to write. Where the mutable state (tags, wiki, OKF) lives is `OMNI_STATE`'s.
 JOURNAL_ENV = "OMNI_JOURNAL"
 JOURNAL_CONTEXTS_ENV = "OMNI_JOURNAL_CONTEXTS"
 JOURNAL_MODES = frozenset({"", "sqlite", "proxy"})
@@ -1426,8 +1427,15 @@ def require_state_mode() -> str:
 
 
 def _listed(env: str, key: str) -> bool:
+    """Is the store `key` in the list of `env` (unset = every store)?
+
+    A listed context covers its narrow accounts (`ctx/accounts/acc`) : their journal
+    goes to the context's own proxy (`open_proxy_journal(ctx, account)`), and their
+    state to the context's records. An exact match only (until TAC-2492) left every
+    account store of a listed context on its `.journal.db` — the `lsof` proof held
+    only while no account was recalled."""
     listed = {k.strip() for k in os.environ.get(env, "").split(",") if k.strip()}
-    return not listed or key in listed
+    return not listed or key in listed or key.partition("/accounts/")[0] in listed
 
 
 def state_journal_for(key: str) -> Any:
