@@ -35,6 +35,16 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      # setup-python finds `libpython3.11.so.1.0` only through LD_LIBRARY_PATH.
+      # metacog's PyExecutor runs `python -I` with env={"LANG": "C"} and loses it :
+      # « error while loading shared libraries » (tests/test_executor.py). Same step
+      # as HoliChrys/tachikoma's Depot CI : put the lib in ld.so's cache.
+      - name: Register libpython with the dynamic linker
+        run: |
+          echo "${pythonLocation}/lib" | sudo tee /etc/ld.so.conf.d/setup-python.conf
+          sudo ldconfig
+          env -i "${pythonLocation}/bin/python3" -c 'import sys; print(sys.version)'
+
       # sentence-transformers' model (tests/test_answer_cluster.py) is fetched from the
       # Hugging Face hub on first use ; cached between runs.
       - uses: actions/cache@v4
