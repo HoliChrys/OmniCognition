@@ -1,0 +1,53 @@
+# Depot CI (TAC-2461) — the CI that gates merges, modelled on HoliChrys/tachikoma's
+# `.depot/workflows/ci.yaml` (TAC-2404). GitHub Actions does not start on this account
+# (TAC-281) : `.github/workflows/context-isolation.yml` is kept, but this is the run that
+# reports check-runs on PR commits.
+#
+# The whole suite (`python -m pytest tests/ -q`, AGENTS.md) runs, with every dependency
+# it imports installed — [bench] (anthropic, sentence-transformers, torch) and [test]
+# (pytest, networkx, ruff) — never skipped or faked. No API key is given : an LLM call
+# fails and the code's deterministic fallback answers, as in the offline suite. The
+# `neo4j` tests skip by design without OMNI_TEST_API_URL (`tests/neo4j_live.py`).
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest + ruff
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # sentence-transformers' model (tests/test_answer_cluster.py) is fetched from the
+      # Hugging Face hub on first use ; cached between runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: hf-${{ runner.os }}-
+
+      - name: Install
+        # CPU torch wheels : the CUDA ones are ~2 GB and nothing here uses a GPU.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -e '.[bench,test]'
+
+      - name: Ruff
+        run: ruff check
+
+      - name: Pytest
+        run: python -m pytest tests/ -q -rs

@@ -27,9 +27,25 @@ bench = [
     "torch>=2.0.0",
     "anthropic>=0.30.0",
 ]
+# What the CI installs on top of [bench] (TAC-2461) : the test runner, the lint, and
+# `networkx` (louvain communities, `metacog/communities.py`, imported lazily).
+test = [
+    "pytest>=8",
+    "networkx>=3",
+    "ruff==0.17.4",
+]
 
 [project.scripts]
 metacog-mcp = "metacog.mcp_server:main"
 
 [tool.setuptools]
 packages = ["metacog", "metacog.store", "benchmarks", "benchmarks.locomo"]
+
+# The CI lint (TAC-2461) : syntax errors and undefined names only — the flake8 "stop the
+# build" set. The tree is not style-clean (153 E/F findings at 7bf2200), so the wider
+# default set would never be green.
+[tool.ruff]
+extend-exclude = [".paperclip-repositories", ".paperclip-runtime"]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]

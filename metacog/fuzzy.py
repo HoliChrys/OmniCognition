@@ -91,7 +91,7 @@ def fuzzy_score(
     query_text: str,
     points: Sequence["Point"],  # noqa: F821
     k_pool: int,
-) -> List[Tuple[float, "Point"]]:
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Rank points by how many distinct query tokens fuzzy-match a token
     in the point's content. Returns the top `k_pool` (score, point),
     best first. Points with zero fuzzy matches are excluded.
@@ -99,7 +99,7 @@ def fuzzy_score(
     q_tokens = {t for t in _tokens(query_text) if len(t) >= _MIN_TOKEN_LEN}
     if not q_tokens:
         return []
-    scored: List[Tuple[float, "Point"]] = []
+    scored: List[Tuple[float, "Point"]] = []  # noqa: F821
     # Query tokens each document token fuzzy-matches, computed once per
     # DISTINCT document token (TAC-248) : the same token recurs across
     # points, and re-running Levenshtein on it was most of the recall cost.
