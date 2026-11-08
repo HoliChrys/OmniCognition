@@ -9,7 +9,10 @@ from metacog.epistemic import PointKind, SourceClass
 
 
 def _mem():
-    return Memory(encoder=SimpleEncoder(), extractor=SimpleKeywordExtractor())
+    # llm=object() : no `.generate`, so no LLM at all (as tests/test_clue_search.py).
+    # The default ClaudeLLM would call the API, or raise MissingCredential without a key.
+    return Memory(encoder=SimpleEncoder(), extractor=SimpleKeywordExtractor(),
+                  llm=object())
 
 
 # ---------------------------------------------------------------------------

@@ -122,7 +122,7 @@ def build_app(
     recency_weight: Optional[float] = None,
     spreading_weight: Optional[float] = None,
     surface: Optional[str] = None,
-) -> FastMCP:
+) -> FastMCP:  # noqa: F821
     """Build the metacog MCP app.
 
     `memory` lets a caller inject an already-populated Memory (e.g. a

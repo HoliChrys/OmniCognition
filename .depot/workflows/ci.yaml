@@ -1,0 +1,79 @@
+# Depot CI (TAC-2461) — the CI that gates merges, modelled on HoliChrys/tachikoma's
+# `.depot/workflows/ci.yaml` (TAC-2404). GitHub Actions does not start on this account
+# (TAC-281) : `.github/workflows/context-isolation.yml` is kept, but this is the run that
+# reports check-runs on PR commits.
+#
+# The whole suite (`python -m pytest tests/ -q`, AGENTS.md) runs, with every dependency
+# it imports installed — [bench] (anthropic, sentence-transformers, torch) and [test]
+# (pytest, networkx, ruff) — never skipped or faked. The `neo4j` tests skip by design
+# without OMNI_TEST_API_URL (`tests/neo4j_live.py`).
+#
+# The tests that go through the real LLM (e.g. `Memory.sleep()` -> `extract_common`) use
+# Gemini Flash behind the CLIProxy, PO decision on TAC-2461 (08/11) : the key is the Depot
+# secret `ANTHROPIC_API_KEY` (never in the repo), the endpoint and model are plain env.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest + ruff
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # setup-python finds `libpython3.11.so.1.0` only through LD_LIBRARY_PATH.
+      # metacog's PyExecutor runs `python -I` with env={"LANG": "C"} and loses it :
+      # « error while loading shared libraries » (tests/test_executor.py). Same step
+      # as HoliChrys/tachikoma's Depot CI : put the lib in ld.so's cache.
+      - name: Register libpython with the dynamic linker
+        run: |
+          echo "${pythonLocation}/lib" | sudo tee /etc/ld.so.conf.d/setup-python.conf
+          sudo ldconfig
+          env -i "${pythonLocation}/bin/python3" -c 'import sys; print(sys.version)'
+
+      # sentence-transformers' model (tests/test_answer_cluster.py) is fetched from the
+      # Hugging Face hub on first use ; cached between runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: hf-${{ runner.os }}-
+
+      - name: Install
+        # CPU torch wheels : the CUDA ones are ~2 GB and nothing here uses a GPU.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -e '.[bench,test]'
+
+      - name: Ruff
+        run: ruff check
+
+      - name: Pytest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: https://chrysostomes-macbook-pro.taila29aef.ts.net:8443
+          CLAUDE_MODEL: gemini-3-flash
+        # Each failing test also becomes a check-run annotation, readable on GitHub
+        # without a Depot login.
+        shell: bash
+        run: |
+          set +e
+          python -m pytest tests/ -q -rfEs 2>&1 | tee pytest.log
+          rc=${PIPESTATUS[0]}
+          grep -E '^(FAILED|ERROR) ' pytest.log | sed 's/^/::error title=pytest::/'
+          tail -n 1 pytest.log | sed 's/^/::notice title=pytest::/'
+          exit $rc
