@@ -120,7 +120,7 @@ def bm25_score(
         n_qi = sum(1 for d in docs if q in d)
         idfs[q] = math.log((n_total - n_qi + 0.5) / (n_qi + 0.5) + 1.0)
 
-    scores: List[Tuple[float, "Point"]] = []
+    scores: List[Tuple[float, "Point"]] = []  # noqa: F821
     for i, doc in enumerate(docs):
         if not doc:
             continue
