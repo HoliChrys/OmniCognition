@@ -425,7 +425,7 @@ def geometric_spread(
     seed_points: Sequence["Point"],  # noqa: F821
     all_points: Sequence["Point"],  # noqa: F821
     t_now: float,
-) -> List[Tuple[float, "Point"]]:
+) -> List[Tuple[float, "Point"]]:  # noqa: F821
     """Edge-free analog of HeLa-Mem's spreading activation.
 
     HeLa propagates base scores through LEARNED Hebbian edges
