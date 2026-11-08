@@ -62,7 +62,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          python -m pytest tests/ -q -rs 2>&1 | tee pytest.log
+          python -m pytest tests/ -q -rfEs 2>&1 | tee pytest.log
           rc=${PIPESTATUS[0]}
           grep -E '^(FAILED|ERROR) ' pytest.log | sed 's/^/::error title=pytest::/'
           tail -n 1 pytest.log | sed 's/^/::notice title=pytest::/'
