@@ -25,7 +25,8 @@ bench = [
     "sentence-transformers>=2.0.0",
     "transformers>=4.30.0",
     "torch>=2.0.0",
-    "anthropic>=0.30.0",
+    # <1 : anthropic 2.x refuses `temperature` in Messages.create() (TAC-2461).
+    "anthropic>=0.30.0,<1",
 ]
 # What the CI installs on top of [bench] (TAC-2461) : the test runner, the lint, and
 # `networkx` (louvain communities, `metacog/communities.py`, imported lazily).

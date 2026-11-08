@@ -5,9 +5,12 @@
 #
 # The whole suite (`python -m pytest tests/ -q`, AGENTS.md) runs, with every dependency
 # it imports installed — [bench] (anthropic, sentence-transformers, torch) and [test]
-# (pytest, networkx, ruff) — never skipped or faked. No API key is given : an LLM call
-# fails and the code's deterministic fallback answers, as in the offline suite. The
-# `neo4j` tests skip by design without OMNI_TEST_API_URL (`tests/neo4j_live.py`).
+# (pytest, networkx, ruff) — never skipped or faked. The `neo4j` tests skip by design
+# without OMNI_TEST_API_URL (`tests/neo4j_live.py`).
+#
+# The tests that go through the real LLM (e.g. `Memory.sleep()` -> `extract_common`) use
+# Gemini Flash behind the CLIProxy, PO decision on TAC-2461 (08/11) : the key is the Depot
+# secret `ANTHROPIC_API_KEY` (never in the repo), the endpoint and model are plain env.
 name: CI
 
 on:
@@ -50,4 +53,8 @@ jobs:
         run: ruff check
 
       - name: Pytest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: https://chrysostomes-macbook-pro.taila29aef.ts.net:8443
+          CLAUDE_MODEL: gemini-3-flash
         run: python -m pytest tests/ -q -rs
