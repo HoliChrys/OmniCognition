@@ -57,4 +57,13 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: https://chrysostomes-macbook-pro.taila29aef.ts.net:8443
           CLAUDE_MODEL: gemini-3-flash
-        run: python -m pytest tests/ -q -rs
+        # Each failing test also becomes a check-run annotation, readable on GitHub
+        # without a Depot login.
+        shell: bash
+        run: |
+          set +e
+          python -m pytest tests/ -q -rs 2>&1 | tee pytest.log
+          rc=${PIPESTATUS[0]}
+          grep -E '^(FAILED|ERROR) ' pytest.log | sed 's/^/::error title=pytest::/'
+          tail -n 1 pytest.log | sed 's/^/::notice title=pytest::/'
+          exit $rc
