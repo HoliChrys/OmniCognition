@@ -115,7 +115,7 @@ def tag_report(snap: Journal, client: Any) -> Dict[str, int]:
     ids = {p["point_id"] for p in pts}
     neo = {(p["point_id"], t) for p in pts for t in (p["fields"].get("memory_tags") or [])
            if isinstance(t, str) and t}
-    sq = set(snap.conn.execute("SELECT node_id, tag FROM tags").fetchall())
+    sq = {tuple(r) for r in snap.conn.execute("SELECT node_id, tag FROM tags")}  # Row != tuple
     only_sq = sq - neo
     return {"file": len(sq), "points": len(neo), "only_file": len(only_sq),
             "only_file_not_a_point": sum(1 for n, _ in only_sq if n not in ids),

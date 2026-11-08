@@ -57,3 +57,18 @@ def test_an_absent_file_is_named(tmp_path):
     r = mig.migrate_store("demo", root=str(tmp_path), archive_dir=None, apply=False,
                           client_for=lambda c, a: FakeApi())
     assert "absent" in r
+
+
+def test_the_tag_report_compares_the_file_index_with_the_points_tags(tmp_path):
+    _file(str(tmp_path / "root"))            # the file indexes fact_1 -> a
+
+    class Api(FakeApi):
+        def _call(self, method, path, body=None):
+            if path == "/api/memory/points":
+                return 200, {"points": [{"point_id": "fact_1", "fields": {"memory_tags": ["a", "b"]}}]}
+            return super()._call(method, path, body)
+
+    r = mig.migrate_store("global", root=str(tmp_path / "root"), archive_dir=None,
+                          apply=False, client_for=lambda c, a: Api(), tags=True)
+    assert r["tags"] == {"file": 1, "points": 2, "only_file": 0, "only_file_not_a_point": 0,
+                         "only_points": 1}
