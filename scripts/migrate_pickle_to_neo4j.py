@@ -313,7 +313,9 @@ def replayed_forgets(snap: Dict[str, Any], journal_db: Optional[str]) -> Dict[st
     with omni's own code on a COPY of the snapshot and of the journal."""
     if journal_db is None:
         return {"replayed": [], "points_after": None}
-    from metacog.journal import Journal
+    # `journal_db` is a copy of the on-disk SQLite journal : read by the SQLite
+    # class, whichever usage-journal backend the process is configured with.
+    from metacog.journal import SQLiteJournal
     from metacog.memory import Memory
 
     class _Replay:                       # the attributes `_replay_forgets` reads, nothing more
@@ -321,7 +323,7 @@ def replayed_forgets(snap: Dict[str, Any], journal_db: Optional[str]) -> Dict[st
         _replay_forgets = Memory._replay_forgets
 
     r = _Replay()
-    r.journal = Journal(journal_db)
+    r.journal = SQLiteJournal(journal_db)
     r.points = copy.deepcopy(snap.get("points", []))
     r._forget_log = copy.deepcopy(list(snap.get("_forget_log", [])))
     r.storage_path = "(verify)"
