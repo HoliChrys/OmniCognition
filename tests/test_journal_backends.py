@@ -195,7 +195,7 @@ def test_both_backends_implement_the_whole_protocol():
 def test_journal_is_still_the_sqlite_class():
     # 68 call sites construct `Journal(...)` : it stays the SQLite backend.
     assert journal_mod.SQLiteJournal is journal_mod.Journal or (
-        os.environ.get("OMNI_TEST_JOURNAL") == "clickhouse")
+        os.environ.get("OMNI_TEST_JOURNAL") in ("clickhouse", "proxy"))
 
 
 def test_state_methods_are_exactly_the_non_usage_ones():
