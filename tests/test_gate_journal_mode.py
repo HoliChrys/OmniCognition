@@ -47,10 +47,21 @@ def test_proxy_only_for_the_listed_stores(opened, monkeypatch):
     monkeypatch.setenv(gate.JOURNAL_CONTEXTS_ENV,
                        "tachikoma.paradigm, tachikoma.paralelle.GenAI")
     assert gate.usage_journal_for("global", "/r/global/memory.pkl") is None
-    assert gate.usage_journal_for("tachikoma.paradigm/accounts/a",
-                                  "/r/x/memory.pkl") is None
+    assert gate.usage_journal_for("global/accounts/a", "/r/ga/memory.pkl") is None
     assert gate.usage_journal_for("tachikoma.paralelle.GenAI", "/r/g/memory.pkl")
     assert [o[0] for o in opened] == ["tachikoma.paralelle.GenAI"]
+
+
+def test_a_listed_context_covers_its_accounts(opened, monkeypatch):
+    """TAC-2492 : an account's rows go to its context's proxy, so listing the context
+    is enough — an exact match left `ctx/accounts/*` on their `.journal.db`."""
+    monkeypatch.setenv(gate.JOURNAL_ENV, "proxy")
+    monkeypatch.setenv(gate.JOURNAL_CONTEXTS_ENV, "tachikoma.paradigm,global/accounts/b")
+    assert gate.usage_journal_for("tachikoma.paradigm/accounts/a", "/r/pa/memory.pkl")
+    assert gate.usage_journal_for("global/accounts/b", "/r/gb/memory.pkl")
+    assert gate.usage_journal_for("global", "/r/global/memory.pkl") is None
+    assert gate.usage_journal_for("tachikoma.paradigm.child", "/r/c/memory.pkl") is None
+    assert [o[:2] for o in opened] == [("tachikoma.paradigm", "a"), ("global", "b")]
 
 
 def test_a_proxy_journal_that_cannot_open_falls_back(opened, monkeypatch):
