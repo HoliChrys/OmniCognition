@@ -389,7 +389,10 @@ class ApiJournalLoader:
 
 
 def open_proxy_journal(ctx: str, account: str = "", *, state_path: str = ":memory:",
-                       **kwargs: Any) -> ProxyJournal:
-    """The served form : proxy writer, API loader, mutable state in `state_path`."""
+                       state: Optional[Any] = None, **kwargs: Any) -> ProxyJournal:
+    """The served form : proxy writer, API loader, mutable state in `state_path` — or
+    `state` itself (`metacog.journal_state_neo4j`, TAC-2465), which never opens it."""
     return ProxyJournal(ProxyRayWriter(ctx), ctx, account=account,
-                        loader=ApiJournalLoader(), state=SQLiteJournal(state_path), **kwargs)
+                        loader=ApiJournalLoader(),
+                        state=state if state is not None else SQLiteJournal(state_path),
+                        **kwargs)
