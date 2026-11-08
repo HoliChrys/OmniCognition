@@ -524,9 +524,12 @@ class ContextualMemory:
             raise RuntimeError(f"store {key!r} escapes the storage root")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         encoder, reranker = self.models()
-        return Memory(storage_path=path, journal_path="auto",
-                      journal=usage_journal_for(key, path),
-                      encoder=encoder, reranker=reranker)
+        journal = journal_for(key, path)
+        m = Memory(storage_path=path, journal_path="auto", journal=journal,
+                   encoder=encoder, reranker=reranker)
+        if require_state_mode() == "neo4j" and _listed(STATE_CONTEXTS_ENV, key):
+            m.reindex_tags()            # the tag index is the points', never stored
+        return m
 
     def _context_memory(self) -> Any:
         """The memory of the context ITSELF — its account's, the manager's."""
@@ -1385,8 +1388,7 @@ SERVED_STORES = frozenset({"neo4j"})
 #: `OMNI_JOURNAL_CONTEXTS` (comma separated store keys : `ctx` or
 #: `ctx/accounts/acc` ; unset = every store). A store left out keeps the SQLite
 #: journal : a context without a deployed `infra-proxy:<ctx>` has nowhere to
-#: write. The mutable state (tags, wiki, OKF) stays in `<store>.journal.db`
-#: either way, until its own OO ticket.
+#: write. Where the mutable state (tags, wiki, OKF) lives is `OMNI_STATE`'s.
 JOURNAL_ENV = "OMNI_JOURNAL"
 JOURNAL_CONTEXTS_ENV = "OMNI_JOURNAL_CONTEXTS"
 JOURNAL_MODES = frozenset({"", "sqlite", "proxy"})
@@ -1401,22 +1403,76 @@ def require_journal_mode() -> str:
     return mode or "sqlite"
 
 
-def usage_journal_for(key: str, path: str) -> Any:
+#: Where the gate keeps the journal's mutable STATE (D10 — Paperclip TAC-2465).
+#: Unset or `sqlite` : in `<store>.journal.db`, as before. `neo4j` : `memory_wiki_doc`
+#: records and the store's `okf_vocab` / `ref_remaps`, through the API
+#: (`metacog.journal_state_neo4j`), for the stores listed in `OMNI_STATE_CONTEXTS`
+#: (same form as `OMNI_JOURNAL_CONTEXTS` ; unset = every store). The tag index is
+#: rebuilt from the points at open. Removing the variable is the revert : the
+#: `.journal.db` files are never written by the `neo4j` mode, so they still hold
+#: the state as it was before the switch.
+STATE_ENV = "OMNI_STATE"
+STATE_CONTEXTS_ENV = "OMNI_STATE_CONTEXTS"
+STATE_MODES = frozenset({"", "sqlite", "neo4j"})
+
+
+def require_state_mode() -> str:
+    """The state mode the gate will serve — or a refusal BEFORE it listens."""
+    mode = os.environ.get(STATE_ENV, "").strip()
+    if mode not in STATE_MODES:
+        raise SystemExit(f"[gate] refused to start: {STATE_ENV}={mode!r} is not one "
+                         f"of {sorted(STATE_MODES - {''})} (unset = sqlite)")
+    return mode or "sqlite"
+
+
+def _listed(env: str, key: str) -> bool:
+    listed = {k.strip() for k in os.environ.get(env, "").split(",") if k.strip()}
+    return not listed or key in listed
+
+
+def state_journal_for(key: str) -> Any:
+    """The Neo4j state of the store `key`, or None when it stays in the file.
+
+    NOT failure-safe, unlike the usage journal : a state that cannot be loaded is
+    refused (`CorruptStoreError`), because serving an empty wiki would re-ingest
+    the notes over the real one."""
+    if require_state_mode() != "neo4j" or not _listed(STATE_CONTEXTS_ENV, key):
+        return None
+    from metacog.journal_state_neo4j import Neo4jStateJournal
+    from metacog.store.neo4j_backend import Neo4jBackend
+
+    ctx, _, account = key.partition("/accounts/")
+    return Neo4jStateJournal(Neo4jBackend(context_path=ctx, account=account))
+
+
+def journal_for(key: str, path: str) -> Any:
+    """The journal of the store `key` : its usage journal (`usage_journal_for`) with
+    its state where `OMNI_STATE` puts it. None = `Memory` opens the file itself."""
+    state = state_journal_for(key)
+    usage = usage_journal_for(key, path, state=state)
+    if state is None or usage is not None:
+        return usage
+    from metacog.journal import Journal
+    from metacog.journal_state_neo4j import SplitJournal
+
+    return SplitJournal(Journal(f"{path}.journal.db"), state)
+
+
+def usage_journal_for(key: str, path: str, state: Any = None) -> Any:
     """The usage journal of the store `key`, or None for the `journal_path` file.
 
     Failure-safe like every journal of omni : a proxy journal that cannot be
     built (no `ray`, no bearer) logs and falls back to the SQLite file."""
     if require_journal_mode() != "proxy":
         return None
-    listed = {k.strip() for k in os.environ.get(JOURNAL_CONTEXTS_ENV, "").split(",")
-              if k.strip()}
-    if listed and key not in listed:
+    if not _listed(JOURNAL_CONTEXTS_ENV, key):
         return None
     try:
         from metacog.journal_proxy import open_proxy_journal
 
         ctx, _, account = key.partition("/accounts/")
-        return open_proxy_journal(ctx, account, state_path=f"{path}.journal.db")
+        return open_proxy_journal(ctx, account, state_path=f"{path}.journal.db",
+                                  state=state)
     except Exception:
         import logging
         logging.getLogger(__name__).warning(
@@ -1457,6 +1513,7 @@ def main() -> None:
     """
     store = require_served_store()
     journal_mode = require_journal_mode()
+    state_mode = require_state_mode()
     import uvicorn
 
     port = int(os.environ.get("OMNI_HTTP_PORT", "8788"))
@@ -1470,7 +1527,10 @@ def main() -> None:
           f"(layout {storage_root}), notes {notes_root or '(disabled)'}, "
           f"usage journal {journal_mode}"
           + (f" for {os.environ.get(JOURNAL_CONTEXTS_ENV) or 'every store'}"
-             if journal_mode == "proxy" else ""), flush=True)
+             if journal_mode == "proxy" else "")
+          + f", state {state_mode}"
+          + (f" for {os.environ.get(STATE_CONTEXTS_ENV) or 'every store'}"
+             if state_mode == "neo4j" else ""), flush=True)
     # WE SERVE `outer` — the wrapper WITH the context middleware. Serving
     # `inner` (the bare MCP app) would serve without the gate: measured,
     # initialize without header returned 200. The lifespan is inner's,
