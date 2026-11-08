@@ -20,7 +20,8 @@ minted client side, flags as ``journal_flags`` rows, J4 — no ``UPDATE`` ever
 leaves this process) and a SQLite ``:memory:`` journal for what it reads. Every
 write lands in memory at once, so a read always sees it ; the rows reach the
 proxy from a background thread, grouped (``flush_interval_s``). Reads never wait
-on Ray.
+on Ray. ``flush_interval_s <= 0`` sends each call's rows before it returns
+(no thread) : the tests, and a caller that prefers durability to latency.
 
 FAILURE-SAFE, as every journal of omni : a proxy that is down or absent never
 raises out of a journal call. Unsent rows wait in the buffer (bounded by
@@ -212,7 +213,7 @@ class ProxyJournal(ClickHouseJournal):
         self._wake = threading.Event()
         self._closed = threading.Event()
         self._flusher: Optional[threading.Thread] = None
-        if start_flusher:
+        if start_flusher and self.flush_interval_s > 0:
             self._flusher = threading.Thread(
                 target=self._flush_loop, name=f"omni-journal-proxy:{ctx}", daemon=True)
             self._flusher.start()
@@ -244,7 +245,10 @@ class ProxyJournal(ClickHouseJournal):
                 logger.warning("omni journal: %d rows of %s never reached the "
                                "proxy (%d dropped so far)", over, self.ctx, self.dropped)
         if last:
-            self._wake.set()
+            if self.flush_interval_s <= 0:
+                self.flush()
+            else:
+                self._wake.set()
 
     def _flush_locked(self) -> bool:
         # The parent calls this from `flush()` and `close()` under `_lock`.

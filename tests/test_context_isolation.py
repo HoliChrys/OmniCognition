@@ -178,8 +178,8 @@ class Gate:
     def usage_sql(self, ctx: str, query: str, params: tuple,
                   clickhouse_query: str) -> list:
         """A read of the USAGE journal of `ctx` : the SQLite file, or ClickHouse
-        when the suite runs on it (OMNI_TEST_JOURNAL=clickhouse, conftest)."""
-        if os.environ.get("OMNI_TEST_JOURNAL") != "clickhouse":
+        when the suite runs on it (OMNI_TEST_JOURNAL=clickhouse|proxy, conftest)."""
+        if os.environ.get("OMNI_TEST_JOURNAL") not in ("clickhouse", "proxy"):
             return self.sql(ctx, query, params)
         from tests.conftest import clickhouse_usage_rows
         rows = clickhouse_usage_rows(self.journals()[ctx], clickhouse_query,

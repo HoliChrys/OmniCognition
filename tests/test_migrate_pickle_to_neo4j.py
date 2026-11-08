@@ -317,7 +317,7 @@ def test_m8_journal_forgets_replay_alike(route, stores):
     assert v["forgets_replayed"]["same_points_after_replay"] and v["verdict"] == "IDENTIQUE"
     # The fixture's own forget went through the suite's journal : into this
     # SQLite file, or into ClickHouse when the suite runs on it (conftest).
-    on_clickhouse = os.environ.get("OMNI_TEST_JOURNAL") == "clickhouse"
+    on_clickhouse = os.environ.get("OMNI_TEST_JOURNAL") in ("clickhouse", "proxy")
     assert v["journal"]["rows"]["forget_events"] == (1 if on_clickhouse else 2)
 
 
