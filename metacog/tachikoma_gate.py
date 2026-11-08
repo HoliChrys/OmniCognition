@@ -525,6 +525,7 @@ class ContextualMemory:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         encoder, reranker = self.models()
         return Memory(storage_path=path, journal_path="auto",
+                      journal=usage_journal_for(key, path),
                       encoder=encoder, reranker=reranker)
 
     def _context_memory(self) -> Any:
@@ -1377,6 +1378,53 @@ def build_gated_app(storage_root: str, notes_root: str,
 SERVED_STORES = frozenset({"neo4j"})
 
 
+#: Where the served gate keeps its usage journal (JC2-6, TAC2-1212 ; card J5 of
+#: Paperclip TAC-2455). Unset or `sqlite` : the `<store>.journal.db` file, as
+#: before. `proxy` : written by the context's infra-proxy, read once by the API,
+#: then in memory (`metacog.journal_proxy`) — for the stores listed in
+#: `OMNI_JOURNAL_CONTEXTS` (comma separated store keys : `ctx` or
+#: `ctx/accounts/acc` ; unset = every store). A store left out keeps the SQLite
+#: journal : a context without a deployed `infra-proxy:<ctx>` has nowhere to
+#: write. The mutable state (tags, wiki, OKF) stays in `<store>.journal.db`
+#: either way, until its own OO ticket.
+JOURNAL_ENV = "OMNI_JOURNAL"
+JOURNAL_CONTEXTS_ENV = "OMNI_JOURNAL_CONTEXTS"
+JOURNAL_MODES = frozenset({"", "sqlite", "proxy"})
+
+
+def require_journal_mode() -> str:
+    """The journal mode the gate will serve — or a refusal BEFORE it listens."""
+    mode = os.environ.get(JOURNAL_ENV, "").strip()
+    if mode not in JOURNAL_MODES:
+        raise SystemExit(f"[gate] refused to start: {JOURNAL_ENV}={mode!r} is not one "
+                         f"of {sorted(JOURNAL_MODES - {''})} (unset = sqlite)")
+    return mode or "sqlite"
+
+
+def usage_journal_for(key: str, path: str) -> Any:
+    """The usage journal of the store `key`, or None for the `journal_path` file.
+
+    Failure-safe like every journal of omni : a proxy journal that cannot be
+    built (no `ray`, no bearer) logs and falls back to the SQLite file."""
+    if require_journal_mode() != "proxy":
+        return None
+    listed = {k.strip() for k in os.environ.get(JOURNAL_CONTEXTS_ENV, "").split(",")
+              if k.strip()}
+    if listed and key not in listed:
+        return None
+    try:
+        from metacog.journal_proxy import open_proxy_journal
+
+        ctx, _, account = key.partition("/accounts/")
+        return open_proxy_journal(ctx, account, state_path=f"{path}.journal.db")
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[gate] proxy journal unavailable for %s — SQLite journal kept", key,
+            exc_info=True)
+        return None
+
+
 def require_served_store() -> str:
     """The store backend the gate will serve — or a refusal BEFORE it listens.
 
@@ -1408,6 +1456,7 @@ def main() -> None:
     refused before the gate listens, `require_served_store`).
     """
     store = require_served_store()
+    journal_mode = require_journal_mode()
     import uvicorn
 
     port = int(os.environ.get("OMNI_HTTP_PORT", "8788"))
@@ -1418,7 +1467,10 @@ def main() -> None:
 
     outer, mcp_app, inner = build_gated_app(storage_root, notes_root, surface)
     print(f"[gate] omni gated per context on :{port} — store {store} "
-          f"(layout {storage_root}), notes {notes_root or '(disabled)'}", flush=True)
+          f"(layout {storage_root}), notes {notes_root or '(disabled)'}, "
+          f"usage journal {journal_mode}"
+          + (f" for {os.environ.get(JOURNAL_CONTEXTS_ENV) or 'every store'}"
+             if journal_mode == "proxy" else ""), flush=True)
     # WE SERVE `outer` — the wrapper WITH the context middleware. Serving
     # `inner` (the bare MCP app) would serve without the gate: measured,
     # initialize without header returned 200. The lifespan is inner's,
